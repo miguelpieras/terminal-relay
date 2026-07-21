@@ -1,0 +1,36 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+    echo "usage: agent-console-session <codex|claude> [arguments...]" >&2
+    exit 64
+fi
+
+tool="$1"
+shift
+
+case "$tool" in
+    codex)
+        executable="/usr/bin/codex"
+        ;;
+    claude)
+        executable="/usr/bin/claude"
+        ;;
+    *)
+        echo "unsupported tool: $tool" >&2
+        exit 64
+        ;;
+esac
+
+runtime_directory="/run/user/$(/usr/bin/id -u)/agent-console"
+/usr/bin/install -d -m 700 "$runtime_directory"
+
+lock_file="$runtime_directory/$tool.lock"
+exec 9>"$lock_file"
+
+if ! /usr/bin/flock --nonblock 9; then
+    echo "A $tool session is already running on this server." >&2
+    exit 75
+fi
+
+exec "$executable" "$@"
