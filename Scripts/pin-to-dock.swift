@@ -13,7 +13,7 @@ guard FileManager.default.fileExists(atPath: applicationURL.path) else {
 
 var applications = CFPreferencesCopyAppValue(applicationsKey, preferencesDomain) as? [[String: Any]] ?? []
 
-let isAlreadyPinned = applications.contains { item in
+func isTerminalRelayItem(_ item: [String: Any]) -> Bool {
     guard let tileData = item["tile-data"] as? [String: Any] else { return false }
 
     if tileData["bundle-identifier"] as? String == bundleIdentifier {
@@ -28,11 +28,6 @@ let isAlreadyPinned = applications.contains { item in
     }
 
     return urlString == applicationURL.absoluteString
-}
-
-if isAlreadyPinned {
-    print("already-pinned")
-    exit(0)
 }
 
 let bookmark = try applicationURL.bookmarkData(
@@ -54,11 +49,26 @@ let tileData: [String: Any] = [
     "is-beta": 0
 ]
 
-applications.append([
-    "GUID": Int.random(in: 1...Int(UInt32.max)),
+let matchingIndices = applications.indices.filter { isTerminalRelayItem(applications[$0]) }
+let guid = matchingIndices.first.flatMap { applications[$0]["GUID"] }
+    ?? Int.random(in: 1...Int(UInt32.max))
+let refreshedItem: [String: Any] = [
+    "GUID": guid,
     "tile-data": tileData,
     "tile-type": "file-tile"
-])
+]
+
+let result: String
+if let firstIndex = matchingIndices.first {
+    applications[firstIndex] = refreshedItem
+    for duplicateIndex in matchingIndices.dropFirst().reversed() {
+        applications.remove(at: duplicateIndex)
+    }
+    result = "refreshed"
+} else {
+    applications.append(refreshedItem)
+    result = "added"
+}
 
 CFPreferencesSetAppValue(applicationsKey, applications as CFArray, preferencesDomain)
 
@@ -67,4 +77,4 @@ guard CFPreferencesAppSynchronize(preferencesDomain) else {
     exit(1)
 }
 
-print("added")
+print(result)

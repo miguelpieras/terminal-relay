@@ -7,6 +7,8 @@ derived_data="$repository_root/DerivedData"
 source_app="$derived_data/Build/Products/Release/Terminal Relay.app"
 installed_app="/Applications/Terminal Relay.app"
 staged_app="$derived_data/Install/Terminal Relay.app"
+build_number="$(/bin/date -u +%s)"
+launch_services="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
 cd "$repository_root"
 
@@ -20,6 +22,7 @@ xcodebuild \
     -destination 'platform=macOS,arch=arm64' \
     -derivedDataPath "$derived_data" \
     CODE_SIGNING_ALLOWED=NO \
+    CURRENT_PROJECT_VERSION="$build_number" \
     test
 
 echo "Building Terminal Relay Release"
@@ -30,6 +33,7 @@ xcodebuild \
     -destination 'platform=macOS,arch=arm64' \
     -derivedDataPath "$derived_data" \
     CODE_SIGNING_ALLOWED=NO \
+    CURRENT_PROJECT_VERSION="$build_number" \
     build
 
 if [[ ! -d "$source_app" ]]; then
@@ -43,6 +47,9 @@ if /usr/bin/pgrep -x "Terminal Relay" >/dev/null; then
         /usr/bin/pgrep -x "Terminal Relay" >/dev/null || break
         /bin/sleep 1
     done
+    if /usr/bin/pgrep -x "Terminal Relay" >/dev/null; then
+        /usr/bin/pkill -KILL -x "Terminal Relay"
+    fi
 fi
 
 if [[ "$(dirname "$installed_app")" != "/Applications" || "$(basename "$installed_app")" != "Terminal Relay.app" ]]; then
@@ -59,8 +66,19 @@ fi
 /bin/rm -rf "$installed_app"
 /usr/bin/ditto "$staged_app" "$installed_app"
 
+for build_app in \
+    "$derived_data/Build/Products/Debug/Terminal Relay.app" \
+    "$derived_data/Build/Products/Release/Terminal Relay.app" \
+    "$staged_app"
+do
+    if [[ -d "$build_app" ]]; then
+        "$launch_services" -u "$build_app" >/dev/null 2>&1 || true
+    fi
+done
+"$launch_services" -f "$installed_app"
+
 dock_result="$(/usr/bin/swift "$repository_root/Scripts/pin-to-dock.swift")"
-if [[ "$dock_result" == "added" ]]; then
+if [[ "$dock_result" == "added" || "$dock_result" == "refreshed" ]]; then
     /usr/bin/killall Dock 2>/dev/null || true
 fi
 
