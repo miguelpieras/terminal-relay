@@ -29,5 +29,9 @@ struct TerminalRelayApp: App {
         .defaultSize(width: 1_260, height: 820)
         .windowStyle(.titleBar)
         .windowToolbarStyle(.unifiedCompact)
+
+        Settings {
+            AgentDefaultsView()
+        }
     }
 }

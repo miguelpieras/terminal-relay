@@ -16,10 +16,12 @@
 		1FA01C33C8C89624D38B7288 /* SessionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4C76B0396E10CAF3945C3EB /* SessionManager.swift */; };
 		260C7E8CD25E00B853E63C60 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 865E323F9872A2B96FD0A247 /* ContentView.swift */; };
 		354AC532DA7ABB9688F98244 /* ServerProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1A2A3C58843B9F9BBDF0B62 /* ServerProfile.swift */; };
+		4F7EDC395EECB2A7942F567D /* AgentDefaultsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5EC9ECCFD1C5FE64E51E46B2 /* AgentDefaultsView.swift */; };
 		5826EAA6E50EE377AF85D994 /* AgentKind.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95F329024A646D63DF51C026 /* AgentKind.swift */; };
 		5A8B4C6996C6AB625EB6DA1A /* SessionSlot.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CD64E85F20330019303C926 /* SessionSlot.swift */; };
 		6DC711689B3A23294963F406 /* TerminalRelayApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0A02BB8092DDF8AED8C6F603 /* TerminalRelayApp.swift */; };
 		788027947BFEA620BCC4C08A /* TerminalSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F6DC0C9B63E27A8EBF45AAD /* TerminalSession.swift */; };
+		816110D0FC89354E2968F662 /* AgentLaunchDefaults.swift in Sources */ = {isa = PBXBuildFile; fileRef = C563B44090011E0A80AE65E6 /* AgentLaunchDefaults.swift */; };
 		AE9E989F48F3B3EEAF0FC2D4 /* ServerEditorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA47F1A31FE07CB12C137C7D /* ServerEditorView.swift */; };
 		B1FD3BBC4984CEC8284D7ECA /* SSHCommandBuilderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3294B74FA0B27E0781E76BA /* SSHCommandBuilderTests.swift */; };
 		CC8BDB4D65D80A701E9EB31A /* ServerStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1107CD200FBE55F0833D63D /* ServerStoreTests.swift */; };
@@ -41,6 +43,7 @@
 		0A02BB8092DDF8AED8C6F603 /* TerminalRelayApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalRelayApp.swift; sourceTree = "<group>"; };
 		2610AB4602CAB8F3FEC9FB1A /* TerminalRelayTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TerminalRelayTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		2B8C4489491EF49B7822E03A /* SSHCommandBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SSHCommandBuilder.swift; sourceTree = "<group>"; };
+		5EC9ECCFD1C5FE64E51E46B2 /* AgentDefaultsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentDefaultsView.swift; sourceTree = "<group>"; };
 		6F6DC0C9B63E27A8EBF45AAD /* TerminalSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalSession.swift; sourceTree = "<group>"; };
 		7DC204D99814E9F11DA7D053 /* SessionSlotRegistryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionSlotRegistryTests.swift; sourceTree = "<group>"; };
 		865E323F9872A2B96FD0A247 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
@@ -52,6 +55,7 @@
 		AB03758D1CB3A90E9F6492F2 /* ServerProfileTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerProfileTests.swift; sourceTree = "<group>"; };
 		B1A2A3C58843B9F9BBDF0B62 /* ServerProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerProfile.swift; sourceTree = "<group>"; };
 		BA47F1A31FE07CB12C137C7D /* ServerEditorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerEditorView.swift; sourceTree = "<group>"; };
+		C563B44090011E0A80AE65E6 /* AgentLaunchDefaults.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentLaunchDefaults.swift; sourceTree = "<group>"; };
 		CBB3BF44468D527C634FE65A /* TerminalRelay.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TerminalRelay.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		E1107CD200FBE55F0833D63D /* ServerStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerStoreTests.swift; sourceTree = "<group>"; };
 		E31E6BD2ECBE42BE1EFFDD00 /* TerminalHostView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalHostView.swift; sourceTree = "<group>"; };
@@ -103,6 +107,7 @@
 		586AC571CA6720ED167DB5EF /* Views */ = {
 			isa = PBXGroup;
 			children = (
+				5EC9ECCFD1C5FE64E51E46B2 /* AgentDefaultsView.swift */,
 				865E323F9872A2B96FD0A247 /* ContentView.swift */,
 				BA47F1A31FE07CB12C137C7D /* ServerEditorView.swift */,
 				EFB8C7DD5FBA09DF4BB4A6EF /* ServerWorkspaceView.swift */,
@@ -137,6 +142,7 @@
 			isa = PBXGroup;
 			children = (
 				95F329024A646D63DF51C026 /* AgentKind.swift */,
+				C563B44090011E0A80AE65E6 /* AgentLaunchDefaults.swift */,
 				B1A2A3C58843B9F9BBDF0B62 /* ServerProfile.swift */,
 				9CD64E85F20330019303C926 /* SessionSlot.swift */,
 			);
@@ -246,7 +252,9 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				4F7EDC395EECB2A7942F567D /* AgentDefaultsView.swift in Sources */,
 				5826EAA6E50EE377AF85D994 /* AgentKind.swift in Sources */,
+				816110D0FC89354E2968F662 /* AgentLaunchDefaults.swift in Sources */,
 				260C7E8CD25E00B853E63C60 /* ContentView.swift in Sources */,
 				0B69126CE70C815298882288 /* SSHCommandBuilder.swift in Sources */,
 				AE9E989F48F3B3EEAF0FC2D4 /* ServerEditorView.swift in Sources */,

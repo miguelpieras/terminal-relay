@@ -47,12 +47,16 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
     private var hasFinished = false
     private var processExitSource: DispatchSourceProcess?
 
-    init(server: ServerProfile, kind: AgentKind) {
+    init(server: ServerProfile, kind: AgentKind, launchDefaults: AgentLaunchDefaults) {
         self.serverKey = server.concurrencyKey
         self.serverName = server.displayName
         self.kind = kind
         self.accountLabel = server.accountLabel(for: kind)
-        self.configuration = SSHCommandBuilder.configuration(for: server, kind: kind)
+        self.configuration = SSHCommandBuilder.configuration(
+            for: server,
+            kind: kind,
+            launchDefaults: launchDefaults
+        )
         self.terminalView = LocalProcessTerminalView(frame: NSRect(x: 0, y: 0, width: 900, height: 600))
         super.init()
 

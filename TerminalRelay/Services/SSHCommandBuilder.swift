@@ -6,7 +6,11 @@ struct SSHLaunchConfiguration: Equatable {
 }
 
 enum SSHCommandBuilder {
-    static func configuration(for server: ServerProfile, kind: AgentKind) -> SSHLaunchConfiguration {
+    static func configuration(
+        for server: ServerProfile,
+        kind: AgentKind,
+        launchDefaults: AgentLaunchDefaults
+    ) -> SSHLaunchConfiguration {
         var arguments = [
             "-tt",
             "-o", "ServerAliveInterval=30",
@@ -23,20 +27,28 @@ enum SSHCommandBuilder {
         }
 
         arguments.append(server.destination)
-        arguments.append(remoteCommand(for: server, kind: kind))
+        arguments.append(remoteCommand(for: server, kind: kind, launchDefaults: launchDefaults))
 
         return SSHLaunchConfiguration(executable: "/usr/bin/ssh", arguments: arguments)
     }
 
-    static func remoteCommand(for server: ServerProfile, kind: AgentKind) -> String {
+    static func remoteCommand(
+        for server: ServerProfile,
+        kind: AgentKind,
+        launchDefaults: AgentLaunchDefaults
+    ) -> String {
         let command = server.command(for: kind).trimmingCharacters(in: .whitespacesAndNewlines)
         let directory = server.workingDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+        let launchArguments = launchDefaults.arguments(for: kind)
+            .map(shellQuote)
+            .joined(separator: " ")
+        let launchCommand = "\(command) \(launchArguments)"
 
         let payload: String
         if directory.isEmpty {
-            payload = "exec \(command)"
+            payload = "exec \(launchCommand)"
         } else {
-            payload = "cd -- \(shellQuote(directory)) && exec \(command)"
+            payload = "cd -- \(shellQuote(directory)) && exec \(launchCommand)"
         }
 
         return "exec \"${SHELL:-/bin/sh}\" -lic \(shellQuote(payload))"

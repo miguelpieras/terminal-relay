@@ -9,7 +9,16 @@ final class SSHCommandBuilderTests: XCTestCase {
             workingDirectory: "/srv/terminal relay"
         )
 
-        let configuration = SSHCommandBuilder.configuration(for: server, kind: .codex)
+        let configuration = SSHCommandBuilder.configuration(
+            for: server,
+            kind: .codex,
+            launchDefaults: .standard
+        )
+        let remoteCommand = SSHCommandBuilder.remoteCommand(
+            for: server,
+            kind: .codex,
+            launchDefaults: .standard
+        )
 
         XCTAssertEqual(configuration.executable, "/usr/bin/ssh")
         XCTAssertEqual(
@@ -21,7 +30,7 @@ final class SSHCommandBuilderTests: XCTestCase {
                 "-p", "2222",
                 "-i", ("~/Keys/agent key" as NSString).expandingTildeInPath,
                 "miguel@example.com",
-                "exec \"${SHELL:-/bin/sh}\" -lic 'cd -- '\"'\"'/srv/terminal relay'\"'\"' && exec codex --resume'"
+                remoteCommand
             ]
         )
     }
@@ -29,19 +38,31 @@ final class SSHCommandBuilderTests: XCTestCase {
     func testConfigurationOmitsBlankIdentityFile() {
         let server = makeServer(identityFile: "  \n ", workingDirectory: "")
 
-        let configuration = SSHCommandBuilder.configuration(for: server, kind: .claude)
+        let configuration = SSHCommandBuilder.configuration(
+            for: server,
+            kind: .claude,
+            launchDefaults: .standard
+        )
 
         XCTAssertFalse(configuration.arguments.contains("-i"))
         XCTAssertEqual(configuration.arguments.suffix(2), [
             "miguel@example.com",
-            "exec \"${SHELL:-/bin/sh}\" -lic 'exec claude'"
+            SSHCommandBuilder.remoteCommand(
+                for: server,
+                kind: .claude,
+                launchDefaults: .standard
+            )
         ])
     }
 
     func testDefaultPortDoesNotOverrideSSHConfig() {
         let server = makeServer(port: 22)
 
-        let configuration = SSHCommandBuilder.configuration(for: server, kind: .codex)
+        let configuration = SSHCommandBuilder.configuration(
+            for: server,
+            kind: .codex,
+            launchDefaults: .standard
+        )
 
         XCTAssertFalse(configuration.arguments.contains("-p"))
     }
@@ -52,9 +73,16 @@ final class SSHCommandBuilderTests: XCTestCase {
             codexCommand: "  codex --resume  "
         )
 
-        let command = SSHCommandBuilder.remoteCommand(for: server, kind: .codex)
+        let command = SSHCommandBuilder.remoteCommand(
+            for: server,
+            kind: .codex,
+            launchDefaults: .standard
+        )
         let quotedDirectory = SSHCommandBuilder.shellQuote("/srv/Miguel's agents")
-        let payload = "cd -- \(quotedDirectory) && exec codex --resume"
+        let arguments = AgentLaunchDefaults.standard.arguments(for: .codex)
+            .map(SSHCommandBuilder.shellQuote)
+            .joined(separator: " ")
+        let payload = "cd -- \(quotedDirectory) && exec codex --resume \(arguments)"
 
         XCTAssertEqual(
             command,
@@ -66,6 +94,60 @@ final class SSHCommandBuilderTests: XCTestCase {
         XCTAssertEqual(SSHCommandBuilder.shellQuote("plain text"), "'plain text'")
         XCTAssertEqual(SSHCommandBuilder.shellQuote("it's safe"), "'it'\"'\"'s safe'")
         XCTAssertEqual(SSHCommandBuilder.shellQuote(""), "''")
+    }
+
+    func testCustomDefaultsAreQuotedAndAppliedPerAgent() {
+        let server = makeServer(workingDirectory: "")
+        let defaults = AgentLaunchDefaults(
+            codexModel: "custom codex",
+            codexReasoningEffort: .high,
+            claudeModel: "custom'claude",
+            claudeReasoningEffort: .xhigh
+        )
+
+        let codexCommand = SSHCommandBuilder.remoteCommand(
+            for: server,
+            kind: .codex,
+            launchDefaults: defaults
+        )
+        let claudeCommand = SSHCommandBuilder.remoteCommand(
+            for: server,
+            kind: .claude,
+            launchDefaults: defaults
+        )
+
+        XCTAssertEqual(
+            codexCommand,
+            expectedRemoteCommand(server: server, kind: .codex, defaults: defaults)
+        )
+        XCTAssertEqual(
+            claudeCommand,
+            expectedRemoteCommand(server: server, kind: .claude, defaults: defaults)
+        )
+    }
+
+    func testBlankModelNamesUseProductionDefaults() {
+        let defaults = AgentLaunchDefaults(
+            codexModel: " \n ",
+            codexReasoningEffort: .max,
+            claudeModel: "\t",
+            claudeReasoningEffort: .max
+        )
+
+        XCTAssertEqual(defaults.codexModel, "gpt-5.6-sol")
+        XCTAssertEqual(defaults.claudeModel, "fable")
+    }
+
+    private func expectedRemoteCommand(
+        server: ServerProfile,
+        kind: AgentKind,
+        defaults: AgentLaunchDefaults
+    ) -> String {
+        let arguments = defaults.arguments(for: kind)
+            .map(SSHCommandBuilder.shellQuote)
+            .joined(separator: " ")
+        let payload = "exec \(server.command(for: kind)) \(arguments)"
+        return "exec \"${SHELL:-/bin/sh}\" -lic \(SSHCommandBuilder.shellQuote(payload))"
     }
 
     private func makeServer(

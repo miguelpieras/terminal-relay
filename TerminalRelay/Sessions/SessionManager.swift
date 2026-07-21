@@ -17,7 +17,7 @@ final class SessionManager: ObservableObject {
         sessions.filter { $0.serverKey == server.concurrencyKey }
     }
 
-    func open(server: ServerProfile, kind: AgentKind) {
+    func open(server: ServerProfile, kind: AgentKind, launchDefaults: AgentLaunchDefaults) {
         if let existing = session(server: server, kind: kind) {
             if existing.status.occupiesSlot {
                 selectedSessionID = existing.id
@@ -32,7 +32,7 @@ final class SessionManager: ObservableObject {
             return
         }
 
-        let session = TerminalSession(server: server, kind: kind)
+        let session = TerminalSession(server: server, kind: kind, launchDefaults: launchDefaults)
         session.onTermination = { [weak self] sessionID in
             self?.handleTermination(sessionID: sessionID)
         }

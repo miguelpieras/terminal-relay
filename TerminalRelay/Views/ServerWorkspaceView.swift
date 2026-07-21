@@ -2,7 +2,28 @@ import SwiftUI
 
 struct ServerWorkspaceView: View {
     @EnvironmentObject private var sessionManager: SessionManager
+    @AppStorage(AgentLaunchDefaults.StorageKey.codexModel)
+    private var codexModel = AgentLaunchDefaults.standard.codexModel
+
+    @AppStorage(AgentLaunchDefaults.StorageKey.codexReasoningEffort)
+    private var codexReasoningEffort = AgentLaunchDefaults.standard.codexReasoningEffort
+
+    @AppStorage(AgentLaunchDefaults.StorageKey.claudeModel)
+    private var claudeModel = AgentLaunchDefaults.standard.claudeModel
+
+    @AppStorage(AgentLaunchDefaults.StorageKey.claudeReasoningEffort)
+    private var claudeReasoningEffort = AgentLaunchDefaults.standard.claudeReasoningEffort
+
     let server: ServerProfile
+
+    private var launchDefaults: AgentLaunchDefaults {
+        AgentLaunchDefaults(
+            codexModel: codexModel,
+            codexReasoningEffort: codexReasoningEffort,
+            claudeModel: claudeModel,
+            claudeReasoningEffort: claudeReasoningEffort
+        )
+    }
 
     private var serverSessions: [TerminalSession] {
         sessionManager.sessions(for: server)
@@ -68,7 +89,8 @@ struct ServerWorkspaceView: View {
                 AgentLaunchControl(
                     server: server,
                     kind: kind,
-                    session: sessionManager.session(server: server, kind: kind)
+                    session: sessionManager.session(server: server, kind: kind),
+                    launchDefaults: launchDefaults
                 )
             }
         }
@@ -92,7 +114,7 @@ struct ServerWorkspaceView: View {
 
             HStack(spacing: 14) {
                 ForEach(AgentKind.allCases) { kind in
-                    EmptyAgentCard(server: server, kind: kind)
+                    EmptyAgentCard(server: server, kind: kind, launchDefaults: launchDefaults)
                 }
             }
         }
@@ -119,13 +141,19 @@ private struct AgentLaunchControl: View {
     let server: ServerProfile
     let kind: AgentKind
     let session: TerminalSession?
+    let launchDefaults: AgentLaunchDefaults
 
     var body: some View {
         if let session {
-            ExistingAgentLaunchControl(server: server, kind: kind, session: session)
+            ExistingAgentLaunchControl(
+                server: server,
+                kind: kind,
+                session: session,
+                launchDefaults: launchDefaults
+            )
         } else {
             Button {
-                sessionManager.open(server: server, kind: kind)
+                sessionManager.open(server: server, kind: kind, launchDefaults: launchDefaults)
             } label: {
                 Label("Start \(kind.displayName)", systemImage: kind.systemImage)
             }
@@ -140,10 +168,11 @@ private struct ExistingAgentLaunchControl: View {
     let server: ServerProfile
     let kind: AgentKind
     @ObservedObject var session: TerminalSession
+    let launchDefaults: AgentLaunchDefaults
 
     var body: some View {
         Button {
-            sessionManager.open(server: server, kind: kind)
+            sessionManager.open(server: server, kind: kind, launchDefaults: launchDefaults)
         } label: {
             Label(buttonLabel, systemImage: kind.systemImage)
         }
@@ -165,6 +194,7 @@ private struct EmptyAgentCard: View {
     @EnvironmentObject private var sessionManager: SessionManager
     let server: ServerProfile
     let kind: AgentKind
+    let launchDefaults: AgentLaunchDefaults
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -178,13 +208,17 @@ private struct EmptyAgentCard: View {
 
             Text(server.accountLabel(for: kind))
                 .foregroundStyle(.secondary)
+            Text(launchDefaults.summary(for: kind))
+                .font(.caption.weight(.medium))
+                .foregroundStyle(kind.tint)
+                .lineLimit(1)
             Text(server.command(for: kind))
                 .font(.system(.caption, design: .monospaced))
                 .foregroundStyle(.tertiary)
                 .lineLimit(1)
 
             Button("Start \(kind.displayName)") {
-                sessionManager.open(server: server, kind: kind)
+                sessionManager.open(server: server, kind: kind, launchDefaults: launchDefaults)
             }
             .buttonStyle(.borderedProminent)
             .tint(kind.tint)
