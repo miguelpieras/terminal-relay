@@ -1,5 +1,5 @@
 import XCTest
-@testable import AgentConsole
+@testable import TerminalRelay
 
 final class SessionSlotRegistryTests: XCTestCase {
     func testRegistryAllowsOneSlotPerAgentKindOnEachServer() {

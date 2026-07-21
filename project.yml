@@ -1,4 +1,4 @@
-name: AgentConsole
+name: TerminalRelay
 
 options:
   bundleIdPrefix: com.miguelpieras
@@ -12,45 +12,50 @@ packages:
     exactVersion: 1.15.0
 
 targets:
-  AgentConsole:
+  TerminalRelay:
     type: application
     platform: macOS
     sources:
-      - path: AgentConsole
+      - path: TerminalRelay
     dependencies:
       - package: SwiftTerm
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.miguelpieras.AgentConsole
-        PRODUCT_MODULE_NAME: AgentConsole
+        PRODUCT_BUNDLE_IDENTIFIER: com.miguelpieras.TerminalRelay
+        PRODUCT_NAME: Terminal Relay
+        PRODUCT_MODULE_NAME: TerminalRelay
         GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_CFBundleDisplayName: Agent Console
+        INFOPLIST_KEY_CFBundleName: Terminal Relay
+        INFOPLIST_KEY_CFBundleDisplayName: Terminal Relay
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         MARKETING_VERSION: 1.0
         CURRENT_PROJECT_VERSION: 1
         SWIFT_VERSION: 5.0
         ENABLE_HARDENED_RUNTIME: YES
         CODE_SIGN_STYLE: Automatic
 
-  AgentConsoleTests:
+  TerminalRelayTests:
     type: bundle.unit-test
     platform: macOS
     sources:
-      - path: AgentConsoleTests
+      - path: TerminalRelayTests
     dependencies:
-      - target: AgentConsole
+      - target: TerminalRelay
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.miguelpieras.AgentConsoleTests
+        PRODUCT_BUNDLE_IDENTIFIER: com.miguelpieras.TerminalRelayTests
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_VERSION: 5.0
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/Terminal Relay.app/Contents/MacOS/Terminal Relay
+        BUNDLE_LOADER: $(TEST_HOST)
 
 schemes:
-  AgentConsole:
+  TerminalRelay:
     build:
       targets:
-        AgentConsole: all
-        AgentConsoleTests: [test]
+        TerminalRelay: all
+        TerminalRelayTests: [test]
     test:
       targets:
-        - AgentConsoleTests
+        - TerminalRelayTests

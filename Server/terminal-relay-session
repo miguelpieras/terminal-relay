@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-    echo "usage: agent-console-session <codex|claude> [arguments...]" >&2
+    echo "usage: terminal-relay-session <codex|claude> [arguments...]" >&2
     exit 64
 fi
 
@@ -22,7 +22,7 @@ case "$tool" in
         ;;
 esac
 
-runtime_directory="/run/user/$(/usr/bin/id -u)/agent-console"
+runtime_directory="/run/user/$(/usr/bin/id -u)/terminal-relay"
 /usr/bin/install -d -m 700 "$runtime_directory"
 
 lock_file="$runtime_directory/$tool.lock"

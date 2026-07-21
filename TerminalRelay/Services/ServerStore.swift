@@ -7,17 +7,17 @@ final class ServerStore: ObservableObject {
     @Published private(set) var persistenceError: String?
 
     private let defaults: UserDefaults
-    private let storageKey = "serverProfiles.v2"
+    private let storageKey = "serverProfiles.v3"
 
     private static let bundledServers = [
         ServerProfile(
-            name: "Agent Console Worker 1",
-            host: "agent-console-worker-1",
+            name: "Terminal Relay Worker 1",
+            host: "terminal-relay-worker-1",
             workingDirectory: "/workspace",
             codexAccountLabel: "Worker Codex",
             claudeAccountLabel: "Worker Claude",
-            codexCommand: "/usr/local/bin/agent-console-session codex",
-            claudeCommand: "/usr/local/bin/agent-console-session claude"
+            codexCommand: "/usr/local/bin/terminal-relay-session codex",
+            claudeCommand: "/usr/local/bin/terminal-relay-session claude"
         )
     ]
 

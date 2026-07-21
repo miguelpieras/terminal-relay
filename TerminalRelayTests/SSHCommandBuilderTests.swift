@@ -1,12 +1,12 @@
 import XCTest
-@testable import AgentConsole
+@testable import TerminalRelay
 
 final class SSHCommandBuilderTests: XCTestCase {
     func testConfigurationBuildsSSHArgumentsInRequiredOrder() {
         let server = makeServer(
             port: 2_222,
             identityFile: "~/Keys/agent key",
-            workingDirectory: "/srv/agent console"
+            workingDirectory: "/srv/terminal relay"
         )
 
         let configuration = SSHCommandBuilder.configuration(for: server, kind: .codex)
@@ -21,7 +21,7 @@ final class SSHCommandBuilderTests: XCTestCase {
                 "-p", "2222",
                 "-i", ("~/Keys/agent key" as NSString).expandingTildeInPath,
                 "miguel@example.com",
-                "exec \"${SHELL:-/bin/sh}\" -lic 'cd -- '\"'\"'/srv/agent console'\"'\"' && exec codex --resume'"
+                "exec \"${SHELL:-/bin/sh}\" -lic 'cd -- '\"'\"'/srv/terminal relay'\"'\"' && exec codex --resume'"
             ]
         )
     }

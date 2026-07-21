@@ -1,10 +1,10 @@
 import XCTest
-@testable import AgentConsole
+@testable import TerminalRelay
 
 @MainActor
 final class ServerStoreTests: XCTestCase {
     func testSaveUpdateLoadAndDeletePersistAcrossStoreInstances() {
-        let suiteName = "AgentConsoleTests.ServerStore.\(UUID().uuidString)"
+        let suiteName = "TerminalRelayTests.ServerStore.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
@@ -35,10 +35,10 @@ final class ServerStoreTests: XCTestCase {
     }
 
     func testInvalidSavedDataReportsDismissiblePersistenceError() {
-        let suiteName = "AgentConsoleTests.ServerStore.Invalid.\(UUID().uuidString)"
+        let suiteName = "TerminalRelayTests.ServerStore.Invalid.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        defaults.set(Data("not-json".utf8), forKey: "serverProfiles.v2")
+        defaults.set(Data("not-json".utf8), forKey: "serverProfiles.v3")
 
         let store = ServerStore(defaults: defaults, initialServers: [])
 

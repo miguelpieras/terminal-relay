@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 @MainActor
-final class AgentConsoleApplicationDelegate: NSObject, NSApplicationDelegate {
+final class TerminalRelayApplicationDelegate: NSObject, NSApplicationDelegate {
     weak var sessionManager: SessionManager?
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -11,13 +11,13 @@ final class AgentConsoleApplicationDelegate: NSObject, NSApplicationDelegate {
 }
 
 @main
-struct AgentConsoleApp: App {
-    @NSApplicationDelegateAdaptor(AgentConsoleApplicationDelegate.self) private var appDelegate
+struct TerminalRelayApp: App {
+    @NSApplicationDelegateAdaptor(TerminalRelayApplicationDelegate.self) private var appDelegate
     @StateObject private var serverStore = ServerStore()
     @StateObject private var sessionManager = SessionManager()
 
     var body: some Scene {
-        Window("Agent Console", id: "main") {
+        Window("Terminal Relay", id: "main") {
             ContentView()
                 .environmentObject(serverStore)
                 .environmentObject(sessionManager)

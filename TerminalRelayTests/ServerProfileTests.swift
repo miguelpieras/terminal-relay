@@ -1,5 +1,5 @@
 import XCTest
-@testable import AgentConsole
+@testable import TerminalRelay
 
 final class ServerProfileTests: XCTestCase {
     func testValidProfileAcceptsPortBoundariesAndTrimsRequiredText() {
@@ -49,8 +49,8 @@ final class ServerProfileTests: XCTestCase {
             host: "mac.example.com",
             port: 2_222,
             username: "runner",
-            identityFile: "~/.ssh/agent_console",
-            workingDirectory: "/Users/runner/Projects/Agent Console",
+            identityFile: "~/.ssh/terminal_relay",
+            workingDirectory: "/Users/runner/Projects/Terminal Relay",
             codexAccountLabel: "Work Codex",
             claudeAccountLabel: "Work Claude",
             codexCommand: "codex --resume",
@@ -65,10 +65,10 @@ final class ServerProfileTests: XCTestCase {
 
     func testConcurrencyKeyTreatsMagicDNSAndShortNameAsOneServer() {
         var shortProfile = makeValidProfile()
-        shortProfile.host = "agent-console-worker-1"
+        shortProfile.host = "terminal-relay-worker-1"
 
         var magicDNSProfile = makeValidProfile()
-        magicDNSProfile.host = "agent-console-worker-1.example-tailnet.ts.net."
+        magicDNSProfile.host = "terminal-relay-worker-1.example-tailnet.ts.net."
 
         XCTAssertEqual(shortProfile.concurrencyKey, magicDNSProfile.concurrencyKey)
     }

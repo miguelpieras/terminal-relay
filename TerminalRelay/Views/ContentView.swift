@@ -83,7 +83,7 @@ struct ContentView: View {
             Text("Its active terminals will be stopped and its saved connection settings removed.")
         }
         .alert(
-            "Agent Console",
+            "Terminal Relay",
             isPresented: Binding(
                 get: { serverStore.persistenceError != nil },
                 set: { if !$0 { serverStore.dismissPersistenceError() } }
@@ -127,7 +127,7 @@ struct ContentView: View {
                 }
             }
         }
-        .navigationTitle("Agent Console")
+        .navigationTitle("Terminal Relay")
         .overlay {
             if serverStore.servers.isEmpty {
                 ContentUnavailableView(

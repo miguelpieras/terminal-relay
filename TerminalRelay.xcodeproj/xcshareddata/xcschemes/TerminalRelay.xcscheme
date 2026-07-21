@@ -15,10 +15,10 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "D1EA6366162B186DC5BD0932"
-               BuildableName = "AgentConsole.app"
-               BlueprintName = "AgentConsole"
-               ReferencedContainer = "container:AgentConsole.xcodeproj">
+               BlueprintIdentifier = "06241A6EBADB09447CB9555B"
+               BuildableName = "TerminalRelay.app"
+               BlueprintName = "TerminalRelay"
+               ReferencedContainer = "container:TerminalRelay.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
          <BuildActionEntry
@@ -29,10 +29,10 @@
             buildForAnalyzing = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "D641524A6CA84E4AFF4182A1"
-               BuildableName = "AgentConsoleTests.xctest"
-               BlueprintName = "AgentConsoleTests"
-               ReferencedContainer = "container:AgentConsole.xcodeproj">
+               BlueprintIdentifier = "F358B45827DD93D8A05631EE"
+               BuildableName = "TerminalRelayTests.xctest"
+               BlueprintName = "TerminalRelayTests"
+               ReferencedContainer = "container:TerminalRelay.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
@@ -46,10 +46,10 @@
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "D1EA6366162B186DC5BD0932"
-            BuildableName = "AgentConsole.app"
-            BlueprintName = "AgentConsole"
-            ReferencedContainer = "container:AgentConsole.xcodeproj">
+            BlueprintIdentifier = "06241A6EBADB09447CB9555B"
+            BuildableName = "TerminalRelay.app"
+            BlueprintName = "TerminalRelay"
+            ReferencedContainer = "container:TerminalRelay.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
       <Testables>
@@ -58,10 +58,10 @@
             parallelizable = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "D641524A6CA84E4AFF4182A1"
-               BuildableName = "AgentConsoleTests.xctest"
-               BlueprintName = "AgentConsoleTests"
-               ReferencedContainer = "container:AgentConsole.xcodeproj">
+               BlueprintIdentifier = "F358B45827DD93D8A05631EE"
+               BuildableName = "TerminalRelayTests.xctest"
+               BlueprintName = "TerminalRelayTests"
+               ReferencedContainer = "container:TerminalRelay.xcodeproj">
             </BuildableReference>
          </TestableReference>
       </Testables>
@@ -82,10 +82,10 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "D1EA6366162B186DC5BD0932"
-            BuildableName = "AgentConsole.app"
-            BlueprintName = "AgentConsole"
-            ReferencedContainer = "container:AgentConsole.xcodeproj">
+            BlueprintIdentifier = "06241A6EBADB09447CB9555B"
+            BuildableName = "TerminalRelay.app"
+            BlueprintName = "TerminalRelay"
+            ReferencedContainer = "container:TerminalRelay.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </LaunchAction>
@@ -99,10 +99,10 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "D1EA6366162B186DC5BD0932"
-            BuildableName = "AgentConsole.app"
-            BlueprintName = "AgentConsole"
-            ReferencedContainer = "container:AgentConsole.xcodeproj">
+            BlueprintIdentifier = "06241A6EBADB09447CB9555B"
+            BuildableName = "TerminalRelay.app"
+            BlueprintName = "TerminalRelay"
+            ReferencedContainer = "container:TerminalRelay.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </ProfileAction>
