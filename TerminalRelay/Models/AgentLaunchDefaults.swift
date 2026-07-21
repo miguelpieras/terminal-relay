@@ -26,6 +26,7 @@ struct AgentLaunchDefaults: Equatable {
         static let codexReasoningEffort = "agentLaunchDefaults.codexReasoningEffort"
         static let claudeModel = "agentLaunchDefaults.claudeModel"
         static let claudeReasoningEffort = "agentLaunchDefaults.claudeReasoningEffort"
+        static let fullAccessEnabled = "agentLaunchDefaults.fullAccessEnabled"
     }
 
     static let defaultCodexModel = "gpt-5.6-sol"
@@ -35,38 +36,50 @@ struct AgentLaunchDefaults: Equatable {
         codexModel: defaultCodexModel,
         codexReasoningEffort: .max,
         claudeModel: defaultClaudeModel,
-        claudeReasoningEffort: .max
+        claudeReasoningEffort: .max,
+        fullAccessEnabled: true
     )
 
     let codexModel: String
     let codexReasoningEffort: AgentReasoningEffort
     let claudeModel: String
     let claudeReasoningEffort: AgentReasoningEffort
+    let fullAccessEnabled: Bool
 
     init(
         codexModel: String,
         codexReasoningEffort: AgentReasoningEffort,
         claudeModel: String,
-        claudeReasoningEffort: AgentReasoningEffort
+        claudeReasoningEffort: AgentReasoningEffort,
+        fullAccessEnabled: Bool
     ) {
         self.codexModel = Self.normalizedModel(codexModel, fallback: Self.defaultCodexModel)
         self.codexReasoningEffort = codexReasoningEffort
         self.claudeModel = Self.normalizedModel(claudeModel, fallback: Self.defaultClaudeModel)
         self.claudeReasoningEffort = claudeReasoningEffort
+        self.fullAccessEnabled = fullAccessEnabled
     }
 
     func arguments(for kind: AgentKind) -> [String] {
         switch kind {
         case .codex:
-            return [
+            var arguments = [
                 "--model", codexModel,
                 "--config", "model_reasoning_effort=\"\(codexReasoningEffort.rawValue)\""
             ]
+            if fullAccessEnabled {
+                arguments.append("--dangerously-bypass-approvals-and-sandbox")
+            }
+            return arguments
         case .claude:
-            return [
+            var arguments = [
                 "--model", claudeModel,
                 "--effort", claudeReasoningEffort.rawValue
             ]
+            if fullAccessEnabled {
+                arguments.append("--dangerously-skip-permissions")
+            }
+            return arguments
         }
     }
 

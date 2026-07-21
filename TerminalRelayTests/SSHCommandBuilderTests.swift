@@ -102,7 +102,8 @@ final class SSHCommandBuilderTests: XCTestCase {
             codexModel: "custom codex",
             codexReasoningEffort: .high,
             claudeModel: "custom'claude",
-            claudeReasoningEffort: .xhigh
+            claudeReasoningEffort: .xhigh,
+            fullAccessEnabled: true
         )
 
         let codexCommand = SSHCommandBuilder.remoteCommand(
@@ -131,11 +132,42 @@ final class SSHCommandBuilderTests: XCTestCase {
             codexModel: " \n ",
             codexReasoningEffort: .max,
             claudeModel: "\t",
-            claudeReasoningEffort: .max
+            claudeReasoningEffort: .max,
+            fullAccessEnabled: true
         )
 
         XCTAssertEqual(defaults.codexModel, "gpt-5.6-sol")
         XCTAssertEqual(defaults.claudeModel, "fable")
+    }
+
+    func testStandardDefaultsEnableFullAccessForBothAgents() {
+        XCTAssertTrue(
+            AgentLaunchDefaults.standard.arguments(for: .codex)
+                .contains("--dangerously-bypass-approvals-and-sandbox")
+        )
+        XCTAssertTrue(
+            AgentLaunchDefaults.standard.arguments(for: .claude)
+                .contains("--dangerously-skip-permissions")
+        )
+    }
+
+    func testFullAccessCanBeDisabledForBothAgents() {
+        let defaults = AgentLaunchDefaults(
+            codexModel: "gpt-5.6-sol",
+            codexReasoningEffort: .max,
+            claudeModel: "fable",
+            claudeReasoningEffort: .max,
+            fullAccessEnabled: false
+        )
+
+        XCTAssertFalse(
+            defaults.arguments(for: .codex)
+                .contains("--dangerously-bypass-approvals-and-sandbox")
+        )
+        XCTAssertFalse(
+            defaults.arguments(for: .claude)
+                .contains("--dangerously-skip-permissions")
+        )
     }
 
     private func expectedRemoteCommand(

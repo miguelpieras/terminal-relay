@@ -14,6 +14,9 @@ struct ServerWorkspaceView: View {
     @AppStorage(AgentLaunchDefaults.StorageKey.claudeReasoningEffort)
     private var claudeReasoningEffort = AgentLaunchDefaults.standard.claudeReasoningEffort
 
+    @AppStorage(AgentLaunchDefaults.StorageKey.fullAccessEnabled)
+    private var fullAccessEnabled = AgentLaunchDefaults.standard.fullAccessEnabled
+
     let server: ServerProfile
 
     private var launchDefaults: AgentLaunchDefaults {
@@ -21,7 +24,8 @@ struct ServerWorkspaceView: View {
             codexModel: codexModel,
             codexReasoningEffort: codexReasoningEffort,
             claudeModel: claudeModel,
-            claudeReasoningEffort: claudeReasoningEffort
+            claudeReasoningEffort: claudeReasoningEffort,
+            fullAccessEnabled: fullAccessEnabled
         )
     }
 
@@ -212,6 +216,12 @@ private struct EmptyAgentCard: View {
                 .font(.caption.weight(.medium))
                 .foregroundStyle(kind.tint)
                 .lineLimit(1)
+            if launchDefaults.fullAccessEnabled {
+                Text("Full access · auto-approved")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.red)
+                    .lineLimit(1)
+            }
             Text(server.command(for: kind))
                 .font(.system(.caption, design: .monospaced))
                 .foregroundStyle(.tertiary)

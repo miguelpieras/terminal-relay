@@ -13,6 +13,9 @@ struct AgentDefaultsView: View {
     @AppStorage(AgentLaunchDefaults.StorageKey.claudeReasoningEffort)
     private var claudeReasoningEffort = AgentLaunchDefaults.standard.claudeReasoningEffort
 
+    @AppStorage(AgentLaunchDefaults.StorageKey.fullAccessEnabled)
+    private var fullAccessEnabled = AgentLaunchDefaults.standard.fullAccessEnabled
+
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
             VStack(alignment: .leading, spacing: 5) {
@@ -37,6 +40,20 @@ struct AgentDefaultsView: View {
                 model: $claudeModel,
                 effort: $claudeReasoningEffort
             )
+
+            GroupBox {
+                VStack(alignment: .leading, spacing: 7) {
+                    Toggle("Auto-approve full access", isOn: $fullAccessEnabled)
+                    Text("Disables approval prompts and the agents' built-in permission boundaries on every worker.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 4)
+            } label: {
+                Label("Permissions", systemImage: "exclamationmark.shield.fill")
+                    .foregroundStyle(fullAccessEnabled ? Color.red : Color.secondary)
+            }
 
             HStack {
                 Text("Running terminals keep their current settings until restarted.")
@@ -90,5 +107,6 @@ struct AgentDefaultsView: View {
         codexReasoningEffort = AgentLaunchDefaults.standard.codexReasoningEffort
         claudeModel = AgentLaunchDefaults.standard.claudeModel
         claudeReasoningEffort = AgentLaunchDefaults.standard.claudeReasoningEffort
+        fullAccessEnabled = AgentLaunchDefaults.standard.fullAccessEnabled
     }
 }
