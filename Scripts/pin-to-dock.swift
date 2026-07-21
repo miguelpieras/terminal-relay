@@ -2,7 +2,7 @@ import CoreFoundation
 import Foundation
 
 let applicationURL = URL(fileURLWithPath: "/Applications/Terminal Relay.app", isDirectory: true)
-let bundleIdentifier = "com.miguelpieras.TerminalRelay"
+let bundleIdentifier = "com.mpieras.TerminalRelay"
 let preferencesDomain = "com.apple.dock" as CFString
 let applicationsKey = "persistent-apps" as CFString
 
@@ -50,10 +50,8 @@ let tileData: [String: Any] = [
 ]
 
 let matchingIndices = applications.indices.filter { isTerminalRelayItem(applications[$0]) }
-let guid = matchingIndices.first.flatMap { applications[$0]["GUID"] }
-    ?? Int.random(in: 1...Int(UInt32.max))
 let refreshedItem: [String: Any] = [
-    "GUID": guid,
+    "GUID": Int.random(in: 1...Int(UInt32.max)),
     "tile-data": tileData,
     "tile-type": "file-tile"
 ]

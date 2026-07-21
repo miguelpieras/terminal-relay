@@ -63,7 +63,11 @@ fi
 /usr/bin/codesign --force --deep --sign - "$staged_app"
 /usr/bin/codesign --verify --deep --strict "$staged_app"
 
-/bin/rm -rf "$installed_app"
+if [[ -d "$installed_app" ]]; then
+    /usr/bin/find "$installed_app" -mindepth 1 -maxdepth 1 -exec /bin/rm -rf {} +
+else
+    /bin/mkdir -p "$installed_app"
+fi
 /usr/bin/ditto "$staged_app" "$installed_app"
 
 for build_app in \

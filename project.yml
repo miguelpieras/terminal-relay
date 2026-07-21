@@ -21,7 +21,7 @@ targets:
       - package: SwiftTerm
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.miguelpieras.TerminalRelay
+        PRODUCT_BUNDLE_IDENTIFIER: com.mpieras.TerminalRelay
         PRODUCT_NAME: Terminal Relay
         PRODUCT_MODULE_NAME: TerminalRelay
         GENERATE_INFOPLIST_FILE: YES
@@ -44,7 +44,7 @@ targets:
       - target: TerminalRelay
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.miguelpieras.TerminalRelayTests
+        PRODUCT_BUNDLE_IDENTIFIER: com.mpieras.TerminalRelayTests
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_VERSION: 5.0
         TEST_HOST: $(BUILT_PRODUCTS_DIR)/Terminal Relay.app/Contents/MacOS/Terminal Relay

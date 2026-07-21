@@ -357,7 +357,7 @@
 					"@executable_path/../Frameworks",
 					"@loader_path/../Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.miguelpieras.TerminalRelayTests;
+				PRODUCT_BUNDLE_IDENTIFIER = com.mpieras.TerminalRelayTests;
 				SDKROOT = macosx;
 				SWIFT_VERSION = 5.0;
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Terminal Relay.app/Contents/MacOS/Terminal Relay";
@@ -437,7 +437,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.miguelpieras.TerminalRelay;
+				PRODUCT_BUNDLE_IDENTIFIER = com.mpieras.TerminalRelay;
 				PRODUCT_MODULE_NAME = TerminalRelay;
 				PRODUCT_NAME = "Terminal Relay";
 				SDKROOT = macosx;
@@ -462,7 +462,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.miguelpieras.TerminalRelay;
+				PRODUCT_BUNDLE_IDENTIFIER = com.mpieras.TerminalRelay;
 				PRODUCT_MODULE_NAME = TerminalRelay;
 				PRODUCT_NAME = "Terminal Relay";
 				SDKROOT = macosx;
@@ -481,7 +481,7 @@
 					"@executable_path/../Frameworks",
 					"@loader_path/../Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.miguelpieras.TerminalRelayTests;
+				PRODUCT_BUNDLE_IDENTIFIER = com.mpieras.TerminalRelayTests;
 				SDKROOT = macosx;
 				SWIFT_VERSION = 5.0;
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Terminal Relay.app/Contents/MacOS/Terminal Relay";
