@@ -8,6 +8,7 @@ struct SSHLaunchConfiguration: Equatable {
 enum SSHCommandBuilder {
     static func configuration(
         for server: ServerProfile,
+        project: ProjectProfile,
         kind: AgentKind,
         launchDefaults: AgentLaunchDefaults
     ) -> SSHLaunchConfiguration {
@@ -27,18 +28,26 @@ enum SSHCommandBuilder {
         }
 
         arguments.append(server.destination)
-        arguments.append(remoteCommand(for: server, kind: kind, launchDefaults: launchDefaults))
+        arguments.append(
+            remoteCommand(
+                for: server,
+                project: project,
+                kind: kind,
+                launchDefaults: launchDefaults
+            )
+        )
 
         return SSHLaunchConfiguration(executable: "/usr/bin/ssh", arguments: arguments)
     }
 
     static func remoteCommand(
         for server: ServerProfile,
+        project: ProjectProfile,
         kind: AgentKind,
         launchDefaults: AgentLaunchDefaults
     ) -> String {
         let command = server.command(for: kind).trimmingCharacters(in: .whitespacesAndNewlines)
-        let directory = server.workingDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+        let directory = project.workingDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
         let launchArguments = launchDefaults.arguments(for: kind)
             .map(shellQuote)
             .joined(separator: " ")

@@ -5,17 +5,19 @@ final class SSHCommandBuilderTests: XCTestCase {
     func testConfigurationBuildsSSHArgumentsInRequiredOrder() {
         let server = makeServer(
             port: 2_222,
-            identityFile: "~/Keys/agent key",
-            workingDirectory: "/srv/terminal relay"
+            identityFile: "~/Keys/agent key"
         )
+        let project = makeProject(server: server, workingDirectory: "/srv/terminal relay")
 
         let configuration = SSHCommandBuilder.configuration(
             for: server,
+            project: project,
             kind: .codex,
             launchDefaults: .standard
         )
         let remoteCommand = SSHCommandBuilder.remoteCommand(
             for: server,
+            project: project,
             kind: .codex,
             launchDefaults: .standard
         )
@@ -36,10 +38,12 @@ final class SSHCommandBuilderTests: XCTestCase {
     }
 
     func testConfigurationOmitsBlankIdentityFile() {
-        let server = makeServer(identityFile: "  \n ", workingDirectory: "")
+        let server = makeServer(identityFile: "  \n ")
+        let project = makeProject(server: server, workingDirectory: "")
 
         let configuration = SSHCommandBuilder.configuration(
             for: server,
+            project: project,
             kind: .claude,
             launchDefaults: .standard
         )
@@ -49,6 +53,7 @@ final class SSHCommandBuilderTests: XCTestCase {
             "miguel@example.com",
             SSHCommandBuilder.remoteCommand(
                 for: server,
+                project: project,
                 kind: .claude,
                 launchDefaults: .standard
             )
@@ -57,9 +62,11 @@ final class SSHCommandBuilderTests: XCTestCase {
 
     func testDefaultPortDoesNotOverrideSSHConfig() {
         let server = makeServer(port: 22)
+        let project = makeProject(server: server)
 
         let configuration = SSHCommandBuilder.configuration(
             for: server,
+            project: project,
             kind: .codex,
             launchDefaults: .standard
         )
@@ -69,12 +76,13 @@ final class SSHCommandBuilderTests: XCTestCase {
 
     func testRemoteCommandQuotesApostrophesInWorkingDirectory() {
         let server = makeServer(
-            workingDirectory: "/srv/Miguel's agents",
             codexCommand: "  codex --resume  "
         )
+        let project = makeProject(server: server, workingDirectory: "/srv/Miguel's agents")
 
         let command = SSHCommandBuilder.remoteCommand(
             for: server,
+            project: project,
             kind: .codex,
             launchDefaults: .standard
         )
@@ -97,7 +105,8 @@ final class SSHCommandBuilderTests: XCTestCase {
     }
 
     func testCustomDefaultsAreQuotedAndAppliedPerAgent() {
-        let server = makeServer(workingDirectory: "")
+        let server = makeServer()
+        let project = makeProject(server: server, workingDirectory: "")
         let defaults = AgentLaunchDefaults(
             codexModel: "custom codex",
             codexReasoningEffort: .high,
@@ -108,22 +117,32 @@ final class SSHCommandBuilderTests: XCTestCase {
 
         let codexCommand = SSHCommandBuilder.remoteCommand(
             for: server,
+            project: project,
             kind: .codex,
             launchDefaults: defaults
         )
         let claudeCommand = SSHCommandBuilder.remoteCommand(
             for: server,
+            project: project,
             kind: .claude,
             launchDefaults: defaults
         )
 
         XCTAssertEqual(
             codexCommand,
-            expectedRemoteCommand(server: server, kind: .codex, defaults: defaults)
+            expectedRemoteCommand(
+                server: server,
+                kind: .codex,
+                defaults: defaults
+            )
         )
         XCTAssertEqual(
             claudeCommand,
-            expectedRemoteCommand(server: server, kind: .claude, defaults: defaults)
+            expectedRemoteCommand(
+                server: server,
+                kind: .claude,
+                defaults: defaults
+            )
         )
     }
 
@@ -185,7 +204,6 @@ final class SSHCommandBuilderTests: XCTestCase {
     private func makeServer(
         port: Int = 22,
         identityFile: String = "",
-        workingDirectory: String = "/srv/agents",
         codexCommand: String = "codex --resume"
     ) -> ServerProfile {
         ServerProfile(
@@ -194,9 +212,21 @@ final class SSHCommandBuilderTests: XCTestCase {
             port: port,
             username: "miguel",
             identityFile: identityFile,
-            workingDirectory: workingDirectory,
+            workingDirectory: "/legacy/server/workspace",
             codexCommand: codexCommand,
             claudeCommand: "claude"
+        )
+    }
+
+    private func makeProject(
+        server: ServerProfile,
+        workingDirectory: String = "/srv/agents"
+    ) -> ProjectProfile {
+        ProjectProfile(
+            name: "Terminal Relay",
+            serverID: server.id,
+            githubRepository: "owner/terminal-relay",
+            workingDirectory: workingDirectory
         )
     }
 }

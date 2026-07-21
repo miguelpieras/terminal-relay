@@ -2,158 +2,251 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject private var serverStore: ServerStore
+    @EnvironmentObject private var projectStore: ProjectStore
     @EnvironmentObject private var sessionManager: SessionManager
 
-    @State private var selectedServerID: UUID?
-    @State private var editorProfile: ServerProfile?
-    @State private var serverPendingDeletion: ServerProfile?
+    @State private var selectedProjectID: UUID?
+    @State private var editorProject: ProjectProfile?
+    @State private var projectPendingDeletion: ProjectProfile?
+    @State private var isManagingWorkers = false
 
-    private var selectedServer: ServerProfile? {
-        serverStore.server(id: selectedServerID)
+    private var selectedProject: ProjectProfile? {
+        projectStore.project(id: selectedProjectID)
     }
 
     var body: some View {
         NavigationSplitView {
             sidebar
-                .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 340)
+                .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 340)
         } detail: {
-            if let selectedServer {
-                ServerWorkspaceView(server: selectedServer)
-            } else {
-                WelcomeView {
-                    editorProfile = ServerProfile()
-                }
-            }
+            detail
         }
+        .navigationSplitViewStyle(.balanced)
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                Button {
-                    editorProfile = ServerProfile()
-                } label: {
-                    Label("Add Server", systemImage: "plus")
+                Button(action: addProject) {
+                    Image(systemName: "plus")
                 }
-                .help("Add server")
+                .help("New project")
 
-                Button {
-                    if let selectedServer {
-                        editorProfile = selectedServer
+                Menu {
+                    Button("Edit Project", systemImage: "pencil") {
+                        editorProject = selectedProject
                     }
-                } label: {
-                    Label("Edit Server", systemImage: "pencil")
-                }
-                .disabled(selectedServer == nil)
-                .help("Edit selected server")
+                    .disabled(selectedProject == nil)
 
-                Button {
-                    serverPendingDeletion = selectedServer
+                    Button("Manage Workers", systemImage: "server.rack") {
+                        isManagingWorkers = true
+                    }
+
+                    Divider()
+
+                    Button("Delete Project", systemImage: "trash", role: .destructive) {
+                        projectPendingDeletion = selectedProject
+                    }
+                    .disabled(selectedProject == nil)
                 } label: {
-                    Label("Delete Server", systemImage: "trash")
+                    Image(systemName: "ellipsis")
                 }
-                .disabled(selectedServer == nil)
-                .help("Delete selected server")
+                .help("Project actions")
             }
         }
-        .sheet(item: $editorProfile) { profile in
-            ServerEditorView(profile: profile) { savedProfile in
-                serverStore.save(savedProfile)
-                selectedServerID = savedProfile.id
-                editorProfile = nil
+        .sheet(item: $editorProject) { project in
+            ProjectEditorView(project: project, workers: serverStore.servers) { savedProject in
+                guard projectStore.save(savedProject) else { return }
+                selectedProjectID = savedProject.id
+                editorProject = nil
             } onCancel: {
-                editorProfile = nil
+                editorProject = nil
             }
+        }
+        .sheet(isPresented: $isManagingWorkers) {
+            WorkerManagementView()
         }
         .confirmationDialog(
-            "Delete \(serverPendingDeletion?.displayName ?? "server")?",
+            "Remove \(projectPendingDeletion?.displayName ?? "project") from Terminal Relay?",
             isPresented: Binding(
-                get: { serverPendingDeletion != nil },
-                set: { if !$0 { serverPendingDeletion = nil } }
+                get: { projectPendingDeletion != nil },
+                set: { if !$0 { projectPendingDeletion = nil } }
             )
         ) {
-            Button("Delete Server", role: .destructive) {
-                guard let profile = serverPendingDeletion else { return }
-                sessionManager.closeSessions(for: profile)
-                serverStore.delete(id: profile.id)
-                selectedServerID = serverStore.servers.first?.id
-                serverPendingDeletion = nil
+            Button("Remove Project", role: .destructive) {
+                guard let project = projectPendingDeletion else { return }
+                sessionManager.closeSessions(forProjectID: project.id)
+                projectStore.delete(id: project.id)
+                selectedProjectID = projectStore.projects.first?.id
+                projectPendingDeletion = nil
             }
             Button("Cancel", role: .cancel) {
-                serverPendingDeletion = nil
+                projectPendingDeletion = nil
             }
         } message: {
-            Text("Its active terminals will be stopped and its saved connection settings removed.")
+            Text("Open terminals will stop. The remote repository and files will not be deleted.")
         }
         .alert(
             "Terminal Relay",
             isPresented: Binding(
-                get: { serverStore.persistenceError != nil },
-                set: { if !$0 { serverStore.dismissPersistenceError() } }
+                get: { projectStore.persistenceError != nil || projectStore.validationError != nil },
+                set: {
+                    if !$0 {
+                        projectStore.dismissPersistenceError()
+                        projectStore.dismissValidationError()
+                    }
+                }
             )
         ) {
-            Button("OK") { serverStore.dismissPersistenceError() }
+            Button("OK") {
+                projectStore.dismissPersistenceError()
+                projectStore.dismissValidationError()
+            }
         } message: {
-            Text(serverStore.persistenceError ?? "Unknown persistence error")
+            Text(projectStore.persistenceError ?? projectStore.validationError ?? "Unknown project error")
         }
-        .onAppear {
-            if selectedServerID == nil {
-                selectedServerID = serverStore.servers.first?.id
-            }
+        .onAppear(perform: selectFirstProjectIfNeeded)
+        .onChange(of: projectStore.projects) { _, _ in selectFirstProjectIfNeeded() }
+        .onChange(of: serverStore.servers) { _, workers in
+            projectStore.updateServers(workers)
         }
-        .onChange(of: selectedServerID) { _, newServerID in
-            guard let newServerID else {
+        .onChange(of: selectedProjectID) { _, projectID in
+            guard let projectID else {
                 sessionManager.selectedSessionID = nil
                 return
             }
-            guard let server = serverStore.server(id: newServerID) else {
-                sessionManager.selectedSessionID = nil
-                return
-            }
-            sessionManager.selectedSessionID = sessionManager.sessions(for: server).first?.id
+            sessionManager.selectedSessionID = sessionManager.sessions(forProjectID: projectID).first?.id
         }
     }
 
     private var sidebar: some View {
-        List(selection: $selectedServerID) {
-            Section("Servers") {
-                ForEach(serverStore.servers) { server in
-                    ServerSidebarRow(server: server)
-                        .tag(server.id)
-                        .contextMenu {
-                            Button("Edit") { editorProfile = server }
-                            Divider()
-                            Button("Delete", role: .destructive) {
-                                serverPendingDeletion = server
-                            }
+        List {
+            HStack {
+                Text("Terminal Relay")
+                    .font(.title3.weight(.semibold))
+                Spacer()
+            }
+            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 6, trailing: 12))
+            .listRowSeparator(.hidden)
+
+            Button(action: addProject) {
+                Label("New Project", systemImage: "square.and.pencil")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 12))
+
+            Section("Projects") {
+                ForEach(projectStore.projects) { project in
+                    Button {
+                        selectedProjectID = project.id
+                    } label: {
+                        ProjectSidebarRow(
+                            project: project,
+                            worker: serverStore.server(id: project.serverID),
+                            isSelected: selectedProjectID == project.id
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .listRowInsets(EdgeInsets(top: 2, leading: 8, bottom: 2, trailing: 8))
+                    .contextMenu {
+                        Button("Edit") { editorProject = project }
+                        Divider()
+                        Button("Remove", role: .destructive) {
+                            projectPendingDeletion = project
                         }
+                    }
                 }
             }
         }
-        .navigationTitle("Terminal Relay")
-        .overlay {
-            if serverStore.servers.isEmpty {
-                ContentUnavailableView(
-                    "No Servers",
-                    systemImage: "server.rack",
-                    description: Text("Add the first remote server to get started.")
-                )
+        .listStyle(.sidebar)
+        .safeAreaInset(edge: .bottom) {
+            VStack(spacing: 0) {
+                Divider()
+
+                Button {
+                    isManagingWorkers = true
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: "server.rack")
+                            .frame(width: 18)
+                        Text("Workers")
+                        Spacer()
+                        Text("\(serverStore.servers.count)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .contentShape(Rectangle())
+                    .padding(.horizontal, 16)
+                    .frame(height: 42)
+                }
+                .buttonStyle(.plain)
             }
+            .background(.bar)
+        }
+    }
+
+    @ViewBuilder
+    private var detail: some View {
+        if let project = selectedProject,
+           let worker = serverStore.server(id: project.serverID) {
+            ProjectWorkspaceView(
+                project: project,
+                worker: worker,
+                onSelectProject: { selectedProjectID = $0 }
+            )
+        } else if projectStore.projects.isEmpty {
+            ContentUnavailableView {
+                Label("No Projects", systemImage: "folder.badge.plus")
+            } description: {
+                Text("Create a project and assign it to a remote Terminal Relay worker.")
+            } actions: {
+                Button("New Project", action: addProject)
+                    .buttonStyle(.borderedProminent)
+                Button("Manage Workers") { isManagingWorkers = true }
+            }
+        } else {
+            ContentUnavailableView(
+                "Worker Unavailable",
+                systemImage: "exclamationmark.triangle",
+                description: Text("Reassign this project to an available worker.")
+            )
+        }
+    }
+
+    private func addProject() {
+        guard let worker = serverStore.servers.first else {
+            isManagingWorkers = true
+            return
+        }
+
+        editorProject = ProjectProfile(serverID: worker.id)
+    }
+
+    private func selectFirstProjectIfNeeded() {
+        if selectedProjectID == nil || projectStore.project(id: selectedProjectID) == nil {
+            selectedProjectID = projectStore.projects.first?.id
         }
     }
 }
 
-private struct ServerSidebarRow: View {
+private struct ProjectSidebarRow: View {
     @EnvironmentObject private var sessionManager: SessionManager
-    let server: ServerProfile
+
+    let project: ProjectProfile
+    let worker: ServerProfile?
+    let isSelected: Bool
 
     var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "server.rack")
+        HStack(spacing: 9) {
+            Image(systemName: "folder")
+                .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(.secondary)
-                .frame(width: 20)
+                .frame(width: 18)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(server.displayName)
+                Text(project.displayName)
+                    .font(.callout.weight(.medium))
                     .lineLimit(1)
-                Text(server.destination)
+                Text(worker?.displayName ?? "Worker unavailable")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -161,33 +254,60 @@ private struct ServerSidebarRow: View {
 
             Spacer(minLength: 6)
 
-            HStack(spacing: 4) {
+            HStack(spacing: 6) {
                 ForEach(AgentKind.allCases) { kind in
-                    if sessionManager.session(server: server, kind: kind)?.status.occupiesSlot == true {
-                        Circle()
-                            .fill(kind == .codex ? Color.blue : Color.orange)
-                            .frame(width: 7, height: 7)
-                            .help("\(kind.displayName) is running")
-                    }
+                    ProjectSessionDot(
+                        kind: kind,
+                        session: sessionManager.session(projectID: project.id, kind: kind)
+                    )
                 }
             }
+            .frame(width: 28, alignment: .trailing)
         }
-        .padding(.vertical, 3)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .frame(minHeight: 46)
+        .background(
+            isSelected ? Color.primary.opacity(0.09) : Color.clear,
+            in: RoundedRectangle(cornerRadius: 8)
+        )
+        .contentShape(Rectangle())
     }
 }
 
-private struct WelcomeView: View {
-    let addServer: () -> Void
+private struct ProjectSessionDot: View {
+    let kind: AgentKind
+    let session: TerminalSession?
 
     var body: some View {
-        ContentUnavailableView {
-            Label("Remote agents, one workspace", systemImage: "rectangle.3.group.bubble.left")
-        } description: {
-            Text("Run Codex and Claude on your servers without moving projects or account credentials onto this Mac.")
-        } actions: {
-            Button("Add Server", action: addServer)
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
+        Circle()
+            .fill(fillColor)
+            .overlay {
+                Circle()
+                    .stroke(strokeColor, lineWidth: session?.status.occupiesSlot == true ? 0 : 1)
+            }
+            .frame(width: 7, height: 7)
+            .help(helpText)
+            .accessibilityLabel(helpText)
+    }
+
+    private var fillColor: Color {
+        guard let session else { return Color.secondary.opacity(0.2) }
+        return session.status.occupiesSlot ? kind.tint : Color.secondary.opacity(0.16)
+    }
+
+    private var strokeColor: Color {
+        guard let session else { return Color.secondary.opacity(0.45) }
+        switch session.status {
+        case .exited: return .red.opacity(0.8)
+        case .connecting, .running, .stopping: return .clear
         }
+    }
+
+    private var helpText: String {
+        guard let session else { return "\(kind.displayName) terminal closed" }
+        return session.status.occupiesSlot
+            ? "\(kind.displayName) terminal open"
+            : "\(kind.displayName) terminal exited"
     }
 }

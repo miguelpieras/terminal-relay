@@ -11,15 +11,26 @@ final class TerminalRelayApplicationDelegate: NSObject, NSApplicationDelegate {
 }
 
 @main
+@MainActor
 struct TerminalRelayApp: App {
     @NSApplicationDelegateAdaptor(TerminalRelayApplicationDelegate.self) private var appDelegate
-    @StateObject private var serverStore = ServerStore()
+    @StateObject private var serverStore: ServerStore
+    @StateObject private var projectStore: ProjectStore
     @StateObject private var sessionManager = SessionManager()
+
+    init() {
+        let serverStore = ServerStore()
+        _serverStore = StateObject(wrappedValue: serverStore)
+        _projectStore = StateObject(
+            wrappedValue: ProjectStore(servers: serverStore.servers)
+        )
+    }
 
     var body: some Scene {
         Window("Terminal Relay", id: "main") {
             ContentView()
                 .environmentObject(serverStore)
+                .environmentObject(projectStore)
                 .environmentObject(sessionManager)
                 .frame(minWidth: 980, minHeight: 640)
                 .onAppear {

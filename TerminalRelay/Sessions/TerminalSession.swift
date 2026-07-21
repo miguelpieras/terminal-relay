@@ -30,6 +30,9 @@ enum TerminalSessionStatus: Equatable {
 @MainActor
 final class TerminalSession: NSObject, ObservableObject, Identifiable {
     let id = UUID()
+    let projectID: UUID
+    let projectName: String
+    let workingDirectory: String
     let serverKey: String
     let serverName: String
     let kind: AgentKind
@@ -47,13 +50,22 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
     private var hasFinished = false
     private var processExitSource: DispatchSourceProcess?
 
-    init(server: ServerProfile, kind: AgentKind, launchDefaults: AgentLaunchDefaults) {
+    init(
+        project: ProjectProfile,
+        server: ServerProfile,
+        kind: AgentKind,
+        launchDefaults: AgentLaunchDefaults
+    ) {
+        self.projectID = project.id
+        self.projectName = project.displayName
+        self.workingDirectory = project.workingDirectory
         self.serverKey = server.concurrencyKey
         self.serverName = server.displayName
         self.kind = kind
         self.accountLabel = server.accountLabel(for: kind)
         self.configuration = SSHCommandBuilder.configuration(
             for: server,
+            project: project,
             kind: kind,
             launchDefaults: launchDefaults
         )
@@ -62,14 +74,14 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
 
         terminalView.processDelegate = self
         terminalView.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
-        terminalView.nativeBackgroundColor = NSColor(srgbRed: 0.055, green: 0.067, blue: 0.09, alpha: 1)
+        terminalView.nativeBackgroundColor = NSColor(srgbRed: 0.071, green: 0.071, blue: 0.078, alpha: 1)
         terminalView.nativeForegroundColor = NSColor(srgbRed: 0.87, green: 0.89, blue: 0.92, alpha: 1)
         terminalView.optionAsMetaKey = true
         terminalView.allowMouseReporting = true
     }
 
     var title: String {
-        "\(serverName) · \(kind.displayName)"
+        "\(projectName) · \(kind.displayName)"
     }
 
     func startIfNeeded() {

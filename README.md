@@ -4,13 +4,16 @@ Terminal Relay is a native macOS workspace for Codex CLI and Claude Code session
 
 ## What it does
 
-- Keeps a reusable list of SSH server profiles.
+- Keeps a project-first list of remote workspaces, each assigned to a reusable worker profile.
+- Stores an optional GitHub `owner/repository` identity for each project without storing GitHub credentials.
 - Opens embedded, full interactive SSH terminals for Codex CLI and Claude Code.
-- Allows one Codex session and one Claude session per configured server at the same time.
+- Allows one Codex session and one Claude session per worker at the same time, even when that worker hosts several projects.
 - Uses the existing OpenSSH config, agent, known-hosts checks, and optional identity files on the Mac.
 - Persists connection details and account labels, but never passwords, API keys, terminal output, or running-session state.
 
-The first launch includes the dedicated **Terminal Relay Worker 1** profile. Its `terminal-relay-worker-1` SSH alias uses the existing private Tailscale route, with `/workspace` as the remote workspace root.
+The first launch includes the dedicated **Terminal Relay Worker 1** profile. Its `terminal-relay-worker-1` SSH alias uses the existing private Tailscale route. Existing installs are migrated to a **Workspace** project at `/workspace`; new projects choose their own remote directory.
+
+The sidebar always reserves one Codex dot and one Claude dot for every project. A colored dot means that project's terminal is open; a gray dot means it is closed. Working-versus-waiting activity signals are intentionally not inferred from terminal output.
 
 That worker also has the small root-owned `terminal-relay-session` launcher from `Server/`. It uses one host-local lock per tool, so the server itself allows one Codex and one Claude process at a time even across separate app launches.
 
@@ -38,6 +41,8 @@ To work in Xcode, run `open TerminalRelay.xcodeproj`.
 
 The app target intentionally does not enable App Sandbox because its embedded terminal needs to launch `/usr/bin/ssh` inside a pseudo-terminal.
 
-## Server setup
+## Worker setup
 
-Add a server with either a normal hostname or an alias from `~/.ssh/config`. If the alias already defines the user, port, identity, or proxy, leave the corresponding fields in Terminal Relay at their defaults. Commands run through the remote account's login shell, so shell-managed installations such as `nvm` are available.
+Add a worker with either a normal hostname or an alias from `~/.ssh/config`, then assign projects to it. If the alias already defines the user, port, identity, or proxy, leave the corresponding fields in Terminal Relay at their defaults. Commands run through the remote account's login shell, so shell-managed installations such as `nvm` are available.
+
+The approved GitHub authentication direction is a private Terminal Relay GitHub App with short-lived repository-scoped installation tokens. The current project UI records repository identity; token provisioning and repository cloning are a separate integration step.

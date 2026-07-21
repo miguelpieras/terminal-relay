@@ -1,6 +1,6 @@
 import SwiftUI
 
-struct ServerEditorView: View {
+struct WorkerEditorView: View {
     @State private var draft: ServerProfile
 
     let onSave: (ServerProfile) -> Void
@@ -20,9 +20,9 @@ struct ServerEditorView: View {
         VStack(spacing: 0) {
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(draft.name.isEmpty ? "Add Server" : "Server Settings")
+                    Text(draft.name.isEmpty ? "Add Worker" : "Worker Settings")
                         .font(.title2.weight(.semibold))
-                    Text("SSH and remote agent commands")
+                    Text("SSH connection and remote agent accounts")
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -33,15 +33,11 @@ struct ServerEditorView: View {
 
             Form {
                 Section("Connection") {
-                    TextField("Name", text: $draft.name, prompt: Text("Worker 1"))
-                    TextField("Host or SSH alias", text: $draft.host, prompt: Text("worker-1"))
+                    TextField("Worker name", text: $draft.name, prompt: Text("Terminal Relay Worker 1"))
+                    TextField("Host or SSH alias", text: $draft.host, prompt: Text("terminal-relay-worker-1"))
                     TextField("Username (optional)", text: $draft.username, prompt: Text("ubuntu"))
                     TextField("Port", value: $draft.port, format: .number)
                     TextField("Identity file (optional)", text: $draft.identityFile, prompt: Text("~/.ssh/id_ed25519"))
-                }
-
-                Section("Remote workspace") {
-                    TextField("Working directory (optional)", text: $draft.workingDirectory, prompt: Text("/srv/project"))
                 }
 
                 Section("Codex") {
@@ -58,7 +54,7 @@ struct ServerEditorView: View {
 
                 Section {
                     Label(
-                        "Passwords and API keys are not stored. SSH authentication and agent accounts remain in their existing system locations.",
+                        "Passwords and API keys are not stored. SSH authentication and agent accounts stay on the worker.",
                         systemImage: "lock.shield"
                     )
                     .font(.callout)
@@ -82,7 +78,7 @@ struct ServerEditorView: View {
             }
             .padding(16)
         }
-        .frame(width: 580, height: 670)
+        .frame(width: 580, height: 610)
     }
 
     private func trimmed(_ profile: ServerProfile) -> ServerProfile {
