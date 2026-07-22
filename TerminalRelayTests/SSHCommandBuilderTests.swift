@@ -7,7 +7,7 @@ final class SSHCommandBuilderTests: XCTestCase {
             port: 2_222,
             identityFile: "~/Keys/agent key"
         )
-        let project = makeProject(server: server, workingDirectory: "/srv/terminal relay")
+        let project = makeProject(server: server, repositoryName: "terminal-relay")
 
         let configuration = SSHCommandBuilder.configuration(
             for: server,
@@ -39,7 +39,7 @@ final class SSHCommandBuilderTests: XCTestCase {
 
     func testConfigurationOmitsBlankIdentityFile() {
         let server = makeServer(identityFile: "  \n ")
-        let project = makeProject(server: server, workingDirectory: "")
+        let project = makeProject(server: server)
 
         let configuration = SSHCommandBuilder.configuration(
             for: server,
@@ -74,11 +74,11 @@ final class SSHCommandBuilderTests: XCTestCase {
         XCTAssertFalse(configuration.arguments.contains("-p"))
     }
 
-    func testRemoteCommandQuotesApostrophesInWorkingDirectory() {
+    func testRemoteCommandUsesTheProjectsFixedWorkspaceDirectory() {
         let server = makeServer(
             codexCommand: "  codex --resume  "
         )
-        let project = makeProject(server: server, workingDirectory: "/srv/Miguel's agents")
+        let project = makeProject(server: server, repositoryName: "terminal-relay")
 
         let command = SSHCommandBuilder.remoteCommand(
             for: server,
@@ -86,7 +86,7 @@ final class SSHCommandBuilderTests: XCTestCase {
             kind: .codex,
             launchDefaults: .standard
         )
-        let quotedDirectory = SSHCommandBuilder.shellQuote("/srv/Miguel's agents")
+        let quotedDirectory = SSHCommandBuilder.shellQuote("/workspace/terminal-relay")
         let arguments = AgentLaunchDefaults.standard.arguments(for: .codex)
             .map(SSHCommandBuilder.shellQuote)
             .joined(separator: " ")
@@ -106,7 +106,7 @@ final class SSHCommandBuilderTests: XCTestCase {
 
     func testCustomDefaultsAreQuotedAndAppliedPerAgent() {
         let server = makeServer()
-        let project = makeProject(server: server, workingDirectory: "")
+        let project = makeProject(server: server)
         let defaults = AgentLaunchDefaults(
             codexModel: "custom codex",
             codexReasoningEffort: .high,
@@ -132,6 +132,7 @@ final class SSHCommandBuilderTests: XCTestCase {
             codexCommand,
             expectedRemoteCommand(
                 server: server,
+                project: project,
                 kind: .codex,
                 defaults: defaults
             )
@@ -140,6 +141,7 @@ final class SSHCommandBuilderTests: XCTestCase {
             claudeCommand,
             expectedRemoteCommand(
                 server: server,
+                project: project,
                 kind: .claude,
                 defaults: defaults
             )
@@ -191,13 +193,14 @@ final class SSHCommandBuilderTests: XCTestCase {
 
     private func expectedRemoteCommand(
         server: ServerProfile,
+        project: ProjectProfile,
         kind: AgentKind,
         defaults: AgentLaunchDefaults
     ) -> String {
         let arguments = defaults.arguments(for: kind)
             .map(SSHCommandBuilder.shellQuote)
             .joined(separator: " ")
-        let payload = "exec \(server.command(for: kind)) \(arguments)"
+        let payload = "cd -- \(SSHCommandBuilder.shellQuote(project.workingDirectory)) && exec \(server.command(for: kind)) \(arguments)"
         return "exec \"${SHELL:-/bin/sh}\" -lic \(SSHCommandBuilder.shellQuote(payload))"
     }
 
@@ -220,13 +223,12 @@ final class SSHCommandBuilderTests: XCTestCase {
 
     private func makeProject(
         server: ServerProfile,
-        workingDirectory: String = "/srv/agents"
+        repositoryName: String = "terminal-relay"
     ) -> ProjectProfile {
         ProjectProfile(
-            name: "Terminal Relay",
             serverID: server.id,
-            githubRepository: "owner/terminal-relay",
-            workingDirectory: workingDirectory
+            repositoryOwner: "owner",
+            repositoryName: repositoryName
         )
     }
 }

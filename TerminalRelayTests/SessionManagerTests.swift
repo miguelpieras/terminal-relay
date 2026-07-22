@@ -77,11 +77,7 @@ final class SessionManagerTests: XCTestCase {
 
     func testProjectSessionQueriesAndIdentityUseProjectValues() {
         let server = makeServer(name: "Worker 1", host: "worker-1")
-        let project = makeProject(
-            name: "Terminal Relay",
-            server: server,
-            workingDirectory: "/home/relay/dev/terminal-relay"
-        )
+        let project = makeProject(name: "terminal-relay", server: server)
         let manager = SessionManager()
 
         let result = manager.open(
@@ -95,12 +91,109 @@ final class SessionManagerTests: XCTestCase {
         }
 
         XCTAssertEqual(session.projectID, project.id)
-        XCTAssertEqual(session.projectName, "Terminal Relay")
-        XCTAssertEqual(session.workingDirectory, "/home/relay/dev/terminal-relay")
-        XCTAssertEqual(session.title, "Terminal Relay · Claude")
+        XCTAssertEqual(session.projectName, "terminal-relay")
+        XCTAssertEqual(session.workingDirectory, "/workspace/terminal-relay")
+        XCTAssertEqual(session.title, "terminal-relay · Claude")
+        XCTAssertEqual(session.displayTitle, "Claude 1")
+        XCTAssertEqual(session.sequenceNumber, 1)
         XCTAssertTrue(manager.session(projectID: project.id, kind: .claude) === session)
+        XCTAssertTrue(manager.activeSession(projectID: project.id, kind: .claude) === session)
+        XCTAssertTrue(manager.activeSession(for: server, kind: .claude) === session)
         XCTAssertEqual(manager.sessions(forProjectID: project.id).map(\.id), [session.id])
         XCTAssertEqual(manager.sessions(for: server).map(\.id), [session.id])
+    }
+
+    func testExitedSessionRemainsInProjectHistoryAndOpeningAgainAppendsANewSession() async {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let manager = SessionManager()
+
+        let firstResult = manager.open(
+            project: project,
+            on: server,
+            kind: .codex,
+            launchDefaults: .standard
+        )
+        guard case .opened(let firstSession) = firstResult else {
+            return XCTFail("Expected the first session to open")
+        }
+
+        firstSession.processTerminated(source: firstSession.terminalView, exitCode: 0)
+        await Task.yield()
+
+        XCTAssertEqual(firstSession.status, .exited(0))
+        XCTAssertEqual(manager.sessions(forProjectID: project.id).map(\.id), [firstSession.id])
+        XCTAssertNil(manager.activeSession(projectID: project.id, kind: .codex))
+
+        let secondResult = manager.open(
+            project: project,
+            on: server,
+            kind: .codex,
+            launchDefaults: .standard
+        )
+        guard case .opened(let secondSession) = secondResult else {
+            return XCTFail("Expected a distinct second session")
+        }
+
+        XCTAssertFalse(secondSession === firstSession)
+        XCTAssertEqual(secondSession.sequenceNumber, 2)
+        XCTAssertEqual(secondSession.displayTitle, "Codex 2")
+        XCTAssertEqual(
+            manager.sessions(forProjectID: project.id).map(\.id),
+            [firstSession.id, secondSession.id]
+        )
+        XCTAssertTrue(manager.activeSession(projectID: project.id, kind: .codex) === secondSession)
+        XCTAssertTrue(manager.session(projectID: project.id, kind: .codex) === secondSession)
+    }
+
+    func testDisplayTitlePrefersNormalizedTerminalTitle() async {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let manager = SessionManager()
+        let result = manager.open(
+            project: project,
+            on: server,
+            kind: .claude,
+            launchDefaults: .standard
+        )
+        guard case .opened(let session) = result else {
+            return XCTFail("Expected a new session")
+        }
+
+        session.setTerminalTitle(
+            source: session.terminalView,
+            title: "  Review   release\n topology  "
+        )
+        await Task.yield()
+
+        XCTAssertEqual(session.displayTitle, "Review release topology")
+    }
+
+    func testSequenceNumberDoesNotResetWhenHistoryIsExplicitlyClosed() async {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let manager = SessionManager()
+        let firstSession = manager.open(
+            project: project,
+            on: server,
+            kind: .codex,
+            launchDefaults: .standard
+        ).session
+
+        firstSession.processTerminated(source: firstSession.terminalView, exitCode: 0)
+        await Task.yield()
+        manager.close(sessionID: firstSession.id)
+        XCTAssertTrue(manager.sessions(forProjectID: project.id).isEmpty)
+
+        let secondSession = manager.open(
+            project: project,
+            on: server,
+            kind: .codex,
+            launchDefaults: .standard
+        ).session
+
+        XCTAssertEqual(secondSession.sequenceNumber, 2)
+        XCTAssertEqual(secondSession.displayTitle, "Codex 2")
     }
 
     func testClosingProjectSessionsLeavesOtherProjectsAlone() {
@@ -145,16 +238,11 @@ final class SessionManagerTests: XCTestCase {
         )
     }
 
-    private func makeProject(
-        name: String,
-        server: ServerProfile,
-        workingDirectory: String? = nil
-    ) -> ProjectProfile {
+    private func makeProject(name: String, server: ServerProfile) -> ProjectProfile {
         ProjectProfile(
-            name: name,
             serverID: server.id,
-            githubRepository: "owner/\(name.lowercased().replacingOccurrences(of: " ", with: "-"))",
-            workingDirectory: workingDirectory ?? "/home/relay/dev/\(name.lowercased().replacingOccurrences(of: " ", with: "-"))"
+            repositoryOwner: "owner",
+            repositoryName: name.lowercased().replacingOccurrences(of: " ", with: "-")
         )
     }
 }

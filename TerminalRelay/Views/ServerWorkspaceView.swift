@@ -39,10 +39,6 @@ struct ProjectWorkspaceView: View {
         return projectSessions.first { $0.id == selectedSessionID }
     }
 
-    private var sessionIDs: [UUID] {
-        projectSessions.map(\.id)
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             agentBar
@@ -57,9 +53,6 @@ struct ProjectWorkspaceView: View {
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .navigationTitle(project.displayName)
-        .onAppear(perform: selectFirstSessionIfNeeded)
-        .onChange(of: project.id) { _, _ in selectFirstSessionIfNeeded() }
-        .onChange(of: sessionIDs) { _, _ in selectFirstSessionIfNeeded() }
         .alert(item: $conflictingSession) { occupant in
             Alert(
                 title: Text("\(occupant.kind.displayName) is already open"),
@@ -176,11 +169,6 @@ struct ProjectWorkspaceView: View {
         }
     }
 
-    private func selectFirstSessionIfNeeded() {
-        if selectedSession == nil {
-            sessionManager.selectedSessionID = projectSessions.first?.id
-        }
-    }
 }
 
 private struct TerminalPane: View {

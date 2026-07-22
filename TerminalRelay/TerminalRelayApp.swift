@@ -17,6 +17,7 @@ struct TerminalRelayApp: App {
     @StateObject private var serverStore: ServerStore
     @StateObject private var projectStore: ProjectStore
     @StateObject private var sessionManager = SessionManager()
+    @StateObject private var githubService = GitHubProjectService()
 
     init() {
         let serverStore = ServerStore()
@@ -32,6 +33,7 @@ struct TerminalRelayApp: App {
                 .environmentObject(serverStore)
                 .environmentObject(projectStore)
                 .environmentObject(sessionManager)
+                .environmentObject(githubService)
                 .frame(minWidth: 980, minHeight: 640)
                 .onAppear {
                     appDelegate.sessionManager = sessionManager

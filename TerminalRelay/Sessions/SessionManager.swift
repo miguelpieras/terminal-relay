@@ -20,17 +20,31 @@ final class SessionManager: ObservableObject {
     @Published var selectedSessionID: UUID?
 
     private var sessionsPendingClose: Set<UUID> = []
+    private var lastSequenceNumberByProjectAndKind: [ProjectAgentKey: Int] = [:]
 
     func session(projectID: UUID, kind: AgentKind) -> TerminalSession? {
-        sessions.first { $0.projectID == projectID && $0.kind == kind }
+        activeSession(projectID: projectID, kind: kind)
+            ?? sessions.last { $0.projectID == projectID && $0.kind == kind }
     }
 
     func sessions(forProjectID projectID: UUID) -> [TerminalSession] {
         sessions.filter { $0.projectID == projectID }
     }
 
+    func activeSession(projectID: UUID, kind: AgentKind) -> TerminalSession? {
+        sessions.last {
+            $0.projectID == projectID
+                && $0.kind == kind
+                && $0.status.occupiesSlot
+        }
+    }
+
     func sessions(for server: ServerProfile) -> [TerminalSession] {
         sessions.filter { $0.serverKey == server.concurrencyKey }
+    }
+
+    func activeSession(for server: ServerProfile, kind: AgentKind) -> TerminalSession? {
+        occupyingSession(server: server, kind: kind)
     }
 
     @discardableResult
@@ -40,15 +54,12 @@ final class SessionManager: ObservableObject {
         kind: AgentKind,
         launchDefaults: AgentLaunchDefaults
     ) -> SessionOpenResult {
-        if let existing = session(projectID: project.id, kind: kind) {
-            if existing.status.occupiesSlot {
-                if existing.serverKey == server.concurrencyKey {
-                    selectedSessionID = existing.id
-                    return .selectedExisting(existing)
-                }
-                return .occupied(existing)
+        if let existing = activeSession(projectID: project.id, kind: kind) {
+            if existing.serverKey == server.concurrencyKey {
+                selectedSessionID = existing.id
+                return .selectedExisting(existing)
             }
-            removeSession(id: existing.id)
+            return .occupied(existing)
         }
 
         if let occupant = occupyingSession(server: server, kind: kind) {
@@ -59,6 +70,7 @@ final class SessionManager: ObservableObject {
             project: project,
             server: server,
             kind: kind,
+            sequenceNumber: nextSequenceNumber(projectID: project.id, kind: kind),
             launchDefaults: launchDefaults
         )
         session.onTermination = { [weak self] sessionID in
@@ -110,12 +122,21 @@ final class SessionManager: ObservableObject {
 
     private func removeSession(id: UUID) {
         guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
+        let removedProjectID = sessions[index].projectID
         sessions.remove(at: index)
         sessionsPendingClose.remove(id)
 
         if selectedSessionID == id {
-            selectedSessionID = sessions.last?.id
+            selectedSessionID = sessions.last(where: { $0.projectID == removedProjectID })?.id
+                ?? sessions.last?.id
         }
+    }
+
+    private func nextSequenceNumber(projectID: UUID, kind: AgentKind) -> Int {
+        let key = ProjectAgentKey(projectID: projectID, kind: kind)
+        let nextNumber = (lastSequenceNumberByProjectAndKind[key] ?? 0) + 1
+        lastSequenceNumberByProjectAndKind[key] = nextNumber
+        return nextNumber
     }
 
     private func occupyingSession(server: ServerProfile, kind: AgentKind) -> TerminalSession? {
@@ -125,4 +146,9 @@ final class SessionManager: ObservableObject {
                 && $0.status.occupiesSlot
         }
     }
+}
+
+private struct ProjectAgentKey: Hashable {
+    let projectID: UUID
+    let kind: AgentKind
 }

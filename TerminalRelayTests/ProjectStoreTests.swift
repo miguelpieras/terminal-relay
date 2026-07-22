@@ -3,41 +3,23 @@ import XCTest
 
 @MainActor
 final class ProjectStoreTests: XCTestCase {
-    func testSeedsOneProjectForEachServerWorkingDirectoryOnlyOnce() {
-        let suiteName = "TerminalRelayTests.ProjectStore.Seed.\(UUID().uuidString)"
+    func testStartsEmptyAndIgnoresLegacyWorkspaceStorage() throws {
+        let suiteName = "TerminalRelayTests.ProjectStore.Empty.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
-        let firstServer = ServerProfile(
-            name: "Worker 1",
-            host: "worker-1",
-            workingDirectory: "/home/relay/dev/terminal-relay"
-        )
-        let secondServer = ServerProfile(
-            name: "Worker 2",
-            host: "worker-2",
+        let server = ServerProfile(
+            name: "Worker",
+            host: "worker",
             workingDirectory: "/workspace"
         )
-        let emptyServer = ServerProfile(name: "Worker 3", host: "worker-3")
+        let legacyWorkspace = ProjectProfile(serverID: server.id, repositoryName: "Workspace")
+        defaults.set(try JSONEncoder().encode([legacyWorkspace]), forKey: "projectProfiles.v1")
 
-        let firstStore = ProjectStore(
-            defaults: defaults,
-            servers: [firstServer, secondServer, emptyServer]
-        )
+        let store = ProjectStore(defaults: defaults, servers: [server])
 
-        XCTAssertEqual(firstStore.projects.count, 2)
-        XCTAssertEqual(firstStore.projects.map(\.name), ["terminal-relay", "Workspace"])
-        XCTAssertEqual(firstStore.projects.map(\.serverID), [firstServer.id, secondServer.id])
-        XCTAssertTrue(firstStore.projects.allSatisfy { $0.githubRepository.isEmpty })
-
-        let changedServer = ServerProfile(
-            name: "New Worker",
-            host: "new-worker",
-            workingDirectory: "/home/relay/dev/new-project"
-        )
-        let reloadedStore = ProjectStore(defaults: defaults, servers: [firstServer, secondServer, changedServer])
-
-        XCTAssertEqual(reloadedStore.projects, firstStore.projects)
+        XCTAssertTrue(store.projects.isEmpty)
+        XCTAssertNotNil(defaults.data(forKey: "projectProfiles.v2"))
     }
 
     func testSaveUpdateLoadAndDeletePersistAcrossStoreInstances() {
@@ -49,9 +31,8 @@ final class ProjectStoreTests: XCTestCase {
         let projectID = UUID()
         let original = ProjectProfile(
             id: projectID,
-            name: "Original",
             serverID: server.id,
-            workingDirectory: "/home/relay/dev/original"
+            repositoryName: "original"
         )
         let firstStore = ProjectStore(defaults: defaults, servers: [server], initialProjects: [])
 
@@ -59,29 +40,28 @@ final class ProjectStoreTests: XCTestCase {
         XCTAssertEqual(ProjectStore(defaults: defaults, servers: [server]).project(id: projectID), original)
 
         var updated = original
-        updated.name = "Updated"
-        updated.githubRepository = "owner/updated"
+        updated.repositoryName = "updated"
         XCTAssertTrue(firstStore.save(updated))
 
         let reloadedStore = ProjectStore(defaults: defaults, servers: [server])
         XCTAssertEqual(reloadedStore.projects, [updated])
         XCTAssertEqual(reloadedStore.projects(for: server.id), [updated])
+        XCTAssertEqual(reloadedStore.projects.first?.workingDirectory, "/workspace/updated")
         XCTAssertNil(reloadedStore.persistenceError)
 
         reloadedStore.delete(id: projectID)
         XCTAssertTrue(ProjectStore(defaults: defaults, servers: [server]).projects.isEmpty)
     }
 
-    func testRejectsSaveForMissingServerAndDetectsServerRemoval() {
+    func testRejectsInvalidProjectOrMissingServerAndDetectsServerRemoval() {
         let suiteName = "TerminalRelayTests.ProjectStore.Validation.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         let server = ServerProfile(name: "Worker", host: "worker")
         let project = ProjectProfile(
-            name: "Terminal Relay",
             serverID: server.id,
-            workingDirectory: "/home/relay/dev/terminal-relay"
+            repositoryName: "terminal-relay"
         )
         let store = ProjectStore(defaults: defaults, servers: [server], initialProjects: [])
 
@@ -95,20 +75,30 @@ final class ProjectStoreTests: XCTestCase {
         XCTAssertNil(store.validationError)
 
         let missingProject = ProjectProfile(
-            name: "Missing",
             serverID: UUID(),
-            workingDirectory: "/home/relay/dev/missing"
+            repositoryName: "missing"
         )
         XCTAssertFalse(store.save(missingProject))
         XCTAssertEqual(store.projects, [project])
         XCTAssertNotNil(store.validationError)
+
+        let invalidProject = ProjectProfile(serverID: server.id, repositoryName: "../invalid")
+        XCTAssertFalse(store.save(invalidProject))
+        XCTAssertEqual(store.projects, [project])
+
+        let duplicate = ProjectProfile(
+            serverID: server.id,
+            repositoryName: "TERMINAL-RELAY"
+        )
+        XCTAssertFalse(store.save(duplicate))
+        XCTAssertEqual(store.projects, [project])
     }
 
     func testInvalidSavedDataReportsDismissiblePersistenceError() {
         let suiteName = "TerminalRelayTests.ProjectStore.Invalid.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        defaults.set(Data("not-json".utf8), forKey: "projectProfiles.v1")
+        defaults.set(Data("not-json".utf8), forKey: "projectProfiles.v2")
 
         let store = ProjectStore(defaults: defaults, servers: [], initialProjects: [])
 

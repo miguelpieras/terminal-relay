@@ -37,6 +37,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
     let serverName: String
     let kind: AgentKind
     let accountLabel: String
+    let sequenceNumber: Int
     let startedAt = Date()
     let terminalView: LocalProcessTerminalView
 
@@ -54,6 +55,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         project: ProjectProfile,
         server: ServerProfile,
         kind: AgentKind,
+        sequenceNumber: Int,
         launchDefaults: AgentLaunchDefaults
     ) {
         self.projectID = project.id
@@ -63,6 +65,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         self.serverName = server.displayName
         self.kind = kind
         self.accountLabel = server.accountLabel(for: kind)
+        self.sequenceNumber = sequenceNumber
         self.configuration = SSHCommandBuilder.configuration(
             for: server,
             project: project,
@@ -82,6 +85,23 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
 
     var title: String {
         "\(projectName) · \(kind.displayName)"
+    }
+
+    var displayTitle: String {
+        guard let terminalTitle else {
+            return "\(kind.displayName) \(sequenceNumber)"
+        }
+
+        let normalizedTitle = terminalTitle
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+        guard !normalizedTitle.isEmpty else {
+            return "\(kind.displayName) \(sequenceNumber)"
+        }
+
+        let maximumLength = 48
+        guard normalizedTitle.count > maximumLength else { return normalizedTitle }
+        return String(normalizedTitle.prefix(maximumLength - 1)) + "…"
     }
 
     func startIfNeeded() {

@@ -1,11 +1,35 @@
 import SwiftUI
 
+private enum ProjectSource: String, CaseIterable, Identifiable {
+    case new
+    case existing
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .new: "New repository"
+        case .existing: "Existing repository"
+        }
+    }
+}
+
 struct ProjectEditorView: View {
+    @EnvironmentObject private var githubService: GitHubProjectService
+
     @State private var draft: ProjectProfile
+    @State private var source: ProjectSource
+    @State private var projectName: String
+    @State private var selectedRepositoryName: String?
+    @State private var repositorySearch = ""
+    @State private var isSaving = false
+    @State private var saveError: String?
 
     let workers: [ServerProfile]
     let onSave: (ProjectProfile) -> Void
     let onCancel: () -> Void
+
+    private let isCreatingProject: Bool
 
     init(
         project: ProjectProfile,
@@ -13,55 +37,89 @@ struct ProjectEditorView: View {
         onSave: @escaping (ProjectProfile) -> Void,
         onCancel: @escaping () -> Void
     ) {
+        let isCreatingProject = project.repositoryName.isEmpty
         _draft = State(initialValue: project)
+        _source = State(initialValue: isCreatingProject ? .new : .existing)
+        _projectName = State(initialValue: project.repositoryName)
+        _selectedRepositoryName = State(
+            initialValue: isCreatingProject ? nil : project.repositoryName
+        )
+        self.isCreatingProject = isCreatingProject
         self.workers = workers
         self.onSave = onSave
         self.onCancel = onCancel
     }
 
+    private var normalizedProjectName: String {
+        ProjectProfile.normalizedRepositoryName(from: projectName)
+    }
+
+    private var repositoryName: String? {
+        if !isCreatingProject { return draft.repositoryName }
+        switch source {
+        case .new:
+            return normalizedProjectName.isEmpty ? nil : normalizedProjectName
+        case .existing:
+            return selectedRepositoryName
+        }
+    }
+
+    private var filteredRepositories: [GitHubRepository] {
+        let query = repositorySearch.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return githubService.repositories }
+        return githubService.repositories.filter {
+            $0.name.localizedCaseInsensitiveContains(query)
+                || $0.nameWithOwner.localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    private var selectedWorker: ServerProfile? {
+        workers.first { $0.id == draft.serverID }
+    }
+
+    private var canSave: Bool {
+        repositoryName != nil
+            && selectedWorker != nil
+            && !isSaving
+            && !githubService.isLoading
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(draft.name.isEmpty ? "New Project" : "Project Settings")
-                        .font(.title2.weight(.semibold))
-                    Text("Choose the repository, worker, and remote workspace.")
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-            }
-            .padding(20)
-
+            header
             Divider()
 
             Form {
-                Section("Project") {
-                    TextField("Name", text: $draft.name, prompt: Text("Website API"))
-                    TextField(
-                        "GitHub repository",
-                        text: $draft.githubRepository,
-                        prompt: Text("owner/repository")
-                    )
-                }
-
-                Section("Remote workspace") {
-                    Picker("Worker", selection: $draft.serverID) {
-                        ForEach(workers) { worker in
-                            Text(worker.displayName).tag(worker.id)
+                if isCreatingProject {
+                    Section {
+                        Picker("Project source", selection: $source) {
+                            ForEach(ProjectSource.allCases) { source in
+                                Text(source.title).tag(source)
+                            }
                         }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
                     }
 
-                    TextField(
-                        "Directory",
-                        text: $draft.workingDirectory,
-                        prompt: Text("/workspace/project-name")
-                    )
-                        .font(.system(.body, design: .monospaced))
+                    if source == .new {
+                        newRepositorySection
+                    } else {
+                        existingRepositorySection
+                    }
+                } else {
+                    Section("Repository") {
+                        LabeledContent("GitHub") {
+                            Text(draft.githubRepository)
+                                .textSelection(.enabled)
+                        }
+                    }
                 }
+
+                workerSection
 
                 Section {
                     Label(
-                        "Repository access will use the Terminal Relay GitHub App. No GitHub credential is saved with the project.",
+                        "The GitHub credential stays on this Mac. The worker receives only a writable deploy key for this repository.",
                         systemImage: "lock.shield"
                     )
                     .font(.callout)
@@ -71,28 +129,176 @@ struct ProjectEditorView: View {
             .formStyle(.grouped)
 
             Divider()
-
-            HStack {
-                Spacer()
-                Button("Cancel", action: onCancel)
-                    .keyboardShortcut(.cancelAction)
-                Button("Save") {
-                    onSave(trimmed(draft))
-                }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.defaultAction)
-                .disabled(!draft.isValid || !draft.hasAssignedServer(in: workers))
-            }
-            .padding(16)
+            footer
         }
-        .frame(width: 560, height: 500)
+        .frame(width: 580, height: isCreatingProject && source == .existing ? 610 : 500)
+        .task {
+            await githubService.refreshRepositories()
+        }
     }
 
-    private func trimmed(_ project: ProjectProfile) -> ProjectProfile {
-        var result = project
-        result.name = result.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        result.githubRepository = result.githubRepository.trimmingCharacters(in: .whitespacesAndNewlines)
-        result.workingDirectory = result.workingDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
-        return result
+    private var header: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(isCreatingProject ? "Add Project" : "Project Settings")
+                    .font(.title2.weight(.semibold))
+                Text(
+                    isCreatingProject
+                        ? "Choose a GitHub repository and a worker."
+                        : "Move this project to another worker."
+                )
+                .foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(20)
+    }
+
+    private var newRepositorySection: some View {
+        Section("New project") {
+            TextField("Project name", text: $projectName, prompt: Text("terminal-relay"))
+
+            LabeledContent("Repository") {
+                Text("miguelpieras/\(normalizedProjectName.isEmpty ? "…" : normalizedProjectName)")
+                    .font(.system(.body, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
+            LabeledContent("Worker folder") {
+                Text("/workspace/\(normalizedProjectName.isEmpty ? "…" : normalizedProjectName)")
+                    .font(.system(.body, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
+            Text("Terminal Relay creates a private repository initialized with a README.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var existingRepositorySection: some View {
+        Section("GitHub repositories") {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("Find a repository", text: $repositorySearch)
+                    .textFieldStyle(.plain)
+                if githubService.isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Button {
+                        Task { await githubService.refreshRepositories() }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Refresh repositories")
+                }
+            }
+
+            List(filteredRepositories, selection: $selectedRepositoryName) { repository in
+                HStack(spacing: 8) {
+                    Image(systemName: repository.isPrivate ? "lock" : "globe")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 14)
+                    Text(repository.name)
+                        .lineLimit(1)
+                }
+                .tag(repository.name)
+            }
+            .frame(minHeight: 180)
+            .overlay {
+                if !githubService.isLoading && filteredRepositories.isEmpty {
+                    ContentUnavailableView(
+                        "No Repositories",
+                        systemImage: "folder",
+                        description: Text(repositorySearch.isEmpty ? "No GitHub repositories are available." : "No repositories match your search.")
+                    )
+                }
+            }
+
+            if let githubError = githubService.errorMessage {
+                Label(githubError, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+        }
+    }
+
+    private var workerSection: some View {
+        Section("Worker") {
+            Picker("Worker", selection: $draft.serverID) {
+                ForEach(workers) { worker in
+                    Text(worker.displayName).tag(worker.id)
+                }
+            }
+
+            if let repositoryName {
+                LabeledContent("Folder") {
+                    Text("/workspace/\(repositoryName)")
+                        .font(.system(.body, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private var footer: some View {
+        HStack(spacing: 12) {
+            if isSaving {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Preparing GitHub and worker…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if let saveError {
+                Text(saveError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .lineLimit(2)
+            }
+
+            Spacer()
+
+            Button("Cancel", action: onCancel)
+                .keyboardShortcut(.cancelAction)
+                .disabled(isSaving)
+
+            Button(isCreatingProject ? "Add Project" : "Save") {
+                Task { await save() }
+            }
+            .buttonStyle(.borderedProminent)
+            .keyboardShortcut(.defaultAction)
+            .disabled(!canSave)
+        }
+        .padding(16)
+    }
+
+    private func save() async {
+        guard let repositoryName, let selectedWorker else { return }
+
+        isSaving = true
+        saveError = nil
+        defer { isSaving = false }
+
+        do {
+            let repository = try await githubService.prepare(
+                repositoryName: repositoryName,
+                create: isCreatingProject && source == .new,
+                on: selectedWorker
+            )
+
+            var saved = draft
+            saved.repositoryOwner = ProjectProfile.defaultRepositoryOwner
+            saved.repositoryName = repository.name
+            onSave(saved)
+        } catch {
+            saveError = error.localizedDescription
+            if isCreatingProject && source == .new {
+                await githubService.refreshRepositories()
+            }
+        }
     }
 }

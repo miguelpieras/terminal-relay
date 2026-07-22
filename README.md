@@ -5,15 +5,16 @@ Terminal Relay is a native macOS workspace for Codex CLI and Claude Code session
 ## What it does
 
 - Keeps a project-first list of remote workspaces, each assigned to a reusable worker profile.
-- Stores an optional GitHub `owner/repository` identity for each project without storing GitHub credentials.
+- Lists repositories from the authenticated GitHub account on the Mac and can create private repositories under `miguelpieras`.
+- Uses the same remote path for every worker: `/workspace/<repository-name>`.
 - Opens embedded, full interactive SSH terminals for Codex CLI and Claude Code.
 - Allows one Codex session and one Claude session per worker at the same time, even when that worker hosts several projects.
 - Uses the existing OpenSSH config, agent, known-hosts checks, and optional identity files on the Mac.
 - Persists connection details and account labels, but never passwords, API keys, terminal output, or running-session state.
 
-The first launch includes the dedicated **Terminal Relay Worker 1** profile. Its `terminal-relay-worker-1` SSH alias uses the existing private Tailscale route. Existing installs are migrated to a **Workspace** project at `/workspace`; new projects choose their own remote directory.
+The first launch includes the dedicated **Terminal Relay Worker 1** profile. Its `terminal-relay-worker-1` SSH alias uses the existing private Tailscale route. The project list starts empty; Terminal Relay never creates or opens a generic Workspace project.
 
-The sidebar always reserves one Codex dot and one Claude dot for every project. A colored dot means that project's terminal is open; a gray dot means it is closed. Working-versus-waiting activity signals are intentionally not inferred from terminal output.
+Each project expands into thin session rows in the sidebar. A static colored dot means that terminal is open; a gray outlined dot means it has exited. Exited sessions remain as history until closed, so one project can accumulate many Codex and Claude rows without implying that more than one of either tool is active on a worker.
 
 That worker also has the small root-owned `terminal-relay-session` launcher from `Server/`. It uses one host-local lock per tool, so the server itself allows one Codex and one Claude process at a time even across separate app launches.
 
@@ -25,6 +26,7 @@ The concurrency limit applies to sessions started by Terminal Relay. It cannot d
 - Xcode 26 or later
 - `xcodegen` (`brew install xcodegen`)
 - Working SSH access to each configured server
+- GitHub CLI authenticated as `miguelpieras` on the Mac (`gh auth login`)
 - `codex` and/or `claude` available to a login shell on the remote server
 - Apple's Metal toolchain component, used to compile SwiftTerm's optional renderer (`xcodebuild -downloadComponent MetalToolchain`)
 
@@ -45,4 +47,4 @@ The app target intentionally does not enable App Sandbox because its embedded te
 
 Add a worker with either a normal hostname or an alias from `~/.ssh/config`, then assign projects to it. If the alias already defines the user, port, identity, or proxy, leave the corresponding fields in Terminal Relay at their defaults. Commands run through the remote account's login shell, so shell-managed installations such as `nvm` are available.
 
-The approved GitHub authentication direction is a private Terminal Relay GitHub App with short-lived repository-scoped installation tokens. The current project UI records repository identity; token provisioning and repository cloning are a separate integration step.
+When a project is added, Terminal Relay uses the Mac's authenticated `gh` CLI to create or inspect the repository. It generates a dedicated deploy key on the selected worker, grants that key access only to the selected repository, and clones into `/workspace/<repository-name>`. The private key never leaves the worker, the GitHub credential never leaves the Mac, and no credential is stored in the project record or Git remote URL.

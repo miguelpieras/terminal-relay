@@ -70,6 +70,7 @@ else
 fi
 /usr/bin/ditto "$staged_app" "$installed_app"
 
+unregistered_duplicate=false
 for build_app in \
     "$derived_data/Build/Products/Debug/Terminal Relay.app" \
     "$derived_data/Build/Products/Release/Terminal Relay.app" \
@@ -77,12 +78,21 @@ for build_app in \
 do
     if [[ -d "$build_app" ]]; then
         "$launch_services" -u "$build_app" >/dev/null 2>&1 || true
+        unregistered_duplicate=true
     fi
 done
+
+while IFS= read -r duplicate_app; do
+    if [[ "$duplicate_app" != "$installed_app" && "$(basename "$duplicate_app")" == "Terminal Relay.app" ]]; then
+        "$launch_services" -u "$duplicate_app" >/dev/null 2>&1 || true
+        unregistered_duplicate=true
+    fi
+done < <(/usr/bin/mdfind 'kMDItemCFBundleIdentifier == "com.mpieras.TerminalRelay"c || kMDItemCFBundleIdentifier == "com.miguelpieras.TerminalRelay"c')
+
 "$launch_services" -f "$installed_app"
 
 dock_result="$(/usr/bin/swift "$repository_root/Scripts/pin-to-dock.swift")"
-if [[ "$dock_result" == "added" || "$dock_result" == "refreshed" ]]; then
+if [[ "$dock_result" == "added" || "$dock_result" == "refreshed" || "$unregistered_duplicate" == "true" ]]; then
     /usr/bin/killall Dock 2>/dev/null || true
 fi
 

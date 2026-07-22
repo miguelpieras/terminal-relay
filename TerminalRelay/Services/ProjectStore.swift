@@ -8,7 +8,7 @@ final class ProjectStore: ObservableObject {
     @Published private(set) var validationError: String?
 
     private let defaults: UserDefaults
-    private let storageKey = "projectProfiles.v1"
+    private let storageKey = "projectProfiles.v2"
     private var serverIDs: Set<UUID>
 
     init(
@@ -18,7 +18,7 @@ final class ProjectStore: ObservableObject {
     ) {
         self.defaults = defaults
         self.serverIDs = Set(servers.map(\.id))
-        self.projects = initialProjects ?? Self.seedProjects(from: servers)
+        self.projects = initialProjects ?? []
 
         if defaults.data(forKey: storageKey) == nil {
             persist()
@@ -39,8 +39,21 @@ final class ProjectStore: ObservableObject {
 
     @discardableResult
     func save(_ profile: ProjectProfile) -> Bool {
+        guard profile.isValid else {
+            validationError = "Enter a valid GitHub repository name."
+            return false
+        }
+
         guard serverIDs.contains(profile.serverID) else {
             validationError = "\(profile.displayName.isEmpty ? "Project" : profile.displayName) is assigned to a worker that no longer exists."
+            return false
+        }
+
+        if projects.contains(where: {
+            $0.id != profile.id
+                && $0.githubRepository.caseInsensitiveCompare(profile.githubRepository) == .orderedSame
+        }) {
+            validationError = "\(profile.githubRepository) is already in Terminal Relay."
             return false
         }
 
@@ -72,30 +85,6 @@ final class ProjectStore: ObservableObject {
 
     func dismissValidationError() {
         validationError = nil
-    }
-
-    private static func seedProjects(from servers: [ServerProfile]) -> [ProjectProfile] {
-        servers.compactMap { server in
-            let workingDirectory = server.workingDirectory
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !workingDirectory.isEmpty else { return nil }
-
-            let directoryName = URL(fileURLWithPath: workingDirectory).lastPathComponent
-            let projectName: String
-            if directoryName.isEmpty {
-                projectName = server.displayName
-            } else if directoryName.caseInsensitiveCompare("workspace") == .orderedSame {
-                projectName = "Workspace"
-            } else {
-                projectName = directoryName
-            }
-
-            return ProjectProfile(
-                name: projectName,
-                serverID: server.id,
-                workingDirectory: workingDirectory
-            )
-        }
     }
 
     private func load() {

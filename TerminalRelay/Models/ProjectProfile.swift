@@ -1,33 +1,59 @@
 import Foundation
 
 struct ProjectProfile: Codable, Hashable, Identifiable {
+    static let defaultRepositoryOwner = "miguelpieras"
+
     var id: UUID
-    var name: String
     var serverID: UUID
-    var githubRepository: String
-    var workingDirectory: String
+    var repositoryOwner: String
+    var repositoryName: String
 
     init(
         id: UUID = UUID(),
-        name: String = "",
         serverID: UUID,
-        githubRepository: String = "",
-        workingDirectory: String = ""
+        repositoryOwner: String = Self.defaultRepositoryOwner,
+        repositoryName: String = ""
     ) {
         self.id = id
-        self.name = name
         self.serverID = serverID
-        self.githubRepository = githubRepository
-        self.workingDirectory = workingDirectory
+        self.repositoryOwner = repositoryOwner
+        self.repositoryName = repositoryName
     }
 
     var displayName: String {
-        name.trimmingCharacters(in: .whitespacesAndNewlines)
+        repositoryName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var githubRepository: String {
+        "\(repositoryOwner.trimmingCharacters(in: .whitespacesAndNewlines))/\(displayName)"
+    }
+
+    var workingDirectory: String {
+        "/workspace/\(displayName)"
     }
 
     var isValid: Bool {
-        !displayName.isEmpty
-            && !workingDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let owner = repositoryOwner.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !owner.isEmpty
+            && !displayName.isEmpty
+            && !owner.contains("/")
+            && !displayName.contains("/")
+            && displayName != "."
+            && displayName != ".."
+            && owner.range(of: #"^[A-Za-z0-9-]+$"#, options: .regularExpression) != nil
+            && displayName.range(of: #"^[A-Za-z0-9._-]+$"#, options: .regularExpression) != nil
+            && displayName.count <= 100
+    }
+
+    static func normalizedRepositoryName(from value: String) -> String {
+        let folded = value
+            .folding(options: [.diacriticInsensitive, .widthInsensitive], locale: .current)
+            .lowercased()
+        let components = folded.components(separatedBy: CharacterSet.alphanumerics.inverted)
+        let slug = components
+            .filter { !$0.isEmpty }
+            .joined(separator: "-")
+        return String(slug.prefix(100))
     }
 
     func hasAssignedServer(in servers: [ServerProfile]) -> Bool {

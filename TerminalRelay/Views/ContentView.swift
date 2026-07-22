@@ -112,7 +112,13 @@ struct ContentView: View {
                 sessionManager.selectedSessionID = nil
                 return
             }
-            sessionManager.selectedSessionID = sessionManager.sessions(forProjectID: projectID).first?.id
+
+            let selectedSessionBelongsToProject = sessionManager
+                .sessions(forProjectID: projectID)
+                .contains { $0.id == sessionManager.selectedSessionID }
+            if !selectedSessionBelongsToProject {
+                sessionManager.selectedSessionID = nil
+            }
         }
     }
 
@@ -134,26 +140,25 @@ struct ContentView: View {
             .buttonStyle(.plain)
             .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 12))
 
-            Section("Projects") {
+            Section {
                 ForEach(projectStore.projects) { project in
-                    Button {
-                        selectedProjectID = project.id
-                    } label: {
-                        ProjectSidebarRow(
-                            project: project,
-                            worker: serverStore.server(id: project.serverID),
-                            isSelected: selectedProjectID == project.id
-                        )
-                    }
-                    .buttonStyle(.plain)
-                    .listRowInsets(EdgeInsets(top: 2, leading: 8, bottom: 2, trailing: 8))
-                    .contextMenu {
-                        Button("Edit") { editorProject = project }
-                        Divider()
-                        Button("Remove", role: .destructive) {
-                            projectPendingDeletion = project
-                        }
-                    }
+                    ProjectSidebarSection(
+                        project: project,
+                        isProjectSelected: selectedProjectID == project.id,
+                        selectedSessionID: sessionManager.selectedSessionID,
+                        onSelectProject: {
+                            selectedProjectID = project.id
+                            sessionManager.selectedSessionID = nil
+                        },
+                        onSelectSession: { sessionID in
+                            selectedProjectID = project.id
+                            sessionManager.selectedSessionID = sessionID
+                        },
+                        onEdit: { editorProject = project },
+                        onRemove: { projectPendingDeletion = project }
+                    )
+                    .listRowInsets(EdgeInsets(top: 3, leading: 8, bottom: 3, trailing: 8))
+                    .listRowSeparator(.hidden)
                 }
             }
         }
@@ -228,86 +233,115 @@ struct ContentView: View {
     }
 }
 
-private struct ProjectSidebarRow: View {
+private struct ProjectSidebarSection: View {
     @EnvironmentObject private var sessionManager: SessionManager
 
     let project: ProjectProfile
-    let worker: ServerProfile?
-    let isSelected: Bool
+    let isProjectSelected: Bool
+    let selectedSessionID: UUID?
+    let onSelectProject: () -> Void
+    let onSelectSession: (UUID) -> Void
+    let onEdit: () -> Void
+    let onRemove: () -> Void
+
+    private var sessions: [TerminalSession] {
+        Array(sessionManager.sessions(forProjectID: project.id).reversed())
+    }
 
     var body: some View {
-        HStack(spacing: 9) {
-            Image(systemName: "folder")
-                .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(.secondary)
-                .frame(width: 18)
+        VStack(alignment: .leading, spacing: 1) {
+            Button(action: onSelectProject) {
+                HStack(spacing: 9) {
+                    Image(systemName: "folder")
+                        .font(.system(size: 15, weight: .regular))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 18)
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(project.displayName)
-                    .font(.callout.weight(.medium))
-                    .lineLimit(1)
-                Text(worker?.displayName ?? "Worker unavailable")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                    Text(project.displayName)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(1)
+
+                    Spacer(minLength: 6)
+                }
+                .padding(.horizontal, 7)
+                .frame(height: 32)
+                .background(
+                    isProjectSelected && selectedSessionID == nil
+                        ? Color.primary.opacity(0.09)
+                        : Color.clear,
+                    in: RoundedRectangle(cornerRadius: 6)
+                )
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .contextMenu {
+                Button("Edit Project", action: onEdit)
+                Divider()
+                Button("Remove Project", role: .destructive, action: onRemove)
             }
 
-            Spacer(minLength: 6)
-
-            HStack(spacing: 6) {
-                ForEach(AgentKind.allCases) { kind in
-                    ProjectSessionDot(
-                        kind: kind,
-                        session: sessionManager.session(projectID: project.id, kind: kind)
+            ForEach(sessions) { session in
+                Button {
+                    onSelectSession(session.id)
+                } label: {
+                    ProjectSessionRow(
+                        session: session,
+                        isSelected: selectedSessionID == session.id
                     )
                 }
+                .buttonStyle(.plain)
+                .contextMenu {
+                    Button(session.status.occupiesSlot ? "Stop Session" : "Close Session") {
+                        sessionManager.close(sessionID: session.id)
+                    }
+                    .disabled(session.status == .stopping)
+                }
             }
-            .frame(width: 28, alignment: .trailing)
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .frame(minHeight: 46)
-        .background(
-            isSelected ? Color.primary.opacity(0.09) : Color.clear,
-            in: RoundedRectangle(cornerRadius: 8)
-        )
-        .contentShape(Rectangle())
     }
 }
 
-private struct ProjectSessionDot: View {
-    let kind: AgentKind
-    let session: TerminalSession?
+private struct ProjectSessionRow: View {
+    @ObservedObject var session: TerminalSession
+    let isSelected: Bool
 
     var body: some View {
-        Circle()
-            .fill(fillColor)
-            .overlay {
-                Circle()
-                    .stroke(strokeColor, lineWidth: session?.status.occupiesSlot == true ? 0 : 1)
-            }
-            .frame(width: 7, height: 7)
-            .help(helpText)
-            .accessibilityLabel(helpText)
-    }
+        HStack(spacing: 8) {
+            Color.clear
+                .frame(width: 25, height: 1)
 
-    private var fillColor: Color {
-        guard let session else { return Color.secondary.opacity(0.2) }
-        return session.status.occupiesSlot ? kind.tint : Color.secondary.opacity(0.16)
-    }
+            Text(session.displayTitle)
+                .font(.callout)
+                .foregroundStyle(session.status.occupiesSlot ? .primary : .secondary)
+                .lineLimit(1)
 
-    private var strokeColor: Color {
-        guard let session else { return Color.secondary.opacity(0.45) }
-        switch session.status {
-        case .exited: return .red.opacity(0.8)
-        case .connecting, .running, .stopping: return .clear
+            Spacer(minLength: 5)
+
+            Image(systemName: session.kind.systemImage)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(session.status.occupiesSlot ? session.kind.tint : Color.secondary)
+
+            Circle()
+                .fill(session.status.occupiesSlot ? session.kind.tint : Color.secondary.opacity(0.16))
+                .overlay {
+                    if !session.status.occupiesSlot {
+                        Circle()
+                            .stroke(Color.secondary.opacity(0.55), lineWidth: 1)
+                    }
+                }
+                .frame(width: 7, height: 7)
+                .help(session.status.occupiesSlot ? "Terminal open" : session.status.label)
+                .accessibilityLabel(
+                    "\(session.kind.displayName), \(session.status.occupiesSlot ? "terminal open" : session.status.label)"
+                )
         }
-    }
-
-    private var helpText: String {
-        guard let session else { return "\(kind.displayName) terminal closed" }
-        return session.status.occupiesSlot
-            ? "\(kind.displayName) terminal open"
-            : "\(kind.displayName) terminal exited"
+        .padding(.leading, 7)
+        .padding(.trailing, 9)
+        .frame(height: 30)
+        .background(
+            isSelected ? Color.primary.opacity(0.09) : Color.clear,
+            in: RoundedRectangle(cornerRadius: 6)
+        )
+        .contentShape(Rectangle())
     }
 }

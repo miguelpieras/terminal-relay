@@ -2,13 +2,12 @@ import XCTest
 @testable import TerminalRelay
 
 final class ProjectProfileTests: XCTestCase {
-    func testCodableRoundTripPreservesEveryField() throws {
+    func testCodableRoundTripPreservesStoredFields() throws {
         let original = ProjectProfile(
             id: UUID(uuidString: "70C5B403-C7D6-48BA-8A2F-61AE88B0C705")!,
-            name: "Terminal Relay",
             serverID: UUID(uuidString: "50A309A8-FF38-4350-A80F-33653992B039")!,
-            githubRepository: "owner/terminal-relay",
-            workingDirectory: "/home/relay/dev/terminal-relay"
+            repositoryOwner: "miguelpieras",
+            repositoryName: "terminal-relay"
         )
 
         let data = try JSONEncoder().encode(original)
@@ -17,31 +16,56 @@ final class ProjectProfileTests: XCTestCase {
         XCTAssertEqual(decoded, original)
     }
 
-    func testValidationRequiresOnlyNameAndWorkingDirectory() {
-        let serverID = UUID()
-        var project = ProjectProfile(
-            name: "  Terminal Relay  ",
-            serverID: serverID,
-            workingDirectory: "  /home/relay/dev/terminal-relay  "
+    func testRepositoryIdentityAndWorkingDirectoryAreDerivedFromRepositoryName() {
+        let project = ProjectProfile(
+            serverID: UUID(),
+            repositoryName: "  terminal-relay  "
         )
 
+        XCTAssertEqual(project.displayName, "terminal-relay")
+        XCTAssertEqual(project.githubRepository, "miguelpieras/terminal-relay")
+        XCTAssertEqual(project.workingDirectory, "/workspace/terminal-relay")
+    }
+
+    func testValidationRequiresSafeOwnerAndRepositoryName() {
+        let serverID = UUID()
+        var project = ProjectProfile(serverID: serverID, repositoryName: "terminal-relay")
+
         XCTAssertTrue(project.isValid)
-        XCTAssertEqual(project.displayName, "Terminal Relay")
 
-        project.name = " \n "
+        project.repositoryName = " "
         XCTAssertFalse(project.isValid)
 
-        project.name = "Terminal Relay"
-        project.workingDirectory = "\t"
+        project.repositoryName = "../terminal-relay"
         XCTAssertFalse(project.isValid)
+
+        project.repositoryName = ".."
+        XCTAssertFalse(project.isValid)
+
+        project.repositoryName = "terminal-relay"
+        project.repositoryOwner = ""
+        XCTAssertFalse(project.isValid)
+
+        project.repositoryOwner = "miguelpieras/team"
+        XCTAssertFalse(project.isValid)
+
+        project.repositoryOwner = "miguelpieras"
+        project.repositoryName = "terminal relay"
+        XCTAssertFalse(project.isValid)
+    }
+
+    func testRepositoryNameNormalizationCreatesAStableGitHubSlug() {
+        XCTAssertEqual(
+            ProjectProfile.normalizedRepositoryName(from: "  Café Control / macOS  "),
+            "cafe-control-macos"
+        )
     }
 
     func testAssignedServerValidationUsesServerIdentifier() {
         let server = ServerProfile(name: "Worker", host: "worker")
         let project = ProjectProfile(
-            name: "Terminal Relay",
             serverID: server.id,
-            workingDirectory: "/workspace"
+            repositoryName: "terminal-relay"
         )
 
         XCTAssertTrue(project.hasAssignedServer(in: [server]))
