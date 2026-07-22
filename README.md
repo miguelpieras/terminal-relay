@@ -17,6 +17,9 @@ Terminal Relay is a native macOS workspace for Codex CLI and Claude Code session
 
 The first launch includes the dedicated **Terminal Relay Worker 1** profile. Its `terminal-relay-worker-1` SSH alias uses the existing private Tailscale route. The project list starts empty; Terminal Relay never creates or opens a generic Workspace project.
 
+The current worker-to-host mapping, access commands, trusted fingerprints, and
+recovery details are documented in [`docs/workers.md`](docs/workers.md).
+
 Each project expands into thin session rows in the sidebar. An animated spinner means the agent is working, a static colored dot means it is open and ready, and a gray outlined dot means it has exited. Exited sessions remain as history until closed, so one project can accumulate many Codex and Claude rows without implying that more than one of either tool is active on a worker.
 
 That worker also has the small root-owned `terminal-relay-session` launcher from
