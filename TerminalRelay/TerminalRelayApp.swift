@@ -19,6 +19,7 @@ struct TerminalRelayApp: App {
     @StateObject private var sessionManager = SessionManager()
     @StateObject private var githubService = GitHubProjectService()
     @StateObject private var accountUsageService = AccountUsageService()
+    @StateObject private var projectGitService = ProjectGitService()
 
     init() {
         let serverStore = ServerStore()
@@ -36,6 +37,7 @@ struct TerminalRelayApp: App {
                 .environmentObject(sessionManager)
                 .environmentObject(githubService)
                 .environmentObject(accountUsageService)
+                .environmentObject(projectGitService)
                 .preferredColorScheme(.dark)
                 .frame(minWidth: 980, minHeight: 640)
                 .onAppear {
@@ -45,9 +47,5 @@ struct TerminalRelayApp: App {
         .defaultSize(width: 1_260, height: 820)
         .windowStyle(.titleBar)
         .windowToolbarStyle(.unifiedCompact)
-
-        Settings {
-            AgentDefaultsView()
-        }
     }
 }

@@ -18,19 +18,6 @@ struct WorkerEditorView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(draft.name.isEmpty ? "Add Worker" : "Worker Settings")
-                        .font(.title2.weight(.semibold))
-                    Text("SSH connection and remote agent accounts")
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-            }
-            .padding(20)
-
-            Divider()
-
             Form {
                 Section("Connection") {
                     TextField("Worker name", text: $draft.name, prompt: Text("Terminal Relay Worker 1"))
@@ -62,6 +49,8 @@ struct WorkerEditorView: View {
                 }
             }
             .formStyle(.grouped)
+            .frame(maxWidth: 760)
+            .frame(maxWidth: .infinity)
 
             Divider()
 
@@ -78,7 +67,7 @@ struct WorkerEditorView: View {
             }
             .padding(16)
         }
-        .frame(width: 580, height: 610)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func trimmed(_ profile: ServerProfile) -> ServerProfile {

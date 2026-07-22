@@ -3,6 +3,10 @@ import SwiftUI
 private enum SidebarDestination: Equatable {
     case project(UUID)
     case session(projectID: UUID, sessionID: UUID)
+    case workers
+    case settings
+    case newProject(ProjectProfile)
+    case editProject(UUID)
 }
 
 private enum SidebarPalette {
@@ -28,23 +32,17 @@ private enum SidebarRowGeometry {
 }
 
 struct ContentView: View {
-    @Environment(\.openSettings) private var openSettings
     @EnvironmentObject private var serverStore: ServerStore
     @EnvironmentObject private var projectStore: ProjectStore
     @EnvironmentObject private var sessionManager: SessionManager
 
     @State private var selectedProjectID: UUID?
-    @State private var editorProject: ProjectProfile?
     @State private var projectPendingDeletion: ProjectProfile?
-    @State private var isManagingWorkers = false
+    @State private var pageDestination: SidebarDestination?
     @State private var isSearching = false
     @State private var searchQuery = ""
     @State private var navigationHistory: [SidebarDestination] = []
     @State private var navigationIndex = -1
-
-    private var selectedProject: ProjectProfile? {
-        projectStore.project(id: selectedProjectID)
-    }
 
     private var visibleProjects: [ProjectProfile] {
         let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -59,12 +57,24 @@ struct ContentView: View {
     }
 
     private var currentDestination: SidebarDestination? {
+        if let pageDestination {
+            return pageDestination
+        }
         guard let projectID = selectedProjectID else { return nil }
         if let sessionID = sessionManager.selectedSessionID,
            sessionManager.sessions(forProjectID: projectID).contains(where: { $0.id == sessionID }) {
             return .session(projectID: projectID, sessionID: sessionID)
         }
         return .project(projectID)
+    }
+
+    private var projectForActions: ProjectProfile? {
+        switch currentDestination {
+        case .project(let projectID), .session(let projectID, _):
+            return projectStore.project(id: projectID)
+        default:
+            return nil
+        }
     }
 
     var body: some View {
@@ -79,80 +89,28 @@ struct ContentView: View {
         }
         .navigationSplitViewStyle(.balanced)
         .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Menu {
-                    Button("Edit Project", systemImage: "pencil") {
-                        editorProject = selectedProject
-                    }
-                    .disabled(selectedProject == nil)
+            if let project = projectForActions {
+                ToolbarItem(placement: .primaryAction) {
+                    Menu {
+                        Button("Edit Project", systemImage: "pencil") {
+                            navigate(to: .editProject(project.id))
+                        }
 
-                    Button("Manage Workers", systemImage: "server.rack") {
-                        isManagingWorkers = true
-                    }
+                        Button("Manage Workers", systemImage: "server.rack") {
+                            navigate(to: .workers)
+                        }
 
-                    Divider()
+                        Divider()
 
-                    Button("Delete Project", systemImage: "trash", role: .destructive) {
-                        projectPendingDeletion = selectedProject
+                        Button("Delete Project", systemImage: "trash", role: .destructive) {
+                            projectPendingDeletion = project
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis")
                     }
-                    .disabled(selectedProject == nil)
-                } label: {
-                    Image(systemName: "ellipsis")
+                    .help("Project actions")
                 }
-                .help("Project actions")
             }
-        }
-        .sheet(item: $editorProject) { project in
-            ProjectEditorView(project: project, workers: serverStore.servers) { savedProject in
-                guard projectStore.save(savedProject) else { return }
-                navigate(to: .project(savedProject.id))
-                editorProject = nil
-            } onCancel: {
-                editorProject = nil
-            }
-        }
-        .sheet(isPresented: $isManagingWorkers) {
-            WorkerManagementView()
-        }
-        .confirmationDialog(
-            "Remove \(projectPendingDeletion?.displayName ?? "project") from Terminal Relay?",
-            isPresented: Binding(
-                get: { projectPendingDeletion != nil },
-                set: { if !$0 { projectPendingDeletion = nil } }
-            )
-        ) {
-            Button("Remove Project", role: .destructive) {
-                guard let project = projectPendingDeletion else { return }
-                sessionManager.closeSessions(forProjectID: project.id)
-                projectStore.delete(id: project.id)
-                selectedProjectID = projectStore.projects.first?.id
-                sessionManager.selectedSessionID = nil
-                projectPendingDeletion = nil
-            }
-            Button("Cancel", role: .cancel) {
-                projectPendingDeletion = nil
-            }
-        } message: {
-            Text("Open terminals will stop. The remote repository and files will not be deleted.")
-        }
-        .alert(
-            "Terminal Relay",
-            isPresented: Binding(
-                get: { projectStore.persistenceError != nil || projectStore.validationError != nil },
-                set: {
-                    if !$0 {
-                        projectStore.dismissPersistenceError()
-                        projectStore.dismissValidationError()
-                    }
-                }
-            )
-        ) {
-            Button("OK") {
-                projectStore.dismissPersistenceError()
-                projectStore.dismissValidationError()
-            }
-        } message: {
-            Text(projectStore.persistenceError ?? projectStore.validationError ?? "Unknown project error")
         }
         .onAppear(perform: selectFirstProjectIfNeeded)
         .onChange(of: projectStore.projects) { _, _ in selectFirstProjectIfNeeded() }
@@ -196,7 +154,7 @@ struct ContentView: View {
                             onSelectSession: { sessionID in
                                 navigate(to: .session(projectID: project.id, sessionID: sessionID))
                             },
-                            onEdit: { editorProject = project },
+                            onEdit: { navigate(to: .editProject(project.id)) },
                             onRemove: { projectPendingDeletion = project }
                         )
                     }
@@ -247,10 +205,10 @@ struct ContentView: View {
             HStack(spacing: 0) {
                 Menu {
                     Button("Manage Workers", systemImage: "server.rack") {
-                        isManagingWorkers = true
+                        navigate(to: .workers)
                     }
                     Button("Settings…", systemImage: "gearshape") {
-                        openSettings()
+                        navigate(to: .settings)
                     }
                 } label: {
                     Text("Terminal Relay")
@@ -321,7 +279,7 @@ struct ContentView: View {
 
             HStack(spacing: 10) {
                 Button {
-                    openSettings()
+                    navigate(to: .settings)
                 } label: {
                     HStack(spacing: 7) {
                         ZStack {
@@ -344,7 +302,7 @@ struct ContentView: View {
                 Spacer()
 
                 Button {
-                    isManagingWorkers = true
+                    navigate(to: .workers)
                 } label: {
                     Image(systemName: "server.rack")
                         .font(.system(size: 11.5, weight: .semibold))
@@ -363,23 +321,81 @@ struct ContentView: View {
 
     @ViewBuilder
     private var detail: some View {
-        if let project = selectedProject,
+        VStack(spacing: 0) {
+            if let message = projectStore.persistenceError ?? projectStore.validationError {
+                projectErrorBanner(message)
+            }
+
+            if let projectPendingDeletion {
+                ProjectRemovalConfirmation(
+                    project: projectPendingDeletion,
+                    onCancel: { self.projectPendingDeletion = nil },
+                    onRemove: { removeProject(projectPendingDeletion) }
+                )
+            } else {
+                destinationDetail
+            }
+        }
+    }
+
+    private func projectErrorBanner(_ message: String) -> some View {
+        HStack(spacing: 9) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            Text(message)
+                .font(.callout)
+                .lineLimit(2)
+            Spacer(minLength: 12)
+            Button {
+                projectStore.dismissPersistenceError()
+                projectStore.dismissValidationError()
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss")
+        }
+        .padding(.horizontal, 14)
+        .frame(minHeight: 38)
+        .background(Color.orange.opacity(0.1))
+    }
+
+    @ViewBuilder
+    private var destinationDetail: some View {
+        switch currentDestination {
+        case .workers:
+            WorkersView(onSelectProject: { projectID in
+                navigate(to: .project(projectID))
+            })
+        case .settings:
+            AgentDefaultsView()
+        case .newProject(let project):
+            projectEditor(project)
+                .id(project.id)
+        case .editProject(let projectID):
+            if let project = projectStore.project(id: projectID) {
+                projectEditor(project)
+                    .id(project.id)
+            } else {
+                missingProject
+            }
+        case .project(let projectID), .session(let projectID, _):
+            projectDetail(projectID: projectID)
+        case nil:
+            emptyProjectDetail
+        }
+    }
+
+    @ViewBuilder
+    private func projectDetail(projectID: UUID) -> some View {
+        if let project = projectStore.project(id: projectID),
            let worker = serverStore.server(id: project.serverID) {
             ProjectWorkspaceView(
                 project: project,
                 worker: worker,
-                onSelectProject: { selectedProjectID = $0 }
+                onSelectProject: { navigate(to: .project($0)) }
             )
-        } else if projectStore.projects.isEmpty {
-            ContentUnavailableView {
-                Label("No Projects", systemImage: "folder.badge.plus")
-            } description: {
-                Text("Create a project and assign it to a remote Terminal Relay worker.")
-            } actions: {
-                Button("New Project", action: addProject)
-                    .buttonStyle(.borderedProminent)
-                Button("Manage Workers") { isManagingWorkers = true }
-            }
+            .id(project.id)
         } else {
             ContentUnavailableView(
                 "Worker Unavailable",
@@ -389,13 +405,79 @@ struct ContentView: View {
         }
     }
 
+    private func projectEditor(_ project: ProjectProfile) -> some View {
+        ProjectEditorView(project: project, workers: serverStore.servers) { savedProject in
+            let shouldOpenSavedProject = isShowingEditor(for: project.id)
+            guard projectStore.save(savedProject) else {
+                let message = projectStore.persistenceError
+                    ?? projectStore.validationError
+                    ?? "The project could not be saved."
+                projectStore.dismissPersistenceError()
+                projectStore.dismissValidationError()
+                return message
+            }
+
+            replaceEditorHistory(projectID: project.id, with: savedProject.id)
+            if shouldOpenSavedProject {
+                apply(.project(savedProject.id))
+            }
+            return nil
+        } onCancel: {
+            returnFromEditor(project)
+        }
+    }
+
+    private func isShowingEditor(for projectID: UUID) -> Bool {
+        switch currentDestination {
+        case .newProject(let draft):
+            return draft.id == projectID
+        case .editProject(let editingProjectID):
+            return editingProjectID == projectID
+        default:
+            return false
+        }
+    }
+
+    private func replaceEditorHistory(projectID: UUID, with savedProjectID: UUID) {
+        navigationHistory = navigationHistory.map { destination in
+            switch destination {
+            case .newProject(let draft) where draft.id == projectID:
+                return .project(savedProjectID)
+            case .editProject(let editingProjectID) where editingProjectID == projectID:
+                return .project(savedProjectID)
+            default:
+                return destination
+            }
+        }
+    }
+
+    private var emptyProjectDetail: some View {
+        ContentUnavailableView {
+            Label("No Projects", systemImage: "folder.badge.plus")
+        } description: {
+            Text("Create a project and assign it to a remote Terminal Relay worker.")
+        } actions: {
+            Button("New Project", action: addProject)
+                .buttonStyle(.borderedProminent)
+            Button("Manage Workers") { navigate(to: .workers) }
+        }
+    }
+
+    private var missingProject: some View {
+        ContentUnavailableView(
+            "Project Unavailable",
+            systemImage: "folder.badge.questionmark",
+            description: Text("This project is no longer available in Terminal Relay.")
+        )
+    }
+
     private func addProject() {
         guard let worker = serverStore.servers.first else {
-            isManagingWorkers = true
+            navigate(to: .workers)
             return
         }
 
-        editorProject = ProjectProfile(serverID: worker.id)
+        navigate(to: .newProject(ProjectProfile(serverID: worker.id)))
     }
 
     private func selectFirstProjectIfNeeded() {
@@ -406,6 +488,8 @@ struct ContentView: View {
     }
 
     private func navigate(to destination: SidebarDestination) {
+        projectPendingDeletion = nil
+
         if currentDestination != destination {
             if navigationHistory.isEmpty, let currentDestination {
                 navigationHistory.append(currentDestination)
@@ -436,14 +520,95 @@ struct ContentView: View {
     private func apply(_ destination: SidebarDestination) {
         switch destination {
         case .project(let projectID):
+            pageDestination = nil
             selectedProjectID = projectID
             sessionManager.selectedSessionID = nil
         case .session(let projectID, let sessionID):
+            pageDestination = nil
             selectedProjectID = projectID
             sessionManager.selectedSessionID = sessionManager
                 .sessions(forProjectID: projectID)
                 .contains(where: { $0.id == sessionID }) ? sessionID : nil
+        case .workers, .settings, .newProject, .editProject:
+            pageDestination = destination
         }
+    }
+
+    private func returnFromEditor(_ project: ProjectProfile) {
+        if navigationIndex > 0 {
+            navigateBack()
+        } else if projectStore.project(id: project.id) != nil {
+            apply(.project(project.id))
+        } else if let selectedProjectID {
+            apply(.project(selectedProjectID))
+        } else {
+            pageDestination = nil
+        }
+    }
+
+    private func removeProject(_ project: ProjectProfile) {
+        let nextProjectID = selectedProjectID.flatMap { selectedID in
+            selectedID == project.id ? nil : projectStore.project(id: selectedID)?.id
+        }
+
+        sessionManager.closeSessions(forProjectID: project.id)
+        projectStore.delete(id: project.id)
+        projectPendingDeletion = nil
+        sessionManager.selectedSessionID = nil
+
+        navigationHistory.removeAll { destination in
+            switch destination {
+            case .project(let projectID), .session(let projectID, _), .editProject(let projectID):
+                return projectID == project.id
+            case .newProject(let draft):
+                return draft.id == project.id
+            case .workers, .settings:
+                return false
+            }
+        }
+        navigationIndex = min(navigationIndex, navigationHistory.count - 1)
+        selectedProjectID = nil
+
+        if let destinationID = nextProjectID ?? projectStore.projects.first?.id {
+            navigate(to: .project(destinationID))
+        } else {
+            selectedProjectID = nil
+            pageDestination = nil
+            navigationHistory.removeAll()
+            navigationIndex = -1
+        }
+    }
+}
+
+private struct ProjectRemovalConfirmation: View {
+    let project: ProjectProfile
+    let onCancel: () -> Void
+    let onRemove: () -> Void
+
+    var body: some View {
+        VStack(spacing: 18) {
+            Image(systemName: "trash.circle")
+                .font(.system(size: 42, weight: .light))
+                .foregroundStyle(.red)
+
+            VStack(spacing: 7) {
+                Text("Remove \(project.displayName)?")
+                    .font(.title2.weight(.semibold))
+                Text("Open terminals will stop. The GitHub repository and remote files will not be deleted.")
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 460)
+            }
+
+            HStack(spacing: 10) {
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+                Button("Remove Project", role: .destructive, action: onRemove)
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(32)
     }
 }
 

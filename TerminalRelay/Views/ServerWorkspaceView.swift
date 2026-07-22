@@ -3,6 +3,7 @@ import SwiftUI
 struct ProjectWorkspaceView: View {
     @EnvironmentObject private var sessionManager: SessionManager
     @EnvironmentObject private var accountUsageService: AccountUsageService
+    @EnvironmentObject private var projectGitService: ProjectGitService
 
     @AppStorage(AgentLaunchDefaults.StorageKey.codexModel)
     private var codexModel = AgentLaunchDefaults.standard.codexModel
@@ -21,6 +22,8 @@ struct ProjectWorkspaceView: View {
 
     @State private var conflictingSession: TerminalSession?
     @State private var isShowingCodexResets = false
+    @State private var isWritingCommitMessage = false
+    @State private var commitMessage = ""
 
     private var launchDefaults: AgentLaunchDefaults {
         AgentLaunchDefaults(
@@ -41,10 +44,38 @@ struct ProjectWorkspaceView: View {
         return projectSessions.first { $0.id == selectedSessionID }
     }
 
+    private var gitSnapshot: ProjectGitSnapshot? {
+        projectGitService.snapshot(for: project.id)
+    }
+
+    private var gitOperation: ProjectGitOperation? {
+        projectGitService.currentOperations[project.id]
+    }
+
+    private var hasOpenProjectTerminal: Bool {
+        projectSessions.contains { $0.status.occupiesSlot }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             agentBar
+
+            if isWritingCommitMessage {
+                Divider()
+                commitBar
+            }
+
+            if gitNoticeText != nil {
+                Divider()
+                gitNoticeBar
+            }
+
             Divider()
+
+            if let conflictingSession {
+                conflictBanner(conflictingSession)
+                Divider()
+            }
 
             if let selectedSession {
                 TerminalPane(session: selectedSession)
@@ -59,26 +90,26 @@ struct ProjectWorkspaceView: View {
             guard selectedSession == nil else { return }
             await accountUsageService.refresh(worker: worker)
         }
-        .alert(item: $conflictingSession) { occupant in
-            Alert(
-                title: Text("\(occupant.kind.displayName) is already open"),
-                message: Text(
-                    "\(worker.displayName)'s \(occupant.kind.displayName) slot is being used by \(occupant.projectName)."
-                ),
-                primaryButton: .default(Text("Show \(occupant.projectName)")) {
-                    onSelectProject(occupant.projectID)
-                    sessionManager.selectedSessionID = occupant.id
-                },
-                secondaryButton: .cancel()
-            )
-        }
-        .sheet(isPresented: $isShowingCodexResets) {
-            CodexResetCreditsSheet(worker: worker)
+        .task(id: project.id) {
+            var shouldFetchRemote = true
+            repeat {
+                _ = await projectGitService.refresh(
+                    project: project,
+                    worker: worker,
+                    fetchRemote: shouldFetchRemote
+                )
+                shouldFetchRemote = false
+                do {
+                    try await Task.sleep(for: .seconds(12))
+                } catch {
+                    return
+                }
+            } while !Task.isCancelled
         }
     }
 
     private var agentBar: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             Image(systemName: "server.rack")
                 .foregroundStyle(.tertiary)
 
@@ -92,10 +123,153 @@ struct ProjectWorkspaceView: View {
                 .lineLimit(1)
 
             Spacer(minLength: 16)
+
+            gitChangeSummary
+
+            Menu {
+                if let gitSnapshot {
+                    ForEach(gitSnapshot.availableBranches, id: \.self) { branch in
+                        Button {
+                            switchBranch(to: branch)
+                        } label: {
+                            if branch == gitSnapshot.currentBranch {
+                                Label(branch, systemImage: "checkmark")
+                            } else {
+                                Text(branch)
+                            }
+                        }
+                    }
+                } else {
+                    Text("Branch unavailable")
+                }
+            } label: {
+                Label(gitSnapshot?.currentBranch ?? "Branch", systemImage: "arrow.triangle.branch")
+                    .lineLimit(1)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .disabled(branchSwitchDisabled)
+            .help(branchSwitchHelp)
+
+            Button {
+                Task {
+                    _ = await projectGitService.refresh(
+                        project: project,
+                        worker: worker,
+                        fetchRemote: true
+                    )
+                }
+            } label: {
+                if gitOperation == .refreshing, gitSnapshot == nil {
+                    ProgressView()
+                        .controlSize(.mini)
+                } else {
+                    Image(systemName: "arrow.clockwise")
+                }
+            }
+            .buttonStyle(.borderless)
+            .disabled(projectGitService.isBusy(projectID: project.id))
+            .help("Fetch and refresh Git status")
+
+            Button(commitButtonTitle, action: commitButtonAction)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(commitButtonDisabled)
+                .help(commitButtonHelp)
         }
         .padding(.horizontal, 14)
         .frame(height: 44)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.55))
+    }
+
+    @ViewBuilder
+    private var gitChangeSummary: some View {
+        if let gitSnapshot {
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(
+                        gitSnapshot.hasChanges || gitSnapshot.behindCount > 0
+                            ? Color.orange
+                            : Color.green
+                    )
+                    .frame(width: 6, height: 6)
+                Text(gitSnapshot.hasChanges
+                    ? "\(gitSnapshot.changedFileCount) \(gitSnapshot.changedFileCount == 1 ? "change" : "changes")"
+                    : "Clean")
+                if gitSnapshot.aheadCount > 0 {
+                    Text("· \(gitSnapshot.aheadCount) ahead")
+                        .foregroundStyle(.orange)
+                } else if gitSnapshot.hasPendingPush {
+                    Text("· unpublished")
+                        .foregroundStyle(.orange)
+                }
+                if gitSnapshot.behindCount > 0 {
+                    Text("· \(gitSnapshot.behindCount) behind")
+                        .foregroundStyle(.orange)
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize()
+        } else if gitOperation == .refreshing {
+            Text("Reading Git…")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .fixedSize()
+        } else {
+            Text("Git unavailable")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .fixedSize()
+        }
+    }
+
+    private var commitBar: some View {
+        HStack(spacing: 10) {
+            TextField("Commit message", text: $commitMessage)
+                .textFieldStyle(.plain)
+                .onSubmit(commitAndPush)
+
+            Button("Cancel") {
+                isWritingCommitMessage = false
+                commitMessage = ""
+            }
+            .buttonStyle(.borderless)
+            .disabled(projectGitService.isBusy(projectID: project.id))
+
+            Button("Commit & push", action: commitAndPush)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(
+                    commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        || hasOpenProjectTerminal
+                        || projectGitService.isBusy(projectID: project.id)
+                )
+                .help(commitButtonHelp)
+        }
+        .padding(.horizontal, 14)
+        .frame(height: 40)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.38))
+    }
+
+    private var gitNoticeBar: some View {
+        HStack(spacing: 9) {
+            Image(systemName: gitNoticeIsError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                .foregroundStyle(gitNoticeIsError ? Color.orange : Color.green)
+            Text(gitNoticeText ?? "")
+                .font(.caption)
+                .lineLimit(2)
+            Spacer(minLength: 8)
+            if projectGitService.operationResult(for: project.id) != nil, !needsPushRetry {
+                Button("Dismiss") {
+                    projectGitService.clearOperationResult(for: project.id)
+                }
+                .buttonStyle(.borderless)
+            }
+        }
+        .padding(.horizontal, 14)
+        .frame(minHeight: 34)
+        .background(Color.primary.opacity(0.025))
     }
 
     private var readyState: some View {
@@ -117,13 +291,21 @@ struct ProjectWorkspaceView: View {
                             isLoading: accountUsageService.isLoading(workerID: worker.id, kind: kind),
                             errorMessage: accountUsageService.error(for: worker.id, kind: kind),
                             buttonTitle: launchTitle(for: kind),
-                            isButtonDisabled: sessionManager.activeSession(for: worker, kind: kind)?.status == .stopping,
+                            isButtonDisabled: isGitMutationInProgress
+                                || sessionManager.activeSession(for: worker, kind: kind)?.status == .stopping,
                             onViewResets: kind == .codex ? { isShowingCodexResets = true } : nil,
                             action: { open(kind) }
                         )
                     }
                 }
                 .frame(maxWidth: 820)
+
+                if isShowingCodexResets {
+                    CodexResetCreditsView(worker: worker) {
+                        isShowingCodexResets = false
+                    }
+                    .frame(maxWidth: 820)
+                }
 
                 HStack(spacing: 8) {
                     Text(project.workingDirectory)
@@ -156,6 +338,118 @@ struct ProjectWorkspaceView: View {
         "\(worker.id.uuidString)-\(selectedSession?.id.uuidString ?? "overview")"
     }
 
+    private var isGitMutationInProgress: Bool {
+        switch gitOperation {
+        case .switchingBranch, .committingAndPushing, .pushing:
+            return true
+        case .refreshing, nil:
+            return false
+        }
+    }
+
+    private var branchSwitchDisabled: Bool {
+        guard let gitSnapshot else { return true }
+        return gitSnapshot.hasChanges
+            || hasOpenProjectTerminal
+            || projectGitService.isBusy(projectID: project.id)
+    }
+
+    private var branchSwitchHelp: String {
+        guard let gitSnapshot else { return "Git status is unavailable" }
+        if gitSnapshot.hasChanges { return "Commit or discard changes before switching branches" }
+        if hasOpenProjectTerminal { return "Stop this project's terminals before switching branches" }
+        if projectGitService.isBusy(projectID: project.id) { return "A Git operation is in progress" }
+        return "Change the current branch on the worker"
+    }
+
+    private var commitButtonTitle: String {
+        guard let gitSnapshot else { return "Commit & push" }
+        return !gitSnapshot.hasChanges && needsPushRetry ? "Push" : "Commit & push"
+    }
+
+    private var commitButtonDisabled: Bool {
+        guard let gitSnapshot else { return true }
+        return (!gitSnapshot.hasChanges && !needsPushRetry)
+            || hasOpenProjectTerminal
+            || projectGitService.isBusy(projectID: project.id)
+    }
+
+    private var commitButtonHelp: String {
+        if hasOpenProjectTerminal { return "Stop this project's terminals before changing its Git state" }
+        if projectGitService.isBusy(projectID: project.id) { return "A Git operation is in progress" }
+        return needsPushRetry ? "Push the current branch" : "Commit all changes and push the current branch"
+    }
+
+    private var needsPushRetry: Bool {
+        if gitSnapshot?.hasPendingPush == true { return true }
+        switch projectGitService.operationResult(for: project.id) {
+        case .some(.committedLocally(pushError: _)), .some(.pushFailed(_)):
+            return true
+        default:
+            return false
+        }
+    }
+
+    private var gitNoticeIsError: Bool {
+        if projectGitService.error(for: project.id) != nil { return true }
+        switch projectGitService.operationResult(for: project.id) {
+        case .some(.committedLocally(pushError: _)), .some(.pushFailed(_)):
+            return true
+        default:
+            return false
+        }
+    }
+
+    private var gitNoticeText: String? {
+        projectGitService.error(for: project.id)
+            ?? projectGitService.operationResult(for: project.id)?.message
+    }
+
+    private func commitButtonAction() {
+        guard let gitSnapshot else { return }
+        if !gitSnapshot.hasChanges, needsPushRetry {
+            Task {
+                _ = await projectGitService.push(project: project, worker: worker)
+            }
+        } else {
+            isWritingCommitMessage.toggle()
+        }
+    }
+
+    private func commitAndPush() {
+        let message = commitMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty, !hasOpenProjectTerminal else { return }
+
+        Task {
+            let succeeded = await projectGitService.commitAndPush(
+                message: message,
+                project: project,
+                worker: worker
+            )
+            let committedLocally: Bool
+            if case .some(.committedLocally(pushError: _)) = projectGitService.operationResult(for: project.id) {
+                committedLocally = true
+            } else {
+                committedLocally = false
+            }
+            if succeeded || committedLocally {
+                commitMessage = ""
+                isWritingCommitMessage = false
+            }
+        }
+    }
+
+    private func switchBranch(to branch: String) {
+        guard branch != gitSnapshot?.currentBranch else { return }
+        Task {
+            _ = await projectGitService.switchBranch(
+                branch,
+                project: project,
+                worker: worker
+            )
+        }
+    }
+
     private func launchTitle(for kind: AgentKind) -> String {
         let productName = kind == .claude ? "Claude Code" : kind.displayName
         guard let occupant = sessionManager.activeSession(for: worker, kind: kind) else {
@@ -167,6 +461,7 @@ struct ProjectWorkspaceView: View {
     }
 
     private func open(_ kind: AgentKind) {
+        guard !isGitMutationInProgress else { return }
         let result = sessionManager.open(
             project: project,
             on: worker,
@@ -177,6 +472,33 @@ struct ProjectWorkspaceView: View {
         if case .occupied(let occupant) = result {
             conflictingSession = occupant
         }
+    }
+
+    private func conflictBanner(_ occupant: TerminalSession) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+
+            Text("\(occupant.kind.displayName) is already open on \(occupant.projectName).")
+                .font(.callout)
+
+            Spacer(minLength: 12)
+
+            Button("Show \(occupant.projectName)") {
+                onSelectProject(occupant.projectID)
+                sessionManager.selectedSessionID = occupant.id
+                conflictingSession = nil
+            }
+            .buttonStyle(.borderless)
+
+            Button("Dismiss") {
+                conflictingSession = nil
+            }
+            .buttonStyle(.borderless)
+        }
+        .padding(.horizontal, 14)
+        .frame(minHeight: 38)
+        .background(Color.orange.opacity(0.08))
     }
 
 }
@@ -340,14 +662,13 @@ private struct AccountUsageCard: View {
     }
 }
 
-private struct CodexResetCreditsSheet: View {
-    @Environment(\.dismiss) private var dismiss
+private struct CodexResetCreditsView: View {
     @EnvironmentObject private var accountUsageService: AccountUsageService
 
     let worker: ServerProfile
+    let onClose: () -> Void
 
     @State private var selectedReset: ResetSelection?
-    @State private var isShowingConfirmation = false
     @State private var isRedeeming = false
     @State private var notice: ResetNotice?
 
@@ -386,10 +707,53 @@ private struct CodexResetCreditsSheet: View {
                     Text(summary.availableCount == 1 ? "1 available" : "\(summary.availableCount) available")
                         .font(.callout.weight(.semibold))
                 }
+
+                Button("Close", action: onClose)
+                    .buttonStyle(.borderless)
+                    .disabled(isRedeeming)
             }
-            .padding(20)
+            .padding(16)
 
             Divider()
+
+            if let notice {
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: "info.circle.fill")
+                        .foregroundStyle(.blue)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(notice.title)
+                            .font(.callout.weight(.semibold))
+                        Text(notice.message)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 8)
+                    Button("Dismiss") { self.notice = nil }
+                        .buttonStyle(.borderless)
+                }
+                .padding(12)
+                .background(Color.blue.opacity(0.07))
+
+                Divider()
+            }
+
+            if let selectedReset {
+                HStack(spacing: 12) {
+                    Text("Redeem \(selectedReset.name)? This cannot be undone.")
+                        .font(.callout)
+                    Spacer(minLength: 8)
+                    Button("Cancel") { self.selectedReset = nil }
+                        .disabled(isRedeeming)
+                    Button("Redeem", role: .destructive) {
+                        redeem(selectedReset)
+                    }
+                    .disabled(isRedeeming)
+                }
+                .padding(12)
+                .background(Color.orange.opacity(0.07))
+
+                Divider()
+            }
 
             Group {
                 if let summary {
@@ -423,35 +787,18 @@ private struct CodexResetCreditsSheet: View {
                 }
 
                 Spacer()
-                Button("Done") { dismiss() }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(isRedeeming)
             }
-            .padding(16)
+            .padding(.horizontal, 16)
+            .frame(minHeight: isRedeeming ? 42 : 0)
         }
-        .frame(width: 520, height: 420)
-        .interactiveDismissDisabled(isRedeeming)
-        .confirmationDialog(
-            "Redeem rate-limit reset?",
-            isPresented: $isShowingConfirmation,
-            titleVisibility: .visible,
-            presenting: selectedReset
-        ) { selection in
-            Button("Redeem reset", role: .destructive) {
-                redeem(selection)
-            }
-            Button("Cancel", role: .cancel) {
-                selectedReset = nil
-            }
-        } message: { selection in
-            Text("This consumes \(selection.name) immediately and cannot be undone.")
-        }
-        .alert(item: $notice) { notice in
-            Alert(
-                title: Text(notice.title),
-                message: Text(notice.message),
-                dismissButton: .default(Text("OK"))
-            )
+        .frame(minHeight: 300)
+        .background(
+            Color.primary.opacity(0.035),
+            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.primary.opacity(0.09), lineWidth: 1)
         }
     }
 
@@ -549,7 +896,6 @@ private struct CodexResetCreditsSheet: View {
 
     private func confirm(creditID: String?, name: String) {
         selectedReset = ResetSelection(creditID: creditID, name: name)
-        isShowingConfirmation = true
     }
 
     private func redeem(_ selection: ResetSelection) {

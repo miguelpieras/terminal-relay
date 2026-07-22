@@ -17,60 +17,70 @@ struct AgentDefaultsView: View {
     private var fullAccessEnabled = AgentLaunchDefaults.standard.fullAccessEnabled
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            VStack(alignment: .leading, spacing: 5) {
-                Text("Agent Defaults")
-                    .font(.title2.weight(.semibold))
-                Text("Applied to every newly started terminal on every worker.")
-                    .foregroundStyle(.secondary)
-            }
-
-            agentSettings(
-                title: "Codex",
-                systemImage: AgentKind.codex.systemImage,
-                tint: .blue,
-                model: $codexModel,
-                effort: $codexReasoningEffort
-            )
-
-            agentSettings(
-                title: "Claude Code",
-                systemImage: AgentKind.claude.systemImage,
-                tint: .orange,
-                model: $claudeModel,
-                effort: $claudeReasoningEffort
-            )
-
-            GroupBox {
-                VStack(alignment: .leading, spacing: 7) {
-                    Toggle("Auto-approve full access", isOn: $fullAccessEnabled)
-                    Text("Disables approval prompts and the agents' built-in permission boundaries on every worker.")
-                        .font(.caption)
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Settings")
+                        .font(.title2.weight(.semibold))
+                    Text("Defaults applied to every newly started terminal on every worker.")
+                        .font(.callout)
                         .foregroundStyle(.secondary)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.top, 4)
-            } label: {
-                Label("Permissions", systemImage: "exclamationmark.shield.fill")
-                    .foregroundStyle(fullAccessEnabled ? Color.red : Color.secondary)
-            }
-
-            HStack {
-                Text("Running terminals keep their current settings until restarted.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
                 Spacer()
                 Button("Restore Defaults", action: restoreDefaults)
             }
+            .padding(.horizontal, 24)
+            .frame(minHeight: 72)
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    agentSettings(
+                        kind: .codex,
+                        title: "Codex",
+                        model: $codexModel,
+                        effort: $codexReasoningEffort
+                    )
+
+                    agentSettings(
+                        kind: .claude,
+                        title: "Claude Code",
+                        model: $claudeModel,
+                        effort: $claudeReasoningEffort
+                    )
+
+                    GroupBox {
+                        VStack(alignment: .leading, spacing: 7) {
+                            Toggle("Auto-approve full access", isOn: $fullAccessEnabled)
+                            Text("Disables approval prompts and the agents' built-in permission boundaries on every worker.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, 4)
+                    } label: {
+                        Label("Permissions", systemImage: "exclamationmark.shield.fill")
+                            .foregroundStyle(fullAccessEnabled ? Color.red : Color.secondary)
+                    }
+
+                    Text("Running terminals keep their current settings until restarted.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(24)
+                .frame(maxWidth: 760)
+                .frame(maxWidth: .infinity)
+            }
         }
-        .padding(24)
-        .frame(width: 500)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .navigationTitle("Settings")
     }
 
     private func agentSettings(
+        kind: AgentKind,
         title: String,
-        systemImage: String,
-        tint: Color,
         model: Binding<String>,
         effort: Binding<AgentReasoningEffort>
     ) -> some View {
@@ -97,8 +107,10 @@ struct AgentDefaultsView: View {
             }
             .padding(.top, 4)
         } label: {
-            Label(title, systemImage: systemImage)
-                .foregroundStyle(tint)
+            HStack(spacing: 7) {
+                AgentBrandIcon(kind: kind, size: 18)
+                Text(title)
+            }
         }
     }
 

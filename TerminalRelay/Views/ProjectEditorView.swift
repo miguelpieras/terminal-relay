@@ -26,7 +26,7 @@ struct ProjectEditorView: View {
     @State private var saveError: String?
 
     let workers: [ServerProfile]
-    let onSave: (ProjectProfile) -> Void
+    let onSave: (ProjectProfile) -> String?
     let onCancel: () -> Void
 
     private let isCreatingProject: Bool
@@ -34,7 +34,7 @@ struct ProjectEditorView: View {
     init(
         project: ProjectProfile,
         workers: [ServerProfile],
-        onSave: @escaping (ProjectProfile) -> Void,
+        onSave: @escaping (ProjectProfile) -> String?,
         onCancel: @escaping () -> Void
     ) {
         let isCreatingProject = project.repositoryName.isEmpty
@@ -127,11 +127,15 @@ struct ProjectEditorView: View {
                 }
             }
             .formStyle(.grouped)
+            .frame(maxWidth: 760)
+            .frame(maxWidth: .infinity)
 
             Divider()
             footer
         }
-        .frame(width: 580, height: isCreatingProject && source == .existing ? 610 : 500)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .navigationTitle(isCreatingProject ? "New Project" : draft.displayName)
         .task {
             await githubService.refreshRepositories()
         }
@@ -254,10 +258,10 @@ struct ProjectEditorView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else if let saveError {
-                Text(saveError)
+                Label(saveError, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.red)
-                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             Spacer()
@@ -293,7 +297,7 @@ struct ProjectEditorView: View {
             var saved = draft
             saved.repositoryOwner = ProjectProfile.defaultRepositoryOwner
             saved.repositoryName = repository.name
-            onSave(saved)
+            saveError = onSave(saved)
         } catch {
             saveError = error.localizedDescription
             if isCreatingProject && source == .new {
