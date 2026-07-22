@@ -20,6 +20,7 @@ struct ProjectWorkspaceView: View {
     let onSelectProject: (UUID) -> Void
 
     @State private var conflictingSession: TerminalSession?
+    @State private var isShowingCodexResets = false
 
     private var launchDefaults: AgentLaunchDefaults {
         AgentLaunchDefaults(
@@ -71,6 +72,9 @@ struct ProjectWorkspaceView: View {
                 secondaryButton: .cancel()
             )
         }
+        .sheet(isPresented: $isShowingCodexResets) {
+            CodexResetCreditsSheet(worker: worker)
+        }
     }
 
     private var agentBar: some View {
@@ -113,10 +117,10 @@ struct ProjectWorkspaceView: View {
                             isLoading: accountUsageService.isLoading(workerID: worker.id, kind: kind),
                             errorMessage: accountUsageService.error(for: worker.id, kind: kind),
                             buttonTitle: launchTitle(for: kind),
-                            isButtonDisabled: sessionManager.activeSession(for: worker, kind: kind)?.status == .stopping
-                        ) {
-                            open(kind)
-                        }
+                            isButtonDisabled: sessionManager.activeSession(for: worker, kind: kind)?.status == .stopping,
+                            onViewResets: kind == .codex ? { isShowingCodexResets = true } : nil,
+                            action: { open(kind) }
+                        )
                     }
                 }
                 .frame(maxWidth: 820)
@@ -185,6 +189,7 @@ private struct AccountUsageCard: View {
     let errorMessage: String?
     let buttonTitle: String
     let isButtonDisabled: Bool
+    let onViewResets: (() -> Void)?
     let action: () -> Void
 
     private var productName: String {
@@ -255,14 +260,34 @@ private struct AccountUsageCard: View {
                     .foregroundStyle(.secondary)
             }
 
+            if kind == .codex {
+                Divider()
+
+                HStack(alignment: .center, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Rate-limit resets")
+                            .font(.callout.weight(.medium))
+                        Text(resetAvailabilityText)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer(minLength: 8)
+
+                    if let onViewResets {
+                        Button("View resets", action: onViewResets)
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(snapshot?.codexResetCredits == nil || isLoading)
+                    }
+                }
+            }
+
             Spacer(minLength: 0)
 
             Button(action: action) {
-                HStack(spacing: 8) {
-                    AgentBrandIcon(kind: kind, size: 20)
-                    Text(buttonTitle)
-                }
-                .frame(maxWidth: .infinity)
+                Text(buttonTitle)
+                    .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
             .controlSize(.large)
@@ -304,6 +329,319 @@ private struct AccountUsageCard: View {
             }
             .font(.caption2)
             .foregroundStyle(.tertiary)
+        }
+    }
+
+    private var resetAvailabilityText: String {
+        guard let count = snapshot?.codexResetCredits?.availableCount else {
+            return "Unavailable"
+        }
+        return count == 1 ? "1 available" : "\(count) available"
+    }
+}
+
+private struct CodexResetCreditsSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var accountUsageService: AccountUsageService
+
+    let worker: ServerProfile
+
+    @State private var selectedReset: ResetSelection?
+    @State private var isShowingConfirmation = false
+    @State private var isRedeeming = false
+    @State private var notice: ResetNotice?
+
+    private var snapshot: AccountUsageSnapshot? {
+        accountUsageService.snapshot(for: worker.id, kind: .codex)
+    }
+
+    private var summary: CodexRateLimitResetCredits? {
+        snapshot?.codexResetCredits
+    }
+
+    private var listedCredits: [CodexRateLimitResetCredit] {
+        summary?.credits ?? []
+    }
+
+    private var availableListedCreditCount: Int {
+        listedCredits.lazy.filter(\.isAvailable).count
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                AgentBrandIcon(kind: .codex, size: 36)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Codex rate-limit resets")
+                        .font(.headline)
+                    Text(snapshot?.account ?? worker.accountLabel(for: .codex))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                if let summary {
+                    Text(summary.availableCount == 1 ? "1 available" : "\(summary.availableCount) available")
+                        .font(.callout.weight(.semibold))
+                }
+            }
+            .padding(20)
+
+            Divider()
+
+            Group {
+                if let summary {
+                    resetContent(summary)
+                } else if accountUsageService.isLoading(workerID: worker.id, kind: .codex) {
+                    VStack(spacing: 10) {
+                        ProgressView()
+                        Text("Reading earned resets…")
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ContentUnavailableView(
+                        "Resets unavailable",
+                        systemImage: "arrow.counterclockwise",
+                        description: Text("Codex did not return earned reset information for this account.")
+                    )
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            Divider()
+
+            HStack {
+                if isRedeeming {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Redeeming and refreshing limits…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isRedeeming)
+            }
+            .padding(16)
+        }
+        .frame(width: 520, height: 420)
+        .interactiveDismissDisabled(isRedeeming)
+        .confirmationDialog(
+            "Redeem rate-limit reset?",
+            isPresented: $isShowingConfirmation,
+            titleVisibility: .visible,
+            presenting: selectedReset
+        ) { selection in
+            Button("Redeem reset", role: .destructive) {
+                redeem(selection)
+            }
+            Button("Cancel", role: .cancel) {
+                selectedReset = nil
+            }
+        } message: { selection in
+            Text("This consumes \(selection.name) immediately and cannot be undone.")
+        }
+        .alert(item: $notice) { notice in
+            Alert(
+                title: Text(notice.title),
+                message: Text(notice.message),
+                dismissButton: .default(Text("OK"))
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func resetContent(_ summary: CodexRateLimitResetCredits) -> some View {
+        if summary.availableCount == 0 {
+            ContentUnavailableView(
+                "No resets available",
+                systemImage: "checkmark.circle",
+                description: Text("This Codex account has no earned rate-limit resets right now.")
+            )
+        } else if listedCredits.isEmpty {
+            VStack(spacing: 14) {
+                Text("\(summary.availableCount) earned \(summary.availableCount == 1 ? "reset is" : "resets are") available.")
+                    .font(.title3.weight(.semibold))
+                Text("Codex returned the count without individual reset details.")
+                    .foregroundStyle(.secondary)
+                Button("Redeem next reset") {
+                    confirm(creditID: nil, name: "one earned reset")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isRedeeming)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(24)
+        } else {
+            ScrollView {
+                LazyVStack(spacing: 10) {
+                    ForEach(listedCredits) { credit in
+                        resetRow(credit)
+                    }
+
+                    if summary.availableCount > availableListedCreditCount {
+                        VStack(spacing: 8) {
+                            Text("Showing \(availableListedCreditCount) of \(summary.availableCount) available resets")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Button("Redeem next reset") {
+                                confirm(creditID: nil, name: "the next earned reset")
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(isRedeeming)
+                        }
+                        .padding(.top, 4)
+                    }
+                }
+                .padding(16)
+            }
+        }
+    }
+
+    private func resetRow(_ credit: CodexRateLimitResetCredit) -> some View {
+        HStack(alignment: .top, spacing: 14) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(creditTitle(credit))
+                    .font(.callout.weight(.semibold))
+
+                if let description = nonempty(credit.description) {
+                    Text(description)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack(spacing: 10) {
+                    Text("Earned \(credit.grantedAt, style: .relative)")
+                    if let expiresAt = credit.expiresAt {
+                        Text("Expires \(expiresAt, style: .relative)")
+                    }
+                }
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+            }
+
+            Spacer(minLength: 8)
+
+            if credit.isAvailable {
+                Button("Redeem") {
+                    confirm(creditID: credit.id, name: creditTitle(credit))
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(isRedeeming)
+            } else {
+                Text(credit.status.capitalized)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(12)
+        .background(
+            Color.primary.opacity(0.045),
+            in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+        )
+    }
+
+    private func confirm(creditID: String?, name: String) {
+        selectedReset = ResetSelection(creditID: creditID, name: name)
+        isShowingConfirmation = true
+    }
+
+    private func redeem(_ selection: ResetSelection) {
+        isRedeeming = true
+        Task {
+            do {
+                let result = try await accountUsageService.redeemCodexReset(
+                    worker: worker,
+                    creditID: selection.creditID
+                )
+                notice = ResetNotice(result: result)
+            } catch {
+                notice = ResetNotice(
+                    title: "Reset not redeemed",
+                    message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                )
+            }
+            selectedReset = nil
+            isRedeeming = false
+        }
+    }
+
+    private func creditTitle(_ credit: CodexRateLimitResetCredit) -> String {
+        nonempty(credit.title) ?? "Rate-limit reset"
+    }
+
+    private func nonempty(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+private struct ResetSelection: Identifiable {
+    let id = UUID()
+    let creditID: String?
+    let name: String
+}
+
+private struct ResetNotice: Identifiable {
+    let id = UUID()
+    let title: String
+    let message: String
+
+    init(title: String, message: String) {
+        self.title = title
+        self.message = message
+    }
+
+    init(result: CodexResetRedemptionResult) {
+        guard result.limitsRefreshed else {
+            switch result.outcome {
+            case .reset, .alreadyRedeemed:
+                self.init(
+                    title: "Reset redeemed",
+                    message: "The redemption completed, but current limits could not be refreshed. Refresh usage before redeeming another reset."
+                )
+            case .nothingToReset:
+                self.init(
+                    title: "Nothing to reset",
+                    message: "There was no eligible rate-limit window, and current Codex limits could not be refreshed."
+                )
+            case .noCredit:
+                self.init(
+                    title: "No reset available",
+                    message: "No earned reset was available, and current Codex limits could not be refreshed."
+                )
+            }
+            return
+        }
+
+        switch result.outcome {
+        case .reset:
+            self.init(
+                title: "Reset redeemed",
+                message: "The earned reset was consumed and the Codex limits were refreshed."
+            )
+        case .alreadyRedeemed:
+            self.init(
+                title: "Reset already redeemed",
+                message: "This redemption had already completed. The Codex limits were refreshed."
+            )
+        case .nothingToReset:
+            self.init(
+                title: "Nothing to reset",
+                message: "There is no eligible Codex rate-limit window to reset right now."
+            )
+        case .noCredit:
+            self.init(
+                title: "No reset available",
+                message: "This Codex account has no earned reset credit available."
+            )
         }
     }
 }

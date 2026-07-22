@@ -16,6 +16,17 @@ private enum SidebarPalette {
     static let footerSeparator = Color(red: 56.0 / 255.0, green: 56.0 / 255.0, blue: 56.0 / 255.0)
 }
 
+private enum SidebarRowGeometry {
+    static let horizontalMargin: CGFloat = 10
+    static let contentLeadingPadding: CGFloat = 6
+    static let contentTrailingPadding: CGFloat = 8
+    static let height: CGFloat = 35
+    static let iconSize: CGFloat = 13
+    static let iconFrameWidth: CGFloat = 14
+    static let iconSpacing: CGFloat = 9
+    static let cornerRadius: CGFloat = 6
+}
+
 struct ContentView: View {
     @Environment(\.openSettings) private var openSettings
     @EnvironmentObject private var serverStore: ServerStore
@@ -445,27 +456,26 @@ private struct SidebarActionButton: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 9) {
+            HStack(spacing: SidebarRowGeometry.iconSpacing) {
                 Image(systemName: systemImage)
-                    .font(.system(size: 15, weight: .regular))
-                    .frame(width: 15)
+                    .font(.system(size: SidebarRowGeometry.iconSize, weight: .regular))
+                    .frame(width: SidebarRowGeometry.iconFrameWidth)
                 Text(title)
                     .font(.system(size: 14))
                 Spacer()
             }
             .foregroundStyle(SidebarPalette.primary)
-            .padding(.leading, 4)
-            .padding(.trailing, 6)
-            .frame(height: 38)
+            .padding(.leading, SidebarRowGeometry.contentLeadingPadding)
+            .padding(.trailing, SidebarRowGeometry.contentTrailingPadding)
+            .frame(height: SidebarRowGeometry.height)
             .background(
                 isHovering ? SidebarPalette.hover : Color.clear,
-                in: RoundedRectangle(cornerRadius: 6)
+                in: RoundedRectangle(cornerRadius: SidebarRowGeometry.cornerRadius)
             )
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .padding(.horizontal, 6)
-        .padding(.bottom, 4)
+        .padding(.horizontal, SidebarRowGeometry.horizontalMargin)
         .onHover { isHovering = $0 }
     }
 }
@@ -505,11 +515,11 @@ private struct ProjectSidebarSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Button(action: onSelectProject) {
-                HStack(spacing: 9) {
+                HStack(spacing: SidebarRowGeometry.iconSpacing) {
                     Image(systemName: "folder")
-                        .font(.system(size: 15, weight: .regular))
+                        .font(.system(size: SidebarRowGeometry.iconSize, weight: .regular))
                         .foregroundStyle(SidebarPalette.primary)
-                        .frame(width: 15)
+                        .frame(width: SidebarRowGeometry.iconFrameWidth)
 
                     Text(project.displayName)
                         .font(.system(size: 14, weight: .regular))
@@ -518,17 +528,17 @@ private struct ProjectSidebarSection: View {
 
                     Spacer(minLength: 6)
                 }
-                .padding(.leading, 6)
-                .padding(.trailing, 8)
-                .frame(height: 35)
+                .padding(.leading, SidebarRowGeometry.contentLeadingPadding)
+                .padding(.trailing, SidebarRowGeometry.contentTrailingPadding)
+                .frame(height: SidebarRowGeometry.height)
                 .background(
                     isProjectHovering ? SidebarPalette.hover : Color.clear,
-                    in: RoundedRectangle(cornerRadius: 6)
+                    in: RoundedRectangle(cornerRadius: SidebarRowGeometry.cornerRadius)
                 )
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .padding(.horizontal, 10)
+            .padding(.horizontal, SidebarRowGeometry.horizontalMargin)
             .onHover { isProjectHovering = $0 }
             .contextMenu {
                 Button("Edit Project", action: onEdit)
@@ -597,7 +607,7 @@ private struct ProjectSessionRow: View {
 
             Spacer(minLength: 5)
 
-            AgentBrandIcon(kind: session.kind, size: 14)
+            AgentBrandIcon(kind: session.kind, size: 12)
                 .opacity(session.status.occupiesSlot ? 1 : 0.55)
 
             Circle()

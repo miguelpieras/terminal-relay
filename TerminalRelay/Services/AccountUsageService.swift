@@ -29,16 +29,73 @@ struct AccountUsageLimit: Equatable, Identifiable {
     }
 }
 
+struct CodexRateLimitResetCredit: Equatable, Identifiable, Decodable {
+    let id: String
+    let resetType: String
+    let status: String
+    let grantedAt: Date
+    let expiresAt: Date?
+    let title: String?
+    let description: String?
+
+    var isAvailable: Bool {
+        status == "available"
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case resetType
+        case status
+        case grantedAt
+        case expiresAt
+        case title
+        case description
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        resetType = try container.decode(String.self, forKey: .resetType)
+        status = try container.decode(String.self, forKey: .status)
+        grantedAt = Date(
+            timeIntervalSince1970: TimeInterval(try container.decode(Int64.self, forKey: .grantedAt))
+        )
+        expiresAt = try container.decodeIfPresent(Int64.self, forKey: .expiresAt)
+            .map { Date(timeIntervalSince1970: TimeInterval($0)) }
+        title = try container.decodeIfPresent(String.self, forKey: .title)
+        description = try container.decodeIfPresent(String.self, forKey: .description)
+    }
+}
+
+struct CodexRateLimitResetCredits: Equatable, Decodable {
+    let availableCount: Int
+    let credits: [CodexRateLimitResetCredit]?
+}
+
+enum CodexResetConsumeOutcome: String, Decodable, Equatable {
+    case reset
+    case alreadyRedeemed
+    case nothingToReset
+    case noCredit
+}
+
+struct CodexResetRedemptionResult: Equatable {
+    let outcome: CodexResetConsumeOutcome
+    let limitsRefreshed: Bool
+}
+
 struct AccountUsageSnapshot: Equatable {
     let account: String?
     let plan: String?
     let limits: [AccountUsageLimit]
+    let codexResetCredits: CodexRateLimitResetCredits?
     let fetchedAt: Date
 }
 
 enum AccountUsageError: LocalizedError, Equatable {
     case commandFailed(AgentKind)
     case invalidResponse(AgentKind)
+    case resetRedemptionFailed
 
     var errorDescription: String? {
         switch self {
@@ -46,6 +103,8 @@ enum AccountUsageError: LocalizedError, Equatable {
             return "Could not reach \(kind.displayName) on this worker."
         case .invalidResponse(let kind):
             return "\(kind.displayName) did not return usage limits."
+        case .resetRedemptionFailed:
+            return "Codex could not redeem this reset."
         }
     }
 }
@@ -62,6 +121,8 @@ final class AccountUsageService: ObservableObject {
     @Published private(set) var loadingKeys: Set<Key> = []
 
     private let cacheDuration: TimeInterval = 60
+    private var resetRedemptionKeys: [ResetRedemptionKey: UUID] = [:]
+    private var workersRedeemingCodexReset: Set<UUID> = []
 
     func snapshot(for workerID: UUID, kind: AgentKind) -> AccountUsageSnapshot? {
         snapshots[Key(workerID: workerID, kind: kind)]
@@ -79,6 +140,9 @@ final class AccountUsageService: ObservableObject {
         let now = Date()
         let kinds = AgentKind.allCases.filter { kind in
             let key = Key(workerID: worker.id, kind: kind)
+            guard kind != .codex || !workersRedeemingCodexReset.contains(worker.id) else {
+                return false
+            }
             guard !loadingKeys.contains(key) else { return false }
             guard !force, let snapshot = snapshots[key] else { return true }
             return now.timeIntervalSince(snapshot.fetchedAt) >= cacheDuration
@@ -115,6 +179,55 @@ final class AccountUsageService: ObservableObject {
                         ?? AccountUsageError.commandFailed(kind).localizedDescription
                 }
             }
+        }
+    }
+
+    func redeemCodexReset(
+        worker: ServerProfile,
+        creditID: String?
+    ) async throws -> CodexResetRedemptionResult {
+        let usageKey = Key(workerID: worker.id, kind: .codex)
+        while loadingKeys.contains(usageKey) {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        guard workersRedeemingCodexReset.insert(worker.id).inserted else {
+            throw AccountUsageError.resetRedemptionFailed
+        }
+        defer { workersRedeemingCodexReset.remove(worker.id) }
+
+        let creditID = creditID?.nilIfEmpty
+        let key = ResetRedemptionKey(workerID: worker.id, creditID: creditID)
+        let idempotencyKey = resetRedemptionKeys[key] ?? UUID()
+        resetRedemptionKeys[key] = idempotencyKey
+
+        let outcome = try await Self.consumeCodexReset(
+            worker: worker,
+            creditID: creditID,
+            idempotencyKey: idempotencyKey
+        )
+        resetRedemptionKeys[key] = nil
+        let limitsRefreshed = await refreshCodexAfterRedemption(worker: worker)
+        return CodexResetRedemptionResult(
+            outcome: outcome,
+            limitsRefreshed: limitsRefreshed
+        )
+    }
+
+    private func refreshCodexAfterRedemption(worker: ServerProfile) async -> Bool {
+        let key = Key(workerID: worker.id, kind: .codex)
+        loadingKeys.insert(key)
+        errors[key] = nil
+
+        do {
+            snapshots[key] = try await Self.fetch(kind: .codex, worker: worker)
+            loadingKeys.remove(key)
+            return true
+        } catch {
+            snapshots[key] = nil
+            errors[key] = (error as? LocalizedError)?.errorDescription
+                ?? AccountUsageError.commandFailed(.codex).localizedDescription
+            loadingKeys.remove(key)
+            return false
         }
     }
 
@@ -167,6 +280,7 @@ final class AccountUsageService: ObservableObject {
             account: account,
             plan: plan,
             limits: limits,
+            codexResetCredits: rateLimitResult?.rateLimitResetCredits,
             fetchedAt: fetchedAt
         )
     }
@@ -204,8 +318,22 @@ final class AccountUsageService: ObservableObject {
             account: auth?.email?.nilIfEmpty ?? fallbackAccount?.nilIfEmpty,
             plan: auth?.subscriptionType?.nilIfEmpty,
             limits: limits,
+            codexResetCredits: nil,
             fetchedAt: fetchedAt
         )
+    }
+
+    static func parseCodexResetConsume(_ data: Data) throws -> CodexResetConsumeOutcome {
+        for line in String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline) {
+            guard let lineData = String(line).data(using: .utf8),
+                  let envelope = try? JSONDecoder().decode(CodexEnvelope.self, from: lineData),
+                  envelope.id == codexResetRequestID,
+                  let outcome = envelope.result?.outcome else {
+                continue
+            }
+            return outcome
+        }
+        throw AccountUsageError.resetRedemptionFailed
     }
 
     static func codexWindowName(minutes: Int?, index: Int) -> String {
@@ -263,6 +391,7 @@ final class AccountUsageService: ObservableObject {
 
     private static let codexRateLimitRequestID = 1
     private static let codexAccountRequestID = 2
+    private static let codexResetRequestID = 2
 
     private static func fetch(kind: AgentKind, worker: ServerProfile) async throws -> AccountUsageSnapshot {
         let script: String
@@ -295,12 +424,63 @@ final class AccountUsageService: ObservableObject {
         }
     }
 
+    private static func consumeCodexReset(
+        worker: ServerProfile,
+        creditID: String?,
+        idempotencyKey: UUID
+    ) async throws -> CodexResetConsumeOutcome {
+        let script = try codexResetScript(
+            creditID: creditID,
+            idempotencyKey: idempotencyKey
+        )
+        let result = try await Subprocess.run(
+            executable: URL(fileURLWithPath: "/usr/bin/ssh"),
+            arguments: GitHubProjectService.sshArguments(for: worker, script: script)
+        )
+        guard result.exitCode == 0 else {
+            throw AccountUsageError.commandFailed(.codex)
+        }
+        return try parseCodexResetConsume(result.standardOutput)
+    }
+
     private static var codexProbeScript: String {
         let requests = [
             #"{"method":"initialize","id":0,"params":{"clientInfo":{"name":"terminal_relay","title":"Terminal Relay","version":"1.0.0"}}}"#,
             #"{"method":"initialized","params":{}}"#,
             #"{"method":"account/rateLimits/read","id":1,"params":null}"#,
             #"{"method":"account/read","id":2,"params":{"refreshToken":false}}"#
+        ]
+        let quotedRequests = requests
+            .map(GitHubProjectService.shellQuote)
+            .joined(separator: " ")
+        return """
+        cd "$HOME" || exit 1
+        { printf '%s\\n' \(quotedRequests); sleep 2; } | timeout 10s codex app-server 2>/dev/null
+        """
+    }
+
+    private static func codexResetScript(
+        creditID: String?,
+        idempotencyKey: UUID
+    ) throws -> String {
+        var params: [String: String] = ["idempotencyKey": idempotencyKey.uuidString]
+        if let creditID {
+            params["creditId"] = creditID
+        }
+        let requestObject: [String: Any] = [
+            "method": "account/rateLimitResetCredit/consume",
+            "id": codexResetRequestID,
+            "params": params
+        ]
+        let requestData = try JSONSerialization.data(withJSONObject: requestObject, options: [.sortedKeys])
+        guard let consumeRequest = String(data: requestData, encoding: .utf8) else {
+            throw AccountUsageError.resetRedemptionFailed
+        }
+
+        let requests = [
+            #"{"method":"initialize","id":0,"params":{"clientInfo":{"name":"terminal_relay","title":"Terminal Relay","version":"1.0.0"}}}"#,
+            #"{"method":"initialized","params":{}}"#,
+            consumeRequest
         ]
         let quotedRequests = requests
             .map(GitHubProjectService.shellQuote)
@@ -320,6 +500,11 @@ final class AccountUsageService: ObservableObject {
     """
 }
 
+private struct ResetRedemptionKey: Hashable {
+    let workerID: UUID
+    let creditID: String?
+}
+
 private struct CodexEnvelope: Decodable {
     let id: Int?
     let result: CodexResult?
@@ -327,7 +512,9 @@ private struct CodexEnvelope: Decodable {
 
 private struct CodexResult: Decodable {
     let rateLimits: CodexRateLimitSnapshot?
+    let rateLimitResetCredits: CodexRateLimitResetCredits?
     let account: CodexAccount?
+    let outcome: CodexResetConsumeOutcome?
 }
 
 private struct CodexRateLimitSnapshot: Decodable {

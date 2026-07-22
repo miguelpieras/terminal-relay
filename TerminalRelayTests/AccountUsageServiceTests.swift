@@ -10,7 +10,7 @@ final class AccountUsageServiceTests: XCTestCase {
             {"id":0,"result":{"userAgent":"terminal_relay/1.0"}}
             {"method":"remoteControl/status/changed","params":{"status":"disabled"}}
             {"id":2,"result":{"account":{"type":"chatgpt","email":"codex@example.com","planType":"pro"},"requiresOpenaiAuth":true}}
-            {"id":1,"result":{"rateLimits":{"primary":{"usedPercent":89,"windowDurationMins":10080,"resetsAt":1785258135},"secondary":null,"planType":"pro"}}}
+            {"id":1,"result":{"rateLimits":{"primary":{"usedPercent":89,"windowDurationMins":10080,"resetsAt":1785258135},"secondary":null,"planType":"pro"},"rateLimitResetCredits":{"availableCount":2,"credits":[{"id":"reset-credit-1","resetType":"codexRateLimits","status":"available","grantedAt":1785000000,"expiresAt":1786000000,"title":"Weekly reset","description":"Earned for active Codex use"},{"id":"reset-credit-2","resetType":"unknown","status":"redeemed","grantedAt":1784000000,"expiresAt":null,"title":null,"description":null}]}}}
             """.utf8
         )
 
@@ -27,6 +27,87 @@ final class AccountUsageServiceTests: XCTestCase {
             snapshot.limits[0].resetsAt,
             Date(timeIntervalSince1970: 1_785_258_135)
         )
+
+        let resetCredits = try XCTUnwrap(snapshot.codexResetCredits)
+        XCTAssertEqual(resetCredits.availableCount, 2)
+        let credits = try XCTUnwrap(resetCredits.credits)
+        XCTAssertEqual(credits.count, 2)
+
+        XCTAssertEqual(credits[0].id, "reset-credit-1")
+        XCTAssertEqual(credits[0].resetType, "codexRateLimits")
+        XCTAssertEqual(credits[0].status, "available")
+        XCTAssertEqual(credits[0].grantedAt, Date(timeIntervalSince1970: 1_785_000_000))
+        XCTAssertEqual(credits[0].expiresAt, Date(timeIntervalSince1970: 1_786_000_000))
+        XCTAssertEqual(credits[0].title, "Weekly reset")
+        XCTAssertEqual(credits[0].description, "Earned for active Codex use")
+        XCTAssertTrue(credits[0].isAvailable)
+
+        XCTAssertEqual(credits[1].id, "reset-credit-2")
+        XCTAssertEqual(credits[1].resetType, "unknown")
+        XCTAssertEqual(credits[1].status, "redeemed")
+        XCTAssertEqual(credits[1].grantedAt, Date(timeIntervalSince1970: 1_784_000_000))
+        XCTAssertNil(credits[1].expiresAt)
+        XCTAssertNil(credits[1].title)
+        XCTAssertNil(credits[1].description)
+        XCTAssertFalse(credits[1].isAvailable)
+    }
+
+    func testParsesCodexResetCountWithoutCreditDetails() throws {
+        let output = Data(
+            """
+            {"id":1,"result":{"rateLimits":{"primary":{"usedPercent":12,"windowDurationMins":300,"resetsAt":null},"secondary":null,"planType":"plus"},"rateLimitResetCredits":{"availableCount":3,"credits":null}}}
+            """.utf8
+        )
+
+        let snapshot = try AccountUsageService.parseCodex(output)
+
+        let resetCredits = try XCTUnwrap(snapshot.codexResetCredits)
+        XCTAssertEqual(resetCredits.availableCount, 3)
+        XCTAssertNil(resetCredits.credits)
+    }
+
+    func testParsesEveryCodexResetConsumeOutcomeAmidNotifications() throws {
+        let cases: [(rawValue: String, outcome: CodexResetConsumeOutcome)] = [
+            ("reset", .reset),
+            ("alreadyRedeemed", .alreadyRedeemed),
+            ("nothingToReset", .nothingToReset),
+            ("noCredit", .noCredit)
+        ]
+
+        for testCase in cases {
+            let output = Data(
+                """
+                {"method":"remoteControl/status/changed","params":{"status":"disabled"}}
+                {"id":0,"result":{"userAgent":"terminal_relay/1.0"}}
+                {"id":999,"result":{"outcome":"noCredit"}}
+                {"id":2,"result":{"outcome":"\(testCase.rawValue)"}}
+                {"method":"account/rateLimits/updated","params":{"rateLimits":{}}}
+                """.utf8
+            )
+
+            XCTAssertEqual(
+                try AccountUsageService.parseCodexResetConsume(output),
+                testCase.outcome,
+                "Failed to parse \(testCase.rawValue)"
+            )
+        }
+    }
+
+    func testRejectsInvalidCodexResetConsumeResponse() {
+        let output = Data(
+            """
+            {"id":0,"result":{"userAgent":"terminal_relay/1.0"}}
+            {"method":"remoteControl/status/changed","params":{"status":"disabled"}}
+            {"id":1,"result":{"outcome":"reset"}}
+            {"id":2,"result":{"outcome":"futureOutcome"}}
+            """.utf8
+        )
+
+        XCTAssertThrowsError(
+            try AccountUsageService.parseCodexResetConsume(output)
+        ) { error in
+            XCTAssertEqual(error as? AccountUsageError, .resetRedemptionFailed)
+        }
     }
 
     func testCodexWindowLabelsComeFromActualDuration() {
@@ -67,6 +148,7 @@ final class AccountUsageServiceTests: XCTestCase {
         XCTAssertEqual(snapshot.limits[0].remainingPercentText, "87.5")
         XCTAssertEqual(snapshot.limits[1].resetText, "Jul 26, 1:59am (UTC)")
         XCTAssertNil(snapshot.limits[2].resetText)
+        XCTAssertNil(snapshot.codexResetCredits)
     }
 
     func testClaudeParserUsesWorkerLabelWhenAuthMetadataIsAbsent() throws {
