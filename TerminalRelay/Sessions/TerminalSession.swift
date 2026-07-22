@@ -34,21 +34,31 @@ private struct CodexTerminalTitle {
     let isWorking: Bool
 
     init(_ rawTitle: String) {
-        let normalizedTitle = rawTitle
-            .split(whereSeparator: \.isWhitespace)
-            .joined(separator: " ")
+        let normalizedTitle = normalizedTerminalTitle(rawTitle)
         let parts = normalizedTitle.components(separatedBy: " | ")
 
         guard let runState = parts.last, Self.runStates.contains(runState) else {
-            title = normalizedTitle.isEmpty ? nil : normalizedTitle
+            title = displayableTerminalTitle(normalizedTitle)
             isWorking = false
             return
         }
 
         let displayTitle = parts.dropLast().joined(separator: " | ")
-        title = displayTitle.isEmpty ? nil : displayTitle
+        title = displayableTerminalTitle(displayTitle)
         isWorking = runState != "Ready"
     }
+}
+
+private func normalizedTerminalTitle(_ title: String) -> String {
+    title
+        .split(whereSeparator: \.isWhitespace)
+        .joined(separator: " ")
+}
+
+private func displayableTerminalTitle(_ title: String) -> String? {
+    let normalizedTitle = normalizedTerminalTitle(title)
+    guard !normalizedTitle.isEmpty, UUID(uuidString: normalizedTitle) == nil else { return nil }
+    return normalizedTitle
 }
 
 private func progressReport(fromOSC9Payload payload: ArraySlice<UInt8>) -> Terminal.ProgressReport? {
@@ -248,10 +258,12 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
     private func applyTerminalTitle(_ title: String) {
         if kind == .codex {
             let parsedTitle = CodexTerminalTitle(title)
-            terminalTitle = parsedTitle.title
+            if let parsedTitle = parsedTitle.title {
+                terminalTitle = parsedTitle
+            }
             titleIndicatesWorking = parsedTitle.isWorking
-        } else {
-            terminalTitle = title
+        } else if let displayableTitle = displayableTerminalTitle(title) {
+            terminalTitle = displayableTitle
         }
         updateWorkingState()
     }

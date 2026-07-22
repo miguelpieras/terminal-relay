@@ -8,6 +8,7 @@ Terminal Relay is a native macOS workspace for Codex CLI and Claude Code session
 - Lists repositories from the authenticated GitHub account on the Mac and can create private repositories under `miguelpieras`.
 - Uses the same remote path for every worker: `/workspace/<repository-name>`.
 - Opens embedded, full interactive SSH terminals for Codex CLI and Claude Code.
+- Starts those sessions without project or worker MCP servers.
 - Allows one Codex session and one Claude session per worker at the same time, even when that worker hosts several projects.
 - Uses the existing OpenSSH config, agent, known-hosts checks, and optional identity files on the Mac.
 - Persists connection details and account labels, but never passwords, API keys, terminal output, or running-session state.
@@ -46,5 +47,7 @@ The app target intentionally does not enable App Sandbox because its embedded te
 ## Worker setup
 
 Add a worker with either a normal hostname or an alias from `~/.ssh/config`, then assign projects to it. If the alias already defines the user, port, identity, or proxy, leave the corresponding fields in Terminal Relay at their defaults. Commands run through the remote account's login shell, so shell-managed installations such as `nvm` are available.
+
+Worker-wide Codex and Claude guidance is tracked in `Server/worker-config/`. Run `./Scripts/sync-worker-guidance.sh [ssh-target ...]` to install it, defaulting to `terminal-relay-worker-1` when no target is given. Differing remote files receive timestamped backups before replacement.
 
 When a project is added, Terminal Relay uses the Mac's authenticated `gh` CLI to create or inspect the repository. It generates a dedicated deploy key on the selected worker, grants that key access only to the selected repository, and clones into `/workspace/<repository-name>`. The private key never leaves the worker, the GitHub credential never leaves the Mac, and no credential is stored in the project record or Git remote URL.

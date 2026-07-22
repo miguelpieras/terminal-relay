@@ -167,6 +167,14 @@ final class SessionManagerTests: XCTestCase {
         await Task.yield()
 
         XCTAssertEqual(session.displayTitle, "Review release topology")
+
+        session.setTerminalTitle(
+            source: session.terminalView,
+            title: "019f89a7-f067-7e41-a7ec-76d0ed91e684"
+        )
+        await Task.yield()
+
+        XCTAssertEqual(session.displayTitle, "Review release topology")
     }
 
     func testCodexTerminalTitleTracksWorkingStateWithoutChangingTheChatTitle() async {
@@ -197,6 +205,42 @@ final class SessionManagerTests: XCTestCase {
 
         XCTAssertFalse(session.isWorking)
         XCTAssertEqual(session.displayTitle, "Build native macOS terminal hub")
+    }
+
+    func testUnnamedCodexThreadUsesReadableFallbackInsteadOfItsIdentifier() async {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let manager = SessionManager()
+        let session = manager.open(
+            project: project,
+            on: server,
+            kind: .codex,
+            launchDefaults: .standard
+        ).session
+
+        session.setTerminalTitle(
+            source: session.terminalView,
+            title: "019f89a7-f067-7e41-a7ec-76d0ed91e684 | Ready"
+        )
+        await Task.yield()
+
+        XCTAssertNil(session.terminalTitle)
+        XCTAssertEqual(session.displayTitle, "Codex 1")
+        XCTAssertFalse(session.isWorking)
+
+        session.setTerminalTitle(
+            source: session.terminalView,
+            title: "Name the active thread | Ready"
+        )
+        await Task.yield()
+        session.setTerminalTitle(
+            source: session.terminalView,
+            title: "019f89a7-f067-7e41-a7ec-76d0ed91e684 | Working"
+        )
+        await Task.yield()
+
+        XCTAssertEqual(session.displayTitle, "Name the active thread")
+        XCTAssertTrue(session.isWorking)
     }
 
     func testClaudeProgressReportsTrackWorkingStateAcrossSplitTerminalInput() async {

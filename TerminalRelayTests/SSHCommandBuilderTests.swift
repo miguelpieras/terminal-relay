@@ -195,6 +195,14 @@ final class SSHCommandBuilderTests: XCTestCase {
             AgentLaunchDefaults.standard.arguments(for: .claude)
                 .contains("{\"terminalProgressBarEnabled\":true}")
         )
+        XCTAssertTrue(
+            AgentLaunchDefaults.standard.arguments(for: .claude)
+                .contains("--strict-mcp-config")
+        )
+        XCTAssertTrue(
+            AgentLaunchDefaults.standard.arguments(for: .claude)
+                .contains("{\"mcpServers\":{}}")
+        )
     }
 
     func testFullAccessCanBeDisabledForBothAgents() {

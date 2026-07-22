@@ -76,7 +76,9 @@ struct AgentLaunchDefaults: Equatable {
             var arguments = [
                 "--model", claudeModel,
                 "--effort", claudeReasoningEffort.rawValue,
-                "--settings", "{\"terminalProgressBarEnabled\":true}"
+                "--settings", "{\"terminalProgressBarEnabled\":true}",
+                "--mcp-config", "{\"mcpServers\":{}}",
+                "--strict-mcp-config"
             ]
             if fullAccessEnabled {
                 arguments.append("--dangerously-skip-permissions")

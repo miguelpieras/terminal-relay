@@ -12,6 +12,19 @@ shift
 case "$tool" in
     codex)
         executable="/usr/bin/codex"
+        codex_arguments=("$@")
+        for config_file in "/etc/codex/config.toml" "$HOME/.codex/config.toml" ".codex/config.toml"; do
+            [[ -f "$config_file" ]] || continue
+            while IFS= read -r mcp_server; do
+                [[ -n "$mcp_server" && "$mcp_server" =~ ^[A-Za-z0-9_-]+$ ]] || continue
+                codex_arguments+=(--config "mcp_servers.$mcp_server.enabled=false")
+            done < <(
+                /usr/bin/sed -n \
+                    's/^[[:space:]]*\[mcp_servers\.\([A-Za-z0-9_-]*\)\][[:space:]]*$/\1/p' \
+                    "$config_file"
+            )
+        done
+        set -- "${codex_arguments[@]}"
         ;;
     claude)
         executable="/usr/bin/claude"
