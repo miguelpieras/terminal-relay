@@ -73,6 +73,25 @@ final class ServerProfileTests: XCTestCase {
         XCTAssertEqual(shortProfile.concurrencyKey, magicDNSProfile.concurrencyKey)
     }
 
+    func testConcurrencyKeyNormalizesAndSeparatesSSHUsernames() {
+        var firstProfile = makeValidProfile()
+        firstProfile.username = "  relayuser  "
+
+        var normalizedProfile = makeValidProfile()
+        normalizedProfile.username = "relayuser"
+
+        var caseDistinctProfile = makeValidProfile()
+        caseDistinctProfile.username = "RelayUser"
+
+        var otherUserProfile = makeValidProfile()
+        otherUserProfile.username = "deploy"
+
+        XCTAssertEqual(firstProfile.concurrencyKey, normalizedProfile.concurrencyKey)
+        XCTAssertNotEqual(firstProfile.concurrencyKey, caseDistinctProfile.concurrencyKey)
+        XCTAssertNotEqual(firstProfile.concurrencyKey, otherUserProfile.concurrencyKey)
+        XCTAssertEqual(firstProfile.concurrencyKey, "relayuser@build.example.com:22")
+    }
+
     private func makeValidProfile() -> ServerProfile {
         ServerProfile(
             name: "Build Server",

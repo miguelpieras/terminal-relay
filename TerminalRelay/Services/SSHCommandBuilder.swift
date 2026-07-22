@@ -10,7 +10,7 @@ enum SSHCommandBuilder {
         for server: ServerProfile,
         project: ProjectProfile,
         kind: AgentKind,
-        launchDefaults: AgentLaunchDefaults
+        instanceToken: String
     ) -> SSHLaunchConfiguration {
         var arguments = [
             "-tt",
@@ -33,7 +33,7 @@ enum SSHCommandBuilder {
                 for: server,
                 project: project,
                 kind: kind,
-                launchDefaults: launchDefaults
+                instanceToken: instanceToken
             )
         )
 
@@ -41,30 +41,98 @@ enum SSHCommandBuilder {
     }
 
     static func remoteCommand(
-        for server: ServerProfile,
+        for _: ServerProfile,
         project: ProjectProfile,
         kind: AgentKind,
-        launchDefaults: AgentLaunchDefaults
+        instanceToken: String
     ) -> String {
-        let command = server.command(for: kind).trimmingCharacters(in: .whitespacesAndNewlines)
-        let directory = project.workingDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
-        let launchArguments = launchDefaults.arguments(for: kind)
+        let sessionCommand = [
+            WorkerSessionProtocol.helperPath,
+            "reattach",
+            kind.rawValue,
+            project.displayName,
+            instanceToken
+        ]
             .map(shellQuote)
             .joined(separator: " ")
-        let environmentPrefix = kind == .claude ? "env ConEmuANSI=1 " : ""
-        let launchCommand = "\(environmentPrefix)\(command) \(launchArguments)"
-
-        let payload: String
-        if directory.isEmpty {
-            payload = "exec \(launchCommand)"
-        } else {
-            payload = "cd -- \(shellQuote(directory)) && exec \(launchCommand)"
-        }
+        let payload = "exec \(sessionCommand)"
 
         return "exec \"${SHELL:-/bin/sh}\" -lic \(shellQuote(payload))"
     }
 
+    static func workerSessionStatusConfiguration(
+        for server: ServerProfile
+    ) -> SSHLaunchConfiguration {
+        workerSessionConfiguration(
+            for: server,
+            arguments: ["status"]
+        )
+    }
+
+    static func workerSessionStartConfiguration(
+        for server: ServerProfile,
+        kind: AgentKind,
+        repositoryName: String,
+        launchDefaults: AgentLaunchDefaults
+    ) -> SSHLaunchConfiguration {
+        let arguments = ["start", kind.rawValue, repositoryName]
+            + launchDefaults.arguments(for: kind)
+        return workerSessionConfiguration(
+            for: server,
+            arguments: arguments,
+            environment: kind == .claude ? ["ConEmuANSI=1"] : []
+        )
+    }
+
+    static func workerSessionStopConfiguration(
+        for server: ServerProfile,
+        kind: AgentKind,
+        repositoryName: String,
+        instanceToken: String
+    ) -> SSHLaunchConfiguration {
+        workerSessionConfiguration(
+            for: server,
+            arguments: ["stop", kind.rawValue, repositoryName, instanceToken]
+        )
+    }
+
     static func shellQuote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
+    }
+
+    private static func workerSessionConfiguration(
+        for server: ServerProfile,
+        arguments remoteArguments: [String],
+        environment: [String] = []
+    ) -> SSHLaunchConfiguration {
+        var arguments = [
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=5",
+            "-o", "ServerAliveInterval=30",
+            "-o", "ServerAliveCountMax=3",
+            "-o", "StrictHostKeyChecking=accept-new"
+        ]
+
+        if server.port != 22 {
+            arguments += ["-p", String(server.port)]
+        }
+
+        let identityFile = server.identityFile.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !identityFile.isEmpty {
+            arguments += ["-i", (identityFile as NSString).expandingTildeInPath]
+        }
+
+        arguments.append("--")
+        arguments.append(server.destination)
+        let remoteCommand = (
+            (environment.isEmpty ? [] : ["/usr/bin/env"] + environment)
+                + [WorkerSessionProtocol.helperPath]
+                + remoteArguments
+        )
+            .map(shellQuote)
+            .joined(separator: " ")
+        arguments.append(remoteCommand)
+
+        return SSHLaunchConfiguration(executable: "/usr/bin/ssh", arguments: arguments)
     }
 }

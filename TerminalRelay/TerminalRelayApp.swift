@@ -6,7 +6,7 @@ final class TerminalRelayApplicationDelegate: NSObject, NSApplicationDelegate {
     weak var sessionManager: SessionManager?
 
     func applicationWillTerminate(_ notification: Notification) {
-        sessionManager?.stopAll()
+        sessionManager?.disconnectAll()
     }
 }
 
@@ -17,6 +17,7 @@ struct TerminalRelayApp: App {
     @StateObject private var serverStore: ServerStore
     @StateObject private var projectStore: ProjectStore
     @StateObject private var sessionManager = SessionManager()
+    @StateObject private var workerSessionService = WorkerSessionService()
     @StateObject private var githubService = GitHubProjectService()
     @StateObject private var accountUsageService = AccountUsageService()
     @StateObject private var workerMetricsService = WorkerMetricsService()
@@ -36,6 +37,7 @@ struct TerminalRelayApp: App {
                 .environmentObject(serverStore)
                 .environmentObject(projectStore)
                 .environmentObject(sessionManager)
+                .environmentObject(workerSessionService)
                 .environmentObject(githubService)
                 .environmentObject(accountUsageService)
                 .environmentObject(workerMetricsService)

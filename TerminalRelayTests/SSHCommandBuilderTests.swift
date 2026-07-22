@@ -2,6 +2,8 @@ import XCTest
 @testable import TerminalRelay
 
 final class SSHCommandBuilderTests: XCTestCase {
+    private let instanceToken = "01234567-89ab-" + "4def-8abc-0123456789ab"
+
     func testConfigurationBuildsSSHArgumentsInRequiredOrder() {
         let server = makeServer(
             port: 2_222,
@@ -13,13 +15,13 @@ final class SSHCommandBuilderTests: XCTestCase {
             for: server,
             project: project,
             kind: .codex,
-            launchDefaults: .standard
+            instanceToken: instanceToken
         )
         let remoteCommand = SSHCommandBuilder.remoteCommand(
             for: server,
             project: project,
             kind: .codex,
-            launchDefaults: .standard
+            instanceToken: instanceToken
         )
 
         XCTAssertEqual(configuration.executable, "/usr/bin/ssh")
@@ -45,7 +47,7 @@ final class SSHCommandBuilderTests: XCTestCase {
             for: server,
             project: project,
             kind: .claude,
-            launchDefaults: .standard
+            instanceToken: instanceToken
         )
 
         XCTAssertFalse(configuration.arguments.contains("-i"))
@@ -55,7 +57,7 @@ final class SSHCommandBuilderTests: XCTestCase {
                 for: server,
                 project: project,
                 kind: .claude,
-                launchDefaults: .standard
+                instanceToken: instanceToken
             )
         ])
     }
@@ -68,98 +70,169 @@ final class SSHCommandBuilderTests: XCTestCase {
             for: server,
             project: project,
             kind: .codex,
-            launchDefaults: .standard
+            instanceToken: instanceToken
         )
 
         XCTAssertFalse(configuration.arguments.contains("-p"))
     }
 
-    func testClaudeRemoteCommandEnablesTerminalProgressCapability() {
-        let server = makeServer()
-        let project = makeProject(server: server)
+    func testPTYRemoteCommandAlwaysReattachesTheExactConfirmedInstance() {
+        let server = makeServer(codexCommand: "printf should-not-run")
+        let project = makeProject(server: server, repositoryName: "relay's repo")
 
-        let command = SSHCommandBuilder.remoteCommand(
-            for: server,
-            project: project,
-            kind: .claude,
-            launchDefaults: .standard
-        )
+        for kind in AgentKind.allCases {
+            let command = SSHCommandBuilder.remoteCommand(
+                for: server,
+                project: project,
+                kind: kind,
+                instanceToken: instanceToken
+            )
+            let configuration = SSHCommandBuilder.configuration(
+                for: server,
+                project: project,
+                kind: kind,
+                instanceToken: instanceToken
+            )
 
-        XCTAssertTrue(command.contains("exec env ConEmuANSI=1 claude"))
+            XCTAssertEqual(
+                command,
+                expectedReattachRemoteCommand(
+                    project: project,
+                    kind: kind,
+                    instanceToken: instanceToken
+                )
+            )
+            XCTAssertEqual(configuration.arguments.suffix(2), [server.destination, command])
+            XCTAssertTrue(command.contains("'reattach'"))
+            XCTAssertTrue(command.contains(SSHCommandBuilder.shellQuote(instanceToken)))
+            XCTAssertFalse(command.contains("'attach'"))
+            XCTAssertFalse(command.contains("printf should-not-run"))
+            XCTAssertFalse(command.contains("ConEmuANSI=1"))
+            for argument in AgentLaunchDefaults.standard.arguments(for: kind) {
+                XCTAssertFalse(command.contains(SSHCommandBuilder.shellQuote(argument)))
+            }
+        }
     }
 
-    func testRemoteCommandUsesTheProjectsFixedWorkspaceDirectory() {
-        let server = makeServer(
-            codexCommand: "  codex --resume  "
-        )
-        let project = makeProject(server: server, repositoryName: "terminal-relay")
+    func testWorkerSessionStatusUsesNoninteractiveSSHAndFixedHelper() {
+        let server = makeServer(port: 2_222, identityFile: "~/Keys/agent key")
 
-        let command = SSHCommandBuilder.remoteCommand(
-            for: server,
-            project: project,
-            kind: .codex,
-            launchDefaults: .standard
+        let configuration = SSHCommandBuilder.workerSessionStatusConfiguration(for: server)
+
+        XCTAssertEqual(configuration.executable, "/usr/bin/ssh")
+        XCTAssertEqual(
+            configuration.arguments,
+            [
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=5",
+                "-o", "ServerAliveInterval=30",
+                "-o", "ServerAliveCountMax=3",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-p", "2222",
+                "-i", ("~/Keys/agent key" as NSString).expandingTildeInPath,
+                "--",
+                "miguel@example.com",
+                "'/usr/local/bin/terminal-relay-session' 'status'"
+            ]
         )
-        let quotedDirectory = SSHCommandBuilder.shellQuote("/workspace/terminal-relay")
-        let arguments = AgentLaunchDefaults.standard.arguments(for: .codex)
-            .map(SSHCommandBuilder.shellQuote)
-            .joined(separator: " ")
-        let payload = "cd -- \(quotedDirectory) && exec codex --resume \(arguments)"
+        XCTAssertFalse(configuration.arguments.contains("-tt"))
+    }
+
+    func testWorkerSessionStartPassesCodexDefaultsToFixedHelper() {
+        let server = makeServer(codexCommand: "printf should-not-run")
+        let defaults = AgentLaunchDefaults(
+            codexModel: "custom codex",
+            codexReasoningEffort: .high,
+            claudeModel: "unused",
+            claudeReasoningEffort: .low,
+            fullAccessEnabled: true
+        )
+
+        let configuration = SSHCommandBuilder.workerSessionStartConfiguration(
+            for: server,
+            kind: .codex,
+            repositoryName: "relay's repo",
+            launchDefaults: defaults
+        )
 
         XCTAssertEqual(
-            command,
-            "exec \"${SHELL:-/bin/sh}\" -lic \(SSHCommandBuilder.shellQuote(payload))"
+            configuration.arguments.suffix(3),
+            [
+                "--",
+                server.destination,
+                expectedStartRemoteCommand(
+                    kind: .codex,
+                    repositoryName: "relay's repo",
+                    defaults: defaults
+                )
+            ]
         )
+        XCTAssertFalse(configuration.arguments.contains("-tt"))
+        XCTAssertFalse(configuration.arguments.last?.contains("printf should-not-run") == true)
+        XCTAssertFalse(configuration.arguments.last?.contains("'/usr/bin/env'") == true)
+    }
+
+    func testWorkerSessionStartSetsClaudeEnvironmentAndQuotesArguments() throws {
+        let server = makeServer()
+        let defaults = AgentLaunchDefaults(
+            codexModel: "unused",
+            codexReasoningEffort: .low,
+            claudeModel: "custom'claude",
+            claudeReasoningEffort: .xhigh,
+            fullAccessEnabled: true
+        )
+
+        let configuration = SSHCommandBuilder.workerSessionStartConfiguration(
+            for: server,
+            kind: .claude,
+            repositoryName: "relay's repo",
+            launchDefaults: defaults
+        )
+        let remoteCommand = try XCTUnwrap(configuration.arguments.last)
+
+        XCTAssertEqual(
+            remoteCommand,
+            expectedStartRemoteCommand(
+                kind: .claude,
+                repositoryName: "relay's repo",
+                defaults: defaults
+            )
+        )
+        XCTAssertTrue(
+            remoteCommand.hasPrefix(
+                "'/usr/bin/env' 'ConEmuANSI=1' '/usr/local/bin/terminal-relay-session' "
+            )
+        )
+        XCTAssertTrue(remoteCommand.contains("'start' 'claude' 'relay'\"'\"'s repo'"))
+        XCTAssertTrue(remoteCommand.contains("'custom'\"'\"'claude'"))
+        XCTAssertFalse(configuration.arguments.contains("-tt"))
+    }
+
+    func testWorkerSessionStopPassesKindRepositoryAndInstanceToken() {
+        let server = makeServer()
+
+        let configuration = SSHCommandBuilder.workerSessionStopConfiguration(
+            for: server,
+            kind: .claude,
+            repositoryName: "terminal-relay",
+            instanceToken: instanceToken
+        )
+
+        XCTAssertEqual(
+            configuration.arguments.suffix(3),
+            [
+                "--",
+                "miguel@example.com",
+                "'/usr/local/bin/terminal-relay-session' 'stop' 'claude' 'terminal-relay' '\(instanceToken)'"
+            ]
+        )
+        XCTAssertFalse(configuration.arguments.contains("-tt"))
     }
 
     func testShellQuoteProtectsSingleQuotes() {
         XCTAssertEqual(SSHCommandBuilder.shellQuote("plain text"), "'plain text'")
         XCTAssertEqual(SSHCommandBuilder.shellQuote("it's safe"), "'it'\"'\"'s safe'")
         XCTAssertEqual(SSHCommandBuilder.shellQuote(""), "''")
-    }
-
-    func testCustomDefaultsAreQuotedAndAppliedPerAgent() {
-        let server = makeServer()
-        let project = makeProject(server: server)
-        let defaults = AgentLaunchDefaults(
-            codexModel: "custom codex",
-            codexReasoningEffort: .high,
-            claudeModel: "custom'claude",
-            claudeReasoningEffort: .xhigh,
-            fullAccessEnabled: true
-        )
-
-        let codexCommand = SSHCommandBuilder.remoteCommand(
-            for: server,
-            project: project,
-            kind: .codex,
-            launchDefaults: defaults
-        )
-        let claudeCommand = SSHCommandBuilder.remoteCommand(
-            for: server,
-            project: project,
-            kind: .claude,
-            launchDefaults: defaults
-        )
-
-        XCTAssertEqual(
-            codexCommand,
-            expectedRemoteCommand(
-                server: server,
-                project: project,
-                kind: .codex,
-                defaults: defaults
-            )
-        )
-        XCTAssertEqual(
-            claudeCommand,
-            expectedRemoteCommand(
-                server: server,
-                project: project,
-                kind: .claude,
-                defaults: defaults
-            )
-        )
     }
 
     func testBlankModelNamesUseProductionDefaults() {
@@ -224,18 +297,37 @@ final class SSHCommandBuilderTests: XCTestCase {
         )
     }
 
-    private func expectedRemoteCommand(
-        server: ServerProfile,
+    private func expectedReattachRemoteCommand(
         project: ProjectProfile,
         kind: AgentKind,
-        defaults: AgentLaunchDefaults
+        instanceToken: String
     ) -> String {
-        let arguments = defaults.arguments(for: kind)
+        let reattachCommand = [
+            WorkerSessionProtocol.helperPath,
+            "reattach",
+            kind.rawValue,
+            project.displayName,
+            instanceToken
+        ]
             .map(SSHCommandBuilder.shellQuote)
             .joined(separator: " ")
-        let environmentPrefix = kind == .claude ? "env ConEmuANSI=1 " : ""
-        let payload = "cd -- \(SSHCommandBuilder.shellQuote(project.workingDirectory)) && exec \(environmentPrefix)\(server.command(for: kind)) \(arguments)"
+        let payload = "exec \(reattachCommand)"
         return "exec \"${SHELL:-/bin/sh}\" -lic \(SSHCommandBuilder.shellQuote(payload))"
+    }
+
+    private func expectedStartRemoteCommand(
+        kind: AgentKind,
+        repositoryName: String,
+        defaults: AgentLaunchDefaults
+    ) -> String {
+        let environment = kind == .claude ? ["/usr/bin/env", "ConEmuANSI=1"] : []
+        return (
+            environment
+                + [WorkerSessionProtocol.helperPath, "start", kind.rawValue, repositoryName]
+                + defaults.arguments(for: kind)
+        )
+            .map(SSHCommandBuilder.shellQuote)
+            .joined(separator: " ")
     }
 
     private func makeServer(

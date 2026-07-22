@@ -1,49 +1,1159 @@
-#!/usr/bin/bash
+#!/bin/bash
 set -euo pipefail
 
-if [[ $# -lt 1 ]]; then
-    echo "usage: terminal-relay-session <codex|claude> [arguments...]" >&2
-    exit 64
+readonly protocol_marker="__TERMINAL_RELAY_SESSION_V1__"
+readonly installed_helper_path="/usr/local/bin/terminal-relay-session"
+readonly default_tmux_path="/usr/bin/tmux"
+readonly default_tmux_socket="terminal-relay"
+readonly default_workspace_root="/workspace"
+readonly default_codex_path="/usr/bin/codex"
+readonly default_claude_path="/usr/bin/claude"
+readonly default_flock_path="/usr/bin/flock"
+readonly default_python_path="/usr/bin/python3"
+
+resolve_helper_path() {
+    local path="$0"
+    local directory
+
+    case "$path" in
+        /*) ;;
+        */*)
+            directory="$(cd "$(dirname "$path")" && pwd -P)"
+            path="$directory/$(basename "$path")"
+            ;;
+        *)
+            path="$(command -v "$path")"
+            ;;
+    esac
+    printf '%s\n' "$path"
+}
+
+helper_path="$(resolve_helper_path)"
+test_environment_present=0
+if /usr/bin/env | /usr/bin/grep -q '^TERMINAL_RELAY_TEST_'; then
+    test_environment_present=1
 fi
 
-tool="$1"
+helper_is_installed=0
+if [[ "$helper_path" == "$installed_helper_path" ]]; then
+    helper_is_installed=1
+elif [[ -e "$installed_helper_path" ]] \
+    && [[ "$helper_path" -ef "$installed_helper_path" ]]; then
+    helper_is_installed=1
+fi
+
+if [[ $helper_is_installed -eq 1 ]]; then
+    if [[ $test_environment_present -eq 1 ]]; then
+        echo "The installed terminal-relay-session helper refuses test overrides." >&2
+        exit 78
+    fi
+    test_mode=0
+elif [[ "${TERMINAL_RELAY_TEST_MODE:-}" == "1" ]]; then
+    test_mode=1
+elif [[ $test_environment_present -eq 1 ]]; then
+    echo "Test overrides require TERMINAL_RELAY_TEST_MODE=1 and a non-installed helper path." >&2
+    exit 78
+else
+    test_mode=0
+fi
+
+user_id="$(/usr/bin/id -u)"
+if [[ $test_mode -eq 1 ]]; then
+    tmux_path="${TERMINAL_RELAY_TEST_TMUX_PATH:-$default_tmux_path}"
+    tmux_socket="${TERMINAL_RELAY_TEST_TMUX_SOCKET:-$default_tmux_socket}"
+    workspace_root="${TERMINAL_RELAY_TEST_WORKSPACE_ROOT:-$default_workspace_root}"
+    runtime_directory="${TERMINAL_RELAY_TEST_RUNTIME_ROOT:-/run/user/$user_id/terminal-relay}"
+    codex_path="${TERMINAL_RELAY_TEST_CODEX_PATH:-$default_codex_path}"
+    claude_path="${TERMINAL_RELAY_TEST_CLAUDE_PATH:-$default_claude_path}"
+    flock_path="${TERMINAL_RELAY_TEST_FLOCK_PATH:-$default_flock_path}"
+    signal_path="${TERMINAL_RELAY_TEST_SIGNAL_PATH:-}"
+else
+    tmux_path="$default_tmux_path"
+    tmux_socket="$default_tmux_socket"
+    workspace_root="$default_workspace_root"
+    runtime_directory="/run/user/$user_id/terminal-relay"
+    codex_path="$default_codex_path"
+    claude_path="$default_claude_path"
+    flock_path="$default_flock_path"
+    signal_path=""
+fi
+
+usage() {
+    cat >&2 <<'EOF'
+usage:
+  terminal-relay-session list-projects
+  terminal-relay-session status
+  terminal-relay-session start <codex|claude> <repository> [agent arguments...]
+  terminal-relay-session attach <codex|claude> <repository> [agent arguments...]
+  terminal-relay-session reattach <codex|claude> <repository> <instance>
+  terminal-relay-session stop <codex|claude> <repository> <instance>
+  terminal-relay-session <codex|claude> [agent arguments...]
+EOF
+}
+
+fail_usage() {
+    echo "$1" >&2
+    usage
+    exit 64
+}
+
+validate_absolute_path() {
+    local label="$1"
+    local path="$2"
+
+    if [[ "$path" != /* || "$path" == *$'\n'* || "$path" == "/" ]]; then
+        echo "Invalid $label path: $path" >&2
+        exit 78
+    fi
+}
+
+validate_absolute_path "tmux" "$tmux_path"
+validate_absolute_path "workspace root" "$workspace_root"
+validate_absolute_path "runtime root" "$runtime_directory"
+validate_absolute_path "Codex executable" "$codex_path"
+validate_absolute_path "Claude executable" "$claude_path"
+validate_absolute_path "flock executable" "$flock_path"
+
+if [[ ! "$tmux_socket" =~ ^[A-Za-z0-9._-]+$ || ${#tmux_socket} -gt 64 ]]; then
+    echo "Invalid tmux socket label: $tmux_socket" >&2
+    exit 78
+fi
+
+while [[ "$workspace_root" == */ ]]; do
+    workspace_root="${workspace_root%/}"
+done
+while [[ "$runtime_directory" == */ ]]; do
+    runtime_directory="${runtime_directory%/}"
+done
+
+umask 077
+/usr/bin/install -d -m 700 "$runtime_directory"
+/bin/chmod 700 "$runtime_directory"
+
+tmux_command() {
+    "$tmux_path" -f /dev/null -L "$tmux_socket" "$@" 6>&- 7>&- 8>&-
+}
+
+validate_tool() {
+    case "$1" in
+        codex|claude) ;;
+        *) fail_usage "Unsupported tool: $1" ;;
+    esac
+}
+
+is_valid_repository_name() {
+    local repository="$1"
+    [[ -n "$repository" \
+        && ${#repository} -le 100 \
+        && "$repository" != "." \
+        && "$repository" != ".." \
+        && "$repository" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+is_valid_instance() {
+    [[ "$1" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]
+}
+
+is_valid_process_identity() {
+    [[ "$1" =~ ^[A-Za-z0-9._:-]{1,160}$ ]]
+}
+
+project_directory_for() {
+    local repository="$1"
+    local project_directory
+
+    if ! is_valid_repository_name "$repository"; then
+        echo "Invalid repository name: $repository" >&2
+        return 64
+    fi
+
+    project_directory="$workspace_root/$repository"
+    if [[ ! -d "$project_directory" || -L "$project_directory" ]]; then
+        echo "Repository directory does not exist: $project_directory" >&2
+        return 66
+    fi
+    printf '%s\n' "$project_directory"
+}
+
+session_name_for() {
+    printf 'terminal-relay-%s-%s\n' "$1" "$2"
+}
+
+metadata_file_for() {
+    printf '%s/%s.session\n' "$runtime_directory" "$1"
+}
+
+metadata_lock_file_for() {
+    printf '%s/%s.metadata.lock\n' "$runtime_directory" "$1"
+}
+
+control_lock_file_for() {
+    printf '%s/%s.control.lock\n' "$runtime_directory" "$1"
+}
+
+agent_lock_file_for() {
+    printf '%s/%s.lock\n' "$runtime_directory" "$1"
+}
+
+require_flock() {
+    if [[ ! -x "$flock_path" ]]; then
+        echo "Required flock executable is unavailable: $flock_path" >&2
+        exit 69
+    fi
+}
+
+lock_tool_control() {
+    local lock_file
+    require_flock
+    lock_file="$(control_lock_file_for "$1")"
+    exec 8>"$lock_file"
+    "$flock_path" 8
+}
+
+unlock_tool_control() {
+    exec 8>&-
+}
+
+lock_tool_metadata() {
+    local lock_file
+    require_flock
+    lock_file="$(metadata_lock_file_for "$1")"
+    exec 6>"$lock_file"
+    "$flock_path" 6
+}
+
+unlock_tool_metadata() {
+    exec 6>&-
+}
+
+session_exists() {
+    local session_name
+    session_name="$(session_name_for "$1" "$2")"
+    tmux_command has-session -t "$session_name" 2>/dev/null
+}
+
+any_tool_session_exists() {
+    tmux_command list-sessions -F '#{session_name}' 2>/dev/null \
+        | /usr/bin/grep -Eq "^terminal-relay-$1($|-)"
+}
+
+load_metadata_unlocked() {
+    local tool="$1"
+    local metadata_file
+    local key
+    local value
+    local extra
+    local repository_seen=0
+    local instance_seen=0
+    local pid_seen=0
+    local start_seen=0
+
+    metadata_repository=""
+    metadata_instance=""
+    metadata_pid=""
+    metadata_start=""
+    metadata_file="$(metadata_file_for "$tool")"
+    [[ -f "$metadata_file" && ! -L "$metadata_file" ]] || return 1
+
+    while IFS='|' read -r key value extra; do
+        [[ -z "${extra:-}" ]] || return 1
+        case "$key" in
+            repository)
+                [[ $repository_seen -eq 0 ]] || return 1
+                metadata_repository="$value"
+                repository_seen=1
+                ;;
+            instance)
+                [[ $instance_seen -eq 0 ]] || return 1
+                metadata_instance="$value"
+                instance_seen=1
+                ;;
+            pid)
+                [[ $pid_seen -eq 0 ]] || return 1
+                metadata_pid="$value"
+                pid_seen=1
+                ;;
+            start)
+                [[ $start_seen -eq 0 ]] || return 1
+                metadata_start="$value"
+                start_seen=1
+                ;;
+            *) return 1 ;;
+        esac
+    done < "$metadata_file"
+
+    [[ $repository_seen -eq 1 \
+        && $instance_seen -eq 1 \
+        && $pid_seen -eq 1 \
+        && $start_seen -eq 1 ]] || return 1
+    is_valid_repository_name "$metadata_repository" || return 1
+    is_valid_instance "$metadata_instance" || return 1
+    [[ "$metadata_pid" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+    if [[ "$metadata_pid" == "0" ]]; then
+        [[ "$metadata_start" == "pending" ]] || return 1
+    else
+        is_valid_process_identity "$metadata_start" || return 1
+    fi
+}
+
+write_metadata_unlocked() {
+    local tool="$1"
+    local repository="$2"
+    local instance="$3"
+    local pid="$4"
+    local start="$5"
+    local metadata_file
+    local temporary_file
+
+    metadata_file="$(metadata_file_for "$tool")"
+    temporary_file="$metadata_file.$$.$RANDOM.tmp"
+    printf 'repository|%s\ninstance|%s\npid|%s\nstart|%s\n' \
+        "$repository" "$instance" "$pid" "$start" > "$temporary_file"
+    /bin/chmod 600 "$temporary_file"
+    /bin/mv -f "$temporary_file" "$metadata_file"
+}
+
+remove_metadata_unlocked() {
+    local metadata_file
+    metadata_file="$(metadata_file_for "$1")"
+    /bin/rm -f -- "$metadata_file"
+}
+
+generate_instance() {
+    local random_hex
+    local instance
+    random_hex="$(/usr/bin/od -An -N16 -tx1 /dev/urandom | /usr/bin/tr -d ' \n')"
+    [[ "$random_hex" =~ ^[a-f0-9]{32}$ ]] || return 70
+    instance="${random_hex:0:8}-${random_hex:8:4}-${random_hex:12:4}-${random_hex:16:4}-${random_hex:20:12}"
+    is_valid_instance "$instance" || return 70
+    printf '%s\n' "$instance"
+}
+
+process_start_identity() {
+    local pid="$1"
+    local stat_line
+    local stat_fields
+    local started
+    local -a stat_parts
+
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    if [[ -r "/proc/$pid/stat" ]]; then
+        IFS= read -r stat_line < "/proc/$pid/stat" || return 1
+        stat_fields="${stat_line##*) }"
+        [[ "$stat_fields" != "$stat_line" ]] || return 1
+        read -r -a stat_parts <<< "$stat_fields"
+        [[ ${#stat_parts[@]} -ge 20 && "${stat_parts[19]}" =~ ^[0-9]+$ ]] || return 1
+        printf 'proc_%s\n' "${stat_parts[19]}"
+        return 0
+    fi
+
+    [[ $test_mode -eq 1 ]] || return 1
+
+    started="$(LC_ALL=C /bin/ps -o lstart= -p "$pid" 2>/dev/null)" || return 1
+    started="${started#"${started%%[![:space:]]*}"}"
+    [[ -n "$started" ]] || return 1
+    started="${started// /_}"
+    started="${started//$'\t'/_}"
+    is_valid_process_identity "ps_$started" || return 1
+    printf 'ps_%s\n' "$started"
+}
+
+process_matches() {
+    local current_identity
+    current_identity="$(process_start_identity "$1")" || return 1
+    [[ "$current_identity" == "$2" ]]
+}
+
+require_lifetime_signal_support() {
+    if [[ $test_mode -eq 1 ]]; then
+        if [[ -z "$signal_path" || ! -x "$signal_path" || -L "$signal_path" ]]; then
+            echo "The isolated test signal adapter is unavailable: ${signal_path:-unset}" >&2
+            return 69
+        fi
+        return 0
+    fi
+
+    if [[ ! -x "$default_python_path" || ! -r /proc/self/stat ]]; then
+        echo "Production stop requires $default_python_path with Linux pidfd support." >&2
+        return 69
+    fi
+    if ! "$default_python_path" - <<'PYTHON_PIDFD_PROBE'
+import os
+import signal
+
+if not callable(getattr(os, "pidfd_open", None)):
+    raise SystemExit(1)
+if not callable(getattr(signal, "pidfd_send_signal", None)):
+    raise SystemExit(1)
+descriptor = os.pidfd_open(os.getpid(), 0)
+os.close(descriptor)
+PYTHON_PIDFD_PROBE
+    then
+        echo "Production stop requires working Linux pidfd support in $default_python_path." >&2
+        return 69
+    fi
+}
+
+signal_recorded_process() {
+    local pid="$1"
+    local expected_start="$2"
+    local signal_name="$3"
+
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 75
+    case "$signal_name" in
+        TERM|KILL) ;;
+        *) return 64 ;;
+    esac
+
+    if [[ $test_mode -eq 1 ]]; then
+        "$signal_path" "$pid" "$expected_start" "$signal_name"
+        return $?
+    fi
+
+    "$default_python_path" - "$pid" "$expected_start" "$signal_name" <<'PYTHON_PIDFD_SIGNAL'
+import os
+import re
+import signal
+import sys
+
+pid_text, expected_start, signal_name = sys.argv[1:]
+if not re.fullmatch(r"[1-9][0-9]*", pid_text):
+    raise SystemExit(75)
+if not re.fullmatch(r"proc_[0-9]+", expected_start):
+    raise SystemExit(75)
+signals = {"TERM": signal.SIGTERM, "KILL": signal.SIGKILL}
+if signal_name not in signals:
+    raise SystemExit(64)
+
+pid = int(pid_text)
+try:
+    descriptor = os.pidfd_open(pid, 0)
+except ProcessLookupError:
+    raise SystemExit(75)
+except (AttributeError, OSError):
+    raise SystemExit(69)
+
+try:
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as stat_file:
+            stat_line = stat_file.read()
+    except FileNotFoundError:
+        raise SystemExit(75)
+    except OSError:
+        raise SystemExit(69)
+
+    delimiter = stat_line.rfind(b") ")
+    if delimiter < 0:
+        raise SystemExit(70)
+    stat_fields = stat_line[delimiter + 2:].split()
+    if len(stat_fields) < 20 or not stat_fields[19].isdigit():
+        raise SystemExit(70)
+    if f"proc_{stat_fields[19].decode('ascii')}" != expected_start:
+        raise SystemExit(75)
+
+    try:
+        signal.pidfd_send_signal(descriptor, signals[signal_name], None, 0)
+    except ProcessLookupError:
+        raise SystemExit(75)
+    except (AttributeError, OSError):
+        raise SystemExit(69)
+finally:
+    os.close(descriptor)
+PYTHON_PIDFD_SIGNAL
+}
+
+agent_lock_is_free() {
+    local lock_file
+    local result=1
+    lock_file="$(agent_lock_file_for "$1")"
+    exec 7>"$lock_file"
+    if "$flock_path" --nonblock 7; then
+        result=0
+    fi
+    exec 7>&-
+    return "$result"
+}
+
+metadata_launch_is_running() {
+    local tool="$1"
+    if [[ "$metadata_pid" != "0" ]] \
+        && process_matches "$metadata_pid" "$metadata_start"; then
+        return 0
+    fi
+    ! agent_lock_is_free "$tool"
+}
+
+configure_tmux() {
+    if [[ $test_mode -eq 1 && "${TERMINAL_RELAY_TEST_CONFIGURE_FAIL:-}" == "1" ]]; then
+        return 1
+    fi
+    tmux_command set-option -g status off
+    tmux_command set-option -g set-titles on
+    tmux_command set-option -g set-titles-string '#{pane_title}'
+    tmux_command set-option -g detach-on-destroy on
+    tmux_command set-window-option -g allow-rename on
+}
+
+write_launch_script() {
+    local launch_file="$1"
+    local tool="$2"
+    local repository="$3"
+    local instance="$4"
+    shift 4
+
+    {
+        printf '#!/bin/bash\n'
+        printf '/bin/rm -f -- %q\n' "$launch_file"
+        if [[ $test_mode -eq 1 ]]; then
+            printf 'export TERMINAL_RELAY_TEST_MODE=1\n'
+            printf 'export TERMINAL_RELAY_TEST_WORKSPACE_ROOT=%q\n' "$workspace_root"
+            printf 'export TERMINAL_RELAY_TEST_RUNTIME_ROOT=%q\n' "$runtime_directory"
+            printf 'export TERMINAL_RELAY_TEST_CODEX_PATH=%q\n' "$codex_path"
+            printf 'export TERMINAL_RELAY_TEST_CLAUDE_PATH=%q\n' "$claude_path"
+            printf 'export TERMINAL_RELAY_TEST_FLOCK_PATH=%q\n' "$flock_path"
+        fi
+        [[ -z "${ConEmuANSI+x}" ]] || printf 'export ConEmuANSI=%q\n' "$ConEmuANSI"
+        printf 'exec %q __run-agent %q %q %q' "$helper_path" "$tool" "$repository" "$instance"
+        printf ' %q' "$@"
+        printf '\n'
+    } > "$launch_file"
+    /bin/chmod 700 "$launch_file"
+}
+
+list_projects() {
+    local project_directory
+    local repository
+    local -a repositories=()
+
+    printf '%s\n' "$protocol_marker"
+    if [[ ! -d "$workspace_root" ]]; then
+        echo "Workspace root does not exist: $workspace_root" >&2
+        return 66
+    fi
+
+    shopt -s nullglob dotglob
+    for project_directory in "$workspace_root"/*; do
+        [[ -d "$project_directory" && ! -L "$project_directory" ]] || continue
+        repository="${project_directory##*/}"
+        is_valid_repository_name "$repository" || continue
+        repositories+=("$repository")
+    done
+    shopt -u nullglob dotglob
+
+    if [[ ${#repositories[@]} -gt 0 ]]; then
+        printf 'project|%s\n' "${repositories[@]}" | LC_ALL=C /usr/bin/sort
+    fi
+}
+
+status_sessions() {
+    local tool
+    local repository
+    local instance
+    local session_name
+    local attached_client_count
+
+    if [[ ! -x "$tmux_path" ]]; then
+        echo "Required tmux executable is unavailable: $tmux_path" >&2
+        return 69
+    fi
+    require_flock
+
+    printf '%s\n' "$protocol_marker"
+    for tool in codex claude; do
+        lock_tool_control "$tool"
+        lock_tool_metadata "$tool"
+        if ! load_metadata_unlocked "$tool"; then
+            unlock_tool_metadata
+            if any_tool_session_exists "$tool"; then
+                unlock_tool_control
+                echo "The active $tool session has no valid launch metadata." >&2
+                return 70
+            fi
+            unlock_tool_control
+            continue
+        fi
+
+        repository="$metadata_repository"
+        instance="$metadata_instance"
+        if session_exists "$tool" "$instance"; then
+            session_name="$(session_name_for "$tool" "$instance")"
+            if ! attached_client_count="$(tmux_command display-message -p -t "$session_name" '#{session_attached}' 2>/dev/null)"; then
+                if metadata_launch_is_running "$tool"; then
+                    attached_client_count=0
+                else
+                    remove_metadata_unlocked "$tool"
+                    unlock_tool_metadata
+                    unlock_tool_control
+                    continue
+                fi
+            fi
+        elif metadata_launch_is_running "$tool"; then
+            attached_client_count=0
+        else
+            remove_metadata_unlocked "$tool"
+            unlock_tool_metadata
+            unlock_tool_control
+            continue
+        fi
+        unlock_tool_metadata
+        unlock_tool_control
+
+        if [[ ! "$attached_client_count" =~ ^[0-9]+$ ]]; then
+            echo "tmux returned an invalid attached-client count for $tool." >&2
+            return 70
+        fi
+        printf 'session|%s|%s|%s|%s\n' \
+            "$tool" "$repository" "$attached_client_count" "$instance"
+    done
+}
+
+wait_for_recorded_pid() {
+    local tool="$1"
+    local repository="$2"
+    local instance="$3"
+    local attempt
+
+    stop_pid=0
+    stop_start="pending"
+    for attempt in $(seq 1 40); do
+        lock_tool_metadata "$tool"
+        if ! load_metadata_unlocked "$tool"; then
+            unlock_tool_metadata
+            return 75
+        fi
+        if [[ "$metadata_repository" != "$repository" \
+            || "$metadata_instance" != "$instance" ]]; then
+            unlock_tool_metadata
+            return 75
+        fi
+        stop_pid="$metadata_pid"
+        stop_start="$metadata_start"
+        unlock_tool_metadata
+        [[ "$stop_pid" != "0" ]] && return 0
+        session_exists "$tool" "$instance" || return 0
+        sleep 0.05
+    done
+    return 0
+}
+
+wait_for_launch_end() {
+    local tool="$1"
+    local pid="$2"
+    local start="$3"
+    local attempts="$4"
+    local attempt
+
+    attempt=0
+    while [[ $attempt -lt $attempts ]]; do
+        attempt=$((attempt + 1))
+        if { [[ "$pid" == "0" ]] || ! process_matches "$pid" "$start"; } \
+            && agent_lock_is_free "$tool"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
+terminate_launch() {
+    local tool="$1"
+    local repository="$2"
+    local instance="$3"
+    local session_name
+    local signal_status
+
+    if ! wait_for_recorded_pid "$tool" "$repository" "$instance"; then
+        return 75
+    fi
+    require_lifetime_signal_support || return $?
+
+    session_name="$(session_name_for "$tool" "$instance")"
+    if session_exists "$tool" "$instance"; then
+        if ! tmux_command kill-session -t "$session_name" 2>/dev/null \
+            && session_exists "$tool" "$instance"; then
+            return 70
+        fi
+    fi
+
+    if ! wait_for_launch_end "$tool" "$stop_pid" "$stop_start" 20; then
+        if [[ "$stop_pid" != "0" ]]; then
+            signal_status=0
+            signal_recorded_process "$stop_pid" "$stop_start" TERM || signal_status=$?
+            case "$signal_status" in
+                0|75) ;;
+                *) return 70 ;;
+            esac
+        fi
+        if ! wait_for_launch_end "$tool" "$stop_pid" "$stop_start" 20; then
+            if [[ "$stop_pid" != "0" ]]; then
+                signal_status=0
+                signal_recorded_process "$stop_pid" "$stop_start" KILL || signal_status=$?
+                case "$signal_status" in
+                    0|75) ;;
+                    *) return 70 ;;
+                esac
+            fi
+            wait_for_launch_end "$tool" "$stop_pid" "$stop_start" 30 || return 70
+        fi
+    fi
+
+    if session_exists "$tool" "$instance"; then
+        tmux_command kill-session -t "$session_name" 2>/dev/null || true
+        session_exists "$tool" "$instance" && return 70
+    fi
+
+    lock_tool_metadata "$tool"
+    if ! load_metadata_unlocked "$tool" \
+        || [[ "$metadata_repository" != "$repository" \
+            || "$metadata_instance" != "$instance" ]]; then
+        unlock_tool_metadata
+        return 75
+    fi
+    remove_metadata_unlocked "$tool"
+    unlock_tool_metadata
+}
+
+start_session() {
+    local tool="$1"
+    local repository="$2"
+    shift 2
+    local project_directory
+    local session_name
+    local instance
+    local launch_file
+    local launch_command
+    local attached_client_count
+    local created_session=0
+    local metadata_present=0
+    local active_repository=""
+    local active_instance=""
+
+    validate_tool "$tool"
+    project_directory="$(project_directory_for "$repository")" || exit $?
+    [[ -x "$tmux_path" ]] || { echo "Required tmux executable is unavailable: $tmux_path" >&2; exit 69; }
+    require_flock
+    require_lifetime_signal_support || exit $?
+
+    lock_tool_control "$tool"
+    lock_tool_metadata "$tool"
+    if load_metadata_unlocked "$tool"; then
+        metadata_present=1
+    fi
+
+    if [[ $metadata_present -eq 1 ]] && session_exists "$tool" "$metadata_instance"; then
+        if [[ "$metadata_repository" != "$repository" ]]; then
+            active_repository="$metadata_repository"
+            unlock_tool_metadata
+            unlock_tool_control
+            echo "A $tool session is already running for repository '$active_repository'; requested '$repository'." >&2
+            exit 75
+        fi
+        instance="$metadata_instance"
+        session_name="$(session_name_for "$tool" "$instance")"
+        unlock_tool_metadata
+    else
+        if any_tool_session_exists "$tool"; then
+            active_repository="${metadata_repository:-unknown}"
+            unlock_tool_metadata
+            unlock_tool_control
+            echo "A $tool tmux session is already running with inconsistent launch metadata for repository '$active_repository'." >&2
+            exit 75
+        fi
+        if [[ $metadata_present -eq 1 ]] && metadata_launch_is_running "$tool"; then
+            active_repository="$metadata_repository"
+            active_instance="$metadata_instance"
+            unlock_tool_metadata
+            unlock_tool_control
+            echo "A $tool launch '$active_instance' for repository '$active_repository' is still running without an attachable tmux session." >&2
+            exit 75
+        fi
+
+        remove_metadata_unlocked "$tool"
+        instance="$(generate_instance)" || {
+            unlock_tool_metadata
+            unlock_tool_control
+            echo "Unable to generate a launch instance token." >&2
+            exit 70
+        }
+        write_metadata_unlocked "$tool" "$repository" "$instance" 0 pending
+        session_name="$(session_name_for "$tool" "$instance")"
+        unlock_tool_metadata
+
+        launch_file="$runtime_directory/$tool.launch.$$.$RANDOM"
+        write_launch_script "$launch_file" "$tool" "$repository" "$instance" "$@"
+        printf -v launch_command '%q' "$launch_file"
+        if ! tmux_command new-session -d -s "$session_name" -c "$project_directory" "$launch_command"; then
+            /bin/rm -f -- "$launch_file"
+            lock_tool_metadata "$tool"
+            if load_metadata_unlocked "$tool" && [[ "$metadata_instance" == "$instance" ]]; then
+                remove_metadata_unlocked "$tool"
+            fi
+            unlock_tool_metadata
+            unlock_tool_control
+            echo "Unable to start the $tool tmux session." >&2
+            exit 70
+        fi
+        created_session=1
+    fi
+
+    if ! configure_tmux; then
+        if [[ $created_session -eq 1 ]]; then
+            terminate_launch "$tool" "$repository" "$instance" || true
+        fi
+        unlock_tool_control
+        echo "Unable to configure tmux for the $tool launch." >&2
+        exit 70
+    fi
+    if ! attached_client_count="$(tmux_command display-message -p -t "$session_name" '#{session_attached}' 2>/dev/null)" \
+        || [[ ! "$attached_client_count" =~ ^[0-9]+$ ]]; then
+        unlock_tool_control
+        echo "The $tool tmux session ended before start completed." >&2
+        exit 75
+    fi
+
+    unlock_tool_control
+    printf '%s\n' "$protocol_marker"
+    printf 'session|%s|%s|%s|%s\n' \
+        "$tool" "$repository" "$attached_client_count" "$instance"
+}
+
+attach_session() {
+    local tool="$1"
+    local repository="$2"
+    shift 2
+    local project_directory
+    local session_name
+    local instance
+    local launch_file
+    local launch_command
+    local created_session=0
+    local metadata_present=0
+    local active_repository=""
+    local active_instance=""
+
+    validate_tool "$tool"
+    project_directory="$(project_directory_for "$repository")" || exit $?
+    [[ -x "$tmux_path" ]] || { echo "Required tmux executable is unavailable: $tmux_path" >&2; exit 69; }
+    require_flock
+    require_lifetime_signal_support || exit $?
+
+    lock_tool_control "$tool"
+    lock_tool_metadata "$tool"
+    if load_metadata_unlocked "$tool"; then
+        metadata_present=1
+    fi
+
+    if [[ $metadata_present -eq 1 ]] && session_exists "$tool" "$metadata_instance"; then
+        if [[ "$metadata_repository" != "$repository" ]]; then
+            active_repository="$metadata_repository"
+            unlock_tool_metadata
+            unlock_tool_control
+            echo "A $tool session is already running for repository '$active_repository'; requested '$repository'." >&2
+            exit 75
+        fi
+        instance="$metadata_instance"
+        session_name="$(session_name_for "$tool" "$instance")"
+        unlock_tool_metadata
+    else
+        if any_tool_session_exists "$tool"; then
+            if [[ $metadata_present -eq 1 ]]; then
+                active_repository="$metadata_repository"
+            else
+                active_repository="unknown"
+            fi
+            unlock_tool_metadata
+            unlock_tool_control
+            echo "A $tool tmux session is already running with inconsistent launch metadata for repository '$active_repository'." >&2
+            exit 75
+        fi
+        if [[ $metadata_present -eq 1 ]] && metadata_launch_is_running "$tool"; then
+            active_repository="$metadata_repository"
+            active_instance="$metadata_instance"
+            unlock_tool_metadata
+            unlock_tool_control
+            echo "A $tool launch '$active_instance' for repository '$active_repository' is still running without an attachable tmux session." >&2
+            exit 75
+        fi
+        remove_metadata_unlocked "$tool"
+        instance="$(generate_instance)" || {
+            unlock_tool_metadata
+            unlock_tool_control
+            echo "Unable to generate a launch instance token." >&2
+            exit 70
+        }
+        write_metadata_unlocked "$tool" "$repository" "$instance" 0 pending
+        session_name="$(session_name_for "$tool" "$instance")"
+        unlock_tool_metadata
+
+        launch_file="$runtime_directory/$tool.launch.$$.$RANDOM"
+        write_launch_script "$launch_file" "$tool" "$repository" "$instance" "$@"
+        printf -v launch_command '%q' "$launch_file"
+        if ! tmux_command new-session -d -s "$session_name" -c "$project_directory" "$launch_command"; then
+            /bin/rm -f -- "$launch_file"
+            lock_tool_metadata "$tool"
+            if load_metadata_unlocked "$tool" && [[ "$metadata_instance" == "$instance" ]]; then
+                remove_metadata_unlocked "$tool"
+            fi
+            unlock_tool_metadata
+            unlock_tool_control
+            echo "Unable to start the $tool tmux session." >&2
+            exit 70
+        fi
+        created_session=1
+    fi
+
+    if ! configure_tmux; then
+        if [[ $created_session -eq 1 ]]; then
+            if ! terminate_launch "$tool" "$repository" "$instance"; then
+                echo "The newly created $tool launch could not be cleaned up after tmux configuration failed." >&2
+            fi
+        fi
+        unlock_tool_control
+        echo "Unable to configure tmux for the $tool attachment." >&2
+        exit 70
+    fi
+
+    if ! session_exists "$tool" "$instance"; then
+        unlock_tool_control
+        echo "The $tool tmux session ended before it could be attached." >&2
+        exit 75
+    fi
+    unlock_tool_control
+    exec "$tmux_path" -f /dev/null -L "$tmux_socket" attach-session -t "$session_name"
+}
+
+reattach_session() {
+    local tool="$1"
+    local repository="$2"
+    local instance="$3"
+    local session_name
+    local pause_file
+    local active_repository=""
+    local active_instance=""
+
+    validate_tool "$tool"
+    is_valid_repository_name "$repository" || fail_usage "Invalid reattach repository: $repository"
+    is_valid_instance "$instance" || fail_usage "Invalid reattach instance: $instance"
+    [[ -x "$tmux_path" ]] || { echo "Required tmux executable is unavailable: $tmux_path" >&2; exit 69; }
+    require_flock
+
+    lock_tool_control "$tool"
+    lock_tool_metadata "$tool"
+    if load_metadata_unlocked "$tool"; then
+        active_repository="$metadata_repository"
+        active_instance="$metadata_instance"
+    fi
+    unlock_tool_metadata
+
+    session_name="$(session_name_for "$tool" "$instance")"
+    if [[ -z "$active_instance" ]]; then
+        unlock_tool_control
+        echo "The requested $tool launch has ended and cannot be reattached." >&2
+        exit 75
+    fi
+    if [[ "$active_repository" != "$repository" || "$active_instance" != "$instance" ]]; then
+        unlock_tool_control
+        echo "Refusing stale reattach for $tool '$repository' instance '$instance'; active launch is '$active_repository' instance '$active_instance'." >&2
+        exit 75
+    fi
+    if ! session_exists "$tool" "$instance"; then
+        unlock_tool_control
+        echo "The requested $tool launch has ended and cannot be reattached." >&2
+        exit 75
+    fi
+
+    if ! configure_tmux; then
+        unlock_tool_control
+        echo "Unable to configure tmux for the $tool reattachment." >&2
+        exit 70
+    fi
+    if ! session_exists "$tool" "$instance"; then
+        unlock_tool_control
+        echo "The requested $tool launch ended before it could be reattached." >&2
+        exit 75
+    fi
+
+    unlock_tool_control
+    if [[ $test_mode -eq 1 && -n "${TERMINAL_RELAY_TEST_PAUSE_BEFORE_ATTACH:-}" ]]; then
+        pause_file="$TERMINAL_RELAY_TEST_PAUSE_BEFORE_ATTACH"
+        [[ "$pause_file" == /* && "$pause_file" != *$'\n'* ]] || exit 78
+        printf 'ready\n' > "$pause_file.ready"
+        while [[ -e "$pause_file" ]]; do sleep 0.05; done
+    fi
+    exec "$tmux_path" -f /dev/null -L "$tmux_socket" attach-session -t "$session_name"
+}
+
+stop_session() {
+    local tool="$1"
+    local repository="$2"
+    local instance="$3"
+    local active_repository=""
+    local active_instance=""
+    local terminate_status
+
+    validate_tool "$tool"
+    is_valid_repository_name "$repository" || fail_usage "Invalid stop repository: $repository"
+    is_valid_instance "$instance" || fail_usage "Invalid stop instance: $instance"
+    [[ -x "$tmux_path" ]] || { echo "Required tmux executable is unavailable: $tmux_path" >&2; exit 69; }
+    require_flock
+    require_lifetime_signal_support || exit $?
+
+    lock_tool_control "$tool"
+    lock_tool_metadata "$tool"
+    if load_metadata_unlocked "$tool"; then
+        active_repository="$metadata_repository"
+        active_instance="$metadata_instance"
+    fi
+    unlock_tool_metadata
+
+    if [[ -z "$active_instance" ]]; then
+        unlock_tool_control
+        echo "No matching $tool launch is active; the stop request is stale." >&2
+        exit 75
+    fi
+    if [[ "$active_repository" != "$repository" || "$active_instance" != "$instance" ]]; then
+        unlock_tool_control
+        echo "Refusing stale stop for $tool '$repository' instance '$instance'; active launch is '$active_repository' instance '$active_instance'." >&2
+        exit 75
+    fi
+
+    set +e
+    terminate_launch "$tool" "$repository" "$instance"
+    terminate_status=$?
+    set -e
+    unlock_tool_control
+    case "$terminate_status" in
+        0) ;;
+        75)
+            echo "The $tool launch changed while stopping; the request is stale." >&2
+            exit 75
+            ;;
+        *)
+            echo "The $tool launch did not terminate or release its agent lock." >&2
+            exit 70
+            ;;
+    esac
+}
+
+infer_repository_from_working_directory() {
+    local workspace_physical
+    local working_directory
+    local relative_path
+    local repository
+
+    [[ -d "$workspace_root" ]] || { echo "Workspace root does not exist: $workspace_root" >&2; return 66; }
+    workspace_physical="$(cd "$workspace_root" && pwd -P)"
+    working_directory="$(pwd -P)"
+    case "$working_directory" in
+        "$workspace_physical"/*) ;;
+        *) echo "Run the legacy command from within $workspace_root/<repository>." >&2; return 64 ;;
+    esac
+    relative_path="${working_directory#"$workspace_physical"/}"
+    repository="${relative_path%%/*}"
+    project_directory_for "$repository" >/dev/null || return $?
+    printf '%s\n' "$repository"
+}
+
+run_agent() {
+    local tool="$1"
+    local repository="$2"
+    local instance="$3"
+    shift 3
+    local project_directory
+    local executable
+    local config_file
+    local mcp_server
+    local lock_file
+    local start_identity
+    local -a agent_arguments=("$@")
+
+    validate_tool "$tool"
+    is_valid_instance "$instance" || fail_usage "Invalid internal launch instance."
+    project_directory="$(project_directory_for "$repository")" || exit $?
+    cd "$project_directory"
+
+    case "$tool" in
+        codex)
+            executable="$codex_path"
+            for config_file in "/etc/codex/config.toml" "$HOME/.codex/config.toml" ".codex/config.toml"; do
+                [[ -f "$config_file" ]] || continue
+                while IFS= read -r mcp_server; do
+                    [[ -n "$mcp_server" && "$mcp_server" =~ ^[A-Za-z0-9_-]+$ ]] || continue
+                    agent_arguments+=(--config "mcp_servers.$mcp_server.enabled=false")
+                done < <(
+                    /usr/bin/sed -n \
+                        's/^[[:space:]]*\[mcp_servers\.\([A-Za-z0-9_-]*\)\][[:space:]]*$/\1/p' \
+                        "$config_file"
+                )
+            done
+            ;;
+        claude) executable="$claude_path" ;;
+    esac
+
+    [[ -x "$executable" ]] || { echo "Required $tool executable is unavailable: $executable" >&2; exit 69; }
+    require_flock
+    lock_file="$(agent_lock_file_for "$tool")"
+    exec 9>"$lock_file"
+    if ! "$flock_path" --nonblock 9; then
+        echo "A $tool agent process is already running on this server." >&2
+        exit 75
+    fi
+
+    start_identity="$(process_start_identity "$$")" || {
+        echo "Unable to record the $tool process start identity." >&2
+        exit 70
+    }
+    lock_tool_metadata "$tool"
+    if ! load_metadata_unlocked "$tool" \
+        || [[ "$metadata_repository" != "$repository" \
+            || "$metadata_instance" != "$instance" ]]; then
+        unlock_tool_metadata
+        echo "The $tool launch metadata changed before the agent started." >&2
+        exit 75
+    fi
+    write_metadata_unlocked "$tool" "$repository" "$instance" "$$" "$start_identity"
+    unlock_tool_metadata
+
+    exec "$executable" "${agent_arguments[@]}"
+}
+
+[[ $# -ge 1 ]] || { usage; exit 64; }
+command_name="$1"
 shift
 
-case "$tool" in
-    codex)
-        executable="/usr/bin/codex"
-        codex_arguments=("$@")
-        for config_file in "/etc/codex/config.toml" "$HOME/.codex/config.toml" ".codex/config.toml"; do
-            [[ -f "$config_file" ]] || continue
-            while IFS= read -r mcp_server; do
-                [[ -n "$mcp_server" && "$mcp_server" =~ ^[A-Za-z0-9_-]+$ ]] || continue
-                codex_arguments+=(--config "mcp_servers.$mcp_server.enabled=false")
-            done < <(
-                /usr/bin/sed -n \
-                    's/^[[:space:]]*\[mcp_servers\.\([A-Za-z0-9_-]*\)\][[:space:]]*$/\1/p' \
-                    "$config_file"
-            )
-        done
-        set -- "${codex_arguments[@]}"
+case "$command_name" in
+    list-projects)
+        [[ $# -eq 0 ]] || fail_usage "list-projects does not accept arguments."
+        list_projects
         ;;
-    claude)
-        executable="/usr/bin/claude"
+    status)
+        [[ $# -eq 0 ]] || fail_usage "status does not accept arguments."
+        status_sessions
         ;;
-    *)
-        echo "unsupported tool: $tool" >&2
-        exit 64
+    start)
+        [[ $# -ge 2 ]] || fail_usage "start requires a tool and repository."
+        start_session "$@"
         ;;
+    attach)
+        [[ $# -ge 2 ]] || fail_usage "attach requires a tool and repository."
+        attach_session "$@"
+        ;;
+    reattach)
+        [[ $# -eq 3 ]] || fail_usage "reattach requires a tool, repository, and instance."
+        reattach_session "$1" "$2" "$3"
+        ;;
+    stop)
+        [[ $# -eq 3 ]] || fail_usage "stop requires a tool, repository, and instance."
+        stop_session "$1" "$2" "$3"
+        ;;
+    codex|claude)
+        legacy_tool="$command_name"
+        legacy_repository="$(infer_repository_from_working_directory)" || exit $?
+        attach_session "$legacy_tool" "$legacy_repository" "$@"
+        ;;
+    __run-agent)
+        [[ $# -ge 3 ]] || fail_usage "Invalid internal launch request."
+        run_agent "$@"
+        ;;
+    *) fail_usage "Unknown command: $command_name" ;;
 esac
-
-runtime_directory="/run/user/$(/usr/bin/id -u)/terminal-relay"
-/usr/bin/install -d -m 700 "$runtime_directory"
-
-lock_file="$runtime_directory/$tool.lock"
-exec 9>"$lock_file"
-
-if ! /usr/bin/flock --nonblock 9; then
-    echo "A $tool session is already running on this server." >&2
-    exit 75
-fi
-
-exec "$executable" "$@"

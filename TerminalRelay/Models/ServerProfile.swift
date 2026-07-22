@@ -51,6 +51,8 @@ struct ServerProfile: Codable, Hashable, Identifiable {
     }
 
     var concurrencyKey: String {
+        let normalizedUsername = username
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         var normalizedHost = host
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
@@ -63,7 +65,7 @@ struct ServerProfile: Codable, Hashable, Identifiable {
             normalizedHost = String(shortName)
         }
 
-        return "\(normalizedHost):\(port)"
+        return "\(normalizedUsername)@\(normalizedHost):\(port)"
     }
 
     var isValid: Bool {

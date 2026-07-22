@@ -6,13 +6,29 @@ import SwiftTerm
 enum TerminalSessionStatus: Equatable {
     case connecting
     case running
+    case remoteRunning
+    case disconnected(Int32?)
     case stopping
     case exited(Int32?)
 
     var occupiesSlot: Bool {
         switch self {
-        case .connecting, .running, .stopping: true
+        case .connecting, .running, .remoteRunning, .disconnected, .stopping: true
         case .exited: false
+        }
+    }
+
+    var isLocallyAttached: Bool {
+        switch self {
+        case .connecting, .running: true
+        case .remoteRunning, .disconnected, .stopping, .exited: false
+        }
+    }
+
+    var canReconnect: Bool {
+        switch self {
+        case .remoteRunning, .disconnected: true
+        case .connecting, .running, .stopping, .exited: false
         }
     }
 
@@ -20,9 +36,12 @@ enum TerminalSessionStatus: Equatable {
         switch self {
         case .connecting: "Connecting"
         case .running: "Connected"
+        case .remoteRunning: "Running remotely"
+        case .disconnected(let code):
+            if let code { "Disconnected (\(code))" } else { "Disconnected" }
         case .stopping: "Stopping"
         case .exited(let code):
-            if let code { "Exited (\(code))" } else { "Disconnected" }
+            if let code { "Exited (\(code))" } else { "Exited" }
         }
     }
 }
@@ -89,7 +108,8 @@ private func progressReport(fromOSC9Payload payload: ArraySlice<UInt8>) -> Termi
 
 @MainActor
 final class TerminalSession: NSObject, ObservableObject, Identifiable {
-    let id = UUID()
+    let id: UUID
+    let terminalViewIdentity = UUID()
     let projectID: UUID
     let projectName: String
     let workingDirectory: String
@@ -98,14 +118,14 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
     let kind: AgentKind
     let accountLabel: String
     let sequenceNumber: Int
-    let startedAt = Date()
+    let startedAt: Date
+    let instanceToken: String
     let terminalView: LocalProcessTerminalView
 
-    @Published private(set) var status: TerminalSessionStatus = .connecting
+    @Published private(set) var status: TerminalSessionStatus
     @Published private(set) var terminalTitle: String?
     @Published private(set) var isWorking = false
-
-    var onTermination: ((UUID) -> Void)?
+    @Published private(set) var remoteAttachedClientCount: Int?
 
     private let configuration: SSHLaunchConfiguration
     private var hasStarted = false
@@ -113,14 +133,24 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
     private var processExitSource: DispatchSourceProcess?
     private var titleIndicatesWorking = false
     private var progressIndicatesWorking = false
+    private var lastLocalExitCode: Int32?
+    private var statusBeforeStopping: TerminalSessionStatus?
+    private var remoteStopRequested = false
+    private var explicitDisconnectRequested = false
 
     init(
         project: ProjectProfile,
         server: ServerProfile,
         kind: AgentKind,
         sequenceNumber: Int,
-        launchDefaults: AgentLaunchDefaults
+        instanceToken: String,
+        id: UUID = UUID(),
+        startedAt: Date = Date(),
+        initialStatus: TerminalSessionStatus = .connecting,
+        terminalTitle: String? = nil,
+        remoteAttachedClientCount: Int? = nil
     ) {
+        self.id = id
         self.projectID = project.id
         self.projectName = project.displayName
         self.workingDirectory = project.workingDirectory
@@ -129,11 +159,16 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         self.kind = kind
         self.accountLabel = server.accountLabel(for: kind)
         self.sequenceNumber = sequenceNumber
+        self.startedAt = startedAt
+        self.instanceToken = instanceToken
+        self.status = initialStatus
+        self.terminalTitle = terminalTitle
+        self.remoteAttachedClientCount = remoteAttachedClientCount
         self.configuration = SSHCommandBuilder.configuration(
             for: server,
             project: project,
             kind: kind,
-            launchDefaults: launchDefaults
+            instanceToken: instanceToken
         )
         self.terminalView = LocalProcessTerminalView(frame: NSRect(x: 0, y: 0, width: 900, height: 600))
         super.init()
@@ -188,8 +223,12 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
     }
 
     func startIfNeeded() {
-        guard !hasStarted, !hasFinished else { return }
+        guard !hasStarted,
+              !hasFinished,
+              status != .stopping,
+              !isExited else { return }
         hasStarted = true
+        status = .connecting
         terminalView.startProcess(
             executable: configuration.executable,
             args: configuration.arguments,
@@ -204,9 +243,23 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         }
     }
 
-    func requestStop() {
-        guard status.occupiesSlot, !hasFinished else { return }
-        status = .stopping
+    private var isExited: Bool {
+        if case .exited = status { return true }
+        return false
+    }
+
+    func requestDisconnect() {
+        guard status.isLocallyAttached, !hasFinished else { return }
+        explicitDisconnectRequested = true
+
+        if !hasStarted {
+            hasFinished = true
+            status = .exited(nil)
+            updateWorkingState()
+            return
+        }
+
+        status = .remoteRunning
         titleIndicatesWorking = false
         progressIndicatesWorking = false
         updateWorkingState()
@@ -221,6 +274,82 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         if processID <= 0 {
             finish(exitCode: nil)
         }
+    }
+
+    func beginRemoteStop() {
+        guard status.occupiesSlot, status != .stopping else { return }
+        statusBeforeStopping = status
+        remoteStopRequested = true
+        status = .stopping
+        titleIndicatesWorking = false
+        progressIndicatesWorking = false
+        updateWorkingState()
+    }
+
+    func cancelRemoteStop() {
+        guard status == .stopping else { return }
+        if hasFinished, statusBeforeStopping?.isLocallyAttached == true {
+            status = .disconnected(lastLocalExitCode)
+        } else {
+            status = statusBeforeStopping ?? .remoteRunning
+        }
+        statusBeforeStopping = nil
+        remoteStopRequested = false
+        updateWorkingState()
+    }
+
+    func completeRemoteStop() {
+        guard status == .stopping || remoteStopRequested else { return }
+        statusBeforeStopping = nil
+        remoteAttachedClientCount = nil
+        status = .exited(nil)
+        hasFinished = true
+        titleIndicatesWorking = false
+        progressIndicatesWorking = false
+        processExitSource?.cancel()
+        processExitSource = nil
+        if terminalView.process.shellPid > 0 {
+            terminalView.terminate()
+        }
+        updateWorkingState()
+    }
+
+    func applyRemoteSnapshot(_ snapshot: WorkerSessionSnapshot) {
+        guard snapshot.kind == kind,
+              snapshot.repositoryName == projectName,
+              snapshot.instanceToken == instanceToken else {
+            return
+        }
+        remoteAttachedClientCount = snapshot.attachedClientCount
+        if status.canReconnect || isExited {
+            status = .remoteRunning
+        }
+        updateWorkingState()
+    }
+
+    func markRemoteReplaced() {
+        guard status.occupiesSlot else { return }
+        remoteAttachedClientCount = nil
+        statusBeforeStopping = nil
+        remoteStopRequested = false
+        explicitDisconnectRequested = false
+        status = .exited(lastLocalExitCode)
+        hasFinished = true
+        titleIndicatesWorking = false
+        progressIndicatesWorking = false
+        processExitSource?.cancel()
+        processExitSource = nil
+        if terminalView.process.shellPid > 0 {
+            terminalView.terminate()
+        }
+        updateWorkingState()
+    }
+
+    func markRemoteExited() {
+        guard status.canReconnect else { return }
+        remoteAttachedClientCount = nil
+        status = .exited(lastLocalExitCode)
+        updateWorkingState()
     }
 
     private func installExitMonitor(processID: pid_t) {
@@ -241,13 +370,22 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
     private func finish(exitCode: Int32?) {
         guard !hasFinished else { return }
         hasFinished = true
+        lastLocalExitCode = exitCode
         processExitSource?.cancel()
         processExitSource = nil
-        status = .exited(exitCode)
+        if remoteStopRequested {
+            status = .stopping
+        } else if explicitDisconnectRequested {
+            if !isExited {
+                status = .remoteRunning
+            }
+        } else {
+            remoteAttachedClientCount = nil
+            status = .disconnected(exitCode)
+        }
         titleIndicatesWorking = false
         progressIndicatesWorking = false
         updateWorkingState()
-        onTermination?(id)
     }
 
     private func setProgressIndicatesWorking(_ indicatesWorking: Bool) {
@@ -272,7 +410,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         switch status {
         case .connecting, .running:
             isWorking = titleIndicatesWorking || progressIndicatesWorking
-        case .stopping, .exited:
+        case .remoteRunning, .disconnected, .stopping, .exited:
             isWorking = false
         }
     }

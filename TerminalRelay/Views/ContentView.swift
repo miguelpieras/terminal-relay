@@ -33,9 +33,11 @@ private enum SidebarRowGeometry {
 }
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var serverStore: ServerStore
     @EnvironmentObject private var projectStore: ProjectStore
     @EnvironmentObject private var sessionManager: SessionManager
+    @EnvironmentObject private var workerSessionService: WorkerSessionService
 
     @AppStorage(AgentLaunchDefaults.StorageKey.codexModel)
     private var codexModel = AgentLaunchDefaults.standard.codexModel
@@ -152,6 +154,20 @@ struct ContentView: View {
                 sessionManager.selectedSessionID = nil
             }
         }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active else { return }
+            Task { await refreshWorkerSessions() }
+        }
+        .task(id: workerStatusTaskID) {
+            repeat {
+                await refreshWorkerSessions()
+                do {
+                    try await Task.sleep(for: .seconds(15))
+                } catch {
+                    return
+                }
+            } while !Task.isCancelled
+        }
     }
 
     private var sidebar: some View {
@@ -174,7 +190,7 @@ struct ContentView: View {
                                 navigate(to: .project(project.id))
                             },
                             onSelectSession: { sessionID in
-                                navigate(to: .session(projectID: project.id, sessionID: sessionID))
+                                selectSession(sessionID, for: project)
                             },
                             onOpenTerminal: { kind in
                                 openTerminal(kind, for: project)
@@ -520,14 +536,76 @@ struct ContentView: View {
             return
         }
 
-        let result = sessionManager.open(
-            project: project,
-            on: worker,
-            kind: kind,
-            launchDefaults: launchDefaults
-        )
-        let session = result.session
-        navigate(to: .session(projectID: session.projectID, sessionID: session.id))
+        Task {
+            guard let result = await sessionManager.openAfterRefresh(
+                project: project,
+                on: worker,
+                kind: kind,
+                projects: projectStore.projects,
+                launchDefaults: launchDefaults,
+                using: workerSessionService
+            ) else { return }
+            handleOpenResult(result, for: project)
+        }
+    }
+
+    private func handleOpenResult(
+        _ result: SessionOpenResult,
+        for project: ProjectProfile
+    ) {
+        switch result {
+        case .opened(let session), .selectedExisting(let session):
+            navigate(to: .session(projectID: session.projectID, sessionID: session.id))
+        case .occupied(let occupant):
+            if let session = occupant.localSession {
+                navigate(to: .session(projectID: session.projectID, sessionID: session.id))
+            } else {
+                navigate(to: .project(project.id))
+            }
+        }
+    }
+
+    private func selectSession(_ sessionID: UUID, for project: ProjectProfile) {
+        guard let session = sessionManager.sessions(forProjectID: project.id)
+            .first(where: { $0.id == sessionID }),
+              session.status.canReconnect,
+              let worker = serverStore.server(id: project.serverID) else {
+            navigate(to: .session(projectID: project.id, sessionID: sessionID))
+            return
+        }
+
+        Task {
+            _ = await sessionManager.reconnectAfterRefresh(
+                sessionID: sessionID,
+                project: project,
+                on: worker,
+                projects: projectStore.projects,
+                launchDefaults: launchDefaults,
+                using: workerSessionService
+            )
+            navigate(to: .session(projectID: project.id, sessionID: sessionID))
+        }
+    }
+
+    private var workerStatusTaskID: String {
+        let workers = serverStore.servers.map(\.id.uuidString).sorted().joined(separator: ",")
+        let projects = projectStore.projects
+            .map { "\($0.id.uuidString):\($0.serverID.uuidString):\($0.displayName)" }
+            .sorted()
+            .joined(separator: ",")
+        return "\(workers)|\(projects)"
+    }
+
+    private func refreshWorkerSessions() async {
+        for worker in serverStore.servers {
+            guard !Task.isCancelled else { return }
+            _ = await sessionManager.refresh(
+                worker: worker,
+                projects: projectStore.projects,
+                launchDefaults: launchDefaults,
+                using: workerSessionService
+            )
+        }
     }
 
     private func selectFirstProjectIfNeeded() {
@@ -644,7 +722,7 @@ private struct ProjectRemovalConfirmation: View {
             VStack(spacing: 7) {
                 Text("Remove \(project.displayName)?")
                     .font(.title2.weight(.semibold))
-                Text("Open terminals will stop. The GitHub repository and remote files will not be deleted.")
+                Text("Open terminals will disconnect. Remote agents, the GitHub repository, and remote files will not be deleted.")
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 460)
@@ -802,8 +880,20 @@ private struct ProjectSidebarSection: View {
                     }
                     .buttonStyle(.plain)
                     .contextMenu {
-                        Button(session.status.occupiesSlot ? "Stop Session" : "Close Session") {
-                            sessionManager.close(sessionID: session.id)
+                        Group {
+                            if session.status.isLocallyAttached {
+                                Button("Disconnect") {
+                                    sessionManager.disconnect(sessionID: session.id)
+                                }
+                            } else if session.status.canReconnect {
+                                Button("Reconnect") {
+                                    onSelectSession(session.id)
+                                }
+                            } else {
+                                Button("Close Session") {
+                                    sessionManager.close(sessionID: session.id)
+                                }
+                            }
                         }
                         .disabled(session.status == .stopping)
                     }
@@ -876,19 +966,21 @@ private struct ProjectSessionRow: View {
 
     @ViewBuilder
     private var sessionStatusIndicator: some View {
-        if session.isWorking {
+        if session.isWorking || session.status == .connecting || session.status == .stopping {
             ProgressView()
                 .controlSize(.mini)
                 .tint(SidebarPalette.secondary)
         } else {
             Circle()
-                .fill(session.status.occupiesSlot ? session.kind.tint : Color.clear)
+                .fill(session.status == .running ? session.kind.tint : Color.clear)
                 .overlay {
                     Circle()
                         .stroke(
-                            session.status.occupiesSlot
-                                ? Color.clear
-                                : SidebarPalette.secondary,
+                            session.status == .remoteRunning
+                                ? session.kind.tint
+                                : (session.status == .running
+                                    ? Color.clear
+                                    : SidebarPalette.secondary),
                             lineWidth: 1
                         )
                 }

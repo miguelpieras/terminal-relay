@@ -2,6 +2,8 @@ import SwiftUI
 
 struct ProjectWorkspaceView: View {
     @EnvironmentObject private var sessionManager: SessionManager
+    @EnvironmentObject private var projectStore: ProjectStore
+    @EnvironmentObject private var workerSessionService: WorkerSessionService
     @EnvironmentObject private var accountUsageService: AccountUsageService
     @EnvironmentObject private var projectGitService: ProjectGitService
 
@@ -21,7 +23,7 @@ struct ProjectWorkspaceView: View {
     let onSelectProject: (UUID) -> Void
     let onShowWorker: () -> Void
 
-    @State private var conflictingSession: TerminalSession?
+    @State private var conflictingOccupant: SessionOccupant?
     @State private var isShowingCodexResets = false
     @State private var isWritingCommitMessage = false
     @State private var commitMessage = ""
@@ -61,14 +63,24 @@ struct ProjectWorkspaceView: View {
     var body: some View {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
-                if let conflictingSession {
-                    conflictBanner(conflictingSession)
+                if let error = workerSessionService.error(for: worker.id) {
+                    workerSessionErrorBanner(error)
+                    Divider()
+                }
+
+                if let conflictingOccupant {
+                    conflictBanner(conflictingOccupant)
                     Divider()
                 }
 
                 if let selectedSession {
-                    TerminalPane(session: selectedSession)
-                        .id(selectedSession.id)
+                    TerminalPane(
+                        session: selectedSession,
+                        project: project,
+                        worker: worker,
+                        launchDefaults: launchDefaults
+                    )
+                    .id(selectedSession.terminalViewIdentity)
                 } else {
                     readyState
                 }
@@ -460,7 +472,9 @@ struct ProjectWorkspaceView: View {
                             errorMessage: accountUsageService.error(for: worker.id, kind: kind),
                             buttonTitle: launchTitle(for: kind),
                             isButtonDisabled: isGitMutationInProgress
-                                || sessionManager.activeSession(for: worker, kind: kind)?.status == .stopping,
+                                || sessionManager.activeSession(for: worker, kind: kind)?.status == .stopping
+                                || workerSessionService.isStarting(worker: worker, kind: kind)
+                                || workerSessionService.isStopping(worker: worker, kind: kind),
                             onViewResets: kind == .codex ? { isShowingCodexResets = true } : nil,
                             action: { open(kind) }
                         )
@@ -614,52 +628,94 @@ struct ProjectWorkspaceView: View {
 
     private func launchTitle(for kind: AgentKind) -> String {
         let productName = kind == .claude ? "Claude Code" : kind.displayName
-        guard let occupant = sessionManager.activeSession(for: worker, kind: kind) else {
+        if workerSessionService.isStarting(worker: worker, kind: kind) {
+            return "Starting \(productName)"
+        }
+        guard let occupant = sessionManager.occupant(for: worker, kind: kind) else {
             return "Start \(productName)"
         }
-        return occupant.projectID == project.id
-            ? "Show \(productName)"
-            : "\(productName) in use"
+        if occupant.projectID == project.id || occupant.repositoryName == project.displayName {
+            if occupant.localSession?.status == .stopping {
+                return "Stopping \(productName)"
+            }
+            return occupant.localSession?.status.isLocallyAttached == true
+                ? "Show \(productName)"
+                : "Reconnect \(productName)"
+        }
+        return "\(productName) in use"
     }
 
     private func open(_ kind: AgentKind) {
         guard !isGitMutationInProgress else { return }
-        let result = sessionManager.open(
-            project: project,
-            on: worker,
-            kind: kind,
-            launchDefaults: launchDefaults
-        )
 
-        if case .occupied(let occupant) = result {
-            conflictingSession = occupant
+        Task {
+            guard let result = await sessionManager.openAfterRefresh(
+                project: project,
+                on: worker,
+                kind: kind,
+                projects: projectStore.projects,
+                launchDefaults: launchDefaults,
+                using: workerSessionService
+            ) else { return }
+            handleOpenResult(result)
         }
     }
 
-    private func conflictBanner(_ occupant: TerminalSession) -> some View {
+    private func handleOpenResult(_ result: SessionOpenResult) {
+        if case .occupied(let occupant) = result {
+            conflictingOccupant = occupant
+        } else {
+            conflictingOccupant = nil
+        }
+    }
+
+    private func conflictBanner(_ occupant: SessionOccupant) -> some View {
         HStack(spacing: 10) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
 
-            Text("\(occupant.kind.displayName) is already open on \(occupant.projectName).")
+            Text("\(occupant.kind.displayName) is already running on \(occupant.repositoryName).")
                 .font(.callout)
 
             Spacer(minLength: 12)
 
-            Button("Show \(occupant.projectName)") {
-                onSelectProject(occupant.projectID)
-                sessionManager.selectedSessionID = occupant.id
-                conflictingSession = nil
+            if let projectID = occupant.projectID, let session = occupant.localSession {
+                Button("Show \(occupant.repositoryName)") {
+                    onSelectProject(projectID)
+                    sessionManager.selectedSessionID = session.id
+                    conflictingOccupant = nil
+                }
+                .buttonStyle(.borderless)
             }
-            .buttonStyle(.borderless)
 
             Button("Dismiss") {
-                conflictingSession = nil
+                conflictingOccupant = nil
             }
             .buttonStyle(.borderless)
         }
         .padding(.horizontal, 14)
         .frame(minHeight: 38)
+        .background(Color.orange.opacity(0.08))
+    }
+
+    private func workerSessionErrorBanner(_ message: String) -> some View {
+        HStack(spacing: 9) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            Text(message)
+                .font(.caption)
+                .lineLimit(1)
+            Spacer(minLength: 12)
+            Button {
+                workerSessionService.dismissError(for: worker.id)
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss")
+        }
+        .padding(.horizontal, 14)
+        .frame(minHeight: 34)
         .background(Color.orange.opacity(0.08))
     }
 
@@ -1162,7 +1218,15 @@ private struct ResetNotice: Identifiable {
 
 private struct TerminalPane: View {
     @EnvironmentObject private var sessionManager: SessionManager
+    @EnvironmentObject private var projectStore: ProjectStore
+    @EnvironmentObject private var workerSessionService: WorkerSessionService
     @ObservedObject var session: TerminalSession
+
+    let project: ProjectProfile
+    let worker: ServerProfile
+    let launchDefaults: AgentLaunchDefaults
+
+    @State private var isConfirmingStop = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1181,13 +1245,40 @@ private struct TerminalPane: View {
                         .lineLimit(1)
                 }
 
+                if let clientCount = session.remoteAttachedClientCount {
+                    Text("·")
+                        .foregroundStyle(.tertiary)
+                    Text("\(clientCount) \(clientCount == 1 ? "client" : "clients")")
+                        .foregroundStyle(.secondary)
+                }
+
                 Spacer()
 
-                Button(session.status.occupiesSlot ? "Stop" : "Close") {
-                    sessionManager.close(sessionID: session.id)
+                if session.status.isLocallyAttached {
+                    Button("Disconnect") {
+                        sessionManager.disconnect(sessionID: session.id)
+                    }
+                    .buttonStyle(.borderless)
+                } else if session.status.canReconnect {
+                    Button("Reconnect") {
+                        reconnect()
+                    }
+                    .buttonStyle(.borderless)
+                } else if !session.status.occupiesSlot {
+                    Button("Close") {
+                        sessionManager.close(sessionID: session.id)
+                    }
+                    .buttonStyle(.borderless)
                 }
-                .buttonStyle(.borderless)
-                .disabled(session.status == .stopping)
+
+                if session.status.occupiesSlot {
+                    Button("Stop Agent…", role: .destructive) {
+                        isConfirmingStop = true
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.red)
+                    .disabled(session.status == .stopping)
+                }
             }
             .font(.caption)
             .padding(.horizontal, 12)
@@ -1195,7 +1286,29 @@ private struct TerminalPane: View {
             .background(Color(nsColor: .controlBackgroundColor))
 
             ZStack {
-                TerminalHostView(session: session)
+                if session.status.canReconnect {
+                    if case .disconnected = session.status {
+                        ContentUnavailableView {
+                            Label("Connection interrupted", systemImage: "network.slash")
+                        } description: {
+                            Text("The remote agent state is unknown. Reconnect will verify it on \(worker.displayName).")
+                        } actions: {
+                            Button("Reconnect", action: reconnect)
+                                .buttonStyle(.borderedProminent)
+                        }
+                    } else {
+                        ContentUnavailableView {
+                            Label("Agent running remotely", systemImage: "network")
+                        } description: {
+                            Text("This terminal is disconnected. The agent is still running on \(worker.displayName).")
+                        } actions: {
+                            Button("Reconnect", action: reconnect)
+                                .buttonStyle(.borderedProminent)
+                        }
+                    }
+                } else {
+                    TerminalHostView(session: session)
+                }
 
                 if session.status == .stopping {
                     VStack(spacing: 10) {
@@ -1207,6 +1320,35 @@ private struct TerminalPane: View {
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
                 }
             }
+        }
+        .alert("Stop \(session.kind.displayName) agent?", isPresented: $isConfirmingStop) {
+            Button("Cancel", role: .cancel) {}
+            Button("Stop Agent", role: .destructive) {
+                Task {
+                    _ = await sessionManager.stopAgentAfterRefresh(
+                        sessionID: session.id,
+                        on: worker,
+                        projects: projectStore.projects,
+                        launchDefaults: launchDefaults,
+                        using: workerSessionService
+                    )
+                }
+            }
+        } message: {
+            Text("This ends the persistent remote agent for \(project.displayName). Disconnect instead if you want it to keep running.")
+        }
+    }
+
+    private func reconnect() {
+        Task {
+            _ = await sessionManager.reconnectAfterRefresh(
+                sessionID: session.id,
+                project: project,
+                on: worker,
+                projects: projectStore.projects,
+                launchDefaults: launchDefaults,
+                using: workerSessionService
+            )
         }
     }
 }
