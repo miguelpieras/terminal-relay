@@ -74,6 +74,20 @@ final class SSHCommandBuilderTests: XCTestCase {
         XCTAssertFalse(configuration.arguments.contains("-p"))
     }
 
+    func testClaudeRemoteCommandEnablesTerminalProgressCapability() {
+        let server = makeServer()
+        let project = makeProject(server: server)
+
+        let command = SSHCommandBuilder.remoteCommand(
+            for: server,
+            project: project,
+            kind: .claude,
+            launchDefaults: .standard
+        )
+
+        XCTAssertTrue(command.contains("exec env ConEmuANSI=1 claude"))
+    }
+
     func testRemoteCommandUsesTheProjectsFixedWorkspaceDirectory() {
         let server = makeServer(
             codexCommand: "  codex --resume  "
@@ -172,6 +186,17 @@ final class SSHCommandBuilderTests: XCTestCase {
         )
     }
 
+    func testStandardDefaultsRequestNativeActivitySignals() {
+        XCTAssertTrue(
+            AgentLaunchDefaults.standard.arguments(for: .codex)
+                .contains("tui.terminal_title=[\"thread-title\",\"run-state\"]")
+        )
+        XCTAssertTrue(
+            AgentLaunchDefaults.standard.arguments(for: .claude)
+                .contains("{\"terminalProgressBarEnabled\":true}")
+        )
+    }
+
     func testFullAccessCanBeDisabledForBothAgents() {
         let defaults = AgentLaunchDefaults(
             codexModel: "gpt-5.6-sol",
@@ -200,7 +225,8 @@ final class SSHCommandBuilderTests: XCTestCase {
         let arguments = defaults.arguments(for: kind)
             .map(SSHCommandBuilder.shellQuote)
             .joined(separator: " ")
-        let payload = "cd -- \(SSHCommandBuilder.shellQuote(project.workingDirectory)) && exec \(server.command(for: kind)) \(arguments)"
+        let environmentPrefix = kind == .claude ? "env ConEmuANSI=1 " : ""
+        let payload = "cd -- \(SSHCommandBuilder.shellQuote(project.workingDirectory)) && exec \(environmentPrefix)\(server.command(for: kind)) \(arguments)"
         return "exec \"${SHELL:-/bin/sh}\" -lic \(SSHCommandBuilder.shellQuote(payload))"
     }
 

@@ -65,7 +65,8 @@ struct AgentLaunchDefaults: Equatable {
         case .codex:
             var arguments = [
                 "--model", codexModel,
-                "--config", "model_reasoning_effort=\"\(codexReasoningEffort.rawValue)\""
+                "--config", "model_reasoning_effort=\"\(codexReasoningEffort.rawValue)\"",
+                "--config", "tui.terminal_title=[\"thread-title\",\"run-state\"]"
             ]
             if fullAccessEnabled {
                 arguments.append("--dangerously-bypass-approvals-and-sandbox")
@@ -74,7 +75,8 @@ struct AgentLaunchDefaults: Equatable {
         case .claude:
             var arguments = [
                 "--model", claudeModel,
-                "--effort", claudeReasoningEffort.rawValue
+                "--effort", claudeReasoningEffort.rawValue,
+                "--settings", "{\"terminalProgressBarEnabled\":true}"
             ]
             if fullAccessEnabled {
                 arguments.append("--dangerously-skip-permissions")

@@ -169,6 +169,63 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(session.displayTitle, "Review release topology")
     }
 
+    func testCodexTerminalTitleTracksWorkingStateWithoutChangingTheChatTitle() async {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let manager = SessionManager()
+        let session = manager.open(
+            project: project,
+            on: server,
+            kind: .codex,
+            launchDefaults: .standard
+        ).session
+
+        session.setTerminalTitle(
+            source: session.terminalView,
+            title: "Build native macOS terminal hub | Working"
+        )
+        await Task.yield()
+
+        XCTAssertTrue(session.isWorking)
+        XCTAssertEqual(session.displayTitle, "Build native macOS terminal hub")
+
+        session.setTerminalTitle(
+            source: session.terminalView,
+            title: "Build native macOS terminal hub | Ready"
+        )
+        await Task.yield()
+
+        XCTAssertFalse(session.isWorking)
+        XCTAssertEqual(session.displayTitle, "Build native macOS terminal hub")
+    }
+
+    func testClaudeProgressReportsTrackWorkingStateAcrossSplitTerminalInput() async {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let manager = SessionManager()
+        let session = manager.open(
+            project: project,
+            on: server,
+            kind: .claude,
+            launchDefaults: .standard
+        ).session
+        let terminal = session.terminalView.getTerminal()
+
+        terminal.feed(text: "ordinary terminal output")
+        await Task.yield()
+        XCTAssertFalse(session.isWorking)
+
+        let workingSequence = Array("\u{1B}]9;4;3;\u{7}".utf8)
+        terminal.feed(byteArray: Array(workingSequence.prefix(5)))
+        terminal.feed(byteArray: Array(workingSequence.dropFirst(5)))
+        await Task.yield()
+        XCTAssertTrue(session.isWorking)
+
+        terminal.feed(text: "\u{1B}]9;4;0;\u{7}")
+        await Task.yield()
+        XCTAssertFalse(session.isWorking)
+    }
+
     func testSequenceNumberDoesNotResetWhenHistoryIsExplicitlyClosed() async {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let project = makeProject(name: "Terminal Relay", server: server)

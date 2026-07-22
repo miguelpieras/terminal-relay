@@ -775,21 +775,11 @@ private struct ProjectSessionRow: View {
             AgentBrandIcon(kind: session.kind, size: 12)
                 .opacity(session.status.occupiesSlot ? 1 : 0.55)
 
-            Circle()
-                .fill(session.status.occupiesSlot ? session.kind.tint : Color.clear)
-                .overlay {
-                    Circle()
-                        .stroke(
-                            session.status.occupiesSlot
-                                ? Color.clear
-                                : SidebarPalette.secondary,
-                            lineWidth: 1
-                        )
-                }
-                .frame(width: 6, height: 6)
-                .help(session.status.occupiesSlot ? "Terminal open" : session.status.label)
+            sessionStatusIndicator
+                .frame(width: 12, height: 12)
+                .help(sessionStateLabel)
                 .accessibilityLabel(
-                    "\(session.kind.displayName), \(session.status.occupiesSlot ? "terminal open" : session.status.label)"
+                    "\(session.kind.displayName), \(sessionStateLabel.lowercased())"
                 )
         }
         .padding(.leading, 30)
@@ -804,5 +794,33 @@ private struct ProjectSessionRow: View {
         .padding(.horizontal, 10)
         .contentShape(Rectangle())
         .onHover { isHovering = $0 }
+    }
+
+    private var sessionStateLabel: String {
+        if session.isWorking { return "Working" }
+        if session.status == .running { return "Ready" }
+        return session.status.label
+    }
+
+    @ViewBuilder
+    private var sessionStatusIndicator: some View {
+        if session.isWorking {
+            ProgressView()
+                .controlSize(.mini)
+                .tint(SidebarPalette.secondary)
+        } else {
+            Circle()
+                .fill(session.status.occupiesSlot ? session.kind.tint : Color.clear)
+                .overlay {
+                    Circle()
+                        .stroke(
+                            session.status.occupiesSlot
+                                ? Color.clear
+                                : SidebarPalette.secondary,
+                            lineWidth: 1
+                        )
+                }
+                .frame(width: 6, height: 6)
+        }
     }
 }

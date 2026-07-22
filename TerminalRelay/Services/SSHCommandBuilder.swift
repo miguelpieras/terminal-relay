@@ -51,7 +51,8 @@ enum SSHCommandBuilder {
         let launchArguments = launchDefaults.arguments(for: kind)
             .map(shellQuote)
             .joined(separator: " ")
-        let launchCommand = "\(command) \(launchArguments)"
+        let environmentPrefix = kind == .claude ? "env ConEmuANSI=1 " : ""
+        let launchCommand = "\(environmentPrefix)\(command) \(launchArguments)"
 
         let payload: String
         if directory.isEmpty {
