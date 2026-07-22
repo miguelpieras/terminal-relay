@@ -165,6 +165,11 @@ final class ProjectGitServiceTests: XCTestCase {
         )
         XCTAssertTrue(fetchingScript.contains("fetch --prune --quiet origin"))
         XCTAssertFalse(fetchingScript.contains("fetch --prune --quiet origin || true"))
+        XCTAssertTrue(fetchingScript.contains("symbolic-ref --quiet --short HEAD"))
+        XCTAssertTrue(fetchingScript.contains("\" = \"main\""))
+        XCTAssertTrue(fetchingScript.contains("merge-base --is-ancestor HEAD refs/remotes/origin/main"))
+        XCTAssertTrue(fetchingScript.contains("merge --ff-only --quiet refs/remotes/origin/main"))
+        XCTAssertTrue(fetchingScript.contains("status --porcelain --untracked-files=all"))
     }
 
     func testSwitchScriptQuotesBranchRefusesDirtyTreeAndTracksRemote() throws {
@@ -206,6 +211,7 @@ final class ProjectGitServiceTests: XCTestCase {
         XCTAssertTrue(script.contains("repository=\(GitHubProjectService.shellQuote(directory))"))
         XCTAssertTrue(script.contains("message=\(GitHubProjectService.shellQuote(message))"))
         XCTAssertTrue(script.contains("symbolic-ref --quiet --short HEAD"))
+        XCTAssertTrue(script.contains("[ \"$branch\" != \"main\" ]"))
         XCTAssertTrue(script.contains("config --get user.name || printf '%s' 'Terminal Relay'"))
         XCTAssertTrue(script.contains("config --get user.email || printf '%s' 'terminal-relay@localhost'"))
         XCTAssertTrue(script.contains("add --all"))
@@ -219,7 +225,7 @@ final class ProjectGitServiceTests: XCTestCase {
         XCTAssertLessThan(identityCheck.lowerBound, staging.lowerBound)
     }
 
-    func testPushScriptUsesAttachedValidatedBranchAndSetsUpstream() {
+    func testPushScriptRequiresAndPushesMain() {
         let directory = "/workspace/example'; false; '"
         let script = ProjectGitService.pushScript(directory: directory)
 
@@ -227,8 +233,8 @@ final class ProjectGitServiceTests: XCTestCase {
             script.contains("repository=\(GitHubProjectService.shellQuote(directory))")
         )
         XCTAssertTrue(script.contains("symbolic-ref --quiet --short HEAD"))
-        XCTAssertTrue(script.contains("check-ref-format --branch \"$branch\""))
-        XCTAssertTrue(script.contains("push --set-upstream origin \"$branch\""))
+        XCTAssertTrue(script.contains("[ \"$branch\" != \"main\" ]"))
+        XCTAssertTrue(script.contains("push --set-upstream origin main"))
     }
 
     func testCommitAndPushUsesOneRemoteScriptAndMarksCompletedCommit() {
@@ -240,7 +246,8 @@ final class ProjectGitServiceTests: XCTestCase {
         XCTAssertTrue(script.contains("commit --message=\"$message\""))
         XCTAssertTrue(script.contains("__TERMINAL_RELAY_GIT_COMMIT_COMPLETE__"))
         XCTAssertTrue(script.contains("current_branch="))
-        XCTAssertTrue(script.contains("push --set-upstream origin \"$branch\""))
+        XCTAssertTrue(script.contains("[ \"$branch\" != \"main\" ]"))
+        XCTAssertTrue(script.contains("push --set-upstream origin main"))
     }
 
     func testBuildsAndParsesWorkflowRunLookupForPushedCommit() throws {

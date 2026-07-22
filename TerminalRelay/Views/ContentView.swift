@@ -4,6 +4,7 @@ private enum SidebarDestination: Equatable {
     case project(UUID)
     case session(projectID: UUID, sessionID: UUID)
     case workers
+    case worker(UUID)
     case settings
     case newProject(ProjectProfile)
     case editProject(UUID)
@@ -388,7 +389,11 @@ struct ContentView: View {
     private var destinationDetail: some View {
         switch currentDestination {
         case .workers:
-            WorkersView(onSelectProject: { projectID in
+            WorkersView(focusedWorkerID: nil, onSelectProject: { projectID in
+                navigate(to: .project(projectID))
+            })
+        case .worker(let workerID):
+            WorkersView(focusedWorkerID: workerID, onSelectProject: { projectID in
                 navigate(to: .project(projectID))
             })
         case .settings:
@@ -417,7 +422,8 @@ struct ContentView: View {
             ProjectWorkspaceView(
                 project: project,
                 worker: worker,
-                onSelectProject: { navigate(to: .project($0)) }
+                onSelectProject: { navigate(to: .project($0)) },
+                onShowWorker: { navigate(to: .worker(worker.id)) }
             )
             .id(project.id)
         } else {
@@ -569,7 +575,7 @@ struct ContentView: View {
             sessionManager.selectedSessionID = sessionManager
                 .sessions(forProjectID: projectID)
                 .contains(where: { $0.id == sessionID }) ? sessionID : nil
-        case .workers, .settings, .newProject, .editProject:
+        case .workers, .worker, .settings, .newProject, .editProject:
             pageDestination = destination
         }
     }
@@ -602,7 +608,7 @@ struct ContentView: View {
                 return projectID == project.id
             case .newProject(let draft):
                 return draft.id == project.id
-            case .workers, .settings:
+            case .workers, .worker, .settings:
                 return false
             }
         }

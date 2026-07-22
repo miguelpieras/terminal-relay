@@ -425,14 +425,24 @@ final class ProjectGitService: ObservableObject {
     }
 
     static func statusScript(directory: String, fetchRemote: Bool = false) -> String {
-        let fetchCommand = fetchRemote
-            ? "git -C \"$repository\" fetch --prune --quiet origin"
+        let refreshCommand = fetchRemote
+            ? """
+            git -C "$repository" fetch --prune --quiet origin
+            if [ -z "$(git -C "$repository" status --porcelain --untracked-files=all)" ] &&
+               [ "$(git -C "$repository" symbolic-ref --quiet --short HEAD 2>/dev/null || true)" = "main" ] &&
+               git -C "$repository" show-ref --verify --quiet refs/remotes/origin/main; then
+              git -C "$repository" branch --set-upstream-to=origin/main main >/dev/null 2>&1 || true
+              if git -C "$repository" merge-base --is-ancestor HEAD refs/remotes/origin/main; then
+                git -C "$repository" merge --ff-only --quiet refs/remotes/origin/main
+              fi
+            fi
+            """
             : ":"
         return """
         set -eu
         repository=\(GitHubProjectService.shellQuote(directory))
         git -C "$repository" rev-parse --is-inside-work-tree >/dev/null
-        \(fetchCommand)
+        \(refreshCommand)
         printf '%s\\n' '\(statusStartMarker)'
         git -C "$repository" status --porcelain=v2 --branch --untracked-files=all
         printf '%s\\n' '\(statusEndMarker)'
@@ -469,10 +479,14 @@ final class ProjectGitService: ObservableObject {
         set -eu
         repository=\(GitHubProjectService.shellQuote(directory))
         message=\(GitHubProjectService.shellQuote(message))
-        git -C "$repository" symbolic-ref --quiet --short HEAD >/dev/null || {
+        branch="$(git -C "$repository" symbolic-ref --quiet --short HEAD)" || {
           printf '%s\\n' 'Check out a branch before committing.' >&2
           exit 66
         }
+        if [ "$branch" != "main" ]; then
+          printf 'Terminal Relay commits only from main; the worker is on %s.\\n' "$branch" >&2
+          exit 67
+        fi
         author_name="$(git -C "$repository" config --get user.name || printf '%s' 'Terminal Relay')"
         author_email="$(git -C "$repository" config --get user.email || printf '%s' 'terminal-relay@localhost')"
         git -C "$repository" add --all
@@ -493,7 +507,10 @@ final class ProjectGitService: ObservableObject {
           printf '%s\\n' 'Check out a branch before committing.' >&2
           exit 66
         }
-        git -C "$repository" check-ref-format --branch "$branch" >/dev/null
+        if [ "$branch" != "main" ]; then
+          printf 'Terminal Relay commits only from main; the worker is on %s.\\n' "$branch" >&2
+          exit 67
+        fi
         author_name="$(git -C "$repository" config --get user.name || printf '%s' 'Terminal Relay')"
         author_email="$(git -C "$repository" config --get user.email || printf '%s' 'terminal-relay@localhost')"
         git -C "$repository" add --all
@@ -504,11 +521,11 @@ final class ProjectGitService: ObservableObject {
         git -C "$repository" -c user.name="$author_name" -c user.email="$author_email" commit --message="$message"
         printf '%s\\n' '\(commitCompleteMarker)'
         current_branch="$(git -C "$repository" symbolic-ref --quiet --short HEAD)" || exit 70
-        if [ "$current_branch" != "$branch" ]; then
+        if [ "$current_branch" != "main" ]; then
           printf '%s\\n' 'The branch changed before the push; the commit was not pushed.' >&2
           exit 71
         fi
-        git -C "$repository" push --set-upstream origin "$branch"
+        git -C "$repository" push --set-upstream origin main
         """
     }
 
@@ -520,8 +537,11 @@ final class ProjectGitService: ObservableObject {
           printf '%s\\n' 'Check out a branch before pushing.' >&2
           exit 70
         }
-        git -C "$repository" check-ref-format --branch "$branch" >/dev/null
-        git -C "$repository" push --set-upstream origin "$branch"
+        if [ "$branch" != "main" ]; then
+          printf 'Terminal Relay pushes only main; the worker is on %s.\\n' "$branch" >&2
+          exit 67
+        fi
+        git -C "$repository" push --set-upstream origin main
         """
     }
 

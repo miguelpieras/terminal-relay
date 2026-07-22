@@ -136,6 +136,10 @@ final class GitHubProjectService: ObservableObject {
                 worker: worker
             )
             try await provisionCheckout(repository: repository, worker: worker)
+            _ = try await runGH(arguments: [
+                "repo", "edit", repository.nameWithOwner,
+                "--default-branch", "main"
+            ])
 
             if let existingIndex = repositories.firstIndex(where: {
                 $0.nameWithOwner.caseInsensitiveCompare(repository.nameWithOwner) == .orderedSame
@@ -310,6 +314,31 @@ final class GitHubProjectService: ObservableObject {
         key_name=\(shellQuote(keyName))
         ssh_command="ssh -i ~/.ssh/terminal-relay/$key_name -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
 
+        select_main() {
+          if [ -n "$(git -C "$destination" status --porcelain --untracked-files=all)" ]; then
+            return
+          fi
+
+          if git -C "$destination" show-ref --verify --quiet refs/remotes/origin/main; then
+            if git -C "$destination" show-ref --verify --quiet refs/heads/main; then
+              git -C "$destination" switch --quiet main
+            else
+              git -C "$destination" switch --quiet --track -c main origin/main
+            fi
+          else
+            current_branch="$(git -C "$destination" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+            if git -C "$destination" show-ref --verify --quiet refs/heads/main; then
+              git -C "$destination" switch --quiet main
+            elif [ -n "$current_branch" ]; then
+              git -C "$destination" branch -m main
+            else
+              return
+            fi
+            GIT_SSH_COMMAND="$ssh_command" git -C "$destination" push --set-upstream origin main
+          fi
+          git -C "$destination" branch --set-upstream-to=origin/main main >/dev/null 2>&1 || true
+        }
+
         if [ -e "$destination" ] && [ ! -d "$destination" ]; then
           printf 'Project path %s exists and is not a directory.\n' "$destination" >&2
           exit 42
@@ -330,6 +359,8 @@ final class GitHubProjectService: ObservableObject {
           esac
           git -C "$destination" remote set-url origin "$ssh_url"
           git -C "$destination" config core.sshCommand "$ssh_command"
+          GIT_SSH_COMMAND="$ssh_command" git -C "$destination" fetch --prune --quiet origin
+          select_main
           exit 0
         fi
 
@@ -341,6 +372,7 @@ final class GitHubProjectService: ObservableObject {
         mkdir -p /workspace
         GIT_SSH_COMMAND="$ssh_command" git clone "$ssh_url" "$destination"
         git -C "$destination" config core.sshCommand "$ssh_command"
+        select_main
         """
     }
 

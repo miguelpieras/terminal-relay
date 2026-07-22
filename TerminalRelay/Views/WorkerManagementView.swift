@@ -6,6 +6,7 @@ struct WorkersView: View {
     @EnvironmentObject private var sessionManager: SessionManager
     @EnvironmentObject private var accountUsageService: AccountUsageService
 
+    let focusedWorkerID: UUID?
     let onSelectProject: (UUID) -> Void
 
     @State private var editorProfile: ServerProfile?
@@ -14,9 +15,20 @@ struct WorkersView: View {
     @State private var isRefreshingAll = false
 
     private var refreshTaskID: String {
-        serverStore.servers
+        displayedWorkers
             .map { "\($0.id.uuidString)-\($0.destination)-\($0.port)" }
             .joined(separator: "|")
+    }
+
+    private var focusedWorker: ServerProfile? {
+        focusedWorkerID.flatMap(serverStore.server(id:))
+    }
+
+    private var displayedWorkers: [ServerProfile] {
+        if let focusedWorker {
+            return [focusedWorker]
+        }
+        return serverStore.servers
     }
 
     var body: some View {
@@ -67,7 +79,7 @@ struct WorkersView: View {
                     .font(.title2.weight(.semibold))
                 Text(
                     editorProfile == nil
-                        ? "Accounts, capacity, and linked apps across every remote worker."
+                        ? headerSubtitle
                         : "SSH connection and remote agent accounts"
                 )
                 .font(.callout)
@@ -90,13 +102,15 @@ struct WorkersView: View {
                 .buttonStyle(.bordered)
                 .disabled(isRefreshingAll)
 
-                Button {
-                    workerPendingDeletion = nil
-                    editorProfile = ServerProfile()
-                } label: {
-                    Label("Add Worker", systemImage: "plus")
+                if focusedWorker == nil {
+                    Button {
+                        workerPendingDeletion = nil
+                        editorProfile = ServerProfile()
+                    } label: {
+                        Label("Add Worker", systemImage: "plus")
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
-                .buttonStyle(.borderedProminent)
             }
         }
         .padding(.horizontal, 24)
@@ -104,16 +118,23 @@ struct WorkersView: View {
     }
 
     private var headerTitle: String {
-        guard let editorProfile else { return "Workers" }
+        guard let editorProfile else { return focusedWorker?.displayName ?? "Workers" }
         let name = editorProfile.displayName
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return name.isEmpty ? "Add Worker" : "Edit \(name)"
     }
 
+    private var headerSubtitle: String {
+        guard let focusedWorker else {
+            return "Accounts, capacity, and linked apps across every remote worker."
+        }
+        return "Accounts, capacity, and linked apps on \(focusedWorker.destination)."
+    }
+
     private var workerList: some View {
         ScrollView {
             LazyVStack(spacing: 12) {
-                ForEach(serverStore.servers) { worker in
+                ForEach(displayedWorkers) { worker in
                     WorkerOverviewCard(
                         worker: worker,
                         projects: projectStore.projects(for: worker.id),
@@ -157,7 +178,7 @@ struct WorkersView: View {
         defer { isRefreshingAll = false }
 
         await withTaskGroup(of: Void.self) { group in
-            for worker in serverStore.servers {
+            for worker in displayedWorkers {
                 group.addTask {
                     await accountUsageService.refresh(worker: worker, force: force)
                 }

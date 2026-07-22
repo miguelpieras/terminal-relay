@@ -19,6 +19,7 @@ struct ProjectWorkspaceView: View {
     let project: ProjectProfile
     let worker: ServerProfile
     let onSelectProject: (UUID) -> Void
+    let onShowWorker: () -> Void
 
     @State private var conflictingSession: TerminalSession?
     @State private var isShowingCodexResets = false
@@ -95,14 +96,12 @@ struct ProjectWorkspaceView: View {
             await accountUsageService.refresh(worker: worker)
         }
         .task(id: project.id) {
-            var shouldFetchRemote = true
             repeat {
                 _ = await projectGitService.refresh(
                     project: project,
                     worker: worker,
-                    fetchRemote: shouldFetchRemote
+                    fetchRemote: true
                 )
-                shouldFetchRemote = false
                 do {
                     try await Task.sleep(for: .seconds(12))
                 } catch {
@@ -142,9 +141,23 @@ struct ProjectWorkspaceView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(worker.displayName)
-                            .font(.callout.weight(.medium))
+                    VStack(alignment: .leading, spacing: 5) {
+                        Button(action: onShowWorker) {
+                            HStack(spacing: 8) {
+                                Image(systemName: "server.rack")
+                                    .foregroundStyle(.secondary)
+                                Text(worker.displayName)
+                                    .font(.callout.weight(.medium))
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help("Open worker details")
+
                         Text(project.workingDirectory)
                             .font(.system(.caption, design: .monospaced))
                             .foregroundStyle(.tertiary)
@@ -159,7 +172,7 @@ struct ProjectWorkspaceView: View {
                             .foregroundStyle(.secondary)
 
                         gitChangeSummary
-                        branchMenu
+                        branchStatus
 
                         if isWritingCommitMessage {
                             sidebarCommitComposer
@@ -168,8 +181,9 @@ struct ProjectWorkspaceView: View {
                                 Text(commitButtonTitle)
                                     .frame(maxWidth: .infinity)
                             }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.regular)
+                            .frame(minHeight: 34)
                             .disabled(commitButtonDisabled)
                             .help(commitButtonHelp)
                         }
@@ -191,7 +205,7 @@ struct ProjectWorkspaceView: View {
                 .padding(16)
             }
         }
-        .frame(width: 272)
+        .frame(width: 286)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.42))
     }
 
@@ -311,13 +325,17 @@ struct ProjectWorkspaceView: View {
                         .foregroundStyle(.orange)
                 }
                 if gitSnapshot.behindCount > 0 {
-                    Text("· \(gitSnapshot.behindCount) behind")
+                    Text(gitSnapshot.hasChanges
+                        ? "· update waiting for clean tree"
+                        : gitSnapshot.aheadCount > 0
+                            ? "· local and remote history differ"
+                            : "· syncing \(gitSnapshot.behindCount) remote \(gitSnapshot.behindCount == 1 ? "commit" : "commits")")
                         .foregroundStyle(.orange)
                 }
             }
             .font(.caption)
             .foregroundStyle(.secondary)
-            .fixedSize()
+            .fixedSize(horizontal: false, vertical: true)
         } else if gitOperation == .refreshing {
             Text("Reading Git…")
                 .font(.caption)
@@ -331,45 +349,39 @@ struct ProjectWorkspaceView: View {
         }
     }
 
-    private var branchMenu: some View {
-        Menu {
-            if let gitSnapshot {
-                ForEach(gitSnapshot.availableBranches, id: \.self) { branch in
-                    Button {
-                        switchBranch(to: branch)
-                    } label: {
-                        if branch == gitSnapshot.currentBranch {
-                            Label(
-                                branchMenuLabel(branch, snapshot: gitSnapshot),
-                                systemImage: "checkmark"
-                            )
-                        } else {
-                            Text(branchMenuLabel(branch, snapshot: gitSnapshot))
-                        }
-                    }
-                }
-            } else {
-                Text("Branch unavailable")
-            }
-        } label: {
+    private var branchStatus: some View {
+        VStack(spacing: 6) {
             HStack(spacing: 7) {
                 Image(systemName: "arrow.triangle.branch")
                     .foregroundStyle(.secondary)
-                Text(gitSnapshot?.originBranch ?? "origin/branch")
+                Text(gitSnapshot?.currentBranch ?? "Reading branch…")
                     .lineLimit(1)
+                    .foregroundStyle(
+                        gitSnapshot?.currentBranch == "main"
+                            ? Color.primary
+                            : Color.orange
+                    )
                 Spacer(minLength: 4)
-                Image(systemName: "chevron.up.chevron.down")
+                Text(gitSnapshot?.currentBranch == "main" ? "local" : "expected main")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
-            .padding(.horizontal, 8)
-            .frame(height: 32)
-            .contentShape(Rectangle())
-            .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 7))
+
+            HStack(spacing: 7) {
+                Image(systemName: "cloud")
+                    .foregroundStyle(.secondary)
+                Text("origin/main")
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Text("remote")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
         }
-        .menuStyle(.borderlessButton)
-        .disabled(branchSwitchDisabled)
-        .help(branchSwitchHelp)
+        .font(.caption)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 8)
+        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 7))
     }
 
     private var sidebarCommitComposer: some View {
@@ -390,9 +402,10 @@ struct ProjectWorkspaceView: View {
 
                 Button("Commit & push", action: commitAndPush)
                     .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
+                    .controlSize(.regular)
                     .disabled(
                         commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || gitSnapshot?.currentBranch != "main"
                             || hasOpenProjectTerminal
                             || projectGitService.isBusy(projectID: project.id)
                     )
@@ -502,21 +515,6 @@ struct ProjectWorkspaceView: View {
         }
     }
 
-    private var branchSwitchDisabled: Bool {
-        guard let gitSnapshot else { return true }
-        return gitSnapshot.hasChanges
-            || hasOpenProjectTerminal
-            || projectGitService.isBusy(projectID: project.id)
-    }
-
-    private var branchSwitchHelp: String {
-        guard let gitSnapshot else { return "Git status is unavailable" }
-        if gitSnapshot.hasChanges { return "Commit or discard changes before switching branches" }
-        if hasOpenProjectTerminal { return "Stop this project's terminals before switching branches" }
-        if projectGitService.isBusy(projectID: project.id) { return "A Git operation is in progress" }
-        return "Change the current branch on the worker"
-    }
-
     private var commitButtonTitle: String {
         guard let gitSnapshot else { return "Commit & push" }
         return !gitSnapshot.hasChanges && needsPushRetry ? "Push" : "Commit & push"
@@ -525,14 +523,18 @@ struct ProjectWorkspaceView: View {
     private var commitButtonDisabled: Bool {
         guard let gitSnapshot else { return true }
         return (!gitSnapshot.hasChanges && !needsPushRetry)
+            || gitSnapshot.currentBranch != "main"
             || hasOpenProjectTerminal
             || projectGitService.isBusy(projectID: project.id)
     }
 
     private var commitButtonHelp: String {
+        if let gitSnapshot, gitSnapshot.currentBranch != "main" {
+            return "Terminal Relay commits and pushes only main; the worker is currently on \(gitSnapshot.currentBranch)"
+        }
         if hasOpenProjectTerminal { return "Stop this project's terminals before changing its Git state" }
         if projectGitService.isBusy(projectID: project.id) { return "A Git operation is in progress" }
-        return needsPushRetry ? "Push the current branch" : "Commit all changes and push the current branch"
+        return needsPushRetry ? "Push main" : "Commit all changes and push main"
     }
 
     private var needsPushRetry: Bool {
@@ -592,24 +594,6 @@ struct ProjectWorkspaceView: View {
                 isWritingCommitMessage = false
             }
         }
-    }
-
-    private func switchBranch(to branch: String) {
-        guard branch != gitSnapshot?.currentBranch else { return }
-        Task {
-            _ = await projectGitService.switchBranch(
-                branch,
-                project: project,
-                worker: worker
-            )
-        }
-    }
-
-    private func branchMenuLabel(_ branch: String, snapshot: ProjectGitSnapshot) -> String {
-        if snapshot.remoteBranches.contains(branch) || branch == snapshot.currentBranch {
-            return "origin/\(branch)"
-        }
-        return "\(branch) (local only)"
     }
 
     private func workflowStatusText(_ run: GitHubWorkflowRun) -> String {

@@ -164,6 +164,10 @@ final class GitHubProjectServiceTests: XCTestCase {
         XCTAssertTrue(script.contains("Project checkout %s uses origin %s; expected %s."))
         XCTAssertTrue(script.contains("Project path %s is not an empty Git checkout."))
         XCTAssertTrue(script.contains("GIT_SSH_COMMAND=\"$ssh_command\" git clone"))
+        XCTAssertTrue(script.contains("refs/remotes/origin/main"))
+        XCTAssertTrue(script.contains("switch --quiet --track -c main origin/main"))
+        XCTAssertTrue(script.contains("branch -m main"))
+        XCTAssertTrue(script.contains("push --set-upstream origin main"))
     }
 
     func testWorkerKeyScriptUsesRepoScopedKeyWithoutEmbeddingCredentials() {
