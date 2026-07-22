@@ -163,11 +163,21 @@ installed_bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$A
 [[ "$installed_bundle_id" == "$APP_BUNDLE_ID" ]] || die "the installed Terminal Relay bundle identifier is unexpected"
 require_command gh
 require_command ssh
+require_command ssh-keygen
 [[ -x /usr/bin/tar \
     && -x /usr/bin/open \
     && -x /usr/bin/base64 \
     && -x /usr/bin/openssl ]] || die "required macOS system tools are unavailable"
 gh auth status >/dev/null 2>&1 || die "GitHub CLI is not authenticated; run 'gh auth login' first"
+
+identity_fingerprint=""
+if [[ -n "$identity_path" ]]; then
+    identity_fingerprint=$(/usr/bin/ssh-keygen -lf "$identity_path" -E sha256 2>/dev/null \
+        | /usr/bin/awk 'NR == 1 { print $2 }') \
+        || die "could not read the SSH identity fingerprint"
+    [[ "$identity_fingerprint" =~ ^SHA256:[A-Za-z0-9+/]+$ ]] \
+        || die "the SSH identity fingerprint is invalid"
+fi
 
 script_directory="$(cd "$(dirname "$0")" && pwd -P)"
 repository_root="$(cd "$script_directory/.." && pwd -P)"
@@ -178,7 +188,7 @@ done
 
 ssh_options=(-o ControlMaster=no -o ControlPath=none)
 [[ -z "$port" ]] || ssh_options+=(-p "$port")
-[[ -z "$identity_path" ]] || ssh_options+=(-i "$identity_path")
+[[ -z "$identity_path" ]] || ssh_options+=(-o IdentitiesOnly=yes -i "$identity_path")
 ssh_config=$(/usr/bin/ssh "${ssh_options[@]}" -G "$target" 2>/dev/null) || die "could not resolve SSH configuration for $target"
 resolved_host=$(printf '%s\n' "$ssh_config" | /usr/bin/awk '$1 == "hostname" { print $2; exit }')
 resolved_port=$(printf '%s\n' "$ssh_config" | /usr/bin/awk '$1 == "port" { print $2; exit }')
@@ -264,10 +274,24 @@ host_key_fingerprint=$(/usr/bin/awk '
         print fingerprint
     }
 ' "$preflight_ssh_log")
+accepted_identity_fingerprint=$(/usr/bin/awk '
+    /Server accepts key:/ {
+        for (field_index = 1; field_index <= NF; field_index++) {
+            if ($field_index ~ /^SHA256:/) fingerprint = $field_index
+        }
+    }
+    END {
+        sub(/\r$/, "", fingerprint)
+        print fingerprint
+    }
+' "$preflight_ssh_log")
 [[ "$remote_hostname" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] || die "remote hostname is invalid"
 [[ "$remote_os" == "Ubuntu 24.04" && "$remote_architecture" == "amd64" ]] || die "remote platform changed during preflight"
 [[ "$remote_memory_kib" =~ ^[0-9]+$ && "$remote_memory_kib" -ge 3900000 ]] || die "remote memory check failed"
 [[ "$host_key_fingerprint" =~ ^SHA256:[A-Za-z0-9+/]+$ ]] || die "remote host-key fingerprint is invalid"
+if [[ -n "$identity_fingerprint" && "$accepted_identity_fingerprint" != "$identity_fingerprint" ]]; then
+    die "SSH did not authenticate with the requested --identity key"
+fi
 
 echo "Terminal Relay worker bootstrap"
 echo "  SSH target:       $target"
