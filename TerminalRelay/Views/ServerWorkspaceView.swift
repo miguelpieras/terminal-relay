@@ -60,20 +60,6 @@ struct ProjectWorkspaceView: View {
     var body: some View {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
-                agentBar
-
-                if isWritingCommitMessage {
-                    Divider()
-                    commitBar
-                }
-
-                if gitNoticeText != nil {
-                    Divider()
-                    gitNoticeBar
-                }
-
-                Divider()
-
                 if let conflictingSession {
                     conflictBanner(conflictingSession)
                     Divider()
@@ -101,7 +87,7 @@ struct ProjectWorkspaceView: View {
                 } label: {
                     Image(systemName: "sidebar.right")
                 }
-                .help(isShowingEnvironmentSidebar ? "Hide environment sidebar" : "Show environment sidebar")
+                .help(isShowingEnvironmentSidebar ? "Hide details sidebar" : "Show details sidebar")
             }
         }
         .task(id: usageTaskID) {
@@ -126,85 +112,11 @@ struct ProjectWorkspaceView: View {
         }
     }
 
-    private var agentBar: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "server.rack")
-                .foregroundStyle(.tertiary)
-
-            Text(worker.displayName)
-                .font(.caption.weight(.medium))
-            Text("·")
-                .foregroundStyle(.tertiary)
-            Text(project.workingDirectory)
-                .font(.system(.caption, design: .monospaced))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-
-            Spacer(minLength: 16)
-
-            gitChangeSummary
-
-            Menu {
-                if let gitSnapshot {
-                    ForEach(gitSnapshot.availableBranches, id: \.self) { branch in
-                        Button {
-                            switchBranch(to: branch)
-                        } label: {
-                            if branch == gitSnapshot.currentBranch {
-                                Label(branchMenuLabel(branch, snapshot: gitSnapshot), systemImage: "checkmark")
-                            } else {
-                                Text(branchMenuLabel(branch, snapshot: gitSnapshot))
-                            }
-                        }
-                    }
-                } else {
-                    Text("Branch unavailable")
-                }
-            } label: {
-                Label(gitSnapshot?.originBranch ?? "origin/branch", systemImage: "arrow.triangle.branch")
-                    .lineLimit(1)
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .disabled(branchSwitchDisabled)
-            .help(branchSwitchHelp)
-
-            Button {
-                Task {
-                    _ = await projectGitService.refresh(
-                        project: project,
-                        worker: worker,
-                        fetchRemote: true
-                    )
-                }
-            } label: {
-                if gitOperation == .refreshing, gitSnapshot == nil {
-                    ProgressView()
-                        .controlSize(.mini)
-                } else {
-                    Image(systemName: "arrow.clockwise")
-                }
-            }
-            .buttonStyle(.borderless)
-            .disabled(projectGitService.isBusy(projectID: project.id))
-            .help("Fetch and refresh Git status")
-
-            Button(commitButtonTitle, action: commitButtonAction)
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(commitButtonDisabled)
-                .help(commitButtonHelp)
-        }
-        .padding(.horizontal, 14)
-        .frame(height: 44)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.55))
-    }
-
     private var environmentSidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text("Environment")
-                    .font(.title3.weight(.semibold))
+                Text("Details")
+                    .font(.headline)
                 Spacer()
                 Button {
                     Task {
@@ -224,109 +136,63 @@ struct ProjectWorkspaceView: View {
                 .help("Refresh origin and deployment status")
             }
             .padding(.horizontal, 18)
-            .padding(.vertical, 17)
-
-            VStack(spacing: 0) {
-                environmentRemoteRow
-                environmentPushRow
-            }
-            .padding(.horizontal, 18)
+            .frame(height: 50)
 
             Divider()
-                .padding(.horizontal, 18)
-                .padding(.vertical, 16)
 
-            Text("Deployment")
-                .font(.headline)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 18)
-                .padding(.bottom, 8)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(worker.displayName)
+                            .font(.callout.weight(.medium))
+                        Text(project.workingDirectory)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(2)
+                    }
 
-            deploymentRow
-                .padding(.horizontal, 18)
+                    Divider()
 
-            Spacer()
-        }
-        .frame(width: 286)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.48))
-    }
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Git")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
 
-    private var environmentRemoteRow: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "cloud")
-                .frame(width: 18)
-                .foregroundStyle(.secondary)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Remote")
-                    .font(.callout.weight(.medium))
-                Text(gitSnapshot?.originBranch ?? "Reading origin…")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                        gitChangeSummary
+                        branchMenu
+
+                        if isWritingCommitMessage {
+                            sidebarCommitComposer
+                        } else {
+                            Button(action: commitButtonAction) {
+                                Text(commitButtonTitle)
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(commitButtonDisabled)
+                            .help(commitButtonHelp)
+                        }
+
+                        if gitNoticeText != nil {
+                            sidebarGitNotice
+                        }
+                    }
+
+                    Divider()
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Deployment")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        deploymentRow
+                    }
+                }
+                .padding(16)
             }
-            Spacer()
         }
-        .frame(minHeight: 46)
-    }
-
-    private var environmentPushRow: some View {
-        HStack(spacing: 10) {
-            pushStatusIndicator
-                .frame(width: 18)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Commit or push")
-                    .font(.callout.weight(.medium))
-                Text(pushStatusText)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-            }
-            Spacer()
-        }
-        .frame(minHeight: 46)
-    }
-
-    @ViewBuilder
-    private var pushStatusIndicator: some View {
-        switch gitOperation {
-        case .some(.committingAndPushing), .some(.pushing):
-            ProgressView()
-                .controlSize(.mini)
-        default:
-            Circle()
-                .fill(pushStatusColor)
-                .frame(width: 7, height: 7)
-        }
-    }
-
-    private var pushStatusText: String {
-        let destination = gitSnapshot?.originBranch ?? "origin"
-        switch gitOperation {
-        case .some(.committingAndPushing), .some(.pushing):
-            return "Pushing to \(destination)…"
-        default:
-            break
-        }
-
-        switch projectGitService.operationResult(for: project.id) {
-        case .some(.committedAndPushed), .some(.pushed):
-            return "Pushed to \(destination)"
-        case .some(.committedLocally(pushError: _)), .some(.pushFailed(_)):
-            return "Push failed"
-        default:
-            return "Targets \(destination)"
-        }
-    }
-
-    private var pushStatusColor: Color {
-        switch projectGitService.operationResult(for: project.id) {
-        case .some(.committedAndPushed), .some(.pushed):
-            return .green
-        case .some(.committedLocally(pushError: _)), .some(.pushFailed(_)):
-            return .red
-        default:
-            return .secondary
-        }
+        .frame(width: 272)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.42))
     }
 
     @ViewBuilder
@@ -465,52 +331,100 @@ struct ProjectWorkspaceView: View {
         }
     }
 
-    private var commitBar: some View {
-        HStack(spacing: 10) {
-            TextField("Commit message", text: $commitMessage)
-                .textFieldStyle(.plain)
-                .onSubmit(commitAndPush)
-
-            Button("Cancel") {
-                isWritingCommitMessage = false
-                commitMessage = ""
+    private var branchMenu: some View {
+        Menu {
+            if let gitSnapshot {
+                ForEach(gitSnapshot.availableBranches, id: \.self) { branch in
+                    Button {
+                        switchBranch(to: branch)
+                    } label: {
+                        if branch == gitSnapshot.currentBranch {
+                            Label(
+                                branchMenuLabel(branch, snapshot: gitSnapshot),
+                                systemImage: "checkmark"
+                            )
+                        } else {
+                            Text(branchMenuLabel(branch, snapshot: gitSnapshot))
+                        }
+                    }
+                }
+            } else {
+                Text("Branch unavailable")
             }
-            .buttonStyle(.borderless)
-            .disabled(projectGitService.isBusy(projectID: project.id))
-
-            Button("Commit & push", action: commitAndPush)
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .disabled(
-                    commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        || hasOpenProjectTerminal
-                        || projectGitService.isBusy(projectID: project.id)
-                )
-                .help(commitButtonHelp)
+        } label: {
+            HStack(spacing: 7) {
+                Image(systemName: "arrow.triangle.branch")
+                    .foregroundStyle(.secondary)
+                Text(gitSnapshot?.originBranch ?? "origin/branch")
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 8)
+            .frame(height: 32)
+            .contentShape(Rectangle())
+            .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 7))
         }
-        .padding(.horizontal, 14)
-        .frame(height: 40)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.38))
+        .menuStyle(.borderlessButton)
+        .disabled(branchSwitchDisabled)
+        .help(branchSwitchHelp)
     }
 
-    private var gitNoticeBar: some View {
-        HStack(spacing: 9) {
-            Image(systemName: gitNoticeIsError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
-                .foregroundStyle(gitNoticeIsError ? Color.orange : Color.green)
-            Text(gitNoticeText ?? "")
-                .font(.caption)
-                .lineLimit(2)
-            Spacer(minLength: 8)
-            if projectGitService.operationResult(for: project.id) != nil, !needsPushRetry {
-                Button("Dismiss") {
-                    projectGitService.clearOperationResult(for: project.id)
+    private var sidebarCommitComposer: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            TextField("Commit message", text: $commitMessage)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit(commitAndPush)
+
+            HStack {
+                Button("Cancel") {
+                    isWritingCommitMessage = false
+                    commitMessage = ""
                 }
                 .buttonStyle(.borderless)
+                .disabled(projectGitService.isBusy(projectID: project.id))
+
+                Spacer()
+
+                Button("Commit & push", action: commitAndPush)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(
+                        commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || hasOpenProjectTerminal
+                            || projectGitService.isBusy(projectID: project.id)
+                    )
+                    .help(commitButtonHelp)
             }
         }
-        .padding(.horizontal, 14)
-        .frame(minHeight: 34)
-        .background(Color.primary.opacity(0.025))
+        .padding(9)
+        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var sidebarGitNotice: some View {
+        HStack(alignment: .top, spacing: 7) {
+            Circle()
+                .fill(gitNoticeIsError ? Color.orange : Color.green)
+                .frame(width: 6, height: 6)
+                .padding(.top, 4)
+            Text(gitNoticeText ?? "")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 4)
+            if projectGitService.operationResult(for: project.id) != nil, !needsPushRetry {
+                Button {
+                    projectGitService.clearOperationResult(for: project.id)
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption2)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.tertiary)
+            }
+        }
     }
 
     private var readyState: some View {
