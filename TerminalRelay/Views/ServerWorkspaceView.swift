@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ProjectWorkspaceView: View {
     @EnvironmentObject private var sessionManager: SessionManager
+    @EnvironmentObject private var accountUsageService: AccountUsageService
 
     @AppStorage(AgentLaunchDefaults.StorageKey.codexModel)
     private var codexModel = AgentLaunchDefaults.standard.codexModel
@@ -53,6 +54,10 @@ struct ProjectWorkspaceView: View {
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .navigationTitle(project.displayName)
+        .task(id: usageTaskID) {
+            guard selectedSession == nil else { return }
+            await accountUsageService.refresh(worker: worker)
+        }
         .alert(item: $conflictingSession) { occupant in
             Alert(
                 title: Text("\(occupant.kind.displayName) is already open"),
@@ -83,77 +88,78 @@ struct ProjectWorkspaceView: View {
                 .lineLimit(1)
 
             Spacer(minLength: 16)
-
-            ForEach(AgentKind.allCases) { kind in
-                agentButton(for: kind)
-            }
         }
         .padding(.horizontal, 14)
         .frame(height: 44)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.55))
     }
 
-    @ViewBuilder
-    private func agentButton(for kind: AgentKind) -> some View {
-        let session = sessionManager.session(projectID: project.id, kind: kind)
-        Button {
-            open(kind)
-        } label: {
-            HStack(spacing: 7) {
-                Circle()
-                    .fill(session?.status.occupiesSlot == true ? kind.tint : Color.secondary.opacity(0.22))
-                    .frame(width: 7, height: 7)
-                Image(systemName: kind.systemImage)
-                Text(kind.displayName)
-            }
-            .font(.callout.weight(.medium))
-            .foregroundStyle(session?.status.occupiesSlot == true ? Color.primary : Color.secondary)
-            .padding(.horizontal, 10)
-            .frame(height: 30)
-            .background(
-                sessionManager.selectedSessionID == session?.id
-                    ? Color.primary.opacity(0.09)
-                    : Color.clear,
-                in: RoundedRectangle(cornerRadius: 7)
-            )
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .disabled(session?.status == .stopping)
-        .help(session?.status.occupiesSlot == true ? "Show \(kind.displayName) terminal" : "Start \(kind.displayName)")
-    }
-
     private var readyState: some View {
-        VStack(spacing: 18) {
-            Image(systemName: "terminal")
-                .font(.system(size: 30, weight: .medium))
-                .foregroundStyle(.secondary)
+        ScrollView {
+            VStack(spacing: 22) {
+                VStack(spacing: 6) {
+                    Text("Ready to work on \(project.displayName)")
+                        .font(.title3.weight(.semibold))
+                    Text("Choose the account with the most capacity on \(worker.displayName).")
+                        .foregroundStyle(.secondary)
+                }
 
-            VStack(spacing: 6) {
-                Text("Ready to work on \(project.displayName)")
-                    .font(.title3.weight(.semibold))
-                Text("Start a remote terminal on \(worker.displayName).")
-                    .foregroundStyle(.secondary)
-            }
-
-            HStack(spacing: 10) {
-                ForEach(AgentKind.allCases) { kind in
-                    Button {
-                        open(kind)
-                    } label: {
-                        Label("Start \(kind.displayName)", systemImage: kind.systemImage)
+                HStack(alignment: .top, spacing: 14) {
+                    ForEach(AgentKind.allCases) { kind in
+                        AccountUsageCard(
+                            kind: kind,
+                            accountFallback: worker.accountLabel(for: kind),
+                            snapshot: accountUsageService.snapshot(for: worker.id, kind: kind),
+                            isLoading: accountUsageService.isLoading(workerID: worker.id, kind: kind),
+                            errorMessage: accountUsageService.error(for: worker.id, kind: kind),
+                            buttonTitle: launchTitle(for: kind),
+                            isButtonDisabled: sessionManager.activeSession(for: worker, kind: kind)?.status == .stopping
+                        ) {
+                            open(kind)
+                        }
                     }
-                    .buttonStyle(.bordered)
-                    .tint(kind.tint)
+                }
+                .frame(maxWidth: 820)
+
+                HStack(spacing: 8) {
+                    Text(project.workingDirectory)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+
+                    Button {
+                        Task {
+                            await accountUsageService.refresh(worker: worker, force: true)
+                        }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .disabled(AgentKind.allCases.contains {
+                        accountUsageService.isLoading(workerID: worker.id, kind: $0)
+                    })
+                    .help("Refresh account usage")
                 }
             }
-
-            Text(project.workingDirectory)
-                .font(.system(.caption, design: .monospaced))
-                .foregroundStyle(.tertiary)
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 32)
+            .padding(.vertical, 34)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(30)
+    }
+
+    private var usageTaskID: String {
+        "\(worker.id.uuidString)-\(selectedSession?.id.uuidString ?? "overview")"
+    }
+
+    private func launchTitle(for kind: AgentKind) -> String {
+        let productName = kind == .claude ? "Claude Code" : kind.displayName
+        guard let occupant = sessionManager.activeSession(for: worker, kind: kind) else {
+            return "Start \(productName)"
+        }
+        return occupant.projectID == project.id
+            ? "Show \(productName)"
+            : "\(productName) in use"
     }
 
     private func open(_ kind: AgentKind) {
@@ -169,6 +175,137 @@ struct ProjectWorkspaceView: View {
         }
     }
 
+}
+
+private struct AccountUsageCard: View {
+    let kind: AgentKind
+    let accountFallback: String
+    let snapshot: AccountUsageSnapshot?
+    let isLoading: Bool
+    let errorMessage: String?
+    let buttonTitle: String
+    let isButtonDisabled: Bool
+    let action: () -> Void
+
+    private var productName: String {
+        kind == .claude ? "Claude Code" : kind.displayName
+    }
+
+    private var accountDetail: String {
+        let account = snapshot?.account ?? accountFallback
+        guard let plan = snapshot?.plan, !plan.isEmpty else { return account }
+        return "\(account) · \(plan.capitalized)"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 15) {
+            HStack(spacing: 12) {
+                AgentBrandIcon(kind: kind, size: 42)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Text(productName)
+                            .font(.headline)
+                        Circle()
+                            .fill(snapshot == nil ? Color.secondary.opacity(0.35) : Color.green)
+                            .frame(width: 6, height: 6)
+                            .accessibilityLabel(snapshot == nil ? "Usage unavailable" : "Account connected")
+                    }
+                    Text(accountDetail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+
+            Divider()
+
+            if let snapshot {
+                VStack(spacing: 14) {
+                    ForEach(snapshot.limits) { limit in
+                        usageLimit(limit)
+                    }
+                }
+            } else if isLoading {
+                HStack(spacing: 9) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Reading account limits…")
+                        .foregroundStyle(.secondary)
+                }
+                .font(.callout)
+            } else {
+                Text(errorMessage ?? "Usage limits are unavailable.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            if snapshot != nil, isLoading {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.mini)
+                    Text("Refreshing…")
+                }
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+            } else if snapshot != nil, errorMessage != nil {
+                Label("Could not refresh", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 0)
+
+            Button(action: action) {
+                HStack(spacing: 8) {
+                    AgentBrandIcon(kind: kind, size: 20)
+                    Text(buttonTitle)
+                }
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
+            .disabled(isButtonDisabled)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, minHeight: 330, alignment: .topLeading)
+        .background(
+            Color.primary.opacity(0.045),
+            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.primary.opacity(0.09), lineWidth: 1)
+        }
+    }
+
+    private func usageLimit(_ limit: AccountUsageLimit) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(limit.name)
+                    .font(.callout.weight(.medium))
+                Spacer(minLength: 8)
+                Text("\(limit.remainingPercentText)% left")
+                    .font(.callout.weight(.semibold))
+            }
+
+            ProgressView(value: limit.usedPercent, total: 100)
+                .tint(kind.tint)
+
+            HStack {
+                Text("\(limit.usedPercentText)% used")
+                Spacer(minLength: 8)
+                if let resetsAt = limit.resetsAt {
+                    Text("Resets \(resetsAt, style: .relative)")
+                } else if let resetText = limit.resetText {
+                    Text("Resets \(resetText)")
+                }
+            }
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
+        }
+    }
 }
 
 private struct TerminalPane: View {

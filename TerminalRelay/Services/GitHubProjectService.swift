@@ -443,7 +443,7 @@ struct GitHubDeployKey: Decodable {
     let readOnly: Bool
 }
 
-private enum Subprocess {
+enum Subprocess {
     struct Result {
         let exitCode: Int32
         let standardOutput: Data

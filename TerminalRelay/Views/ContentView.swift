@@ -518,9 +518,9 @@ private struct ProjectSidebarSection: View {
 
                     Spacer(minLength: 6)
                 }
-                .padding(.leading, 4)
-                .padding(.trailing, 6)
-                .frame(height: 31)
+                .padding(.leading, 6)
+                .padding(.trailing, 8)
+                .frame(height: 35)
                 .background(
                     isProjectHovering ? SidebarPalette.hover : Color.clear,
                     in: RoundedRectangle(cornerRadius: 6)
@@ -528,7 +528,7 @@ private struct ProjectSidebarSection: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .padding(.horizontal, 6)
+            .padding(.horizontal, 10)
             .onHover { isProjectHovering = $0 }
             .contextMenu {
                 Button("Edit Project", action: onEdit)
@@ -540,9 +540,9 @@ private struct ProjectSidebarSection: View {
                 Text("No sessions")
                     .font(.system(size: 14))
                     .foregroundStyle(SidebarPalette.tertiary)
-                    .padding(.leading, 34)
+                    .padding(.leading, 40)
                     .padding(.trailing, 12)
-                    .frame(height: 31, alignment: .leading)
+                    .frame(height: 35, alignment: .leading)
             } else {
                 ForEach(visibleSessions) { session in
                     Button {
@@ -569,8 +569,8 @@ private struct ProjectSidebarSection: View {
                     .buttonStyle(.plain)
                     .font(.system(size: 14))
                     .foregroundStyle(SidebarPalette.secondary)
-                    .padding(.leading, 34)
-                    .frame(height: 31)
+                    .padding(.leading, 40)
+                    .frame(height: 35)
                 }
             }
         }
@@ -597,13 +597,8 @@ private struct ProjectSessionRow: View {
 
             Spacer(minLength: 5)
 
-            Image(systemName: session.kind.systemImage)
-                .font(.system(size: 10.5, weight: .medium))
-                .foregroundStyle(
-                    session.status.occupiesSlot
-                        ? session.kind.tint
-                        : SidebarPalette.secondary
-                )
+            AgentBrandIcon(kind: session.kind, size: 14)
+                .opacity(session.status.occupiesSlot ? 1 : 0.55)
 
             Circle()
                 .fill(session.status.occupiesSlot ? session.kind.tint : Color.clear)
@@ -622,16 +617,16 @@ private struct ProjectSessionRow: View {
                     "\(session.kind.displayName), \(session.status.occupiesSlot ? "terminal open" : session.status.label)"
                 )
         }
-        .padding(.leading, 28)
-        .padding(.trailing, 9)
-        .frame(height: 31)
+        .padding(.leading, 30)
+        .padding(.trailing, 8)
+        .frame(height: 35)
         .background(
             isSelected
                 ? SidebarPalette.selected
                 : (isHovering ? SidebarPalette.hover : Color.clear),
             in: RoundedRectangle(cornerRadius: 6)
         )
-        .padding(.horizontal, 6)
+        .padding(.horizontal, 10)
         .contentShape(Rectangle())
         .onHover { isHovering = $0 }
     }
