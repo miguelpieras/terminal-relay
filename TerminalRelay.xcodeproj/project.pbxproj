@@ -19,6 +19,7 @@
 		260C7E8CD25E00B853E63C60 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 865E323F9872A2B96FD0A247 /* ContentView.swift */; };
 		2BF33DB4120A9B8E4639F6A2 /* SessionManagerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C873751F82394CA5B3125CE3 /* SessionManagerTests.swift */; };
 		354AC532DA7ABB9688F98244 /* ServerProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1A2A3C58843B9F9BBDF0B62 /* ServerProfile.swift */; };
+		3F0C3E4D664E8C88BC474F21 /* WorkerMetricsService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0678D0C9803DB05DEFD31A0 /* WorkerMetricsService.swift */; };
 		41518A6B6C29B1CC91B48A43 /* WorkerManagementView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3B1A41DF226105884B36B97 /* WorkerManagementView.swift */; };
 		4F35926FD66E6ACA4FC3AAB6 /* ProjectProfileTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CDED8E0950703DD0CEB6F15B /* ProjectProfileTests.swift */; };
 		4F7EDC395EECB2A7942F567D /* AgentDefaultsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5EC9ECCFD1C5FE64E51E46B2 /* AgentDefaultsView.swift */; };
@@ -26,6 +27,7 @@
 		5A8B4C6996C6AB625EB6DA1A /* SessionSlot.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CD64E85F20330019303C926 /* SessionSlot.swift */; };
 		5FFF07C89F2D695D5506B7CD /* ProjectProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CFE8C91CC1888C223E4ABCC /* ProjectProfile.swift */; };
 		6DC711689B3A23294963F406 /* TerminalRelayApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0A02BB8092DDF8AED8C6F603 /* TerminalRelayApp.swift */; };
+		7176098820B3653E154BB020 /* WorkerMetricsServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3E452EE1DE95DB629F3FFB13 /* WorkerMetricsServiceTests.swift */; };
 		788027947BFEA620BCC4C08A /* TerminalSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F6DC0C9B63E27A8EBF45AAD /* TerminalSession.swift */; };
 		792F8E347226F81E6C0264D9 /* AccountUsageService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A102C8E7164EE18CC3FDF9AD /* AccountUsageService.swift */; };
 		816110D0FC89354E2968F662 /* AgentLaunchDefaults.swift in Sources */ = {isa = PBXBuildFile; fileRef = C563B44090011E0A80AE65E6 /* AgentLaunchDefaults.swift */; };
@@ -59,6 +61,7 @@
 		20DDC4D787D741BAF50C5483 /* ProjectGitServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectGitServiceTests.swift; sourceTree = "<group>"; };
 		2610AB4602CAB8F3FEC9FB1A /* TerminalRelayTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TerminalRelayTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		2B8C4489491EF49B7822E03A /* SSHCommandBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SSHCommandBuilder.swift; sourceTree = "<group>"; };
+		3E452EE1DE95DB629F3FFB13 /* WorkerMetricsServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerMetricsServiceTests.swift; sourceTree = "<group>"; };
 		5EC9ECCFD1C5FE64E51E46B2 /* AgentDefaultsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentDefaultsView.swift; sourceTree = "<group>"; };
 		6B5726E0516AF1EBD1B801ED /* AgentBrandIcon.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentBrandIcon.swift; sourceTree = "<group>"; };
 		6CFE8C91CC1888C223E4ABCC /* ProjectProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectProfile.swift; sourceTree = "<group>"; };
@@ -79,6 +82,7 @@
 		BA47F1A31FE07CB12C137C7D /* ServerEditorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerEditorView.swift; sourceTree = "<group>"; };
 		BCB0B7C502410EF96FA04410 /* GitHubProjectService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitHubProjectService.swift; sourceTree = "<group>"; };
 		C058A6638300575CC7AF0914 /* ProjectStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectStoreTests.swift; sourceTree = "<group>"; };
+		C0678D0C9803DB05DEFD31A0 /* WorkerMetricsService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerMetricsService.swift; sourceTree = "<group>"; };
 		C563B44090011E0A80AE65E6 /* AgentLaunchDefaults.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentLaunchDefaults.swift; sourceTree = "<group>"; };
 		C873751F82394CA5B3125CE3 /* SessionManagerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionManagerTests.swift; sourceTree = "<group>"; };
 		CBB3BF44468D527C634FE65A /* TerminalRelay.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TerminalRelay.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -127,6 +131,7 @@
 				C873751F82394CA5B3125CE3 /* SessionManagerTests.swift */,
 				7DC204D99814E9F11DA7D053 /* SessionSlotRegistryTests.swift */,
 				A3294B74FA0B27E0781E76BA /* SSHCommandBuilderTests.swift */,
+				3E452EE1DE95DB629F3FFB13 /* WorkerMetricsServiceTests.swift */,
 			);
 			path = TerminalRelayTests;
 			sourceTree = "<group>";
@@ -140,6 +145,7 @@
 				9A9FBF0D79F64B491FF61EA8 /* ProjectStore.swift */,
 				93E0F148244B4D209F63EB35 /* ServerStore.swift */,
 				2B8C4489491EF49B7822E03A /* SSHCommandBuilder.swift */,
+				C0678D0C9803DB05DEFD31A0 /* WorkerMetricsService.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -320,6 +326,7 @@
 				6DC711689B3A23294963F406 /* TerminalRelayApp.swift in Sources */,
 				788027947BFEA620BCC4C08A /* TerminalSession.swift in Sources */,
 				41518A6B6C29B1CC91B48A43 /* WorkerManagementView.swift in Sources */,
+				3F0C3E4D664E8C88BC474F21 /* WorkerMetricsService.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -337,6 +344,7 @@
 				CC8BDB4D65D80A701E9EB31A /* ServerStoreTests.swift in Sources */,
 				2BF33DB4120A9B8E4639F6A2 /* SessionManagerTests.swift in Sources */,
 				040CA3D96665635AD86CD343 /* SessionSlotRegistryTests.swift in Sources */,
+				7176098820B3653E154BB020 /* WorkerMetricsServiceTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -391,10 +391,14 @@ struct ContentView: View {
         case .workers:
             WorkersView(focusedWorkerID: nil, onSelectProject: { projectID in
                 navigate(to: .project(projectID))
+            }, onShowAllWorkers: {
+                navigate(to: .workers)
             })
         case .worker(let workerID):
             WorkersView(focusedWorkerID: workerID, onSelectProject: { projectID in
                 navigate(to: .project(projectID))
+            }, onShowAllWorkers: {
+                navigate(to: .workers)
             })
         case .settings:
             AgentDefaultsView()

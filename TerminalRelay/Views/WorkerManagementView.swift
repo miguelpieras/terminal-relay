@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 
 struct WorkersView: View {
@@ -5,9 +6,11 @@ struct WorkersView: View {
     @EnvironmentObject private var projectStore: ProjectStore
     @EnvironmentObject private var sessionManager: SessionManager
     @EnvironmentObject private var accountUsageService: AccountUsageService
+    @EnvironmentObject private var workerMetricsService: WorkerMetricsService
 
     let focusedWorkerID: UUID?
     let onSelectProject: (UUID) -> Void
+    let onShowAllWorkers: () -> Void
 
     @State private var editorProfile: ServerProfile?
     @State private var workerPendingDeletion: ServerProfile?
@@ -43,7 +46,15 @@ struct WorkersView: View {
                     self.editorProfile = nil
 
                     Task {
-                        await accountUsageService.refresh(worker: savedProfile, force: true)
+                        async let accountRefresh: Void = accountUsageService.refresh(
+                            worker: savedProfile,
+                            force: true
+                        )
+                        async let metricsRefresh: Void = workerMetricsService.refresh(
+                            worker: savedProfile,
+                            force: true
+                        )
+                        _ = await (accountRefresh, metricsRefresh)
                     }
                 } onCancel: {
                     self.editorProfile = nil
@@ -69,6 +80,7 @@ struct WorkersView: View {
         .navigationTitle("Workers")
         .task(id: refreshTaskID) {
             await refreshAll()
+            await pollMetrics()
         }
     }
 
@@ -89,6 +101,13 @@ struct WorkersView: View {
             Spacer()
 
             if editorProfile == nil {
+                if focusedWorker != nil {
+                    Button(action: onShowAllWorkers) {
+                        Label("All Workers", systemImage: "server.rack")
+                    }
+                    .buttonStyle(.bordered)
+                }
+
                 Button {
                     Task { await refreshAll(force: true) }
                 } label: {
@@ -182,6 +201,27 @@ struct WorkersView: View {
                 group.addTask {
                     await accountUsageService.refresh(worker: worker, force: force)
                 }
+                group.addTask {
+                    await workerMetricsService.refresh(worker: worker, force: force)
+                }
+            }
+        }
+    }
+
+    private func pollMetrics() async {
+        while !Task.isCancelled {
+            do {
+                try await Task.sleep(for: .seconds(10))
+            } catch {
+                return
+            }
+
+            await withTaskGroup(of: Void.self) { group in
+                for worker in displayedWorkers {
+                    group.addTask {
+                        await workerMetricsService.refresh(worker: worker, force: true)
+                    }
+                }
             }
         }
     }
@@ -199,6 +239,7 @@ struct WorkersView: View {
 private struct WorkerOverviewCard: View {
     @EnvironmentObject private var sessionManager: SessionManager
     @EnvironmentObject private var accountUsageService: AccountUsageService
+    @EnvironmentObject private var workerMetricsService: WorkerMetricsService
 
     let worker: ServerProfile
     let projects: [ProjectProfile]
@@ -241,6 +282,15 @@ private struct WorkerOverviewCard: View {
                             : "Reassign or remove this worker's linked apps first"
                     )
             }
+            .padding(16)
+
+            Divider()
+
+            WorkerResourceSummary(
+                snapshot: workerMetricsService.snapshot(for: worker.id),
+                errorMessage: workerMetricsService.error(for: worker.id),
+                isLoading: workerMetricsService.isLoading(workerID: worker.id)
+            )
             .padding(16)
 
             Divider()
@@ -341,6 +391,120 @@ private struct WorkerOverviewCard: View {
         var value = worker.destination
         if worker.port != 22 { value += ":\(worker.port)" }
         return value
+    }
+}
+
+private struct WorkerResourceSummary: View {
+    let snapshot: WorkerMetricsSnapshot?
+    let errorMessage: String?
+    let isLoading: Bool
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            WorkerMetricStatus(
+                title: "CPU",
+                systemImage: "cpu",
+                percentage: snapshot?.cpuUsedPercent,
+                detail: snapshot == nil ? nil : "Host utilization",
+                errorMessage: errorMessage,
+                isLoading: isLoading
+            )
+            WorkerMetricStatus(
+                title: "Memory",
+                systemImage: "memorychip",
+                percentage: snapshot?.memoryUsedPercent,
+                detail: snapshot.map {
+                    "\(byteCount($0.memoryUsedBytes)) of \(byteCount($0.memoryTotalBytes))"
+                },
+                errorMessage: errorMessage,
+                isLoading: isLoading
+            )
+            WorkerMetricStatus(
+                title: "Disk",
+                systemImage: "internaldrive",
+                percentage: snapshot?.diskUsedPercent,
+                detail: snapshot.map {
+                    "\(byteCount($0.diskUsedBytes)) of \(byteCount($0.diskTotalBytes))"
+                },
+                errorMessage: errorMessage,
+                isLoading: isLoading
+            )
+        }
+    }
+
+    private func byteCount(_ value: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useMB, .useGB, .useTB]
+        formatter.countStyle = .binary
+        formatter.includesUnit = true
+        formatter.isAdaptive = true
+        return formatter.string(fromByteCount: value)
+    }
+}
+
+private struct WorkerMetricStatus: View {
+    let title: String
+    let systemImage: String
+    let percentage: Double?
+    let detail: String?
+    let errorMessage: String?
+    let isLoading: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 7) {
+                Image(systemName: systemImage)
+                    .foregroundStyle(.secondary)
+                Text(title)
+                    .font(.caption.weight(.semibold))
+
+                Spacer(minLength: 4)
+
+                if isLoading {
+                    ProgressView()
+                        .controlSize(.mini)
+                }
+            }
+
+            if let percentage {
+                Text(percentText(percentage))
+                    .font(.title3.weight(.semibold))
+
+                ProgressView(value: min(max(percentage, 0), 100), total: 100)
+                    .tint(metricTint(percentage))
+
+                Text(detail ?? "")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            } else {
+                Text(isLoading ? "Reading…" : errorMessage ?? "Not checked")
+                    .font(.caption)
+                    .foregroundStyle(errorMessage == nil ? Color.secondary : Color.red)
+                    .lineLimit(2)
+                    .frame(maxHeight: .infinity, alignment: .topLeading)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, minHeight: 112, alignment: .topLeading)
+        .background(
+            Color.primary.opacity(0.035),
+            in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+        )
+    }
+
+    private func percentText(_ value: Double) -> String {
+        let clamped = min(max(value, 0), 100)
+        if clamped.rounded() == clamped {
+            return String(format: "%.0f%%", clamped)
+        }
+        return String(format: "%.1f%%", clamped)
+    }
+
+    private func metricTint(_ value: Double) -> Color {
+        if value >= 90 { return .red }
+        if value >= 75 { return .orange }
+        return .accentColor
     }
 }
 

@@ -19,6 +19,7 @@ struct TerminalRelayApp: App {
     @StateObject private var sessionManager = SessionManager()
     @StateObject private var githubService = GitHubProjectService()
     @StateObject private var accountUsageService = AccountUsageService()
+    @StateObject private var workerMetricsService = WorkerMetricsService()
     @StateObject private var projectGitService = ProjectGitService()
 
     init() {
@@ -37,6 +38,7 @@ struct TerminalRelayApp: App {
                 .environmentObject(sessionManager)
                 .environmentObject(githubService)
                 .environmentObject(accountUsageService)
+                .environmentObject(workerMetricsService)
                 .environmentObject(projectGitService)
                 .preferredColorScheme(.dark)
                 .frame(minWidth: 980, minHeight: 640)
