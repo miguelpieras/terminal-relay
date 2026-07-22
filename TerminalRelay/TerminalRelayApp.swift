@@ -34,6 +34,7 @@ struct TerminalRelayApp: App {
                 .environmentObject(projectStore)
                 .environmentObject(sessionManager)
                 .environmentObject(githubService)
+                .preferredColorScheme(.dark)
                 .frame(minWidth: 980, minHeight: 640)
                 .onAppear {
                     appDelegate.sessionManager = sessionManager

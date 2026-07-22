@@ -1,6 +1,23 @@
 import SwiftUI
 
+private enum SidebarDestination: Equatable {
+    case project(UUID)
+    case session(projectID: UUID, sessionID: UUID)
+}
+
+private enum SidebarPalette {
+    static let background = Color(red: 33.0 / 255.0, green: 33.0 / 255.0, blue: 33.0 / 255.0)
+    static let primary = Color(red: 222.0 / 255.0, green: 222.0 / 255.0, blue: 222.0 / 255.0)
+    static let secondary = Color(red: 116.0 / 255.0, green: 116.0 / 255.0, blue: 116.0 / 255.0)
+    static let tertiary = Color(red: 89.0 / 255.0, green: 89.0 / 255.0, blue: 89.0 / 255.0)
+    static let hover = Color(red: 41.0 / 255.0, green: 41.0 / 255.0, blue: 41.0 / 255.0)
+    static let selected = Color(red: 51.0 / 255.0, green: 51.0 / 255.0, blue: 51.0 / 255.0)
+    static let separator = Color(red: 52.0 / 255.0, green: 52.0 / 255.0, blue: 52.0 / 255.0)
+    static let footerSeparator = Color(red: 56.0 / 255.0, green: 56.0 / 255.0, blue: 56.0 / 255.0)
+}
+
 struct ContentView: View {
+    @Environment(\.openSettings) private var openSettings
     @EnvironmentObject private var serverStore: ServerStore
     @EnvironmentObject private var projectStore: ProjectStore
     @EnvironmentObject private var sessionManager: SessionManager
@@ -9,26 +26,49 @@ struct ContentView: View {
     @State private var editorProject: ProjectProfile?
     @State private var projectPendingDeletion: ProjectProfile?
     @State private var isManagingWorkers = false
+    @State private var isSearching = false
+    @State private var searchQuery = ""
+    @State private var navigationHistory: [SidebarDestination] = []
+    @State private var navigationIndex = -1
 
     private var selectedProject: ProjectProfile? {
         projectStore.project(id: selectedProjectID)
     }
 
+    private var visibleProjects: [ProjectProfile] {
+        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return projectStore.projects }
+
+        return projectStore.projects.filter { project in
+            project.displayName.localizedCaseInsensitiveContains(query)
+                || sessionManager.sessions(forProjectID: project.id).contains {
+                    $0.displayTitle.localizedCaseInsensitiveContains(query)
+                }
+        }
+    }
+
+    private var currentDestination: SidebarDestination? {
+        guard let projectID = selectedProjectID else { return nil }
+        if let sessionID = sessionManager.selectedSessionID,
+           sessionManager.sessions(forProjectID: projectID).contains(where: { $0.id == sessionID }) {
+            return .session(projectID: projectID, sessionID: sessionID)
+        }
+        return .project(projectID)
+    }
+
     var body: some View {
         NavigationSplitView {
             sidebar
-                .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 340)
+                .navigationSplitViewColumnWidth(min: 268, ideal: 268, max: 268)
+                .overlay(alignment: .topLeading) {
+                    titlebarNavigationControls
+                }
         } detail: {
             detail
         }
         .navigationSplitViewStyle(.balanced)
         .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                Button(action: addProject) {
-                    Image(systemName: "plus")
-                }
-                .help("New project")
-
+            ToolbarItem(placement: .primaryAction) {
                 Menu {
                     Button("Edit Project", systemImage: "pencil") {
                         editorProject = selectedProject
@@ -54,7 +94,7 @@ struct ContentView: View {
         .sheet(item: $editorProject) { project in
             ProjectEditorView(project: project, workers: serverStore.servers) { savedProject in
                 guard projectStore.save(savedProject) else { return }
-                selectedProjectID = savedProject.id
+                navigate(to: .project(savedProject.id))
                 editorProject = nil
             } onCancel: {
                 editorProject = nil
@@ -75,6 +115,7 @@ struct ContentView: View {
                 sessionManager.closeSessions(forProjectID: project.id)
                 projectStore.delete(id: project.id)
                 selectedProjectID = projectStore.projects.first?.id
+                sessionManager.selectedSessionID = nil
                 projectPendingDeletion = nil
             }
             Button("Cancel", role: .cancel) {
@@ -123,70 +164,190 @@ struct ContentView: View {
     }
 
     private var sidebar: some View {
-        List {
-            HStack {
-                Text("Terminal Relay")
-                    .font(.title3.weight(.semibold))
-                Spacer()
-            }
-            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 6, trailing: 12))
-            .listRowSeparator(.hidden)
+        VStack(spacing: 0) {
+            sidebarHeader
+            newProjectButton
 
-            Button(action: addProject) {
-                Label("New Project", systemImage: "square.and.pencil")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 12))
+            Rectangle()
+                .fill(SidebarPalette.separator)
+                .frame(height: 1)
 
-            Section {
-                ForEach(projectStore.projects) { project in
-                    ProjectSidebarSection(
-                        project: project,
-                        isProjectSelected: selectedProjectID == project.id,
-                        selectedSessionID: sessionManager.selectedSessionID,
-                        onSelectProject: {
-                            selectedProjectID = project.id
-                            sessionManager.selectedSessionID = nil
-                        },
-                        onSelectSession: { sessionID in
-                            selectedProjectID = project.id
-                            sessionManager.selectedSessionID = sessionID
-                        },
-                        onEdit: { editorProject = project },
-                        onRemove: { projectPendingDeletion = project }
-                    )
-                    .listRowInsets(EdgeInsets(top: 3, leading: 8, bottom: 3, trailing: 8))
-                    .listRowSeparator(.hidden)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(visibleProjects) { project in
+                        ProjectSidebarSection(
+                            project: project,
+                            searchQuery: searchQuery,
+                            selectedSessionID: sessionManager.selectedSessionID,
+                            onSelectProject: {
+                                navigate(to: .project(project.id))
+                            },
+                            onSelectSession: { sessionID in
+                                navigate(to: .session(projectID: project.id, sessionID: sessionID))
+                            },
+                            onEdit: { editorProject = project },
+                            onRemove: { projectPendingDeletion = project }
+                        )
+                    }
+
+                    if !searchQuery.isEmpty && visibleProjects.isEmpty {
+                        Text("No matching projects or sessions")
+                            .font(.system(size: 13.5))
+                            .foregroundStyle(SidebarPalette.tertiary)
+                            .padding(.horizontal, 15)
+                            .padding(.top, 18)
+                    }
                 }
+                .padding(.vertical, 6)
             }
+            .scrollIndicators(.hidden)
+
+            sidebarFooter
         }
-        .listStyle(.sidebar)
-        .safeAreaInset(edge: .bottom) {
-            VStack(spacing: 0) {
-                Divider()
+        .background(SidebarPalette.background)
+    }
+
+    @ViewBuilder
+    private var sidebarHeader: some View {
+        if isSearching {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(SidebarPalette.secondary)
+
+                TextField("Search", text: $searchQuery)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 14))
+                    .foregroundStyle(SidebarPalette.primary)
+
+                Button {
+                    searchQuery = ""
+                    isSearching = false
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(SidebarPalette.secondary)
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 42)
+        } else {
+            HStack(spacing: 0) {
+                Menu {
+                    Button("Manage Workers", systemImage: "server.rack") {
+                        isManagingWorkers = true
+                    }
+                    Button("Settings…", systemImage: "gearshape") {
+                        openSettings()
+                    }
+                } label: {
+                    Text("Terminal Relay")
+                        .font(.system(size: 16, weight: .bold))
+                    .foregroundStyle(SidebarPalette.primary)
+                    .contentShape(Rectangle())
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+
+                Spacer()
+
+                Button {
+                    isSearching = true
+                } label: {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 14, weight: .medium))
+                        .frame(width: 26, height: 28)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(SidebarPalette.secondary)
+                .help("Search projects and sessions")
+            }
+            .padding(.leading, 10)
+            .padding(.trailing, 8)
+            .frame(height: 42)
+        }
+    }
+
+    private var newProjectButton: some View {
+        SidebarActionButton(
+            title: "New project",
+            systemImage: "square.and.pencil",
+            action: addProject
+        )
+        .keyboardShortcut("n", modifiers: .command)
+    }
+
+    private var titlebarNavigationControls: some View {
+        HStack(spacing: 0) {
+            Button(action: navigateBack) {
+                Image(systemName: "chevron.left")
+                    .frame(width: 24, height: 28)
+            }
+            .disabled(navigationIndex <= 0)
+            .help("Back")
+
+            Button(action: navigateForward) {
+                Image(systemName: "chevron.right")
+                    .frame(width: 24, height: 28)
+            }
+            .disabled(navigationIndex < 0 || navigationIndex >= navigationHistory.count - 1)
+            .help("Forward")
+        }
+        .buttonStyle(.plain)
+        .font(.system(size: 13, weight: .medium))
+        .foregroundStyle(SidebarPalette.secondary)
+        .padding(.leading, 107)
+        .frame(height: 42)
+        .offset(y: -43)
+    }
+
+    private var sidebarFooter: some View {
+        VStack(spacing: 0) {
+            Rectangle()
+                .fill(SidebarPalette.footerSeparator)
+                .frame(height: 1)
+
+            HStack(spacing: 10) {
+                Button {
+                    openSettings()
+                } label: {
+                    HStack(spacing: 7) {
+                        ZStack {
+                            Circle()
+                                .fill(Color(red: 0.49, green: 0.28, blue: 0.63))
+                            Text("MP")
+                                .font(.system(size: 7.5, weight: .medium))
+                                .foregroundStyle(.white)
+                        }
+                        .frame(width: 18, height: 18)
+
+                        Text("Miguel Pieras")
+                            .font(.system(size: 14, weight: .regular))
+                            .foregroundStyle(SidebarPalette.primary)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
+                Spacer()
 
                 Button {
                     isManagingWorkers = true
                 } label: {
-                    HStack(spacing: 10) {
-                        Image(systemName: "server.rack")
-                            .frame(width: 18)
-                        Text("Workers")
-                        Spacer()
-                        Text("\(serverStore.servers.count)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .contentShape(Rectangle())
-                    .padding(.horizontal, 16)
-                    .frame(height: 42)
+                    Image(systemName: "server.rack")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 20, height: 20)
+                        .background(Color.accentColor, in: Circle())
                 }
                 .buttonStyle(.plain)
+                .help("Manage workers")
             }
-            .background(.bar)
+            .padding(.horizontal, 9)
+            .frame(height: 47)
         }
+        .background(SidebarPalette.background)
     }
 
     @ViewBuilder
@@ -229,7 +390,83 @@ struct ContentView: View {
     private func selectFirstProjectIfNeeded() {
         if selectedProjectID == nil || projectStore.project(id: selectedProjectID) == nil {
             selectedProjectID = projectStore.projects.first?.id
+            sessionManager.selectedSessionID = nil
         }
+    }
+
+    private func navigate(to destination: SidebarDestination) {
+        if currentDestination != destination {
+            if navigationHistory.isEmpty, let currentDestination {
+                navigationHistory.append(currentDestination)
+                navigationIndex = 0
+            } else if navigationIndex < navigationHistory.count - 1 {
+                navigationHistory.removeSubrange((navigationIndex + 1)..<navigationHistory.count)
+            }
+
+            navigationHistory.append(destination)
+            navigationIndex = navigationHistory.count - 1
+        }
+
+        apply(destination)
+    }
+
+    private func navigateBack() {
+        guard navigationIndex > 0 else { return }
+        navigationIndex -= 1
+        apply(navigationHistory[navigationIndex])
+    }
+
+    private func navigateForward() {
+        guard navigationIndex >= 0, navigationIndex < navigationHistory.count - 1 else { return }
+        navigationIndex += 1
+        apply(navigationHistory[navigationIndex])
+    }
+
+    private func apply(_ destination: SidebarDestination) {
+        switch destination {
+        case .project(let projectID):
+            selectedProjectID = projectID
+            sessionManager.selectedSessionID = nil
+        case .session(let projectID, let sessionID):
+            selectedProjectID = projectID
+            sessionManager.selectedSessionID = sessionManager
+                .sessions(forProjectID: projectID)
+                .contains(where: { $0.id == sessionID }) ? sessionID : nil
+        }
+    }
+}
+
+private struct SidebarActionButton: View {
+    let title: String
+    let systemImage: String
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 9) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 15, weight: .regular))
+                    .frame(width: 15)
+                Text(title)
+                    .font(.system(size: 14))
+                Spacer()
+            }
+            .foregroundStyle(SidebarPalette.primary)
+            .padding(.leading, 4)
+            .padding(.trailing, 6)
+            .frame(height: 38)
+            .background(
+                isHovering ? SidebarPalette.hover : Color.clear,
+                in: RoundedRectangle(cornerRadius: 6)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 6)
+        .padding(.bottom, 4)
+        .onHover { isHovering = $0 }
     }
 }
 
@@ -237,67 +474,107 @@ private struct ProjectSidebarSection: View {
     @EnvironmentObject private var sessionManager: SessionManager
 
     let project: ProjectProfile
-    let isProjectSelected: Bool
+    let searchQuery: String
     let selectedSessionID: UUID?
     let onSelectProject: () -> Void
     let onSelectSession: (UUID) -> Void
     let onEdit: () -> Void
     let onRemove: () -> Void
 
-    private var sessions: [TerminalSession] {
+    @State private var isExpanded = false
+    @State private var isProjectHovering = false
+
+    private var allSessions: [TerminalSession] {
         Array(sessionManager.sessions(forProjectID: project.id).reversed())
     }
 
+    private var matchingSessions: [TerminalSession] {
+        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty,
+              !project.displayName.localizedCaseInsensitiveContains(query) else {
+            return allSessions
+        }
+        return allSessions.filter { $0.displayTitle.localizedCaseInsensitiveContains(query) }
+    }
+
+    private var visibleSessions: [TerminalSession] {
+        if !searchQuery.isEmpty || isExpanded { return matchingSessions }
+        return Array(matchingSessions.prefix(5))
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 1) {
+        VStack(alignment: .leading, spacing: 0) {
             Button(action: onSelectProject) {
                 HStack(spacing: 9) {
                     Image(systemName: "folder")
                         .font(.system(size: 15, weight: .regular))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 18)
+                        .foregroundStyle(SidebarPalette.primary)
+                        .frame(width: 15)
 
                     Text(project.displayName)
-                        .font(.callout.weight(.medium))
+                        .font(.system(size: 14, weight: .regular))
+                        .foregroundStyle(SidebarPalette.primary)
                         .lineLimit(1)
 
                     Spacer(minLength: 6)
                 }
-                .padding(.horizontal, 7)
-                .frame(height: 32)
+                .padding(.leading, 4)
+                .padding(.trailing, 6)
+                .frame(height: 31)
                 .background(
-                    isProjectSelected && selectedSessionID == nil
-                        ? Color.primary.opacity(0.09)
-                        : Color.clear,
+                    isProjectHovering ? SidebarPalette.hover : Color.clear,
                     in: RoundedRectangle(cornerRadius: 6)
                 )
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .padding(.horizontal, 6)
+            .onHover { isProjectHovering = $0 }
             .contextMenu {
                 Button("Edit Project", action: onEdit)
                 Divider()
                 Button("Remove Project", role: .destructive, action: onRemove)
             }
 
-            ForEach(sessions) { session in
-                Button {
-                    onSelectSession(session.id)
-                } label: {
-                    ProjectSessionRow(
-                        session: session,
-                        isSelected: selectedSessionID == session.id
-                    )
-                }
-                .buttonStyle(.plain)
-                .contextMenu {
-                    Button(session.status.occupiesSlot ? "Stop Session" : "Close Session") {
-                        sessionManager.close(sessionID: session.id)
+            if matchingSessions.isEmpty {
+                Text("No sessions")
+                    .font(.system(size: 14))
+                    .foregroundStyle(SidebarPalette.tertiary)
+                    .padding(.leading, 34)
+                    .padding(.trailing, 12)
+                    .frame(height: 31, alignment: .leading)
+            } else {
+                ForEach(visibleSessions) { session in
+                    Button {
+                        onSelectSession(session.id)
+                    } label: {
+                        ProjectSessionRow(
+                            session: session,
+                            isSelected: selectedSessionID == session.id
+                        )
                     }
-                    .disabled(session.status == .stopping)
+                    .buttonStyle(.plain)
+                    .contextMenu {
+                        Button(session.status.occupiesSlot ? "Stop Session" : "Close Session") {
+                            sessionManager.close(sessionID: session.id)
+                        }
+                        .disabled(session.status == .stopping)
+                    }
+                }
+
+                if searchQuery.isEmpty && matchingSessions.count > 5 {
+                    Button(isExpanded ? "Show less" : "Show more") {
+                        isExpanded.toggle()
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 14))
+                    .foregroundStyle(SidebarPalette.secondary)
+                    .padding(.leading, 34)
+                    .frame(height: 31)
                 }
             }
         }
+        .padding(.bottom, 8)
     }
 }
 
@@ -305,43 +582,57 @@ private struct ProjectSessionRow: View {
     @ObservedObject var session: TerminalSession
     let isSelected: Bool
 
-    var body: some View {
-        HStack(spacing: 8) {
-            Color.clear
-                .frame(width: 25, height: 1)
+    @State private var isHovering = false
 
+    var body: some View {
+        HStack(spacing: 7) {
             Text(session.displayTitle)
-                .font(.callout)
-                .foregroundStyle(session.status.occupiesSlot ? .primary : .secondary)
+                .font(.system(size: 14))
+                .foregroundStyle(
+                    session.status.occupiesSlot
+                        ? SidebarPalette.primary
+                        : SidebarPalette.secondary
+                )
                 .lineLimit(1)
 
             Spacer(minLength: 5)
 
             Image(systemName: session.kind.systemImage)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(session.status.occupiesSlot ? session.kind.tint : Color.secondary)
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(
+                    session.status.occupiesSlot
+                        ? session.kind.tint
+                        : SidebarPalette.secondary
+                )
 
             Circle()
-                .fill(session.status.occupiesSlot ? session.kind.tint : Color.secondary.opacity(0.16))
+                .fill(session.status.occupiesSlot ? session.kind.tint : Color.clear)
                 .overlay {
-                    if !session.status.occupiesSlot {
-                        Circle()
-                            .stroke(Color.secondary.opacity(0.55), lineWidth: 1)
-                    }
+                    Circle()
+                        .stroke(
+                            session.status.occupiesSlot
+                                ? Color.clear
+                                : SidebarPalette.secondary,
+                            lineWidth: 1
+                        )
                 }
-                .frame(width: 7, height: 7)
+                .frame(width: 6, height: 6)
                 .help(session.status.occupiesSlot ? "Terminal open" : session.status.label)
                 .accessibilityLabel(
                     "\(session.kind.displayName), \(session.status.occupiesSlot ? "terminal open" : session.status.label)"
                 )
         }
-        .padding(.leading, 7)
+        .padding(.leading, 28)
         .padding(.trailing, 9)
-        .frame(height: 30)
+        .frame(height: 31)
         .background(
-            isSelected ? Color.primary.opacity(0.09) : Color.clear,
+            isSelected
+                ? SidebarPalette.selected
+                : (isHovering ? SidebarPalette.hover : Color.clear),
             in: RoundedRectangle(cornerRadius: 6)
         )
+        .padding(.horizontal, 6)
         .contentShape(Rectangle())
+        .onHover { isHovering = $0 }
     }
 }
