@@ -36,6 +36,17 @@ struct ContentView: View {
     @EnvironmentObject private var projectStore: ProjectStore
     @EnvironmentObject private var sessionManager: SessionManager
 
+    @AppStorage(AgentLaunchDefaults.StorageKey.codexModel)
+    private var codexModel = AgentLaunchDefaults.standard.codexModel
+    @AppStorage(AgentLaunchDefaults.StorageKey.codexReasoningEffort)
+    private var codexReasoningEffort = AgentLaunchDefaults.standard.codexReasoningEffort
+    @AppStorage(AgentLaunchDefaults.StorageKey.claudeModel)
+    private var claudeModel = AgentLaunchDefaults.standard.claudeModel
+    @AppStorage(AgentLaunchDefaults.StorageKey.claudeReasoningEffort)
+    private var claudeReasoningEffort = AgentLaunchDefaults.standard.claudeReasoningEffort
+    @AppStorage(AgentLaunchDefaults.StorageKey.fullAccessEnabled)
+    private var fullAccessEnabled = AgentLaunchDefaults.standard.fullAccessEnabled
+
     @State private var selectedProjectID: UUID?
     @State private var projectPendingDeletion: ProjectProfile?
     @State private var pageDestination: SidebarDestination?
@@ -43,6 +54,16 @@ struct ContentView: View {
     @State private var searchQuery = ""
     @State private var navigationHistory: [SidebarDestination] = []
     @State private var navigationIndex = -1
+
+    private var launchDefaults: AgentLaunchDefaults {
+        AgentLaunchDefaults(
+            codexModel: codexModel,
+            codexReasoningEffort: codexReasoningEffort,
+            claudeModel: claudeModel,
+            claudeReasoningEffort: claudeReasoningEffort,
+            fullAccessEnabled: fullAccessEnabled
+        )
+    }
 
     private var visibleProjects: [ProjectProfile] {
         let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -153,6 +174,9 @@ struct ContentView: View {
                             },
                             onSelectSession: { sessionID in
                                 navigate(to: .session(projectID: project.id, sessionID: sessionID))
+                            },
+                            onOpenTerminal: { kind in
+                                openTerminal(kind, for: project)
                             },
                             onEdit: { navigate(to: .editProject(project.id)) },
                             onRemove: { projectPendingDeletion = project }
@@ -480,6 +504,22 @@ struct ContentView: View {
         navigate(to: .newProject(ProjectProfile(serverID: worker.id)))
     }
 
+    private func openTerminal(_ kind: AgentKind, for project: ProjectProfile) {
+        guard let worker = serverStore.server(id: project.serverID) else {
+            navigate(to: .editProject(project.id))
+            return
+        }
+
+        let result = sessionManager.open(
+            project: project,
+            on: worker,
+            kind: kind,
+            launchDefaults: launchDefaults
+        )
+        let session = result.session
+        navigate(to: .session(projectID: session.projectID, sessionID: session.id))
+    }
+
     private func selectFirstProjectIfNeeded() {
         if selectedProjectID == nil || projectStore.project(id: selectedProjectID) == nil {
             selectedProjectID = projectStore.projects.first?.id
@@ -653,6 +693,7 @@ private struct ProjectSidebarSection: View {
     let selectedSessionID: UUID?
     let onSelectProject: () -> Void
     let onSelectSession: (UUID) -> Void
+    let onOpenTerminal: (AgentKind) -> Void
     let onEdit: () -> Void
     let onRemove: () -> Void
 
@@ -679,33 +720,54 @@ private struct ProjectSidebarSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Button(action: onSelectProject) {
-                HStack(spacing: SidebarRowGeometry.iconSpacing) {
-                    Image(systemName: "folder")
-                        .font(.system(size: SidebarRowGeometry.iconSize, weight: .regular))
-                        .foregroundStyle(SidebarPalette.primary)
-                        .frame(width: SidebarRowGeometry.iconFrameWidth)
+            HStack(spacing: 4) {
+                Button(action: onSelectProject) {
+                    HStack(spacing: SidebarRowGeometry.iconSpacing) {
+                        Image(systemName: "folder")
+                            .font(.system(size: SidebarRowGeometry.iconSize, weight: .regular))
+                            .foregroundStyle(SidebarPalette.primary)
+                            .frame(width: SidebarRowGeometry.iconFrameWidth)
 
-                    Text(project.displayName)
-                        .font(.system(size: 14, weight: .regular))
-                        .foregroundStyle(SidebarPalette.primary)
-                        .lineLimit(1)
+                        Text(project.displayName)
+                            .font(.system(size: 14, weight: .regular))
+                            .foregroundStyle(SidebarPalette.primary)
+                            .lineLimit(1)
 
-                    Spacer(minLength: 6)
+                        Spacer(minLength: 6)
+                    }
+                    .contentShape(Rectangle())
                 }
-                .padding(.leading, SidebarRowGeometry.contentLeadingPadding)
-                .padding(.trailing, SidebarRowGeometry.contentTrailingPadding)
-                .frame(height: SidebarRowGeometry.height)
-                .background(
-                    isProjectHovering ? SidebarPalette.hover : Color.clear,
-                    in: RoundedRectangle(cornerRadius: SidebarRowGeometry.cornerRadius)
-                )
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
+
+                if isProjectHovering {
+                    ForEach(AgentKind.allCases) { kind in
+                        Button {
+                            onOpenTerminal(kind)
+                        } label: {
+                            AgentBrandIcon(kind: kind, size: 14)
+                                .frame(width: 22, height: 24)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help("Open \(kind == .claude ? "Claude Code" : kind.displayName) in \(project.displayName)")
+                        .accessibilityLabel("Open \(kind.displayName) terminal")
+                    }
+                }
             }
-            .buttonStyle(.plain)
+            .padding(.leading, SidebarRowGeometry.contentLeadingPadding)
+            .padding(.trailing, SidebarRowGeometry.contentTrailingPadding)
+            .frame(height: SidebarRowGeometry.height)
+            .background(
+                isProjectHovering ? SidebarPalette.hover : Color.clear,
+                in: RoundedRectangle(cornerRadius: SidebarRowGeometry.cornerRadius)
+            )
+            .contentShape(Rectangle())
             .padding(.horizontal, SidebarRowGeometry.horizontalMargin)
             .onHover { isProjectHovering = $0 }
             .contextMenu {
+                Button("Open Codex") { onOpenTerminal(.codex) }
+                Button("Open Claude Code") { onOpenTerminal(.claude) }
+                Divider()
                 Button("Edit Project", action: onEdit)
                 Divider()
                 Button("Remove Project", role: .destructive, action: onRemove)
@@ -761,6 +823,9 @@ private struct ProjectSessionRow: View {
 
     var body: some View {
         HStack(spacing: 7) {
+            AgentBrandIcon(kind: session.kind, size: 12)
+                .opacity(session.status.occupiesSlot ? 1 : 0.55)
+
             Text(session.displayTitle)
                 .font(.system(size: 14))
                 .foregroundStyle(
@@ -772,9 +837,6 @@ private struct ProjectSessionRow: View {
 
             Spacer(minLength: 5)
 
-            AgentBrandIcon(kind: session.kind, size: 12)
-                .opacity(session.status.occupiesSlot ? 1 : 0.55)
-
             sessionStatusIndicator
                 .frame(width: 12, height: 12)
                 .help(sessionStateLabel)
@@ -782,7 +844,7 @@ private struct ProjectSessionRow: View {
                     "\(session.kind.displayName), \(sessionStateLabel.lowercased())"
                 )
         }
-        .padding(.leading, 30)
+        .padding(.leading, 18)
         .padding(.trailing, 8)
         .frame(height: 35)
         .background(

@@ -231,8 +231,7 @@ private struct WorkerOverviewCard: View {
                         accountFallback: worker.accountLabel(for: kind),
                         snapshot: accountUsageService.snapshot(for: worker.id, kind: kind),
                         errorMessage: accountUsageService.error(for: worker.id, kind: kind),
-                        isLoading: accountUsageService.isLoading(workerID: worker.id, kind: kind),
-                        activeSession: sessionManager.activeSession(for: worker, kind: kind)
+                        isLoading: accountUsageService.isLoading(workerID: worker.id, kind: kind)
                     )
                 }
             }
@@ -330,7 +329,6 @@ private struct WorkerAccountStatus: View {
     let snapshot: AccountUsageSnapshot?
     let errorMessage: String?
     let isLoading: Bool
-    let activeSession: TerminalSession?
 
     private var productName: String {
         kind == .claude ? "Claude Code" : "Codex"
@@ -407,43 +405,13 @@ private struct WorkerAccountStatus: View {
                     .lineLimit(2)
             }
 
-            Divider()
-
-            if let activeSession {
-                ActiveWorkerSlotStatus(session: activeSession)
-            } else {
-                HStack(spacing: 6) {
-                    Circle()
-                        .stroke(Color.secondary, lineWidth: 1)
-                        .frame(width: 6, height: 6)
-                    Text("Slot available")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
         }
         .padding(12)
-        .frame(maxWidth: .infinity, minHeight: 154, alignment: .topLeading)
+        .frame(maxWidth: .infinity, minHeight: 126, alignment: .topLeading)
         .background(
             Color.primary.opacity(0.035),
             in: RoundedRectangle(cornerRadius: 9, style: .continuous)
         )
-    }
-}
-
-private struct ActiveWorkerSlotStatus: View {
-    @ObservedObject var session: TerminalSession
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(session.kind.tint)
-                .frame(width: 6, height: 6)
-            Text("\(session.status.label) · \(session.projectName)")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-        }
     }
 }
 

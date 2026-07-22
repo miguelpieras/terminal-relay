@@ -45,6 +45,7 @@ final class ProjectGitServiceTests: XCTestCase {
         XCTAssertTrue(snapshot.hasUpstream)
         XCTAssertTrue(snapshot.hasChanges)
         XCTAssertTrue(snapshot.hasPendingPush)
+        XCTAssertEqual(snapshot.originBranch, "origin/feature/login")
         XCTAssertEqual(snapshot.fetchedAt, fetchedAt)
     }
 
@@ -64,6 +65,7 @@ final class ProjectGitServiceTests: XCTestCase {
         XCTAssertEqual(detached.currentBranch, "Detached HEAD")
         XCTAssertEqual(detached.headOID, "abcdef0123456789")
         XCTAssertTrue(detached.isDetachedHead)
+        XCTAssertNil(detached.originBranch)
         XCTAssertFalse(detached.hasUpstream)
         XCTAssertFalse(detached.hasPendingPush)
         XCTAssertEqual(detached.availableBranches, ["main"])
@@ -239,6 +241,39 @@ final class ProjectGitServiceTests: XCTestCase {
         XCTAssertTrue(script.contains("__TERMINAL_RELAY_GIT_COMMIT_COMPLETE__"))
         XCTAssertTrue(script.contains("current_branch="))
         XCTAssertTrue(script.contains("push --set-upstream origin \"$branch\""))
+    }
+
+    func testBuildsAndParsesWorkflowRunLookupForPushedCommit() throws {
+        XCTAssertEqual(
+            ProjectGitService.workflowRunArguments(
+                repository: "worklific/worklific-app",
+                commitOID: "0123456789abcdef"
+            ),
+            [
+                "run", "list",
+                "--repo", "worklific/worklific-app",
+                "--commit", "0123456789abcdef",
+                "--limit", "1",
+                "--json", "databaseId,displayTitle,workflowName,status,conclusion,url"
+            ]
+        )
+
+        let runs = try ProjectGitService.parseWorkflowRuns(Data(
+            """
+            [{
+              "databaseId": 42,
+              "displayTitle": "Ship environment panel",
+              "workflowName": "Deploy",
+              "status": "completed",
+              "conclusion": "success",
+              "url": "https://github.com/worklific/worklific-app/actions/runs/42"
+            }]
+            """.utf8
+        ))
+
+        XCTAssertEqual(runs.first?.workflowName, "Deploy")
+        XCTAssertTrue(try XCTUnwrap(runs.first).isCompleted)
+        XCTAssertTrue(try XCTUnwrap(runs.first).succeeded)
     }
 
     func testOperationResultMessagesPreservePartialPushFailure() {

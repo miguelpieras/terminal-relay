@@ -20,7 +20,7 @@ struct ProjectEditorView: View {
     @State private var draft: ProjectProfile
     @State private var source: ProjectSource
     @State private var projectName: String
-    @State private var selectedRepositoryName: String?
+    @State private var selectedRepositoryReference: String?
     @State private var repositorySearch = ""
     @State private var isSaving = false
     @State private var saveError: String?
@@ -41,8 +41,8 @@ struct ProjectEditorView: View {
         _draft = State(initialValue: project)
         _source = State(initialValue: isCreatingProject ? .new : .existing)
         _projectName = State(initialValue: project.repositoryName)
-        _selectedRepositoryName = State(
-            initialValue: isCreatingProject ? nil : project.repositoryName
+        _selectedRepositoryReference = State(
+            initialValue: isCreatingProject ? nil : project.githubRepository
         )
         self.isCreatingProject = isCreatingProject
         self.workers = workers
@@ -54,13 +54,30 @@ struct ProjectEditorView: View {
         ProjectProfile.normalizedRepositoryName(from: projectName)
     }
 
-    private var repositoryName: String? {
+    private var repositoryReference: String? {
+        if !isCreatingProject { return draft.githubRepository }
+        switch source {
+        case .new:
+            return normalizedProjectName.isEmpty ? nil : normalizedProjectName
+        case .existing:
+            return selectedRepositoryReference
+        }
+    }
+
+    private var selectedRepository: GitHubRepository? {
+        guard let selectedRepositoryReference else { return nil }
+        return githubService.repositories.first {
+            $0.nameWithOwner.caseInsensitiveCompare(selectedRepositoryReference) == .orderedSame
+        }
+    }
+
+    private var pendingRepositoryName: String? {
         if !isCreatingProject { return draft.repositoryName }
         switch source {
         case .new:
             return normalizedProjectName.isEmpty ? nil : normalizedProjectName
         case .existing:
-            return selectedRepositoryName
+            return selectedRepository?.name
         }
     }
 
@@ -78,7 +95,7 @@ struct ProjectEditorView: View {
     }
 
     private var canSave: Bool {
-        repositoryName != nil
+        repositoryReference != nil
             && selectedWorker != nil
             && !isSaving
             && !githubService.isLoading
@@ -201,16 +218,16 @@ struct ProjectEditorView: View {
                 }
             }
 
-            List(filteredRepositories, selection: $selectedRepositoryName) { repository in
+            List(filteredRepositories, selection: $selectedRepositoryReference) { repository in
                 HStack(spacing: 8) {
                     Image(systemName: repository.isPrivate ? "lock" : "globe")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .frame(width: 14)
-                    Text(repository.name)
+                    Text(repository.nameWithOwner)
                         .lineLimit(1)
                 }
-                .tag(repository.name)
+                .tag(repository.nameWithOwner)
             }
             .frame(minHeight: 180)
             .overlay {
@@ -239,7 +256,7 @@ struct ProjectEditorView: View {
                 }
             }
 
-            if let repositoryName {
+            if let repositoryName = pendingRepositoryName {
                 LabeledContent("Folder") {
                     Text("/workspace/\(repositoryName)")
                         .font(.system(.body, design: .monospaced))
@@ -281,7 +298,7 @@ struct ProjectEditorView: View {
     }
 
     private func save() async {
-        guard let repositoryName, let selectedWorker else { return }
+        guard let repositoryReference, let selectedWorker else { return }
 
         isSaving = true
         saveError = nil
@@ -289,13 +306,13 @@ struct ProjectEditorView: View {
 
         do {
             let repository = try await githubService.prepare(
-                repositoryName: repositoryName,
+                repositoryReference: repositoryReference,
                 create: isCreatingProject && source == .new,
                 on: selectedWorker
             )
 
             var saved = draft
-            saved.repositoryOwner = ProjectProfile.defaultRepositoryOwner
+            saved.repositoryOwner = repository.owner
             saved.repositoryName = repository.name
             saveError = onSave(saved)
         } catch {

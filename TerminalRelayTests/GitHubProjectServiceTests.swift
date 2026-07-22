@@ -48,14 +48,16 @@ final class GitHubProjectServiceTests: XCTestCase {
         XCTAssertTrue(try GitHubProjectService.parseDeployKeys(Data(" \n".utf8)).isEmpty)
     }
 
-    func testBuildsNonArchivedListAndPrivateCreateCommands() {
+    func testBuildsAllAccessibleRepositoryListAndPrivateCreateCommands() {
         XCTAssertEqual(
             GitHubProjectService.listRepositoryArguments(),
             [
-                "repo", "list", "miguelpieras",
-                "--limit", "1000",
-                "--no-archived",
-                "--json", "id,name,nameWithOwner,isPrivate,isArchived"
+                "api", "user/repos",
+                "--method", "GET",
+                "--paginate",
+                "--slurp",
+                "-f", "affiliation=owner,collaborator,organization_member",
+                "-f", "per_page=100"
             ]
         )
         XCTAssertEqual(
@@ -66,6 +68,39 @@ final class GitHubProjectServiceTests: XCTestCase {
                 "--add-readme"
             ]
         )
+    }
+
+    func testParsesPersonalAndOrganizationRepositoryPages() throws {
+        let data = Data(
+            """
+            [
+              [
+                {
+                  "node_id": "R_personal",
+                  "name": "terminal-relay",
+                  "full_name": "miguelpieras/terminal-relay",
+                  "private": true,
+                  "archived": false
+                },
+                {
+                  "node_id": "R_org",
+                  "name": "worklific-app",
+                  "full_name": "worklific/worklific-app",
+                  "private": true,
+                  "archived": false
+                }
+              ]
+            ]
+            """.utf8
+        )
+
+        let repositories = try GitHubProjectService.parseRepositoryPages(data)
+
+        XCTAssertEqual(repositories.map(\.nameWithOwner), [
+            "miguelpieras/terminal-relay",
+            "worklific/worklific-app"
+        ])
+        XCTAssertEqual(repositories[1].owner, "worklific")
     }
 
     func testNormalizesHumanProjectNameToSafeRepositoryComponent() {
@@ -82,6 +117,8 @@ final class GitHubProjectServiceTests: XCTestCase {
         XCTAssertTrue(GitHubProjectService.isSafeRepositoryName("Existing_Project.v2"))
         XCTAssertFalse(GitHubProjectService.isSafeRepositoryName("owner/project"))
         XCTAssertFalse(GitHubProjectService.isSafeRepositoryName(".."))
+        XCTAssertTrue(GitHubProjectService.isSafeRepositoryReference("worklific/Existing_Project.v2"))
+        XCTAssertFalse(GitHubProjectService.isSafeRepositoryReference("worklific/team/project"))
     }
 
     func testSSHArgumentsHonorWorkerDestinationPortAndIdentity() {
@@ -115,6 +152,7 @@ final class GitHubProjectServiceTests: XCTestCase {
     func testProvisionScriptQuotesRepositoryInputAndChecksExistingCheckout() {
         let repositoryName = "project'; printf PWNED; '"
         let script = GitHubProjectService.checkoutProvisionScript(
+            repositoryOwner: "worklific",
             repositoryName: repositoryName
         )
 
@@ -129,7 +167,10 @@ final class GitHubProjectServiceTests: XCTestCase {
     }
 
     func testWorkerKeyScriptUsesRepoScopedKeyWithoutEmbeddingCredentials() {
-        let script = GitHubProjectService.workerKeyScript(repositoryName: "terminal-relay")
+        let script = GitHubProjectService.workerKeyScript(
+            repositoryOwner: "miguelpieras",
+            repositoryName: "terminal-relay"
+        )
 
         XCTAssertTrue(script.contains("$HOME/.ssh/terminal-relay"))
         XCTAssertTrue(script.contains("miguelpieras-terminal-relay.ed25519"))

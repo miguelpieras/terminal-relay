@@ -7,6 +7,36 @@ struct GitHubRepository: Codable, Hashable, Identifiable {
     let nameWithOwner: String
     let isPrivate: Bool
     let isArchived: Bool
+
+    var owner: String {
+        String(nameWithOwner.split(separator: "/", maxSplits: 1).first ?? "")
+    }
+}
+
+private struct GitHubAPIRepository: Decodable {
+    let nodeID: String
+    let name: String
+    let fullName: String
+    let isPrivate: Bool
+    let isArchived: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case nodeID = "node_id"
+        case name
+        case fullName = "full_name"
+        case isPrivate = "private"
+        case isArchived = "archived"
+    }
+
+    var repository: GitHubRepository {
+        GitHubRepository(
+            id: nodeID,
+            name: name,
+            nameWithOwner: fullName,
+            isPrivate: isPrivate,
+            isArchived: isArchived
+        )
+    }
 }
 
 enum GitHubProjectError: LocalizedError, Equatable {
@@ -51,14 +81,22 @@ final class GitHubProjectService: ObservableObject {
 
     @discardableResult
     func prepare(
-        repositoryName: String,
+        repositoryReference: String,
         create: Bool,
         on worker: ServerProfile
     ) async throws -> GitHubRepository {
-        let preparedName = create
-            ? Self.normalizedRepositoryName(from: repositoryName)
-            : repositoryName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard Self.isSafeRepositoryName(preparedName) else {
+        let preparedReference: String
+        if create {
+            let name = Self.normalizedRepositoryName(from: repositoryReference)
+            guard Self.isSafeRepositoryName(name) else {
+                throw GitHubProjectError.invalidRepositoryName
+            }
+            preparedReference = "\(Self.repositoryOwner)/\(name)"
+        } else {
+            preparedReference = repositoryReference
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard Self.isSafeRepositoryReference(preparedReference) else {
             throw GitHubProjectError.invalidRepositoryName
         }
 
@@ -68,23 +106,28 @@ final class GitHubProjectService: ObservableObject {
 
         do {
             if create {
-                _ = try await runGH(arguments: Self.createRepositoryArguments(name: preparedName))
+                _ = try await runGH(
+                    arguments: Self.createRepositoryArguments(
+                        name: String(preparedReference.split(separator: "/", maxSplits: 1)[1])
+                    )
+                )
             }
 
             let repositoryData = try await runGH(
-                arguments: Self.viewRepositoryArguments(name: preparedName)
+                arguments: Self.viewRepositoryArguments(repository: preparedReference)
             )
             let repository = try Self.parseRepository(repositoryData)
             guard repository.nameWithOwner.caseInsensitiveCompare(
-                "\(Self.repositoryOwner)/\(repository.name)"
+                preparedReference
             ) == .orderedSame,
+                !repository.owner.isEmpty,
                 Self.isSafeRepositoryName(repository.name),
                 !repository.isArchived else {
                 throw GitHubProjectError.invalidGitHubResponse
             }
 
             let publicKey = try await ensureWorkerKey(
-                repositoryName: repository.name,
+                repository: repository,
                 worker: worker
             )
             try await ensureWritableDeployKey(
@@ -122,12 +165,24 @@ final class GitHubProjectService: ObservableObject {
             && value.range(of: #"^[A-Za-z0-9._-]+$"#, options: .regularExpression) != nil
     }
 
+    static func isSafeRepositoryReference(_ value: String) -> Bool {
+        let components = value.split(separator: "/", omittingEmptySubsequences: false)
+        guard components.count == 2 else { return false }
+        let owner = String(components[0])
+        return !owner.isEmpty
+            && owner.count <= 100
+            && owner.range(of: #"^[A-Za-z0-9-]+$"#, options: .regularExpression) != nil
+            && isSafeRepositoryName(String(components[1]))
+    }
+
     static func listRepositoryArguments() -> [String] {
         [
-            "repo", "list", repositoryOwner,
-            "--limit", "1000",
-            "--no-archived",
-            "--json", "id,name,nameWithOwner,isPrivate,isArchived"
+            "api", "user/repos",
+            "--method", "GET",
+            "--paginate",
+            "--slurp",
+            "-f", "affiliation=owner,collaborator,organization_member",
+            "-f", "per_page=100"
         ]
     }
 
@@ -139,9 +194,9 @@ final class GitHubProjectService: ObservableObject {
         ]
     }
 
-    static func viewRepositoryArguments(name: String) -> [String] {
+    static func viewRepositoryArguments(repository: String) -> [String] {
         [
-            "repo", "view", "\(repositoryOwner)/\(name)",
+            "repo", "view", repository,
             "--json", "id,name,nameWithOwner,isPrivate,isArchived"
         ]
     }
@@ -157,6 +212,16 @@ final class GitHubProjectService: ObservableObject {
     static func parseRepositories(_ data: Data) throws -> [GitHubRepository] {
         do {
             return try JSONDecoder().decode([GitHubRepository].self, from: data)
+        } catch {
+            throw GitHubProjectError.invalidGitHubResponse
+        }
+    }
+
+    static func parseRepositoryPages(_ data: Data) throws -> [GitHubRepository] {
+        do {
+            return try JSONDecoder()
+                .decode([[GitHubAPIRepository]].self, from: data)
+                .flatMap { $0.map(\.repository) }
         } catch {
             throw GitHubProjectError.invalidGitHubResponse
         }
@@ -207,7 +272,7 @@ final class GitHubProjectService: ObservableObject {
         return publicKey
     }
 
-    static func workerKeyScript(repositoryName: String) -> String {
+    static func workerKeyScript(repositoryOwner: String, repositoryName: String) -> String {
         let keyName = "\(repositoryOwner)-\(repositoryName).ed25519"
         return """
         set -eu
@@ -232,7 +297,7 @@ final class GitHubProjectService: ObservableObject {
         """
     }
 
-    static func checkoutProvisionScript(repositoryName: String) -> String {
+    static func checkoutProvisionScript(repositoryOwner: String, repositoryName: String) -> String {
         let keyName = "\(repositoryOwner)-\(repositoryName).ed25519"
         return """
         set -eu
@@ -308,16 +373,21 @@ final class GitHubProjectService: ObservableObject {
 
     private func fetchRepositories() async throws -> [GitHubRepository] {
         let data = try await runGH(arguments: Self.listRepositoryArguments())
-        return try Self.parseRepositories(data)
+        return try Self.parseRepositoryPages(data)
             .filter { !$0.isArchived }
-            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            .sorted {
+                $0.nameWithOwner.localizedCaseInsensitiveCompare($1.nameWithOwner) == .orderedAscending
+            }
     }
 
     private func ensureWorkerKey(
-        repositoryName: String,
+        repository: GitHubRepository,
         worker: ServerProfile
     ) async throws -> String {
-        let script = Self.workerKeyScript(repositoryName: repositoryName)
+        let script = Self.workerKeyScript(
+            repositoryOwner: repository.owner,
+            repositoryName: repository.name
+        )
         let result = try await runSSH(worker: worker, script: script)
         return try Self.parseDeployPublicKey(String(decoding: result, as: UTF8.self))
     }
@@ -374,11 +444,18 @@ final class GitHubProjectService: ObservableObject {
     ) async throws {
         _ = try await runSSH(
             worker: worker,
-            script: Self.checkoutProvisionScript(repositoryName: repository.name)
+            script: Self.checkoutProvisionScript(
+                repositoryOwner: repository.owner,
+                repositoryName: repository.name
+            )
         )
     }
 
     private func runGH(arguments: [String]) async throws -> Data {
+        try await Self.runGitHubCLI(arguments: arguments)
+    }
+
+    static func runGitHubCLI(arguments: [String]) async throws -> Data {
         let executable = try Self.ghExecutableURL()
         let result = try await Subprocess.run(executable: executable, arguments: arguments)
         return try Self.checkedOutput(result, tool: "GitHub CLI")

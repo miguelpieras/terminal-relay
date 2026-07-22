@@ -24,6 +24,7 @@ struct ProjectWorkspaceView: View {
     @State private var isShowingCodexResets = false
     @State private var isWritingCommitMessage = false
     @State private var commitMessage = ""
+    @State private var isShowingEnvironmentSidebar = true
 
     private var launchDefaults: AgentLaunchDefaults {
         AgentLaunchDefaults(
@@ -57,35 +58,52 @@ struct ProjectWorkspaceView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            agentBar
+        HStack(spacing: 0) {
+            VStack(spacing: 0) {
+                agentBar
 
-            if isWritingCommitMessage {
+                if isWritingCommitMessage {
+                    Divider()
+                    commitBar
+                }
+
+                if gitNoticeText != nil {
+                    Divider()
+                    gitNoticeBar
+                }
+
                 Divider()
-                commitBar
+
+                if let conflictingSession {
+                    conflictBanner(conflictingSession)
+                    Divider()
+                }
+
+                if let selectedSession {
+                    TerminalPane(session: selectedSession)
+                        .id(selectedSession.id)
+                } else {
+                    readyState
+                }
             }
 
-            if gitNoticeText != nil {
+            if isShowingEnvironmentSidebar {
                 Divider()
-                gitNoticeBar
-            }
-
-            Divider()
-
-            if let conflictingSession {
-                conflictBanner(conflictingSession)
-                Divider()
-            }
-
-            if let selectedSession {
-                TerminalPane(session: selectedSession)
-                    .id(selectedSession.id)
-            } else {
-                readyState
+                environmentSidebar
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .navigationTitle(project.displayName)
+        .toolbar {
+            ToolbarItem(placement: .automatic) {
+                Button {
+                    isShowingEnvironmentSidebar.toggle()
+                } label: {
+                    Image(systemName: "sidebar.right")
+                }
+                .help(isShowingEnvironmentSidebar ? "Hide environment sidebar" : "Show environment sidebar")
+            }
+        }
         .task(id: usageTaskID) {
             guard selectedSession == nil else { return }
             await accountUsageService.refresh(worker: worker)
@@ -133,9 +151,9 @@ struct ProjectWorkspaceView: View {
                             switchBranch(to: branch)
                         } label: {
                             if branch == gitSnapshot.currentBranch {
-                                Label(branch, systemImage: "checkmark")
+                                Label(branchMenuLabel(branch, snapshot: gitSnapshot), systemImage: "checkmark")
                             } else {
-                                Text(branch)
+                                Text(branchMenuLabel(branch, snapshot: gitSnapshot))
                             }
                         }
                     }
@@ -143,7 +161,7 @@ struct ProjectWorkspaceView: View {
                     Text("Branch unavailable")
                 }
             } label: {
-                Label(gitSnapshot?.currentBranch ?? "Branch", systemImage: "arrow.triangle.branch")
+                Label(gitSnapshot?.originBranch ?? "origin/branch", systemImage: "arrow.triangle.branch")
                     .lineLimit(1)
             }
             .menuStyle(.borderlessButton)
@@ -180,6 +198,229 @@ struct ProjectWorkspaceView: View {
         .padding(.horizontal, 14)
         .frame(height: 44)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.55))
+    }
+
+    private var environmentSidebar: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Environment")
+                    .font(.title3.weight(.semibold))
+                Spacer()
+                Button {
+                    Task {
+                        _ = await projectGitService.refresh(
+                            project: project,
+                            worker: worker,
+                            fetchRemote: true
+                        )
+                        projectGitService.refreshDeployment(project: project)
+                    }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .disabled(projectGitService.isBusy(projectID: project.id))
+                .help("Refresh origin and deployment status")
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 17)
+
+            VStack(spacing: 0) {
+                environmentRemoteRow
+                environmentPushRow
+            }
+            .padding(.horizontal, 18)
+
+            Divider()
+                .padding(.horizontal, 18)
+                .padding(.vertical, 16)
+
+            Text("Deployment")
+                .font(.headline)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 18)
+                .padding(.bottom, 8)
+
+            deploymentRow
+                .padding(.horizontal, 18)
+
+            Spacer()
+        }
+        .frame(width: 286)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.48))
+    }
+
+    private var environmentRemoteRow: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "cloud")
+                .frame(width: 18)
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Remote")
+                    .font(.callout.weight(.medium))
+                Text(gitSnapshot?.originBranch ?? "Reading origin…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+        }
+        .frame(minHeight: 46)
+    }
+
+    private var environmentPushRow: some View {
+        HStack(spacing: 10) {
+            pushStatusIndicator
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Commit or push")
+                    .font(.callout.weight(.medium))
+                Text(pushStatusText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer()
+        }
+        .frame(minHeight: 46)
+    }
+
+    @ViewBuilder
+    private var pushStatusIndicator: some View {
+        switch gitOperation {
+        case .some(.committingAndPushing), .some(.pushing):
+            ProgressView()
+                .controlSize(.mini)
+        default:
+            Circle()
+                .fill(pushStatusColor)
+                .frame(width: 7, height: 7)
+        }
+    }
+
+    private var pushStatusText: String {
+        let destination = gitSnapshot?.originBranch ?? "origin"
+        switch gitOperation {
+        case .some(.committingAndPushing), .some(.pushing):
+            return "Pushing to \(destination)…"
+        default:
+            break
+        }
+
+        switch projectGitService.operationResult(for: project.id) {
+        case .some(.committedAndPushed), .some(.pushed):
+            return "Pushed to \(destination)"
+        case .some(.committedLocally(pushError: _)), .some(.pushFailed(_)):
+            return "Push failed"
+        default:
+            return "Targets \(destination)"
+        }
+    }
+
+    private var pushStatusColor: Color {
+        switch projectGitService.operationResult(for: project.id) {
+        case .some(.committedAndPushed), .some(.pushed):
+            return .green
+        case .some(.committedLocally(pushError: _)), .some(.pushFailed(_)):
+            return .red
+        default:
+            return .secondary
+        }
+    }
+
+    @ViewBuilder
+    private var deploymentRow: some View {
+        switch projectGitService.deploymentState(for: project.id) {
+        case .some(.checking(let commitOID)):
+            deploymentStatusRow(
+                title: "Waiting for workflow",
+                detail: "Commit \(shortOID(commitOID))",
+                color: .secondary,
+                isProgress: true
+            )
+        case .some(.run(let run)):
+            if let url = URL(string: run.url) {
+                Link(destination: url) {
+                    deploymentStatusRow(
+                        title: run.workflowName,
+                        detail: workflowStatusText(run),
+                        color: workflowStatusColor(run),
+                        isProgress: !run.isCompleted,
+                        showsLink: true
+                    )
+                }
+                .buttonStyle(.plain)
+            } else {
+                deploymentStatusRow(
+                    title: run.workflowName,
+                    detail: workflowStatusText(run),
+                    color: workflowStatusColor(run),
+                    isProgress: !run.isCompleted
+                )
+            }
+        case .some(.noWorkflow(let commitOID)):
+            deploymentStatusRow(
+                title: "No workflow run",
+                detail: "Commit \(shortOID(commitOID))",
+                color: .secondary
+            )
+        case .some(.unavailable(let message)):
+            deploymentStatusRow(
+                title: "Status unavailable",
+                detail: message,
+                color: .orange
+            )
+        case nil:
+            deploymentStatusRow(
+                title: "Reading deployment",
+                detail: "Waiting for Git status",
+                color: .secondary,
+                isProgress: true
+            )
+        }
+    }
+
+    private func deploymentStatusRow(
+        title: String,
+        detail: String,
+        color: Color,
+        isProgress: Bool = false,
+        showsLink: Bool = false
+    ) -> some View {
+        HStack(spacing: 10) {
+            Group {
+                if isProgress {
+                    ProgressView()
+                        .controlSize(.mini)
+                } else {
+                    Circle()
+                        .fill(color)
+                        .frame(width: 7, height: 7)
+                }
+            }
+            .frame(width: 18)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1)
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+
+            Spacer(minLength: 4)
+
+            if showsLink {
+                Image(systemName: "arrow.up.right")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(minHeight: 48)
+        .contentShape(Rectangle())
     }
 
     @ViewBuilder
@@ -450,6 +691,29 @@ struct ProjectWorkspaceView: View {
         }
     }
 
+    private func branchMenuLabel(_ branch: String, snapshot: ProjectGitSnapshot) -> String {
+        if snapshot.remoteBranches.contains(branch) || branch == snapshot.currentBranch {
+            return "origin/\(branch)"
+        }
+        return "\(branch) (local only)"
+    }
+
+    private func workflowStatusText(_ run: GitHubWorkflowRun) -> String {
+        if !run.isCompleted {
+            return run.status.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+        return run.conclusion.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+
+    private func workflowStatusColor(_ run: GitHubWorkflowRun) -> Color {
+        guard run.isCompleted else { return .secondary }
+        return run.succeeded ? .green : .red
+    }
+
+    private func shortOID(_ oid: String) -> String {
+        String(oid.prefix(7))
+    }
+
     private func launchTitle(for kind: AgentKind) -> String {
         let productName = kind == .claude ? "Claude Code" : kind.displayName
         guard let occupant = sessionManager.activeSession(for: worker, kind: kind) else {
@@ -637,8 +901,8 @@ private struct AccountUsageCard: View {
                     .font(.callout.weight(.semibold))
             }
 
-            ProgressView(value: limit.usedPercent, total: 100)
-                .tint(kind.tint)
+            ProgressView(value: limit.remainingPercent, total: 100)
+                .tint(usageTint(for: limit.remainingPercent))
 
             HStack {
                 Text("\(limit.usedPercentText)% used")
@@ -652,6 +916,12 @@ private struct AccountUsageCard: View {
             .font(.caption2)
             .foregroundStyle(.tertiary)
         }
+    }
+
+    private func usageTint(for remainingPercent: Double) -> Color {
+        if remainingPercent <= 10 { return .red }
+        if remainingPercent <= 25 { return .orange }
+        return .accentColor
     }
 
     private var resetAvailabilityText: String {

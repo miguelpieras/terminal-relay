@@ -31,6 +31,36 @@ struct ProjectGitSnapshot: Equatable {
     var hasPendingPush: Bool {
         aheadCount > 0 || (headOID != nil && !isDetachedHead && !hasUpstream)
     }
+
+    var originBranch: String? {
+        isDetachedHead ? nil : "origin/\(currentBranch)"
+    }
+}
+
+struct GitHubWorkflowRun: Decodable, Equatable, Identifiable {
+    let databaseId: Int64
+    let displayTitle: String
+    let workflowName: String
+    let status: String
+    let conclusion: String
+    let url: String
+
+    var id: Int64 { databaseId }
+
+    var isCompleted: Bool {
+        status.caseInsensitiveCompare("completed") == .orderedSame
+    }
+
+    var succeeded: Bool {
+        conclusion.caseInsensitiveCompare("success") == .orderedSame
+    }
+}
+
+enum ProjectDeploymentState: Equatable {
+    case checking(commitOID: String)
+    case run(GitHubWorkflowRun)
+    case noWorkflow(commitOID: String)
+    case unavailable(String)
 }
 
 enum ProjectGitOperation: Equatable {
@@ -90,6 +120,9 @@ final class ProjectGitService: ObservableObject {
     @Published private(set) var errors: [UUID: String] = [:]
     @Published private(set) var currentOperations: [UUID: ProjectGitOperation] = [:]
     @Published private(set) var operationResults: [UUID: ProjectGitOperationResult] = [:]
+    @Published private(set) var deploymentStates: [UUID: ProjectDeploymentState] = [:]
+
+    private var deploymentTasks: [UUID: Task<Void, Never>] = [:]
 
     func snapshot(for projectID: UUID) -> ProjectGitSnapshot? {
         snapshots[projectID]
@@ -111,6 +144,15 @@ final class ProjectGitService: ObservableObject {
         operationResults[projectID] = nil
     }
 
+    func deploymentState(for projectID: UUID) -> ProjectDeploymentState? {
+        deploymentStates[projectID]
+    }
+
+    func refreshDeployment(project: ProjectProfile) {
+        guard let commitOID = snapshots[project.id]?.headOID else { return }
+        trackDeployment(project: project, commitOID: commitOID, waitsForNewRun: false)
+    }
+
     @discardableResult
     func refresh(
         project: ProjectProfile,
@@ -123,12 +165,16 @@ final class ProjectGitService: ObservableObject {
         defer { end(projectID: project.id) }
 
         do {
-            snapshots[project.id] = try await Self.fetchSnapshot(
+            let snapshot = try await Self.fetchSnapshot(
                 project: project,
                 worker: worker,
                 fetchRemote: fetchRemote
             )
+            snapshots[project.id] = snapshot
             errors[project.id] = nil
+            if fetchRemote, deploymentStates[project.id] == nil, let commitOID = snapshot.headOID {
+                trackDeployment(project: project, commitOID: commitOID, waitsForNewRun: false)
+            }
             return true
         } catch {
             errors[project.id] = Self.message(for: error)
@@ -203,6 +249,7 @@ final class ProjectGitService: ObservableObject {
             if result.exitCode == 0 {
                 operationResults[project.id] = .committedAndPushed
                 await updateSnapshotAfterMutation(project: project, worker: worker)
+                trackLatestDeployment(project: project)
                 return true
             }
 
@@ -245,6 +292,7 @@ final class ProjectGitService: ObservableObject {
             )
             operationResults[project.id] = .pushed
             await updateSnapshotAfterMutation(project: project, worker: worker)
+            trackLatestDeployment(project: project)
             return true
         } catch {
             let pushError = Self.message(for: error)
@@ -486,6 +534,24 @@ final class ProjectGitService: ObservableObject {
             && !branch.contains("\r")
     }
 
+    static func workflowRunArguments(repository: String, commitOID: String) -> [String] {
+        [
+            "run", "list",
+            "--repo", repository,
+            "--commit", commitOID,
+            "--limit", "1",
+            "--json", "databaseId,displayTitle,workflowName,status,conclusion,url"
+        ]
+    }
+
+    static func parseWorkflowRuns(_ data: Data) throws -> [GitHubWorkflowRun] {
+        do {
+            return try JSONDecoder().decode([GitHubWorkflowRun].self, from: data)
+        } catch {
+            throw GitHubProjectError.invalidGitHubResponse
+        }
+    }
+
     private static let statusStartMarker = "__TERMINAL_RELAY_GIT_STATUS_BEGIN__"
     private static let statusEndMarker = "__TERMINAL_RELAY_GIT_STATUS_END__"
     private static let localBranchMarker = "__TERMINAL_RELAY_GIT_LOCAL_BRANCH__"
@@ -512,6 +578,64 @@ final class ProjectGitService: ObservableObject {
     private func end(projectID: UUID) {
         busyProjectIDs.remove(projectID)
         currentOperations[projectID] = nil
+    }
+
+    private func trackLatestDeployment(project: ProjectProfile) {
+        guard let commitOID = snapshots[project.id]?.headOID else { return }
+        trackDeployment(project: project, commitOID: commitOID, waitsForNewRun: true)
+    }
+
+    private func trackDeployment(
+        project: ProjectProfile,
+        commitOID: String,
+        waitsForNewRun: Bool
+    ) {
+        deploymentTasks[project.id]?.cancel()
+        deploymentStates[project.id] = .checking(commitOID: commitOID)
+        deploymentTasks[project.id] = Task { [weak self] in
+            await self?.pollDeployment(
+                project: project,
+                commitOID: commitOID,
+                waitsForNewRun: waitsForNewRun
+            )
+        }
+    }
+
+    private func pollDeployment(
+        project: ProjectProfile,
+        commitOID: String,
+        waitsForNewRun: Bool
+    ) async {
+        defer { deploymentTasks[project.id] = nil }
+
+        for attempt in 0..<75 {
+            guard !Task.isCancelled else { return }
+
+            do {
+                let data = try await GitHubProjectService.runGitHubCLI(
+                    arguments: Self.workflowRunArguments(
+                        repository: project.githubRepository,
+                        commitOID: commitOID
+                    )
+                )
+                if let run = try Self.parseWorkflowRuns(data).first {
+                    deploymentStates[project.id] = .run(run)
+                    if run.isCompleted { return }
+                } else if !waitsForNewRun || attempt >= 15 {
+                    deploymentStates[project.id] = .noWorkflow(commitOID: commitOID)
+                    return
+                }
+            } catch {
+                deploymentStates[project.id] = .unavailable(Self.message(for: error))
+                return
+            }
+
+            do {
+                try await Task.sleep(for: .seconds(4))
+            } catch {
+                return
+            }
+        }
     }
 
     private func updateSnapshotAfterMutation(
