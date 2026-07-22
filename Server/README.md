@@ -6,6 +6,65 @@ entry point used by Terminal Relay clients. The worker needs Bash, `flock`,
 tmux 3.4), plus Codex and Claude at their standard `/usr/bin` paths. Projects are
 immediate directories below `/workspace`.
 
+## Bootstrap a fresh worker
+
+Version 1 supports a fresh Hetzner Ubuntu 24.04 amd64 host with at least 4 GB of
+RAM and key-based `root` SSH access. From the repository root on the Mac, use:
+
+```bash
+./Scripts/bootstrap-worker.sh [--identity PATH] [--port N] root@host
+```
+
+The host may be an IP address, DNS name, or SSH config alias.
+
+The local script verifies `/Applications/Terminal Relay.app` (bundle identifier
+`com.mpieras.TerminalRelay`) and the authenticated GitHub CLI, keeps normal
+OpenSSH host-key checks, and asks once for confirmation after showing the
+resolved destination, host-key fingerprint, existing hostname, OS, and
+architecture. It sends this directory's installer and configuration to the host
+without provisioning the Hetzner server or changing `sshd`, root SSH access,
+firewall policy, or Tailscale.
+
+`install-worker.sh` is root-only and idempotent. Before privileged writes it
+requires Ubuntu 24.04, amd64, at least 4 GB of RAM, and no conflicting worker
+account, managed path, or non-empty `/workspace`. It then:
+
+- persists a generated UUID in `/etc/terminal-relay/worker-id`, records
+  `terminal-relay-worker-v1` in `/etc/terminal-relay/installer-version`, and
+  derives the stable `terminal-relay-worker-<first-eight-UUID-hex>` hostname and
+  a stable display name in `/etc/terminal-relay/display-name`; a preassigned
+  `terminal-relay-worker-<number>` hostname becomes the friendly **Terminal
+  Relay Worker <number>** app name, while other hosts use the UUID's short form;
+- creates the password-locked `terminal-relay` login account, copies the root
+  account's authorized keys with strict permissions, and creates its writable
+  `/workspace`;
+- installs the explicit OS dependencies, Codex's official standalone release,
+  and Claude's signed stable apt package, exposing `/usr/bin/codex` and
+  `/usr/bin/claude` without using npm;
+- installs this helper as root-owned mode `0755` and installs the worker-wide
+  guidance as the unprivileged account.
+
+After remote readiness checks, the local script reconnects as `terminal-relay`.
+It runs `codex login --device-auth` and `claude auth login` interactively only
+when their status checks show that authentication is missing. Both checks must
+pass before the script writes a mode-`0600`, one-time local proof and opens the
+generated registration URL in Terminal Relay. The app consumes that proof before
+it accepts the externally invokable URL.
+Replaying bootstrap reuses the stable UUID and updates one app profile; it does
+not duplicate the worker or replace valid credentials.
+
+The managed server surface is `/etc/terminal-relay`, `/home/terminal-relay`,
+`/workspace`, the two agent executable paths, this helper, and the guidance
+files beneath the worker's home directory. A changed launcher or Claude apt
+key/source gets a sibling `.backup.<UTC-timestamp>` copy (with a numeric suffix
+when needed), and an install failure restores files changed during that run. The
+UUID and installer marker intentionally remain after a partial failure. To
+recover from an interruption, rerun the exact bootstrap command so it resumes
+the same worker identity. If preflight instead reports an unexpected existing
+user, path, or workspace content, inspect and resolve that conflict rather than
+deleting it blindly; the installer deliberately leaves the root SSH recovery
+route intact.
+
 ## Install or update only the helper
 
 From the repository root, install the helper with the application SSH target and

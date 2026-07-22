@@ -19,6 +19,7 @@
 		149A0AA1438A64937313424E /* WorkerProfileStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBB07D879D1A8101A648ACE6 /* WorkerProfileStoreTests.swift */; };
 		14ADAB4E0A22C6C72C412851 /* ServerProfileTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB03758D1CB3A90E9F6492F2 /* ServerProfileTests.swift */; };
 		1A6BD750D30624EE0FC8DCFE /* SwiftTerm in Frameworks */ = {isa = PBXBuildFile; productRef = 946BC5F61BD8D63948D993CD /* SwiftTerm */; };
+		1B69BD10927990904F26E683 /* WorkerRegistrationTokenAuthorizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = D11B01481FFDEF95AD72D764 /* WorkerRegistrationTokenAuthorizer.swift */; };
 		1FA01C33C8C89624D38B7288 /* SessionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4C76B0396E10CAF3945C3EB /* SessionManager.swift */; };
 		260C7E8CD25E00B853E63C60 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 865E323F9872A2B96FD0A247 /* ContentView.swift */; };
 		2653CA2FF73C430E73EB9F6D /* TerminalRepresentable.swift in Sources */ = {isa = PBXBuildFile; fileRef = 64572D7519667D0D25972D57 /* TerminalRepresentable.swift */; };
@@ -54,11 +55,13 @@
 		B0872FC4A9FFC91C233F3D3E /* ProjectEditorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0C0296EE9E83451DA6E5434 /* ProjectEditorView.swift */; };
 		B1FD3BBC4984CEC8284D7ECA /* SSHCommandBuilderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3294B74FA0B27E0781E76BA /* SSHCommandBuilderTests.swift */; };
 		B4C6BDEAD7BD0A7E5A85C161 /* AccountUsageServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DBCA9937CC101C673C39E7CF /* AccountUsageServiceTests.swift */; };
+		B803A5D7F7D9E936A1E7FA5A /* WorkerRegistrationURLTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 15BC6E4EE2D054D19B80B85F /* WorkerRegistrationURLTests.swift */; };
 		BABCEEBB76402ABD7935E7AB /* WorkerSessionState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 798FCEE76EAC4A8B1B69AC6A /* WorkerSessionState.swift */; };
 		BBA0E3AFE6FC24D98449C066 /* ProjectListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1BE14175A44909F00948D51 /* ProjectListView.swift */; };
 		C0E60721BA9E8000D59BE1F0 /* WorkerSessionState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 798FCEE76EAC4A8B1B69AC6A /* WorkerSessionState.swift */; };
 		C311EC4FEDD437AEBA03C467 /* AgentKindStyle.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2459D0DFD20B6A437841971 /* AgentKindStyle.swift */; };
 		CC8BDB4D65D80A701E9EB31A /* ServerStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1107CD200FBE55F0833D63D /* ServerStoreTests.swift */; };
+		CF183FC8DC3976616792941B /* WorkerRegistrationURL.swift in Sources */ = {isa = PBXBuildFile; fileRef = 987772567FFFDD8F9CAD8EA8 /* WorkerRegistrationURL.swift */; };
 		D1B54B829875C80E2FD689A8 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF68598718838E8064DF0C45 /* RootView.swift */; };
 		D5918837D827D1F3EDB62E20 /* WorkerSessionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B7E5B66FDAB3A827D6F0497 /* WorkerSessionService.swift */; };
 		DB51FE1BE21320B0B25FEA1F /* RelayTerminalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A206B67C5A2B0B64D46F4A2 /* RelayTerminalView.swift */; };
@@ -95,6 +98,7 @@
 		00575E9F28F8065673E390D8 /* SSHTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SSHTransport.swift; sourceTree = "<group>"; };
 		0A02BB8092DDF8AED8C6F603 /* TerminalRelayApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalRelayApp.swift; sourceTree = "<group>"; };
 		0E0A0111A5E62BD133D1B1D8 /* SSHIdentityStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SSHIdentityStore.swift; sourceTree = "<group>"; };
+		15BC6E4EE2D054D19B80B85F /* WorkerRegistrationURLTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerRegistrationURLTests.swift; sourceTree = "<group>"; };
 		1C681D55FCC5367DD2051E01 /* WorkerSessionStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerSessionStateTests.swift; sourceTree = "<group>"; };
 		20DDC4D787D741BAF50C5483 /* ProjectGitServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectGitServiceTests.swift; sourceTree = "<group>"; };
 		2610AB4602CAB8F3FEC9FB1A /* TerminalRelayTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TerminalRelayTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -123,6 +127,8 @@
 		86CC14D081ABBDBDC564291F /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		93E0F148244B4D209F63EB35 /* ServerStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerStore.swift; sourceTree = "<group>"; };
 		95F329024A646D63DF51C026 /* AgentKind.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentKind.swift; sourceTree = "<group>"; };
+		97DEABBF57F733EA24665AE8 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		987772567FFFDD8F9CAD8EA8 /* WorkerRegistrationURL.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerRegistrationURL.swift; sourceTree = "<group>"; };
 		9A9FBF0D79F64B491FF61EA8 /* ProjectStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectStore.swift; sourceTree = "<group>"; };
 		9CD64E85F20330019303C926 /* SessionSlot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionSlot.swift; sourceTree = "<group>"; };
 		A102C8E7164EE18CC3FDF9AD /* AccountUsageService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountUsageService.swift; sourceTree = "<group>"; };
@@ -143,6 +149,7 @@
 		CDED8E0950703DD0CEB6F15B /* ProjectProfileTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectProfileTests.swift; sourceTree = "<group>"; };
 		CE41CB9D4FEF27A7497D439B /* TerminalRelayIOSTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = TerminalRelayIOSTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		D0C0296EE9E83451DA6E5434 /* ProjectEditorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectEditorView.swift; sourceTree = "<group>"; };
+		D11B01481FFDEF95AD72D764 /* WorkerRegistrationTokenAuthorizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerRegistrationTokenAuthorizer.swift; sourceTree = "<group>"; };
 		DBCA9937CC101C673C39E7CF /* AccountUsageServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountUsageServiceTests.swift; sourceTree = "<group>"; };
 		E1107CD200FBE55F0833D63D /* ServerStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerStoreTests.swift; sourceTree = "<group>"; };
 		E162AC5ABBC627C51BD1D70A /* ProjectGitService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectGitService.swift; sourceTree = "<group>"; };
@@ -213,6 +220,7 @@
 				7DC204D99814E9F11DA7D053 /* SessionSlotRegistryTests.swift */,
 				A3294B74FA0B27E0781E76BA /* SSHCommandBuilderTests.swift */,
 				3E452EE1DE95DB629F3FFB13 /* WorkerMetricsServiceTests.swift */,
+				15BC6E4EE2D054D19B80B85F /* WorkerRegistrationURLTests.swift */,
 				7BA492BA581F2C2B0C2AF051 /* WorkerSessionServiceTests.swift */,
 				1C681D55FCC5367DD2051E01 /* WorkerSessionStateTests.swift */,
 			);
@@ -229,6 +237,8 @@
 				93E0F148244B4D209F63EB35 /* ServerStore.swift */,
 				2B8C4489491EF49B7822E03A /* SSHCommandBuilder.swift */,
 				C0678D0C9803DB05DEFD31A0 /* WorkerMetricsService.swift */,
+				D11B01481FFDEF95AD72D764 /* WorkerRegistrationTokenAuthorizer.swift */,
+				987772567FFFDD8F9CAD8EA8 /* WorkerRegistrationURL.swift */,
 				3B7E5B66FDAB3A827D6F0497 /* WorkerSessionService.swift */,
 			);
 			path = Services;
@@ -316,6 +326,7 @@
 			isa = PBXGroup;
 			children = (
 				86CC14D081ABBDBDC564291F /* Assets.xcassets */,
+				97DEABBF57F733EA24665AE8 /* Info.plist */,
 				0A02BB8092DDF8AED8C6F603 /* TerminalRelayApp.swift */,
 				D87781E3C80903DEE64C46E7 /* Models */,
 				26148FB26C95BCDAEEF01846 /* Services */,
@@ -522,6 +533,8 @@
 				788027947BFEA620BCC4C08A /* TerminalSession.swift in Sources */,
 				41518A6B6C29B1CC91B48A43 /* WorkerManagementView.swift in Sources */,
 				3F0C3E4D664E8C88BC474F21 /* WorkerMetricsService.swift in Sources */,
+				1B69BD10927990904F26E683 /* WorkerRegistrationTokenAuthorizer.swift in Sources */,
+				CF183FC8DC3976616792941B /* WorkerRegistrationURL.swift in Sources */,
 				D5918837D827D1F3EDB62E20 /* WorkerSessionService.swift in Sources */,
 				BABCEEBB76402ABD7935E7AB /* WorkerSessionState.swift in Sources */,
 			);
@@ -566,6 +579,7 @@
 				2BF33DB4120A9B8E4639F6A2 /* SessionManagerTests.swift in Sources */,
 				040CA3D96665635AD86CD343 /* SessionSlotRegistryTests.swift in Sources */,
 				7176098820B3653E154BB020 /* WorkerMetricsServiceTests.swift in Sources */,
+				B803A5D7F7D9E936A1E7FA5A /* WorkerRegistrationURLTests.swift in Sources */,
 				F6693B26956A1182277D3400 /* WorkerSessionServiceTests.swift in Sources */,
 				EA0CEC01562388C25B86A9B1 /* WorkerSessionStateTests.swift in Sources */,
 			);
@@ -786,7 +800,8 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_HARDENED_RUNTIME = YES;
-				GENERATE_INFOPLIST_FILE = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = TerminalRelay/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "Terminal Relay";
 				INFOPLIST_KEY_CFBundleName = "Terminal Relay";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
@@ -855,7 +870,8 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_HARDENED_RUNTIME = YES;
-				GENERATE_INFOPLIST_FILE = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = TerminalRelay/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "Terminal Relay";
 				INFOPLIST_KEY_CFBundleName = "Terminal Relay";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";

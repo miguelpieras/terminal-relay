@@ -24,6 +24,18 @@ targets:
     platform: macOS
     sources:
       - path: TerminalRelay
+    info:
+      path: TerminalRelay/Info.plist
+      properties:
+        CFBundleDisplayName: Terminal Relay
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleURLTypes:
+          - CFBundleTypeRole: Editor
+            CFBundleURLName: com.mpieras.TerminalRelay.worker-registration
+            CFBundleURLSchemes:
+              - terminal-relay
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSApplicationCategoryType: public.app-category.developer-tools
     dependencies:
       - package: SwiftTerm
     settings:
@@ -31,7 +43,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.mpieras.TerminalRelay
         PRODUCT_NAME: Terminal Relay
         PRODUCT_MODULE_NAME: TerminalRelay
-        GENERATE_INFOPLIST_FILE: YES
+        GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_KEY_CFBundleName: Terminal Relay
         INFOPLIST_KEY_CFBundleDisplayName: Terminal Relay
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools

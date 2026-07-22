@@ -33,7 +33,8 @@ The concurrency limit applies to sessions started by Terminal Relay. It cannot d
 - `xcodegen` (`brew install xcodegen`)
 - Working SSH access to each configured server
 - GitHub CLI authenticated as `miguelpieras` on the Mac (`gh auth login`)
-- `codex` and/or `claude` available to a login shell on the remote server
+- For manually configured legacy workers, `codex` and/or `claude` available to
+  the remote account's login shell; bootstrap installs both on a fresh worker
 - Apple's Metal toolchain component, used to compile SwiftTerm's optional renderer (`xcodebuild -downloadComponent MetalToolchain`)
 
 ## Build and install
@@ -49,11 +50,70 @@ To work in Xcode, run `open TerminalRelay.xcodeproj`.
 
 The app target intentionally does not enable App Sandbox because its embedded terminal needs to launch `/usr/bin/ssh` inside a pseudo-terminal.
 
-## Worker setup
+## Bootstrap a worker
 
-Add a worker with either a normal hostname or an alias from `~/.ssh/config`, then assign projects to it. If the alias already defines the user, port, identity, or proxy, leave the corresponding fields in Terminal Relay at their defaults. Commands run through the remote account's login shell, so shell-managed installations such as `nvm` are available.
+The supported version 1 starting point is a fresh Hetzner server running Ubuntu
+24.04 on amd64 with at least 4 GB of RAM. It must be reachable as `root` with an
+SSH key. `/Applications/Terminal Relay.app` must already be installed on the
+Mac, and the local GitHub CLI must be authenticated (`gh auth status`).
 
-Worker-wide Codex and Claude guidance is tracked in `Server/worker-config/`. Run `./Scripts/sync-worker-guidance.sh [ssh-target ...]` to install it, defaulting to `terminal-relay-worker-1` when no target is given. Differing remote files receive timestamped backups before replacement.
+From the repository root, run:
+
+```bash
+./Scripts/bootstrap-worker.sh [--identity PATH] [--port N] root@host
+```
+
+For example:
+
+```bash
+./Scripts/bootstrap-worker.sh root@203.0.113.10
+./Scripts/bootstrap-worker.sh --identity ~/.ssh/hetzner --port 2222 root@203.0.113.10
+```
+
+`host` may be an IP address, DNS name, or SSH config alias.
+
+The script keeps normal OpenSSH known-hosts verification. Before changing the
+server, it shows the resolved SSH destination, trusted host-key fingerprint,
+current remote hostname, OS, and architecture in one exact-target confirmation.
+It then creates an unprivileged, password-locked `terminal-relay` account, gives
+it the bootstrap account's authorized keys, and assigns a stable generated UUID,
+hostname, and display name. A preassigned hostname such as
+`terminal-relay-worker-2` is retained as the friendly app name **Terminal Relay
+Worker 2**; otherwise the display name uses the UUID's short form. Root SSH
+access and `sshd` configuration are left unchanged.
+
+Codex and Claude are installed from their official distributions at
+`/usr/bin/codex` and `/usr/bin/claude`; bootstrap does not install either tool
+through npm. After installation, the script reconnects as `terminal-relay`. It
+skips account setup when a CLI is already authenticated and otherwise runs
+`codex login --device-auth` and `claude auth login` interactively. Registration
+in Terminal Relay happens only after both account checks pass, then the script
+opens the app through its `com.mpieras.TerminalRelay` bundle identifier. The app
+receives connection details and the generated worker identity through a
+mode-`0600`, one-time local registration handoff, never CLI credentials.
+
+Re-running the same command is the supported update and recovery path. It reuses
+the UUID in `/etc/terminal-relay/worker-id`, hostname, and display name, updates
+the existing app profile instead of adding a duplicate, preserves valid
+authentication, and makes no change to already-correct managed files. Differing
+installer-owned configuration receives timestamped sibling backups, and a failed
+install restores the managed files changed during that run. The UUID and
+installer marker intentionally remain after a partial failure so the next run
+can recover the same worker. If preflight reports an unexpected existing
+account, managed path, or non-empty `/workspace`, inspect that conflict instead
+of deleting it and retry after resolving it; the unchanged root SSH route
+remains available for recovery.
+
+Bootstrap manages `/etc/terminal-relay` (including `worker-id`, `display-name`,
+and the `installer-version` marker), `/home/terminal-relay`, `/workspace`, the
+agent executables, `/usr/local/bin/terminal-relay-session`, the worker-wide
+guidance under the worker's home directory, and the consumed local registration
+handoff. Hetzner provisioning and retirement, Tailscale, firewall or `sshd`
+hardening, and backup services are outside version 1.
+
+The existing **Terminal Relay Worker 1** predates this flow and remains supported
+unchanged. For helper-only updates or manual guidance synchronization on that
+worker, see `Server/README.md`.
 
 When a project is added, Terminal Relay uses the Mac's authenticated `gh` CLI to create or inspect the repository. It generates a dedicated deploy key on the selected worker, grants that key access only to the selected repository, and clones into `/workspace/<repository-name>`. The private key never leaves the worker, the GitHub credential never leaves the Mac, and no credential is stored in the project record or Git remote URL.
 
