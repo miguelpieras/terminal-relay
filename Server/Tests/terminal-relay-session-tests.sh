@@ -18,6 +18,7 @@ runtime_root="$test_root/runtime"
 test_home="$test_root/home"
 agent_log="$test_root/agent.log"
 signal_log="$test_root/signal.log"
+boot_id_file="$test_root/boot-id"
 stub_agent="$test_root/stub-agent"
 flock_adapter="$test_root/flock"
 signal_adapter="$test_root/signal"
@@ -198,6 +199,28 @@ assert_agent_lock_free() {
     exec 5>&-
 }
 
+wait_for_agent_lock_free() {
+    local tool="$1"
+    local attempt=0
+    while [[ $attempt -lt 160 ]]; do
+        attempt=$((attempt + 1))
+        exec 5>"$runtime_root/$tool.lock"
+        if "$flock_adapter" --nonblock 5; then
+            exec 5>&-
+            return 0
+        fi
+        exec 5>&-
+        sleep 0.05
+    done
+    fail "$tool agent lock remained held"
+}
+
+path_mode() {
+    local path="$1"
+    /usr/bin/stat -c '%a' "$path" 2>/dev/null \
+        || /usr/bin/stat -f '%Lp' "$path" 2>/dev/null
+}
+
 run_stop_expect_75() {
     local tool="$1"
     local repository="$2"
@@ -232,6 +255,7 @@ printf '[mcp_servers.test_server]\n' > "$workspace_root/alpha/.codex/config.toml
 long_name="$(printf '%101s' '' | /usr/bin/tr ' ' a)"
 mkdir -p "$workspace_root/$long_name"
 touch "$workspace_root/not-a-directory" "$agent_log"
+printf '%s\n' '11111111-1111-4111-8111-111111111111' > "$boot_id_file"
 ln -s "$workspace_root/alpha" "$workspace_root/link"
 
 {
@@ -314,7 +338,7 @@ STUB_AGENT
 
 /bin/chmod 700 "$flock_adapter" "$signal_adapter" "$stub_agent"
 
-echo "1/11 test overrides require explicit non-installed test mode; projects are sorted"
+echo "1/17 test overrides require explicit non-installed test mode; projects are sorted"
 set +e
 override_error="$(TERMINAL_RELAY_TEST_WORKSPACE_ROOT="$workspace_root" /bin/bash "$helper" list-projects 2>&1)"
 override_status=$?
@@ -334,6 +358,7 @@ export TERMINAL_RELAY_TEST_AGENT_LOG="$agent_log"
 export TERMINAL_RELAY_TEST_SIGNAL_PATH="$signal_adapter"
 export TERMINAL_RELAY_TEST_SIGNAL_LOG="$signal_log"
 export TERMINAL_RELAY_TEST_SIGNAL_TARGET_PATH="$stub_agent"
+export TERMINAL_RELAY_TEST_BOOT_ID_PATH="$boot_id_file"
 export HOME="$test_home"
 
 list_output="$(/bin/bash "$helper" list-projects)"
@@ -341,8 +366,9 @@ assert_equal \
     $'__TERMINAL_RELAY_SESSION_V1__\nproject|.hidden\nproject|alpha\nproject|beta\nproject|zeta' \
     "$list_output" \
     "list-projects response"
+assert_equal "700" "$(path_mode "$runtime_root")" "persistent state-root mode"
 
-echo "2/11 concurrent first clients create exactly one launch and share one token"
+echo "2/17 concurrent first clients create exactly one launch and share one token"
 start_one_output="$test_root/start-one.out"
 start_two_output="$test_root/start-two.out"
 /bin/bash "$helper" start codex alpha --candidate-one > "$start_one_output" 2>&1 &
@@ -357,6 +383,7 @@ first_instance="${start_one_line##*|}"
 assert_equal "$first_instance" "${start_two_line##*|}" "concurrent start instance"
 first_status="$(wait_for_session codex alpha 0)"
 first_instance="${first_status##*|}"
+assert_equal "600" "$(path_mode "$runtime_root/codex.intent")" "Codex restart-intent mode"
 wait_for_log_lines 1
 first_log="$(/usr/bin/sed -n '1p' "$agent_log")"
 if [[ "$first_log" != *"--candidate-one"* && "$first_log" != *"--candidate-two"* ]]; then
@@ -374,7 +401,7 @@ assert_equal "off" "$("$tmux_path" -f /dev/null -L "$tmux_socket" show-options -
 assert_equal "on" "$("$tmux_path" -f /dev/null -L "$tmux_socket" show-options -gv set-titles)" "tmux title setting"
 assert_equal '#{pane_title}' "$("$tmux_path" -f /dev/null -L "$tmux_socket" show-options -gv set-titles-string)" "tmux title format"
 
-echo "3/11 configure failure on a later attach leaves the shared session untouched"
+echo "3/17 configure failure on a later attach leaves the shared session untouched"
 TERMINAL_RELAY_TEST_CLIENT_CONFIGURE_FAIL=1 \
     start_client configure-failure "$workspace_root/alpha" reattach codex alpha "$first_instance"
 wait_for_harness_exit configure-failure
@@ -386,7 +413,7 @@ wait_for_session codex alpha 3 >/dev/null
 "$tmux_path" -f /dev/null -L "$harness_socket" kill-session -t reattach-client
 wait_for_session codex alpha 2 >/dev/null
 
-echo "4/11 a different repository receives occupied exit 75"
+echo "4/17 a different repository receives occupied exit 75"
 set +e
 conflict_output="$(/bin/bash "$helper" start codex beta 2>&1)"
 conflict_status=$?
@@ -394,13 +421,13 @@ set -e
 assert_equal "75" "$conflict_status" "wrong-project exit status"
 assert_contains "$conflict_output" "already running for repository 'alpha'" "wrong-project error"
 
-echo "5/11 both client connections can disappear while the launch survives"
+echo "5/17 both client connections can disappear while the launch survives"
 "$tmux_path" -f /dev/null -L "$harness_socket" kill-session -t client-one
 "$tmux_path" -f /dev/null -L "$harness_socket" kill-session -t client-two 2>/dev/null || true
 detached_status="$(wait_for_session codex alpha 0)"
 assert_equal "$first_instance" "${detached_status##*|}" "instance after detach"
 
-echo "6/11 an arbitrary stale token cannot stop the active launch"
+echo "6/17 an arbitrary stale token cannot stop the active launch"
 stale_instance="00000000-0000-0000-0000-000000000000"
 [[ "$stale_instance" != "$first_instance" ]] \
     || stale_instance="11111111-1111-1111-1111-111111111111"
@@ -411,7 +438,7 @@ assert_contains "$stale_reattach_output" "Refusing stale reattach" "stale reatta
 still_running="$(wait_for_session codex alpha 0)"
 assert_equal "$first_instance" "${still_running##*|}" "instance after stale stop"
 
-echo "7/11 exact stop ends the first launch and a same-repository replacement gets a new token"
+echo "7/17 exact stop ends the first launch and a same-repository replacement gets a new token"
 /bin/bash "$helper" stop codex alpha "$first_instance"
 wait_for_no_session codex
 assert_agent_lock_free codex
@@ -424,7 +451,7 @@ second_instance="${second_status##*|}"
 wait_for_log_lines 2
 wait_for_session codex alpha 0 >/dev/null
 
-echo "8/11 the old same-repository token cannot stop its replacement"
+echo "8/17 the old same-repository token cannot stop its replacement"
 old_token_output="$(run_stop_expect_75 codex alpha "$first_instance")"
 assert_contains "$old_token_output" "active launch is 'alpha' instance '$second_instance'" "same-repository stale stop"
 old_reattach_output="$(run_reattach_expect_75 codex alpha "$first_instance")"
@@ -432,7 +459,7 @@ assert_contains "$old_reattach_output" "active launch is 'alpha' instance '$seco
 replacement_status="$(wait_for_session codex alpha 0)"
 assert_equal "$second_instance" "${replacement_status##*|}" "replacement after stale stop"
 
-echo "9/11 paused stale reattach fails closed across stubborn stop and replacement"
+echo "9/17 paused stale reattach fails closed across stubborn stop and replacement"
 pause_file="$test_root/pause-before-attach"
 touch "$pause_file"
 TERMINAL_RELAY_TEST_CLIENT_PAUSE_BEFORE_ATTACH="$pause_file" \
@@ -466,7 +493,7 @@ wait_for_session codex alpha 1 >/dev/null
 "$tmux_path" -f /dev/null -L "$harness_socket" kill-session -t client-three 2>/dev/null || true
 wait_for_session codex alpha 0 >/dev/null
 
-echo "10/11 legacy Claude launch infers its repository, preserves environment, and exits cleanly"
+echo "10/17 legacy Claude launch infers its repository, preserves environment, and exits cleanly"
 export ConEmuANSI=1
 start_client clean-client "$workspace_root/beta" claude --exit-cleanly
 wait_for_log_lines 4
@@ -474,13 +501,108 @@ wait_for_no_session claude
 clean_log="$(/usr/bin/sed -n '4p' "$agent_log")"
 assert_contains "$clean_log" "cwd=$workspace_root/beta" "legacy inferred repository"
 assert_contains "$clean_log" "ConEmuANSI=1" "Claude terminal environment"
+[[ ! -e "$runtime_root/claude.intent" ]] || fail "clean Claude exit retained restart intent"
 
-echo "11/11 final exact stop removes metadata only after process and lock release"
+echo "11/17 final exact stop removes metadata only after process and lock release"
 /bin/bash "$helper" stop codex alpha "$third_instance"
 wait_for_no_session codex
 assert_agent_lock_free codex
 assert_equal "__TERMINAL_RELAY_SESSION_V1__" "$(session_status)" "final empty status"
+[[ ! -e "$runtime_root/codex.intent" ]] || fail "exact Codex stop retained restart intent"
 repeat_output="$(run_stop_expect_75 codex alpha "$third_instance")"
 assert_contains "$repeat_output" "stop request is stale" "repeated stop diagnostic"
+
+echo "12/17 caller-supplied provider lifecycle flags are rejected"
+set +e
+managed_codex_output="$(/bin/bash "$helper" start codex alpha resume 2>&1)"
+managed_codex_status=$?
+managed_claude_output="$(/bin/bash "$helper" start claude beta --resume other 2>&1)"
+managed_claude_status=$?
+set -e
+assert_equal "64" "$managed_codex_status" "managed Codex resume flag status"
+assert_contains "$managed_codex_output" "manages Codex resume" "managed Codex resume diagnostic"
+assert_equal "64" "$managed_claude_status" "managed Claude resume flag status"
+assert_contains "$managed_claude_output" "manages Claude session" "managed Claude resume diagnostic"
+
+echo "13/17 Codex survives a simulated reboot with one idempotent resume launch"
+unset ConEmuANSI
+codex_reboot_output="$(/bin/bash "$helper" start codex alpha --reboot-codex)"
+codex_reboot_instance="$(printf '%s\n' "$codex_reboot_output" \
+    | /usr/bin/awk -F'|' '$1 == "session" { print $5; exit }')"
+wait_for_log_lines 5
+"$tmux_path" -f /dev/null -L "$tmux_socket" kill-server
+wait_for_agent_lock_free codex
+printf '%s\n' '22222222-2222-4222-8222-222222222222' > "$boot_id_file"
+/bin/bash "$helper" restore > "$test_root/restore-one.out" 2>&1 &
+restore_one_pid=$!
+/bin/bash "$helper" restore > "$test_root/restore-two.out" 2>&1 &
+restore_two_pid=$!
+wait "$restore_one_pid"
+wait "$restore_two_pid"
+restored_codex_status="$(wait_for_session codex alpha 0)"
+assert_equal "$codex_reboot_instance" "${restored_codex_status##*|}" "restored Codex instance"
+wait_for_log_lines 6
+codex_resume_log="$(/usr/bin/sed -n '6p' "$agent_log")"
+assert_contains "$codex_resume_log" "|resume|--last|--reboot-codex" "Codex resume arguments"
+assert_equal "6" "$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")" "idempotent restore count"
+
+echo "14/17 explicit stop prevents a later Codex reboot restore"
+/bin/bash "$helper" stop codex alpha "$codex_reboot_instance"
+wait_for_no_session codex
+printf '%s\n' '33333333-3333-4333-8333-333333333333' > "$boot_id_file"
+/bin/bash "$helper" restore
+assert_equal "6" "$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")" "stopped Codex restore count"
+
+echo "15/17 Claude resumes the UUID-bound provider conversation after reboot"
+claude_reboot_output="$(/bin/bash "$helper" start claude beta --reboot-claude)"
+claude_reboot_instance="$(printf '%s\n' "$claude_reboot_output" \
+    | /usr/bin/awk -F'|' '$1 == "session" { print $5; exit }')"
+wait_for_log_lines 7
+claude_initial_log="$(/usr/bin/sed -n '7p' "$agent_log")"
+assert_contains "$claude_initial_log" \
+    "|--session-id|$claude_reboot_instance|--reboot-claude" "Claude initial session id"
+"$tmux_path" -f /dev/null -L "$tmux_socket" kill-server
+wait_for_agent_lock_free claude
+printf '%s\n' '44444444-4444-4444-8444-444444444444' > "$boot_id_file"
+/bin/bash "$helper" restore
+restored_claude_status="$(wait_for_session claude beta 0)"
+assert_equal "$claude_reboot_instance" "${restored_claude_status##*|}" "restored Claude instance"
+wait_for_log_lines 8
+claude_resume_log="$(/usr/bin/sed -n '8p' "$agent_log")"
+assert_contains "$claude_resume_log" \
+    "|--resume|$claude_reboot_instance|--reboot-claude" "Claude resume arguments"
+/bin/bash "$helper" stop claude beta "$claude_reboot_instance"
+wait_for_no_session claude
+printf '%s\n' '55555555-5555-4555-8555-555555555555' > "$boot_id_file"
+/bin/bash "$helper" restore
+assert_equal "8" "$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")" "stopped Claude restore count"
+
+echo "16/17 a same-boot death is not resurrected now or on a later reboot"
+same_boot_output="$(/bin/bash "$helper" start codex zeta --same-boot-death)"
+same_boot_instance="$(printf '%s\n' "$same_boot_output" \
+    | /usr/bin/awk -F'|' '$1 == "session" { print $5; exit }')"
+[[ -n "$same_boot_instance" ]] || fail "same-boot launch did not return an instance"
+wait_for_log_lines 9
+"$tmux_path" -f /dev/null -L "$tmux_socket" kill-server
+wait_for_agent_lock_free codex
+/bin/bash "$helper" restore
+assert_equal "9" "$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")" "same-boot restore count"
+assert_equal "__TERMINAL_RELAY_SESSION_V1__" "$(session_status)" "same-boot dead status"
+printf '%s\n' '66666666-6666-4666-8666-666666666666' > "$boot_id_file"
+/bin/bash "$helper" restore
+assert_equal "9" "$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")" "later restore after same-boot cleanup"
+
+echo "17/17 corrupt persistent state fails closed without launching an agent"
+printf '%s\n' 'version|1' 'tool|codex' 'repository|alpha' > "$runtime_root/codex.intent"
+/bin/chmod 600 "$runtime_root/codex.intent"
+printf '%s\n' '77777777-7777-4777-8777-777777777777' > "$boot_id_file"
+set +e
+corrupt_output="$(/bin/bash "$helper" restore 2>&1)"
+corrupt_status=$?
+set -e
+assert_equal "70" "$corrupt_status" "corrupt restore status"
+assert_contains "$corrupt_output" "restart intent is invalid" "corrupt restore diagnostic"
+assert_equal "9" "$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")" "corrupt restore launch count"
+/bin/rm -f -- "$runtime_root/codex.intent"
 
 echo "PASS: terminal-relay-session integration tests"

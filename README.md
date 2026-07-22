@@ -25,7 +25,9 @@ Each project expands into thin session rows in the sidebar. An animated spinner 
 That worker also has the small root-owned `terminal-relay-session` launcher from
 `Server/`. It keeps Codex and Claude inside stable worker-side `tmux` sessions
 and retains the host-local lock per tool, so the server itself allows one Codex
-and one Claude process at a time across Mac and iPhone clients.
+and one Claude process at a time across Mac and iPhone clients. A worker-side
+systemd service restores active sessions after a reboot; neither client nor the
+Mac needs to be online.
 
 The concurrency limit applies to sessions started by Terminal Relay. It cannot detect an agent started independently in another SSH client.
 
@@ -109,14 +111,15 @@ remains available for recovery.
 
 Bootstrap manages `/etc/terminal-relay` (including `worker-id`, `display-name`,
 and the `installer-version` marker), `/home/terminal-relay`, `/workspace`, the
-agent executables, `/usr/local/bin/terminal-relay-session`, the worker-wide
-guidance under the worker's home directory, and the consumed local registration
-handoff. Hetzner provisioning and retirement, Tailscale, firewall or `sshd`
-hardening, and backup services are outside version 1.
+agent executables, `/usr/local/bin/terminal-relay-session`, its systemd restore
+unit, the worker-wide guidance under the worker's home directory, and the
+consumed local registration handoff. Hetzner provisioning and retirement,
+Tailscale, firewall or `sshd` hardening, and backup services are outside version
+1.
 
 The existing **Terminal Relay Worker 1** predates this flow and remains supported
-unchanged. For helper-only updates or manual guidance synchronization on that
-worker, see `Server/README.md`.
+unchanged. For session-runtime updates or manual guidance synchronization on
+that worker, see `Server/README.md`.
 
 When a project is added, Terminal Relay uses the Mac's authenticated `gh` CLI to create or inspect the repository. It generates a dedicated deploy key on the selected worker, grants that key access only to the selected repository, and clones into `/workspace/<repository-name>`. The private key never leaves the worker, the GitHub credential never leaves the Mac, and no credential is stored in the project record or Git remote URL.
 
@@ -135,6 +138,19 @@ returns to the foreground, and while it remains open, then offers **Reconnect**
 for detached sessions. **Stop Agent** is the separately confirmed operation that
 ends the shared remote agent for every client.
 
+If the worker reboots while an agent is active, its systemd restore service
+recreates the `tmux` session with the same Terminal Relay UUID and resumes the
+provider conversation from the worker's local CLI transcript. Claude resumes
+the exact UUID-bound session. Codex runs `resume --last` from the recorded
+repository, so a newer out-of-band Codex session in that same repository can
+change which conversation Codex selects. A normal CLI exit or **Stop Agent**
+deletes the restart intent, preventing resurrection.
+
+Recovery requires the worker disk and the provider's local session data (for
+example `~/.codex/sessions` and `~/.claude/projects`) to survive. It does not
+restore a conversation from OpenAI or Anthropic after disk or host loss; those
+directories need a separate encrypted off-worker backup for that case.
+
 For a manually managed worker, test and install the current helper with:
 
 ```bash
@@ -145,17 +161,26 @@ For a manually managed worker, test and install the current helper with:
 ```
 
 The installer verifies that both SSH targets reach the same machine and that
-`/usr/bin/tmux`, `/usr/bin/flock`, and `/usr/bin/python3` with Linux pidfd
-signaling are available. It retains a differing installed helper as a
-timestamped backup and prints the exact rollback command. Re-run the same
-installer to update or recover the helper. First read the live status record,
-then use its repository and instance UUID for an emergency stop:
+systemd, `/usr/bin/tmux`, `/usr/bin/flock`, and `/usr/bin/python3` with Linux
+pidfd signaling are available. It atomically installs the helper and restore
+unit, retains differing files as timestamped backups, enables the per-user
+service, and prints one guarded rollback command. Re-run the same installer to
+update or recover both managed files. First read the live status record, then
+use its repository and instance UUID for an emergency stop:
 
 ```bash
 ssh terminal-relay-worker-1 /usr/local/bin/terminal-relay-session status
 # session|codex|REPOSITORY|ATTACHED_CLIENTS|INSTANCE_UUID
 ssh terminal-relay-worker-1 \
   '/usr/local/bin/terminal-relay-session stop codex REPOSITORY INSTANCE_UUID'
+
+# Inspect or retry boot recovery (use the worker's application username).
+ssh root@terminal-relay-worker-1 \
+  'systemctl status terminal-relay-session-restore@terminal-relay.service'
+ssh root@terminal-relay-worker-1 \
+  'journalctl -b -u terminal-relay-session-restore@terminal-relay.service'
+ssh root@terminal-relay-worker-1 \
+  'systemctl restart terminal-relay-session-restore@terminal-relay.service'
 ```
 
 Use `claude` in place of `codex` for that slot. The UUID check deliberately

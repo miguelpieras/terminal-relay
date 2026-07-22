@@ -182,7 +182,7 @@ fi
 script_directory="$(cd "$(dirname "$0")" && pwd -P)"
 repository_root="$(cd "$script_directory/.." && pwd -P)"
 server_directory="$repository_root/Server"
-for payload_path in install-worker.sh terminal-relay-session worker-config/install.sh worker-config/AGENTS.md worker-config/CLAUDE.md; do
+for payload_path in install-worker.sh terminal-relay-session terminal-relay-session-restore@.service worker-config/install.sh worker-config/AGENTS.md worker-config/CLAUDE.md; do
     [[ -f "$server_directory/$payload_path" ]] || die "missing bootstrap payload: Server/$payload_path"
 done
 
@@ -309,7 +309,7 @@ IFS= read -r confirmation </dev/tty || die "confirmation was not provided"
 case "$confirmation" in y|Y|yes|YES) ;; *) die "cancelled" ;; esac
 
 result_file="$temporary_directory/install-result"
-/usr/bin/tar --no-xattrs -C "$server_directory" -cf - install-worker.sh terminal-relay-session worker-config | \
+/usr/bin/tar --no-xattrs -C "$server_directory" -cf - install-worker.sh terminal-relay-session terminal-relay-session-restore@.service worker-config | \
     /usr/bin/ssh "${ssh_options[@]}" "$target" '
 set -eu
 temporary_root=${TMPDIR:-/tmp}
@@ -366,8 +366,12 @@ test "$(id -un)" = terminal-relay
 test "$HOME" = /home/terminal-relay
 test -d /workspace && test -w /workspace
 test -x /usr/local/bin/terminal-relay-session
+test -f /etc/systemd/system/terminal-relay-session-restore@.service
 test -x /usr/bin/codex && test -x /usr/bin/claude
 test -r /proc/stat && test -r /proc/meminfo
+systemctl is-enabled --quiet terminal-relay-session-restore@terminal-relay.service
+systemctl is-active --quiet terminal-relay-session-restore@terminal-relay.service
+test "$(systemctl show -p User --value terminal-relay-session-restore@terminal-relay.service)" = terminal-relay
 /usr/local/bin/terminal-relay-session status >/dev/null
 runtime_directory="/run/user/$(id -u)/terminal-relay"
 /usr/bin/flock "$runtime_directory/codex.control.lock" /bin/sleep 3 &

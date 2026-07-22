@@ -41,8 +41,10 @@ account, managed path, or non-empty `/workspace`. It then:
 - installs the explicit OS dependencies, Codex's official standalone release,
   and Claude's signed stable apt package, exposing `/usr/bin/codex` and
   `/usr/bin/claude` without using npm;
-- installs this helper as root-owned mode `0755` and installs the worker-wide
-  guidance as the unprivileged account.
+- installs this helper as root-owned mode `0755`, installs the root-owned
+  `terminal-relay-session-restore@.service` template, enables its instance for
+  `terminal-relay`, and installs the worker-wide guidance as the unprivileged
+  account.
 
 After remote readiness checks, the local script reconnects as `terminal-relay`.
 It runs `codex login --device-auth` and `claude auth login` interactively only
@@ -54,21 +56,21 @@ Replaying bootstrap reuses the stable UUID and updates one app profile; it does
 not duplicate the worker or replace valid credentials.
 
 The managed server surface is `/etc/terminal-relay`, `/home/terminal-relay`,
-`/workspace`, the two agent executable paths, this helper, and the guidance
-files beneath the worker's home directory. A changed launcher or Claude apt
-key/source gets a sibling `.backup.<UTC-timestamp>` copy (with a numeric suffix
-when needed), and an install failure restores files changed during that run. The
-UUID and installer marker intentionally remain after a partial failure. To
-recover from an interruption, rerun the exact bootstrap command so it resumes
+`/workspace`, the two agent executable paths, this helper, its systemd restore
+unit, and the guidance files beneath the worker's home directory. A changed
+managed file gets a sibling `.backup.<UTC-timestamp>` copy (with a numeric
+suffix when needed), and an install failure restores files changed during that
+run. The UUID and installer marker intentionally remain after a partial failure.
+To recover from an interruption, rerun the exact bootstrap command so it resumes
 the same worker identity. If preflight instead reports an unexpected existing
 user, path, or workspace content, inspect and resolve that conflict rather than
 deleting it blindly; the installer deliberately leaves the root SSH recovery
 route intact.
 
-## Install or update only the helper
+## Install or update the session runtime
 
-From the repository root, install the helper with the application SSH target and
-an optional privileged SSH target:
+From the repository root, install the helper and restore service with the
+application SSH target and an optional privileged SSH target:
 
 ```bash
 ./Scripts/install-worker-session-helper.sh \
@@ -77,21 +79,19 @@ an optional privileged SSH target:
 ```
 
 Those are also the defaults, so `./Scripts/install-worker-session-helper.sh` is
-equivalent. The installer verifies the application account and exact
+equivalent. The installer verifies the application account, systemd, exact
 `/usr/bin/tmux`, `/usr/bin/flock`, and `/usr/bin/python3` pidfd support; verifies
 that the admin connection reaches the same hostname and machine ID; and rechecks
 both identity values inside the actual install SSH connection before any managed
 write. It then uses either the root account or non-interactive `sudo`. The full
-inspect, backup, stage, atomic rename, verification, and automatic-restore path
-holds the root-owned `/run/lock/terminal-relay-session-helper.lock`. A truly
-unchanged `root:root` mode-`0755` helper causes no managed write. Otherwise a
-differing helper is retained as a timestamped backup and the new helper is
-staged beside the destination and atomically renamed into place. A failed
-install or verification restores the retained backup automatically while still
-holding the lock. The printed rollback takes that same lock before its guard
-checks and holds it through mutation, rechecks worker identity, refuses
-symlinks, and requires the installed SHA-256 and inode state to still match this
-deployment, so it cannot race or overwrite or delete a later deployment.
+inspect, backup, stage, atomic rename, daemon reload, unit verification, service
+enablement, and automatic-restore path holds the root-owned
+`/run/lock/terminal-relay-session-helper.lock`. Differing helper and unit files
+are retained as timestamped backups. A failed install restores both files and
+the prior service enabled/active state. The printed rollback takes the same lock,
+rechecks worker identity, refuses symlinks, and requires both installed SHA-256
+digests and inode states to still match this deployment, so it cannot overwrite
+or delete a later deployment.
 
 Run the isolated local helper coverage before installation:
 
@@ -99,12 +99,12 @@ Run the isolated local helper coverage before installation:
 ./Server/Tests/terminal-relay-session-tests.sh
 ```
 
-The test owns a unique tmux socket label, temporary workspace, runtime directory,
-stub agents, a real `flock(2)` adapter, and an isolated process-identity signal
-adapter. It covers concurrent first starts, multi-client reattach, stale instance
-rejection, a paused reattach across replacement, configure failure,
-stubborn-agent TERM/KILL escalation, and actual agent-lock release. Its cleanup
-targets only those private resources.
+The test owns a unique tmux socket label, temporary workspace, state directory,
+fake boot ID, stub agents, a real `flock(2)` adapter, and an isolated
+process-identity signal adapter. It covers concurrent starts, multi-client
+reattach, stale instance rejection, exact Stop, normal exit, same-UUID Codex and
+Claude recovery, concurrent restore, corrupt state, same-boot death, and actual
+agent-lock release. Its cleanup targets only those private resources.
 
 ## Version 1 command contract
 
@@ -119,6 +119,7 @@ The commands are:
 ```text
 terminal-relay-session list-projects
 terminal-relay-session status
+terminal-relay-session restore
 terminal-relay-session start <codex|claude> <repository> [agent arguments...]
 terminal-relay-session attach <codex|claude> <repository> [agent arguments...]
 terminal-relay-session reattach <codex|claude> <repository> <instance-uuid>
@@ -165,6 +166,34 @@ reports success only after the actual agent lock is released.
 There is intentionally no detach RPC: closing SSH, Terminal Relay, or an
 individual terminal only disconnects that tmux client.
 
+Each successful initial launch writes a mode-`0600` restart intent below the
+runtime user's mode-`0700` `~/.local/state/terminal-relay` directory. The record
+contains data only: repository, Terminal Relay UUID, boot ID, and the original
+argument array. `restore` holds the same per-tool locks and acts only on a valid
+intent from an earlier boot. It recreates the same UUID-named tmux session,
+starts Claude with `--resume <uuid>`, or starts Codex with `resume --last` from
+the recorded repository. Caller-supplied lifecycle flags are rejected. A normal
+CLI exit, failed initial launch, or exact `stop` removes only its matching
+intent; shutdown retains it. The enabled
+`terminal-relay-session-restore@<user>.service` runs this path after filesystems
+and network readiness, without SSH, the Mac, or iPhone.
+
+Provider recovery depends on local transcript data remaining on the worker.
+Claude is bound to the relay UUID; Codex uses the latest local Codex session for
+the recorded repository, so an out-of-band newer session in that repository can
+be selected instead. Reboot recovery is not disk-loss recovery: back up
+`~/.codex/sessions` and `~/.claude/projects` separately if host-loss recovery is
+required.
+
+Inspect or retry the boot service as an administrator (substitute the actual
+application user for `terminal-relay`):
+
+```bash
+systemctl status terminal-relay-session-restore@terminal-relay.service
+journalctl -b -u terminal-relay-session-restore@terminal-relay.service
+systemctl restart terminal-relay-session-restore@terminal-relay.service
+```
+
 The dedicated tmux socket label is `terminal-relay`. Sessions are uniquely named
 `terminal-relay-<tool>-<instance-uuid>`, preventing a stale attach handoff from
 targeting a replacement. Its status bar is disabled.
@@ -173,8 +202,8 @@ continue to reach SwiftTerm. tmux does not forward Claude's plain OSC 9;4
 progress sequence in this relay path (confirmed with tmux 3.6a even when
 passthrough is enabled), so that progress-only signal cannot cross this helper;
 the agent session and ordinary terminal output are not affected. Repository
-metadata and the control and agent locks live below
-`/run/user/<uid>/terminal-relay`. The original nonblocking `flock`
+metadata, restart intents, and the control and agent locks live below
+`~/.local/state/terminal-relay`. The original nonblocking `flock`
 still surrounds the actual Codex or Claude process, preserving the one-Codex and
 one-Claude limit even if a tmux session is started unexpectedly. Codex MCP
 servers declared in system, user, or project config are disabled at launch;
@@ -188,6 +217,7 @@ For the isolated integration test only, a helper invoked from a path other than
 - `TERMINAL_RELAY_TEST_TMUX_SOCKET`
 - `TERMINAL_RELAY_TEST_WORKSPACE_ROOT`
 - `TERMINAL_RELAY_TEST_RUNTIME_ROOT`
+- `TERMINAL_RELAY_TEST_BOOT_ID_PATH`
 - `TERMINAL_RELAY_TEST_CODEX_PATH`
 - `TERMINAL_RELAY_TEST_CLAUDE_PATH`
 - `TERMINAL_RELAY_TEST_FLOCK_PATH`

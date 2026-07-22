@@ -12,6 +12,8 @@ readonly display_name_file="$state_directory/display-name"
 readonly ssh_keys_marker="$state_directory/authorized-keys-installed"
 readonly workspace_directory="/workspace"
 readonly launcher_destination="/usr/local/bin/terminal-relay-session"
+readonly restore_unit_destination="/etc/systemd/system/terminal-relay-session-restore@.service"
+readonly restore_service="terminal-relay-session-restore@$runtime_user.service"
 readonly codex_destination="/usr/bin/codex"
 readonly claude_destination="/usr/bin/claude"
 readonly codex_root="/opt/terminal-relay"
@@ -28,6 +30,7 @@ readonly minimum_memory_kib=3900000
 
 script_directory="$(cd "$(dirname "$0")" && pwd -P)"
 launcher_source="$script_directory/terminal-relay-session"
+restore_unit_source="$script_directory/terminal-relay-session-restore@.service"
 worker_config_directory="$script_directory/worker-config"
 backup_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 temporary_directory=""
@@ -39,6 +42,9 @@ worker_name=""
 worker_hostname=""
 original_hostname=""
 hostname_was_changed=false
+restore_service_initial_enabled=false
+restore_service_initial_active=false
+restore_service_touched=false
 
 declare -a rollback_destinations=()
 declare -a rollback_backups=()
@@ -167,6 +173,22 @@ rollback_managed_files() {
     done
 }
 
+rollback_restore_service() {
+    [[ "$restore_service_touched" == true ]] || return 0
+
+    /usr/bin/systemctl stop "$restore_service" >/dev/null 2>&1 || true
+    if [[ "$restore_service_initial_enabled" != true ]]; then
+        /usr/bin/systemctl disable "$restore_service" >/dev/null 2>&1 || true
+    fi
+    /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
+    if [[ "$restore_service_initial_enabled" == true ]]; then
+        /usr/bin/systemctl enable "$restore_service" >/dev/null 2>&1 || true
+    fi
+    if [[ "$restore_service_initial_active" == true ]]; then
+        /usr/bin/systemctl start "$restore_service" >/dev/null 2>&1 || true
+    fi
+}
+
 cleanup() {
     local exit_code=$?
     local temporary_parent
@@ -174,7 +196,11 @@ cleanup() {
 
     trap - EXIT
     if [[ "$installation_started" == true && "$installation_succeeded" != true && $exit_code -ne 0 ]]; then
+        if [[ "$restore_service_touched" == true ]]; then
+            /usr/bin/systemctl stop "$restore_service" >/dev/null 2>&1 || true
+        fi
         rollback_managed_files || true
+        rollback_restore_service || true
         if [[ "$hostname_was_changed" == true && -n "$original_hostname" ]]; then
             if /bin/hostname "$original_hostname" 2>/dev/null; then
                 log "Restored live hostname after installation failure."
@@ -205,6 +231,7 @@ validate_source_bundle() {
 
     for required_file in \
         "$launcher_source" \
+        "$restore_unit_source" \
         "$worker_config_directory/install.sh" \
         "$worker_config_directory/AGENTS.md" \
         "$worker_config_directory/CLAUDE.md"; do
@@ -379,6 +406,7 @@ validate_managed_state() {
 
         for entry in \
             "$launcher_destination" \
+            "$restore_unit_destination" \
             "$codex_destination" \
             "$claude_destination" \
             "$codex_root" \
@@ -402,6 +430,7 @@ validate_managed_state() {
     else
         for entry in \
             "$launcher_destination" \
+            "$restore_unit_destination" \
             "$codex_destination" \
             "$claude_destination" \
             "$claude_key_destination" \
@@ -674,6 +703,7 @@ prepare_worker_guidance() {
 install_runtime_files() {
     /usr/bin/install -d -o "$runtime_user" -g "$runtime_group" -m 0750 "$workspace_directory"
     install_managed_file "$launcher_source" "$launcher_destination" 755
+    install_managed_file "$restore_unit_source" "$restore_unit_destination" 644
     prepare_worker_guidance "$worker_config_directory/AGENTS.md" "$runtime_home/AGENTS.md"
     prepare_worker_guidance "$worker_config_directory/CLAUDE.md" "$runtime_home/CLAUDE.md"
     prepare_worker_guidance "$worker_config_directory/AGENTS.md" "$runtime_home/.codex/AGENTS.md"
@@ -690,6 +720,27 @@ install_runtime_files() {
         "$runtime_home/.codex/AGENTS.md" \
         "$runtime_home/.claude/CLAUDE.md"
 
+}
+
+configure_restore_service() {
+    [[ -d /run/systemd/system && -x /usr/bin/systemctl \
+        && -x /usr/bin/systemd-analyze ]] \
+        || fail "systemd is required for reboot-resilient sessions."
+
+    if /usr/bin/systemctl is-enabled --quiet "$restore_service" 2>/dev/null; then
+        restore_service_initial_enabled=true
+    fi
+    if /usr/bin/systemctl is-active --quiet "$restore_service" 2>/dev/null; then
+        restore_service_initial_active=true
+    fi
+    restore_service_touched=true
+
+    /usr/bin/systemctl daemon-reload
+    /usr/bin/systemd-analyze verify "$restore_unit_destination"
+    /usr/bin/systemctl enable "$restore_service"
+    if [[ "$restore_service_initial_active" != true ]]; then
+        /usr/bin/systemctl start "$restore_service"
+    fi
 }
 
 set_worker_hostname() {
@@ -737,6 +788,14 @@ verify_readiness() {
         || fail "Unexpected ownership or mode on $workspace_directory."
     [[ "$(/usr/bin/stat -c '%U:%G:%a' "$launcher_destination")" == "root:root:755" ]] \
         || fail "Unexpected ownership or mode on $launcher_destination."
+    [[ "$(/usr/bin/stat -c '%U:%G:%a' "$restore_unit_destination")" == "root:root:644" ]] \
+        || fail "Unexpected ownership or mode on $restore_unit_destination."
+    /usr/bin/systemctl is-enabled --quiet "$restore_service" \
+        || fail "$restore_service is not enabled."
+    /usr/bin/systemctl is-active --quiet "$restore_service" \
+        || fail "$restore_service is not active."
+    [[ "$(/usr/bin/systemctl show -p User --value "$restore_service")" == "$runtime_user" ]] \
+        || fail "$restore_service is not running as $runtime_user."
     [[ "$(/usr/bin/stat -c '%U:%G:%a' "$runtime_home/.ssh")" == "$runtime_user:$runtime_group:700" ]] \
         || fail "Unexpected ownership or mode on the worker SSH directory."
     [[ "$(/usr/bin/stat -c '%U:%G:%a' "$runtime_home/.ssh/authorized_keys")" == "$runtime_user:$runtime_group:600" ]] \
@@ -788,6 +847,7 @@ main() {
     install_codex
     install_claude
     install_runtime_files
+    configure_restore_service
     set_worker_hostname
     verify_readiness
 

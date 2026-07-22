@@ -1,0 +1,16 @@
+[Unit]
+Description=Restore Terminal Relay agent sessions for %i
+Wants=network-online.target
+After=local-fs.target network-online.target
+ConditionFileIsExecutable=/usr/local/bin/terminal-relay-session
+
+[Service]
+Type=oneshot
+User=%i
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/local/bin/terminal-relay-session restore
+RemainAfterExit=yes
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

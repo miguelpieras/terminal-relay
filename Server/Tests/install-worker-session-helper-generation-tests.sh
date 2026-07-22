@@ -4,32 +4,65 @@ set -euo pipefail
 script_directory="$(cd "$(dirname "$0")" && pwd -P)"
 repository_root="$(cd "$script_directory/../.." && pwd -P)"
 installer="$repository_root/Scripts/install-worker-session-helper.sh"
+restore_unit="$repository_root/Server/terminal-relay-session-restore@.service"
+# Used by build_locked_remote_command loaded from the installer below.
+# shellcheck disable=SC2034
 remote_lock_path="/run/lock/terminal-relay-session-helper.lock"
 
 [[ -f "$installer" && ! -L "$installer" ]] \
     || { echo "Missing regular installer: $installer" >&2; exit 66; }
+[[ -f "$restore_unit" && ! -L "$restore_unit" ]] \
+    || { echo "Missing regular restore unit: $restore_unit" >&2; exit 66; }
 
 # Load only the installer's command-rendering helpers; do not run its SSH path.
-# shellcheck disable=SC1090
-source <(/usr/bin/awk '
+temporary_helpers="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/terminal-relay-renderers.XXXXXX")"
+cleanup() {
+    cleanup_status=$?
+    trap - EXIT
+    case "$temporary_helpers" in
+        "${TMPDIR:-/tmp}"/terminal-relay-renderers.*) /bin/rm -f -- "$temporary_helpers" ;;
+        *) echo "Refusing to remove unexpected renderer file: $temporary_helpers" >&2; cleanup_status=1 ;;
+    esac
+    exit "$cleanup_status"
+}
+trap cleanup EXIT
+/usr/bin/awk '
     /^quote_remote\(\)/ { copying = 1 }
     /^validate_ssh_target / { copying = 0 }
     copying { print }
-' "$installer")
+' "$installer" > "$temporary_helpers"
+# shellcheck disable=SC1090
+source "$temporary_helpers"
 
 install_script="$(/usr/bin/sed -n "/<<'REMOTE_INSTALL'/,/^REMOTE_INSTALL$/p" "$installer" \
     | /usr/bin/sed '1d;$d')"
 rollback_script="$(/usr/bin/sed -n "/<<'REMOTE_ROLLBACK'/,/^REMOTE_ROLLBACK$/p" "$installer" \
     | /usr/bin/sed '1d;$d')"
 
-[[ "$install_script" == *'case "$staged_path" in'* \
-    && "$install_script" == *'"$source_digest"'* \
-    && "$install_script" == *'"$install_result"'* ]] \
+# shellcheck disable=SC2016
+[[ "$install_script" == *'case "$helper_staged" in'* \
+    && "$install_script" == *'"$helper_installed_digest"'* \
+    && "$install_script" == *'"$unit_installed_digest"'* \
+    && "$install_script" == *'"$service_initial_enabled"'* \
+    && "$install_script" == *'systemctl daemon-reload'* \
+    && "$install_script" == *'systemctl enable "$service"'* ]] \
     || { echo "Install renderer expanded or lost literal remote variables." >&2; exit 1; }
-[[ "$rollback_script" == *'case "$staged" in'* \
-    && "$rollback_script" == *'"$expected_digest"'* \
-    && "$rollback_script" == *'"$install_result"'* ]] \
+# shellcheck disable=SC2016
+[[ "$rollback_script" == *'case "$helper_staged" in'* \
+    && "$rollback_script" == *'"$expected_helper_digest"'* \
+    && "$rollback_script" == *'"$expected_unit_digest"'* \
+    && "$rollback_script" == *'"$service_initial_active"'* \
+    && "$rollback_script" == *'systemctl daemon-reload'* ]] \
     || { echo "Rollback renderer expanded or lost literal remote variables." >&2; exit 1; }
+[[ "$(< "$restore_unit")" == *'ExecStart=/usr/local/bin/terminal-relay-session restore'* \
+    && "$(< "$restore_unit")" == *'WantedBy=multi-user.target'* \
+    && "$(< "$restore_unit")" == *'User=%i'* \
+    && "$(< "$restore_unit")" != *'Environment=HOME='* ]] \
+    || { echo "Restore unit is missing its managed restore lifecycle." >&2; exit 1; }
+
+if command -v systemd-analyze >/dev/null 2>&1; then
+    systemd-analyze verify "$restore_unit"
+fi
 
 machine_id=00000000000000000000000000000000
 host_name=terminal-relay-generation-test
@@ -37,10 +70,12 @@ digest=0000000000000000000000000000000000000000000000000000000000000000
 
 for admin_uid in 0 1000; do
     install_command="$(build_locked_remote_command \
-        "$admin_uid" "$install_script" terminal-relay-install "$machine_id" "$host_name")"
+        "$admin_uid" "$install_script" terminal-relay-install \
+        "$machine_id" "$host_name" terminal-relay)"
     rollback_command="$(build_locked_remote_command \
         "$admin_uid" "$rollback_script" terminal-relay-rollback \
-        "$machine_id" "$host_name" "$digest" 1:2:3 new '')"
+        "$machine_id" "$host_name" terminal-relay \
+        "$digest" 1:2:3 new '' "$digest" 4:5:6 new '' false false)"
     validate_remote_rendering install "$install_script" "$install_command"
     validate_remote_rendering rollback "$rollback_script" "$rollback_command"
 done
