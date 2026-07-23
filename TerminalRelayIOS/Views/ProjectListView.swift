@@ -120,6 +120,7 @@ private struct ProjectDetailView: View {
     let repositoryName: String
     @ObservedObject var model: WorkerSessionModel
     @State private var stopRequest: StopRequest?
+    @State private var showsNewTerminalOptions = false
 
     private var sessions: [WorkerSessionSnapshot] {
         model.sessions
@@ -138,9 +139,6 @@ private struct ProjectDetailView: View {
                     Label("No Active Terminals", systemImage: "terminal")
                 } description: {
                     Text("Start a terminal for this project to work from your iPhone.")
-                } actions: {
-                    newTerminalMenu
-                        .buttonStyle(.borderedProminent)
                 }
                 .listRowBackground(Color.clear)
             } else {
@@ -153,7 +151,24 @@ private struct ProjectDetailView: View {
         .refreshable { await model.refresh() }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                newTerminalMenu
+                Button {
+                    showsNewTerminalOptions = true
+                } label: {
+                    Label("New Terminal", systemImage: "plus")
+                }
+                .disabled(!canStartTerminal)
+            }
+        }
+        .confirmationDialog(
+            "New Terminal",
+            isPresented: $showsNewTerminalOptions,
+            titleVisibility: .visible
+        ) {
+            ForEach(AgentKind.allCases) { kind in
+                Button(kind.displayName) {
+                    model.openTerminal(kind: kind, repositoryName: repositoryName)
+                }
+                .disabled(model.session(for: kind) != nil)
             }
         }
         .alert(item: $stopRequest) { request in
@@ -229,22 +244,6 @@ private struct ProjectDetailView: View {
                 Label("Stop Terminal", systemImage: "stop.fill")
             }
         }
-    }
-
-    private var newTerminalMenu: some View {
-        Menu {
-            ForEach(AgentKind.allCases) { kind in
-                Button {
-                    model.openTerminal(kind: kind, repositoryName: repositoryName)
-                } label: {
-                    Label(kind.displayName, systemImage: kind.systemImage)
-                }
-                .disabled(model.session(for: kind) != nil)
-            }
-        } label: {
-            Label("New Terminal", systemImage: "plus")
-        }
-        .disabled(!canStartTerminal)
     }
 
     private func attachedClientLabel(_ count: Int) -> String {

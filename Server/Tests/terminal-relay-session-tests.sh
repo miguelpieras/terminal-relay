@@ -389,7 +389,7 @@ first_log="$(/usr/bin/sed -n '1p' "$agent_log")"
 if [[ "$first_log" != *"--candidate-one"* && "$first_log" != *"--candidate-two"* ]]; then
     fail "concurrent winner did not preserve either first-launch argument"
 fi
-assert_contains "$first_log" "mcp_servers.test_server.enabled=false" "Codex MCP disable argument"
+assert_contains "$first_log" "mcp_servers.test_server={enabled=false}" "Codex MCP disable argument"
 sleep 0.2
 assert_equal "1" "$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")" "concurrent launch count"
 

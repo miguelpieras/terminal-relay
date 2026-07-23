@@ -1696,7 +1696,7 @@ run_agent() {
                 [[ -f "$config_file" ]] || continue
                 while IFS= read -r mcp_server; do
                     [[ -n "$mcp_server" && "$mcp_server" =~ ^[A-Za-z0-9_-]+$ ]] || continue
-                    agent_arguments+=(--config "mcp_servers.$mcp_server.enabled=false")
+                    agent_arguments+=(--config "mcp_servers.$mcp_server={enabled=false}")
                 done < <(
                     /usr/bin/sed -n \
                         's/^[[:space:]]*\[mcp_servers\.\([A-Za-z0-9_-]*\)\][[:space:]]*$/\1/p' \
@@ -1749,7 +1749,7 @@ run_agent() {
     (
         while [[ ! -e "$gate_file" ]]; do sleep 0.01; done
         /bin/rm -f -- "$gate_file"
-        exec "${agent_command[@]}"
+        exec "${agent_command[@]}" </dev/tty
     ) &
     agent_pid=$!
     start_identity="$(process_start_identity "$agent_pid")" || {
