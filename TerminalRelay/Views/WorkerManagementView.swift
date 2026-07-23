@@ -125,9 +125,9 @@ struct WorkersView: View {
 
     private var workerList: some View {
         ScrollView {
-            LazyVStack(spacing: 7) {
+            LazyVStack(spacing: 0) {
                 ForEach(serverStore.servers) { worker in
-                    WorkerOverviewCard(
+                    WorkerOverviewRow(
                         worker: worker,
                         projects: projectStore.projects(for: worker.id),
                         isExpanded: expandedWorkerIDs.contains(worker.id),
@@ -148,9 +148,14 @@ struct WorkersView: View {
                             delete(worker)
                         }
                     )
+
+                    if worker.id != serverStore.servers.last?.id {
+                        Divider()
+                            .padding(.horizontal, 12)
+                    }
                 }
             }
-            .padding(12)
+            .padding(.vertical, 6)
             .frame(maxWidth: 1_060)
             .frame(maxWidth: .infinity)
         }
@@ -209,7 +214,7 @@ struct WorkersView: View {
     }
 }
 
-private struct WorkerOverviewCard: View {
+private struct WorkerOverviewRow: View {
     @EnvironmentObject private var sessionManager: SessionManager
     @EnvironmentObject private var accountUsageService: AccountUsageService
     @EnvironmentObject private var workerMetricsService: WorkerMetricsService
@@ -226,7 +231,7 @@ private struct WorkerOverviewCard: View {
     let onDelete: () -> Void
 
     var body: some View {
-        VStack(spacing: 0) {
+        VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 9) {
                 Image(systemName: "server.rack")
                     .font(.system(size: 12, weight: .medium))
@@ -256,83 +261,88 @@ private struct WorkerOverviewCard: View {
                 .controlSize(.small)
                 .help("Worker actions")
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
+            .padding(.horizontal, 12)
+            .padding(.top, 8)
+            .padding(.bottom, 6)
 
-            Divider()
+            HStack(spacing: 12) {
+                WorkerSectionLabel("Capacity")
 
-            WorkerResourceSummary(
-                snapshot: workerMetricsService.snapshot(for: worker.id),
-                errorMessage: workerMetricsService.error(for: worker.id),
-                isLoading: workerMetricsService.isLoading(workerID: worker.id)
-            )
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
+                WorkerResourceSummary(
+                    snapshot: workerMetricsService.snapshot(for: worker.id),
+                    errorMessage: workerMetricsService.error(for: worker.id),
+                    isLoading: workerMetricsService.isLoading(workerID: worker.id)
+                )
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 4)
 
-            Divider()
+            HStack(spacing: 12) {
+                WorkerSectionLabel("Accounts")
 
-            HStack(alignment: .top, spacing: 7) {
-                ForEach(AgentKind.allCases) { kind in
-                    WorkerAccountStatus(
-                        kind: kind,
-                        accountFallback: worker.accountLabel(for: kind),
-                        snapshot: accountUsageService.snapshot(for: worker.id, kind: kind),
-                        errorMessage: accountUsageService.error(for: worker.id, kind: kind),
-                        isLoading: accountUsageService.isLoading(workerID: worker.id, kind: kind)
-                    )
+                HStack(alignment: .top, spacing: 18) {
+                    ForEach(AgentKind.allCases) { kind in
+                        WorkerAccountStatus(
+                            kind: kind,
+                            accountFallback: worker.accountLabel(for: kind),
+                            snapshot: accountUsageService.snapshot(for: worker.id, kind: kind),
+                            errorMessage: accountUsageService.error(for: worker.id, kind: kind),
+                            isLoading: accountUsageService.isLoading(workerID: worker.id, kind: kind)
+                        )
+                    }
                 }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-
-            Divider()
+            .padding(.horizontal, 12)
+            .padding(.vertical, 4)
 
             Button(action: onToggleApps) {
-                HStack(spacing: 8) {
-                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 12)
-                    Text(linkedAppsTitle)
-                        .font(.caption.weight(.medium))
+                HStack(spacing: 12) {
+                    WorkerSectionLabel("Apps")
+
+                    HStack(spacing: 6) {
+                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.tertiary)
+                            .frame(width: 10)
+                        Text(linkedAppsTitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
                     Spacer()
                 }
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .padding(.horizontal, 10)
-            .frame(height: 30)
+            .padding(.horizontal, 12)
+            .frame(height: 28)
 
             if isExpanded {
-                Divider()
-
                 if projects.isEmpty {
                     Text("No apps are linked to this worker.")
-                        .font(.callout)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(10)
+                        .padding(.leading, 78)
+                        .padding(.trailing, 12)
+                        .padding(.bottom, 6)
                 } else {
-                    VStack(spacing: 0) {
+                    VStack(spacing: 2) {
                         ForEach(projects) { project in
                             LinkedAppRow(
                                 project: project,
                                 sessions: sessionManager.sessions(forProjectID: project.id),
                                 onOpen: { onOpenProject(project.id) }
                             )
-
-                            if project.id != projects.last?.id {
-                                Divider()
-                                    .padding(.leading, 42)
-                            }
                         }
                     }
+                    .padding(.leading, 66)
+                    .padding(.trailing, 12)
+                    .padding(.bottom, 6)
                 }
             }
 
             if isConfirmingDeletion {
-                Divider()
-
                 HStack(spacing: 10) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundStyle(.red)
@@ -343,19 +353,12 @@ private struct WorkerOverviewCard: View {
                     Button("Delete Worker", role: .destructive, action: onDelete)
                 }
                 .font(.caption)
-                .padding(10)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .frame(maxWidth: .infinity)
                 .background(Color.red.opacity(0.055))
             }
         }
-        .background(
-            Color.primary.opacity(0.035),
-            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-        )
-        .overlay {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(Color.primary.opacity(0.09), lineWidth: 1)
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private var linkedAppsTitle: String {
@@ -366,6 +369,21 @@ private struct WorkerOverviewCard: View {
         var value = worker.destination
         if worker.port != 22 { value += ":\(worker.port)" }
         return value
+    }
+}
+
+private struct WorkerSectionLabel: View {
+    let title: String
+
+    init(_ title: String) {
+        self.title = title
+    }
+
+    var body: some View {
+        Text(title)
+            .font(.caption2.weight(.medium))
+            .foregroundStyle(.tertiary)
+            .frame(width: 54, alignment: .leading)
     }
 }
 
@@ -469,13 +487,7 @@ private struct WorkerMetricStatus: View {
                     .frame(height: 2)
             }
         }
-        .padding(.horizontal, 7)
-        .padding(.vertical, 5)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            Color.primary.opacity(0.035),
-            in: RoundedRectangle(cornerRadius: 5, style: .continuous)
-        )
         .help(metricHelp)
     }
 
@@ -529,7 +541,7 @@ private struct WorkerAccountStatus: View {
 
     var body: some View {
         HStack(spacing: 7) {
-            AgentBrandIcon(kind: kind, size: 20)
+            AgentBrandIcon(kind: kind, size: 18)
 
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 5) {
@@ -560,13 +572,7 @@ private struct WorkerAccountStatus: View {
                     .lineLimit(1)
             }
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            Color.primary.opacity(0.035),
-            in: RoundedRectangle(cornerRadius: 5, style: .continuous)
-        )
         .help(accountHelp)
     }
 
@@ -605,18 +611,18 @@ private struct LinkedAppRow: View {
     }
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 9) {
             Image(systemName: "folder")
-                .font(.system(size: 13))
-                .foregroundStyle(.secondary)
-                .frame(width: 18)
+                .font(.system(size: 11))
+                .foregroundStyle(.tertiary)
+                .frame(width: 14)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(project.githubRepository)
-                    .font(.callout.weight(.medium))
+                    .font(.caption.weight(.medium))
                 Text(project.workingDirectory)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.secondary)
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.tertiary)
                     .lineLimit(1)
             }
 
@@ -634,8 +640,8 @@ private struct LinkedAppRow: View {
 
             Button("Open", action: onOpen)
                 .buttonStyle(.borderless)
+                .controlSize(.small)
         }
-        .padding(.horizontal, 10)
-        .frame(minHeight: 40)
+        .frame(minHeight: 34)
     }
 }
