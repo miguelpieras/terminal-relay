@@ -42,6 +42,9 @@ final class WorkerSessionModel: ObservableObject {
     @Published private(set) var profile: WorkerProfile?
     @Published private(set) var projects: [String] = []
     @Published private(set) var sessions: [WorkerSessionSnapshot] = []
+    @Published private(set) var workerOverviews: [UUID: WorkerOverviewSnapshot] = [:]
+    @Published private(set) var workerLoadingIDs: Set<UUID> = []
+    @Published private(set) var projectLoadingIDs: Set<UUID> = []
     @Published private(set) var publicKey = ""
     @Published private(set) var isLoading = false
     @Published var errorMessage: String?
@@ -110,6 +113,9 @@ final class WorkerSessionModel: ObservableObject {
     func deleteProfile(id: UUID) {
         profileStore.delete(id: id)
         profiles = profileStore.load()
+        workerOverviews[id] = nil
+        workerLoadingIDs.remove(id)
+        projectLoadingIDs.remove(id)
         profile = profileStore.selectedProfileID()
             .flatMap { selectedID in profiles.first { $0.id == selectedID } }
             ?? profiles.first
@@ -147,6 +153,20 @@ final class WorkerSessionModel: ObservableObject {
                 discoveredProjects: projectResponse.projects,
                 sessions: statusResponse.sessions
             )
+            let visibleProjects = Set(projects)
+            let visibleSessions = statusResponse.sessions.filter {
+                visibleProjects.contains($0.repositoryName)
+            }
+            if let currentOverview = workerOverviews[profile.id] {
+                workerOverviews[profile.id] = WorkerOverviewSnapshot(
+                    projects: projects,
+                    sessions: visibleSessions,
+                    resources: currentOverview.resources,
+                    accounts: currentOverview.accounts,
+                    accountErrors: currentOverview.accountErrors,
+                    connectionError: nil
+                )
+            }
             errorMessage = nil
         } catch {
             guard refreshToken == token else { return }
@@ -201,5 +221,203 @@ final class WorkerSessionModel: ObservableObject {
 
     func session(for kind: AgentKind) -> WorkerSessionSnapshot? {
         sessions.first { $0.kind == kind }
+    }
+
+    func refreshWorkerOverviews() async {
+        let profilesToRefresh = profiles.filter { !workerLoadingIDs.contains($0.id) }
+        guard !profilesToRefresh.isEmpty else { return }
+        workerLoadingIDs.formUnion(profilesToRefresh.map(\.id))
+
+        await withTaskGroup(of: (UUID, WorkerOverviewSnapshot).self) { group in
+            for profile in profilesToRefresh {
+                group.addTask { [workerClient] in
+                    (
+                        profile.id,
+                        await Self.loadOverview(profile: profile, workerClient: workerClient)
+                    )
+                }
+            }
+
+            for await (profileID, overview) in group {
+                workerOverviews[profileID] = overview
+                workerLoadingIDs.remove(profileID)
+            }
+        }
+    }
+
+    func refreshProjectCatalogs() async {
+        let profilesToRefresh = profiles.filter { !projectLoadingIDs.contains($0.id) }
+        guard !profilesToRefresh.isEmpty else { return }
+        projectLoadingIDs.formUnion(profilesToRefresh.map(\.id))
+
+        await withTaskGroup(of: (UUID, WorkerOverviewSnapshot).self) { group in
+            for profile in profilesToRefresh {
+                let currentOverview = workerOverviews[profile.id]
+                group.addTask { [workerClient] in
+                    (
+                        profile.id,
+                        await Self.loadProjectCatalog(
+                            profile: profile,
+                            currentOverview: currentOverview,
+                            workerClient: workerClient
+                        )
+                    )
+                }
+            }
+
+            for await (profileID, overview) in group {
+                workerOverviews[profileID] = overview
+                projectLoadingIDs.remove(profileID)
+            }
+        }
+    }
+
+    private static func loadProjectCatalog(
+        profile: WorkerProfile,
+        currentOverview: WorkerOverviewSnapshot?,
+        workerClient: SSHWorkerClient
+    ) async -> WorkerOverviewSnapshot {
+        async let projectsResult = commandResult(
+            WorkerRemoteCommand.listProjects,
+            profile: profile,
+            workerClient: workerClient
+        )
+        async let sessionsResult = commandResult(
+            WorkerRemoteCommand.status,
+            profile: profile,
+            workerClient: workerClient
+        )
+
+        do {
+            let (projectData, sessionData) = try await (
+                projectsResult.get(),
+                sessionsResult.get()
+            )
+            let projectResponse = try WorkerSessionProtocol.parse(projectData)
+            let sessionResponse = try WorkerSessionProtocol.parse(sessionData)
+            let projects = WorkerProjectCatalog.visibleProjectNames(
+                discoveredProjects: projectResponse.projects,
+                sessions: sessionResponse.sessions
+            )
+            let visibleProjects = Set(projects)
+            return WorkerOverviewSnapshot(
+                projects: projects,
+                sessions: sessionResponse.sessions.filter {
+                    visibleProjects.contains($0.repositoryName)
+                },
+                resources: currentOverview?.resources,
+                accounts: currentOverview?.accounts ?? [:],
+                accountErrors: currentOverview?.accountErrors ?? [],
+                connectionError: nil
+            )
+        } catch {
+            return WorkerOverviewSnapshot(
+                projects: currentOverview?.projects ?? [],
+                sessions: currentOverview?.sessions ?? [],
+                resources: currentOverview?.resources,
+                accounts: currentOverview?.accounts ?? [:],
+                accountErrors: currentOverview?.accountErrors ?? [],
+                connectionError: error.localizedDescription
+            )
+        }
+    }
+
+    private static func loadOverview(
+        profile: WorkerProfile,
+        workerClient: SSHWorkerClient
+    ) async -> WorkerOverviewSnapshot {
+        async let projectsResult = commandResult(
+            WorkerRemoteCommand.listProjects,
+            profile: profile,
+            workerClient: workerClient
+        )
+        async let sessionsResult = commandResult(
+            WorkerRemoteCommand.status,
+            profile: profile,
+            workerClient: workerClient
+        )
+        async let resourcesResult = commandResult(
+            WorkerRemoteCommand.resources,
+            profile: profile,
+            workerClient: workerClient
+        )
+        async let codexResult = commandResult(
+            WorkerRemoteCommand.codexAccount,
+            profile: profile,
+            workerClient: workerClient
+        )
+        async let claudeResult = commandResult(
+            WorkerRemoteCommand.claudeAccount,
+            profile: profile,
+            workerClient: workerClient
+        )
+
+        let results = await (
+            projectsResult,
+            sessionsResult,
+            resourcesResult,
+            codexResult,
+            claudeResult
+        )
+
+        let projectResponse: WorkerSessionResponse
+        let sessionResponse: WorkerSessionResponse
+        do {
+            projectResponse = try WorkerSessionProtocol.parse(results.0.get())
+            sessionResponse = try WorkerSessionProtocol.parse(results.1.get())
+        } catch {
+            return WorkerOverviewSnapshot(
+                projects: [],
+                sessions: [],
+                resources: nil,
+                accounts: [:],
+                accountErrors: Set(AgentKind.allCases),
+                connectionError: error.localizedDescription
+            )
+        }
+
+        let projects = WorkerProjectCatalog.visibleProjectNames(
+            discoveredProjects: projectResponse.projects,
+            sessions: sessionResponse.sessions
+        )
+        let visibleProjects = Set(projects)
+        let sessions = sessionResponse.sessions.filter {
+            visibleProjects.contains($0.repositoryName)
+        }
+        let resources = try? WorkerOverviewParser.resources(results.2.get())
+
+        var accounts: [AgentKind: WorkerAccountSnapshot] = [:]
+        var accountErrors: Set<AgentKind> = []
+        do {
+            accounts[.codex] = try WorkerOverviewParser.codexAccount(results.3.get())
+        } catch {
+            accountErrors.insert(.codex)
+        }
+        do {
+            accounts[.claude] = try WorkerOverviewParser.claudeAccount(results.4.get())
+        } catch {
+            accountErrors.insert(.claude)
+        }
+
+        return WorkerOverviewSnapshot(
+            projects: projects,
+            sessions: sessions,
+            resources: resources,
+            accounts: accounts,
+            accountErrors: accountErrors,
+            connectionError: nil
+        )
+    }
+
+    private static func commandResult(
+        _ command: String,
+        profile: WorkerProfile,
+        workerClient: SSHWorkerClient
+    ) async -> Result<Data, Error> {
+        do {
+            return .success(try await workerClient.execute(command, on: profile))
+        } catch {
+            return .failure(error)
+        }
     }
 }

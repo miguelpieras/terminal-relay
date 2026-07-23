@@ -8,21 +8,74 @@ private struct StopRequest: Identifiable {
     var id: String { "\(kind.rawValue):\(repositoryName):\(instanceToken)" }
 }
 
+private struct WorkerProject: Identifiable {
+    let workerID: UUID
+    let workerName: String
+    let repositoryName: String
+    let sessions: [WorkerSessionSnapshot]
+
+    var id: String {
+        "\(workerID.uuidString):\(repositoryName)"
+    }
+}
+
 struct ProjectListView: View {
     @ObservedObject var model: WorkerSessionModel
     let onAddWorker: () -> Void
     @State private var searchText = ""
+    @State private var workerFilterID: UUID?
 
-    private var filteredProjects: [String] {
-        guard !searchText.isEmpty else { return model.projects }
-        return model.projects.filter {
-            $0.localizedCaseInsensitiveContains(searchText)
+    private var projects: [WorkerProject] {
+        model.profiles.flatMap { profile -> [WorkerProject] in
+            guard workerFilterID == nil || workerFilterID == profile.id,
+                  let overview = model.workerOverviews[profile.id] else {
+                return []
+            }
+            return overview.projects.map { repositoryName in
+                WorkerProject(
+                    workerID: profile.id,
+                    workerName: profile.displayName,
+                    repositoryName: repositoryName,
+                    sessions: overview.sessions.filter {
+                        $0.repositoryName == repositoryName
+                    }
+                )
+            }
         }
+        .sorted {
+            let projectOrder = $0.repositoryName.localizedStandardCompare($1.repositoryName)
+            if projectOrder == .orderedSame {
+                return $0.workerName.localizedStandardCompare($1.workerName) == .orderedAscending
+            }
+            return projectOrder == .orderedAscending
+        }
+    }
+
+    private var filteredProjects: [WorkerProject] {
+        guard !searchText.isEmpty else { return projects }
+        return projects.filter {
+            $0.repositoryName.localizedCaseInsensitiveContains(searchText)
+                || $0.workerName.localizedCaseInsensitiveContains(searchText)
+        }
+    }
+
+    private var workerFilterName: String {
+        guard let workerFilterID,
+              let profile = model.profiles.first(where: { $0.id == workerFilterID }) else {
+            return "All Workers"
+        }
+        return profile.displayName
+    }
+
+    private var refreshTaskID: String {
+        model.profiles
+            .map { "\($0.id.uuidString):\($0.host):\($0.port)" }
+            .joined(separator: "|")
     }
 
     var body: some View {
         Group {
-            if model.profile == nil {
+            if model.profiles.isEmpty {
                 ContentUnavailableView {
                     Label("No Projects", systemImage: "folder")
                 } description: {
@@ -36,55 +89,129 @@ struct ProjectListView: View {
             }
         }
         .navigationTitle("Projects")
-        .task(id: model.profile?.id) {
-            await model.refresh()
+        .task(id: refreshTaskID) {
+            if let workerFilterID,
+               !model.profiles.contains(where: { $0.id == workerFilterID }) {
+                self.workerFilterID = nil
+            }
+            await model.refreshProjectCatalogs()
         }
     }
 
     private var projectList: some View {
-        List {
-            if model.projects.isEmpty {
-                if model.isLoading {
-                    HStack {
-                        Spacer()
-                        ProgressView("Loading projects…")
-                        Spacer()
+        VStack(spacing: 0) {
+            workerFilter
+
+            List {
+                if projects.isEmpty {
+                    if !model.projectLoadingIDs.isEmpty {
+                        HStack {
+                            Spacer()
+                            ProgressView("Loading projects…")
+                            Spacer()
+                        }
+                        .listRowBackground(Color.clear)
+                    } else {
+                        ContentUnavailableView(
+                            "No Projects",
+                            systemImage: "folder",
+                            description: Text(emptyProjectsDescription)
+                        )
+                        .listRowBackground(Color.clear)
                     }
-                    .listRowBackground(Color.clear)
+                } else if filteredProjects.isEmpty {
+                    ContentUnavailableView.search(text: searchText)
+                        .listRowBackground(Color.clear)
                 } else {
-                    ContentUnavailableView(
-                        "No Projects",
-                        systemImage: "folder",
-                        description: Text("Add a repository under /workspace on this worker, then pull to refresh.")
-                    )
-                    .listRowBackground(Color.clear)
-                }
-            } else if filteredProjects.isEmpty {
-                ContentUnavailableView.search(text: searchText)
-                    .listRowBackground(Color.clear)
-            } else {
-                ForEach(filteredProjects, id: \.self) { repositoryName in
-                    NavigationLink {
-                        ProjectDetailView(
-                            repositoryName: repositoryName,
-                            model: model
-                        )
-                    } label: {
-                        ProjectListRow(
-                            repositoryName: repositoryName,
-                            sessions: model.sessions
-                        )
+                    ForEach(filteredProjects) { project in
+                        NavigationLink {
+                            ProjectDetailView(
+                                workerID: project.workerID,
+                                repositoryName: project.repositoryName,
+                                model: model
+                            )
+                        } label: {
+                            ProjectListRow(
+                                repositoryName: project.repositoryName,
+                                workerName: project.workerName,
+                                sessions: project.sessions
+                            )
+                        }
                     }
                 }
             }
+            .refreshable { await model.refreshProjectCatalogs() }
         }
-        .refreshable { await model.refresh() }
         .searchable(text: $searchText, prompt: "Search Projects")
+    }
+
+    private var workerFilter: some View {
+        Menu {
+            Button {
+                workerFilterID = nil
+            } label: {
+                if workerFilterID == nil {
+                    Label("All Workers", systemImage: "checkmark")
+                } else {
+                    Text("All Workers")
+                }
+            }
+
+            Divider()
+
+            ForEach(model.profiles) { profile in
+                Button {
+                    workerFilterID = profile.id
+                } label: {
+                    if workerFilterID == profile.id {
+                        Label(profile.displayName, systemImage: "checkmark")
+                    } else {
+                        Text(profile.displayName)
+                    }
+                }
+            }
+
+            Divider()
+
+            Button(action: onAddWorker) {
+                Label("Add Worker", systemImage: "plus")
+            }
+        } label: {
+            HStack(spacing: 7) {
+                Image(systemName: "line.3.horizontal.decrease")
+                Text(workerFilterName)
+                    .lineLimit(1)
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.caption.weight(.semibold))
+            }
+            .font(.subheadline.weight(.semibold))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 9)
+            .background(.thinMaterial, in: Capsule())
+            .contentShape(Rectangle())
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(uiColor: .systemBackground))
+        .overlay(alignment: .bottom) {
+            Divider()
+        }
+        .accessibilityLabel("Filter projects by worker")
+        .accessibilityValue(workerFilterName)
+    }
+
+    private var emptyProjectsDescription: String {
+        if workerFilterID == nil {
+            return "Add a repository under /workspace on a worker, then pull to refresh."
+        }
+        return "No repositories were found on \(workerFilterName)."
     }
 }
 
 private struct ProjectListRow: View {
     let repositoryName: String
+    let workerName: String
     let sessions: [WorkerSessionSnapshot]
 
     private var activeTerminalCount: Int {
@@ -101,15 +228,18 @@ private struct ProjectListRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(repositoryName)
                     .font(.body.weight(.medium))
-                if activeTerminalCount == 0 {
-                    Text("No active terminals")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("\(activeTerminalCount) active \(activeTerminalCount == 1 ? "terminal" : "terminals")")
-                        .font(.caption)
-                        .foregroundStyle(.green)
+                HStack(spacing: 5) {
+                    Text(workerName)
+                    Text("·")
+                    if activeTerminalCount == 0 {
+                        Text("No active terminals")
+                    } else {
+                        Text("\(activeTerminalCount) active \(activeTerminalCount == 1 ? "terminal" : "terminals")")
+                            .foregroundStyle(.green)
+                    }
                 }
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
         }
         .padding(.vertical, 4)
@@ -117,13 +247,15 @@ private struct ProjectListRow: View {
 }
 
 private struct ProjectDetailView: View {
+    let workerID: UUID
     let repositoryName: String
     @ObservedObject var model: WorkerSessionModel
     @State private var stopRequest: StopRequest?
     @State private var showsNewTerminalOptions = false
 
     private var sessions: [WorkerSessionSnapshot] {
-        model.sessions
+        guard model.profile?.id == workerID else { return [] }
+        return model.sessions
             .filter { $0.repositoryName == repositoryName }
             .sorted { $0.kind.rawValue < $1.kind.rawValue }
     }
@@ -148,6 +280,12 @@ private struct ProjectDetailView: View {
             }
         }
         .navigationTitle(repositoryName)
+        .task {
+            if model.profile?.id != workerID {
+                model.selectProfile(id: workerID)
+            }
+            await model.refresh()
+        }
         .refreshable { await model.refresh() }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {

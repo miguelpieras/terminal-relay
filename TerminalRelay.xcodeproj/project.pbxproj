@@ -61,6 +61,7 @@
 		BBA0E3AFE6FC24D98449C066 /* ProjectListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1BE14175A44909F00948D51 /* ProjectListView.swift */; };
 		C0E60721BA9E8000D59BE1F0 /* WorkerSessionState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 798FCEE76EAC4A8B1B69AC6A /* WorkerSessionState.swift */; };
 		C311EC4FEDD437AEBA03C467 /* AgentKindStyle.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2459D0DFD20B6A437841971 /* AgentKindStyle.swift */; };
+		CC23D02CEAA3A3EF87935FE0 /* WorkerOverviewTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABB05FB3387FD2E18DF120E9 /* WorkerOverviewTests.swift */; };
 		CC8BDB4D65D80A701E9EB31A /* ServerStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1107CD200FBE55F0833D63D /* ServerStoreTests.swift */; };
 		CF183FC8DC3976616792941B /* WorkerRegistrationURL.swift in Sources */ = {isa = PBXBuildFile; fileRef = 987772567FFFDD8F9CAD8EA8 /* WorkerRegistrationURL.swift */; };
 		D1B54B829875C80E2FD689A8 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF68598718838E8064DF0C45 /* RootView.swift */; };
@@ -74,6 +75,7 @@
 		E3E4645D18A532417C160831 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 86CC14D081ABBDBDC564291F /* Assets.xcassets */; };
 		EA0CEC01562388C25B86A9B1 /* WorkerSessionStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C681D55FCC5367DD2051E01 /* WorkerSessionStateTests.swift */; };
 		F4A28A72A125021D2239CBA1 /* ProjectGitService.swift in Sources */ = {isa = PBXBuildFile; fileRef = E162AC5ABBC627C51BD1D70A /* ProjectGitService.swift */; };
+		F54E906C1BD44DCB15A4F89E /* WorkerOverview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9B82967FBC08D0A3EDD8DB9C /* WorkerOverview.swift */; };
 		F6693B26956A1182277D3400 /* WorkerSessionServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7BA492BA581F2C2B0C2AF051 /* WorkerSessionServiceTests.swift */; };
 		FB4A6F2362CE2E84DD4A957D /* ServerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 93E0F148244B4D209F63EB35 /* ServerStore.swift */; };
 /* End PBXBuildFile section */
@@ -133,12 +135,14 @@
 		97DEABBF57F733EA24665AE8 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		987772567FFFDD8F9CAD8EA8 /* WorkerRegistrationURL.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerRegistrationURL.swift; sourceTree = "<group>"; };
 		9A9FBF0D79F64B491FF61EA8 /* ProjectStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectStore.swift; sourceTree = "<group>"; };
+		9B82967FBC08D0A3EDD8DB9C /* WorkerOverview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerOverview.swift; sourceTree = "<group>"; };
 		9CD64E85F20330019303C926 /* SessionSlot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionSlot.swift; sourceTree = "<group>"; };
 		A102C8E7164EE18CC3FDF9AD /* AccountUsageService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountUsageService.swift; sourceTree = "<group>"; };
 		A3294B74FA0B27E0781E76BA /* SSHCommandBuilderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SSHCommandBuilderTests.swift; sourceTree = "<group>"; };
 		A3B1A41DF226105884B36B97 /* WorkerManagementView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerManagementView.swift; sourceTree = "<group>"; };
 		A69DA6CF7B2592BF444DB18E /* TerminalRelayIOSApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalRelayIOSApp.swift; sourceTree = "<group>"; };
 		AB03758D1CB3A90E9F6492F2 /* ServerProfileTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerProfileTests.swift; sourceTree = "<group>"; };
+		ABB05FB3387FD2E18DF120E9 /* WorkerOverviewTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerOverviewTests.swift; sourceTree = "<group>"; };
 		B1A2A3C58843B9F9BBDF0B62 /* ServerProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerProfile.swift; sourceTree = "<group>"; };
 		BA47F1A31FE07CB12C137C7D /* ServerEditorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerEditorView.swift; sourceTree = "<group>"; };
 		BBB07D879D1A8101A648ACE6 /* WorkerProfileStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerProfileStoreTests.swift; sourceTree = "<group>"; };
@@ -309,6 +313,7 @@
 		ACA96F67DC5FB8F90277471D /* TerminalRelayIOSTests */ = {
 			isa = PBXGroup;
 			children = (
+				ABB05FB3387FD2E18DF120E9 /* WorkerOverviewTests.swift */,
 				BBB07D879D1A8101A648ACE6 /* WorkerProfileStoreTests.swift */,
 				35F10890C7A7B20CEA93E345 /* WorkerProfileTests.swift */,
 				C960F483C9C9B2DA0E97774D /* WorkerRemoteCommandTests.swift */,
@@ -368,6 +373,7 @@
 		FBDE745F9CA1FC7C92990705 /* Models */ = {
 			isa = PBXGroup;
 			children = (
+				9B82967FBC08D0A3EDD8DB9C /* WorkerOverview.swift */,
 				564D16B412E4E650C5D4DB1C /* WorkerProfile.swift */,
 			);
 			path = Models;
@@ -570,6 +576,7 @@
 				9C9080C99E862B01B2501009 /* TerminalScreen.swift in Sources */,
 				07CE458918D5CC0869DB4BF4 /* TerminalSessionController.swift in Sources */,
 				E0351DAD70326C8BCC2E65BB /* WorkerOnboardingView.swift in Sources */,
+				F54E906C1BD44DCB15A4F89E /* WorkerOverview.swift in Sources */,
 				74E7BBE2E5DE43DB6016A4AB /* WorkerProfile.swift in Sources */,
 				57DFC1FA07366333D4D4CE46 /* WorkerProfileStore.swift in Sources */,
 				4E043EF2DA8AC4358489FE32 /* WorkerRemoteCommand.swift in Sources */,
@@ -603,6 +610,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				CC23D02CEAA3A3EF87935FE0 /* WorkerOverviewTests.swift in Sources */,
 				149A0AA1438A64937313424E /* WorkerProfileStoreTests.swift in Sources */,
 				11CC230FC23C4396DE674214 /* WorkerProfileTests.swift in Sources */,
 				4F01464136D32A3DD20E7ED5 /* WorkerRemoteCommandTests.swift in Sources */,

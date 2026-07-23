@@ -38,6 +38,9 @@ final class WorkerRemoteCommandTests: XCTestCase {
             WorkerRemoteCommand.status,
             "/usr/local/bin/terminal-relay-session status"
         )
+        XCTAssertTrue(WorkerRemoteCommand.resources.contains("__TERMINAL_RELAY_METRICS_V1__"))
+        XCTAssertTrue(WorkerRemoteCommand.codexAccount.contains("account/rateLimits/read"))
+        XCTAssertTrue(WorkerRemoteCommand.claudeAccount.contains("__TERMINAL_RELAY_CLAUDE_USAGE__"))
     }
 
     func testStopIsRepositoryAndInstanceScoped() throws {

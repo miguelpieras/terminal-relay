@@ -17,6 +17,23 @@ struct RootView: View {
     @State private var selectedTab = RootTab.projects
     @State private var editorRoute: WorkerEditorRoute?
     @State private var workerPendingDeletion: WorkerProfile?
+    @State private var workerSearchText = ""
+
+    private var filteredWorkerProfiles: [WorkerProfile] {
+        model.profiles.filter {
+            WorkerOverviewFilter.matches(
+                profile: $0,
+                snapshot: model.workerOverviews[$0.id],
+                query: workerSearchText
+            )
+        }
+    }
+
+    private var workerRefreshTaskID: String {
+        model.profiles
+            .map { "\($0.id.uuidString):\($0.host):\($0.port)" }
+            .joined(separator: "|")
+    }
 
     var body: some View {
         TabView(selection: $selectedTab) {
@@ -71,6 +88,11 @@ struct RootView: View {
                 Task { await model.refresh() }
             }
         }
+        .onChange(of: selectedTab) { _, tab in
+            if tab == .workers {
+                Task { await model.refreshWorkerOverviews() }
+            }
+        }
         .alert("Remove worker?", isPresented: Binding(
             get: { workerPendingDeletion != nil },
             set: { if !$0 { workerPendingDeletion = nil } }
@@ -119,33 +141,16 @@ struct RootView: View {
                 }
             } else {
                 List {
-                    Section {
-                        ForEach(model.profiles) { profile in
-                            Button {
-                                model.selectProfile(id: profile.id)
-                                selectedTab = .projects
-                            } label: {
-                                HStack(spacing: 12) {
-                                    Image(systemName: "server.rack")
-                                        .foregroundStyle(.secondary)
-                                        .frame(width: 24)
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        Text(profile.displayName)
-                                            .foregroundStyle(.primary)
-                                        Text("\(profile.username)@\(profile.host):\(profile.port)")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                            .lineLimit(1)
-                                    }
-                                    Spacer()
-                                    if model.profile?.id == profile.id {
-                                        Image(systemName: "checkmark")
-                                            .fontWeight(.semibold)
-                                            .foregroundStyle(.tint)
-                                    }
-                                }
-                            }
-                            .buttonStyle(.plain)
+                    if filteredWorkerProfiles.isEmpty {
+                        ContentUnavailableView.search(text: workerSearchText)
+                            .listRowBackground(Color.clear)
+                    } else {
+                        ForEach(filteredWorkerProfiles) { profile in
+                            WorkerOverviewRow(
+                                profile: profile,
+                                snapshot: model.workerOverviews[profile.id],
+                                isLoading: model.workerLoadingIDs.contains(profile.id)
+                            )
                             .swipeActions(edge: .trailing) {
                                 Button("Remove", role: .destructive) {
                                     workerPendingDeletion = profile
@@ -158,14 +163,37 @@ struct RootView: View {
                                 }
                                 .tint(.blue)
                             }
+                            .contextMenu {
+                                Button {
+                                    editorRoute = WorkerEditorRoute(
+                                        profile: profile,
+                                        showsProjectsAfterSave: false
+                                    )
+                                } label: {
+                                    Label("Edit Worker", systemImage: "pencil")
+                                }
+
+                                Button(role: .destructive) {
+                                    workerPendingDeletion = profile
+                                } label: {
+                                    Label("Remove Worker", systemImage: "trash")
+                                }
+                            }
                         }
-                    } footer: {
-                        Text("The selected worker supplies the Projects tab. Tap another worker to switch.")
                     }
+                }
+                .searchable(text: $workerSearchText, prompt: "Filter workers or projects")
+                .refreshable {
+                    await model.refreshWorkerOverviews()
                 }
             }
         }
         .navigationTitle("Workers")
+        .task(id: workerRefreshTaskID) {
+            if selectedTab == .workers {
+                await model.refreshWorkerOverviews()
+            }
+        }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
@@ -178,5 +206,189 @@ struct RootView: View {
                 }
             }
         }
+    }
+}
+
+private struct WorkerOverviewRow: View {
+    let profile: WorkerProfile
+    let snapshot: WorkerOverviewSnapshot?
+    let isLoading: Bool
+
+    private var status: (label: String, color: Color) {
+        if let snapshot {
+            return snapshot.isOnline ? ("Online", .green) : ("Unavailable", .red)
+        }
+        return isLoading ? ("Checking", .orange) : ("Not checked", .secondary)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 11) {
+                Image(systemName: "server.rack")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(.tint)
+                    .frame(width: 32, height: 32)
+                    .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Text(profile.displayName)
+                            .font(.body.weight(.semibold))
+                        Circle()
+                            .fill(status.color)
+                            .frame(width: 7, height: 7)
+                            .accessibilityLabel(status.label)
+                    }
+                    Text("\(profile.username)@\(profile.host)\(profile.port == 22 ? "" : ":\(profile.port)")")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer()
+
+                if isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+
+            if let snapshot, snapshot.isOnline {
+                HStack(spacing: 16) {
+                    Label(
+                        "\(snapshot.projects.count) \(snapshot.projects.count == 1 ? "project" : "projects")",
+                        systemImage: "folder"
+                    )
+                    Label(
+                        "\(snapshot.sessions.count) active \(snapshot.sessions.count == 1 ? "task" : "tasks")",
+                        systemImage: "terminal"
+                    )
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                if !snapshot.projects.isEmpty {
+                    Text(snapshot.projects.joined(separator: " · "))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+
+                if let resources = snapshot.resources {
+                    HStack(spacing: 8) {
+                        WorkerMetricPill(title: "CPU", value: resources.cpuUsedPercent)
+                        WorkerMetricPill(title: "Memory", value: resources.memoryUsedPercent)
+                        WorkerMetricPill(title: "Disk", value: resources.diskUsedPercent)
+                    }
+                } else {
+                    Label("System usage unavailable", systemImage: "gauge.with.dots.needle.0percent")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                VStack(spacing: 9) {
+                    ForEach(AgentKind.allCases) { kind in
+                        WorkerAccountOverviewRow(
+                            kind: kind,
+                            snapshot: snapshot.accounts[kind],
+                            hasError: snapshot.accountErrors.contains(kind)
+                        )
+                    }
+                }
+            } else if let message = snapshot?.connectionError {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .lineLimit(2)
+            } else {
+                Text(isLoading ? "Loading worker status and account usage…" : "Pull to refresh worker status.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 8)
+    }
+}
+
+private struct WorkerMetricPill: View {
+    let title: String
+    let value: Double
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(title)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 4)
+                Text("\(Int(value.rounded()))%")
+                    .monospacedDigit()
+                    .foregroundStyle(metricColor)
+            }
+            .font(.caption2.weight(.medium))
+
+            ProgressView(value: min(max(value, 0), 100), total: 100)
+                .tint(metricColor)
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity)
+        .background(Color.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var metricColor: Color {
+        if value >= 90 { return .red }
+        if value >= 75 { return .orange }
+        return .accentColor
+    }
+}
+
+private struct WorkerAccountOverviewRow: View {
+    let kind: AgentKind
+    let snapshot: WorkerAccountSnapshot?
+    let hasError: Bool
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: kind.systemImage)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(kind == .codex ? Color.blue : Color.orange)
+                .frame(width: 28, height: 28)
+                .background(
+                    (kind == .codex ? Color.blue : Color.orange).opacity(0.12),
+                    in: RoundedRectangle(cornerRadius: 7)
+                )
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(kind.displayName)
+                    .font(.caption.weight(.semibold))
+                Text(accountLabel)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            Spacer(minLength: 8)
+
+            Text(usageLabel)
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(hasError ? Color.red : Color.secondary)
+                .multilineTextAlignment(.trailing)
+                .lineLimit(2)
+        }
+    }
+
+    private var accountLabel: String {
+        guard let snapshot else { return hasError ? "Usage unavailable" : "Not checked" }
+        let account = snapshot.account ?? "Signed in"
+        guard let plan = snapshot.plan, !plan.isEmpty else { return account }
+        return "\(account) · \(plan.capitalized)"
+    }
+
+    private var usageLabel: String {
+        guard let snapshot else { return hasError ? "Unavailable" : "—" }
+        let labels = snapshot.limits.prefix(2).map {
+            "\($0.name) \(Int($0.remainingPercent.rounded()))% left"
+        }
+        return labels.isEmpty ? "Connected" : labels.joined(separator: "\n")
     }
 }
