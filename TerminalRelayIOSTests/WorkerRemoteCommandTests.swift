@@ -4,6 +4,31 @@ import XCTest
 final class WorkerRemoteCommandTests: XCTestCase {
     private let instanceToken = "88b888aa-4d15-" + "4e2b-aacc-4932f440b9ee"
 
+    func testProjectCatalogExcludesRelayCheckoutFromDiscoveryAndSessions() {
+        let sessions = [
+            WorkerSessionSnapshot(
+                kind: .codex,
+                repositoryName: "terminal-relay",
+                attachedClientCount: 0,
+                instanceToken: instanceToken
+            ),
+            WorkerSessionSnapshot(
+                kind: .claude,
+                repositoryName: "zeta",
+                attachedClientCount: 0,
+                instanceToken: instanceToken
+            ),
+        ]
+
+        XCTAssertEqual(
+            WorkerProjectCatalog.visibleProjectNames(
+                discoveredProjects: ["Terminal-Relay", "alpha", "zeta"],
+                sessions: sessions
+            ),
+            ["alpha", "zeta"]
+        )
+    }
+
     func testFixedCommandsUsePinnedHelperPath() {
         XCTAssertEqual(
             WorkerRemoteCommand.listProjects,

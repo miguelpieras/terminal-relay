@@ -23,6 +23,19 @@ enum WorkerSessionModelError: LocalizedError, Equatable {
     }
 }
 
+enum WorkerProjectCatalog {
+    private static let excludedProjectNames = Set(["terminal-relay"])
+
+    static func visibleProjectNames(
+        discoveredProjects: [String],
+        sessions: [WorkerSessionSnapshot]
+    ) -> [String] {
+        Set(discoveredProjects + sessions.map(\.repositoryName))
+            .filter { !excludedProjectNames.contains($0.lowercased()) }
+            .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
+}
+
 @MainActor
 final class WorkerSessionModel: ObservableObject {
     @Published private(set) var profiles: [WorkerProfile]
@@ -130,8 +143,10 @@ final class WorkerSessionModel: ObservableObject {
 
             guard refreshToken == token else { return }
             sessions = statusResponse.sessions
-            let names = Set(projectResponse.projects + statusResponse.sessions.map(\.repositoryName))
-            projects = names.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+            projects = WorkerProjectCatalog.visibleProjectNames(
+                discoveredProjects: projectResponse.projects,
+                sessions: statusResponse.sessions
+            )
             errorMessage = nil
         } catch {
             guard refreshToken == token else { return }

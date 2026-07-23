@@ -87,10 +87,8 @@ private struct ProjectListRow: View {
     let repositoryName: String
     let sessions: [WorkerSessionSnapshot]
 
-    private var activeKinds: [AgentKind] {
-        sessions
-            .filter { $0.repositoryName == repositoryName }
-            .map(\.kind)
+    private var activeTerminalCount: Int {
+        sessions.filter { $0.repositoryName == repositoryName }.count
     }
 
     var body: some View {
@@ -103,12 +101,12 @@ private struct ProjectListRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(repositoryName)
                     .font(.body.weight(.medium))
-                if activeKinds.isEmpty {
-                    Text("No active sessions")
+                if activeTerminalCount == 0 {
+                    Text("No active terminals")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
-                    Text(activeKinds.map(\.displayName).joined(separator: " · "))
+                    Text("\(activeTerminalCount) active \(activeTerminalCount == 1 ? "terminal" : "terminals")")
                         .font(.caption)
                         .foregroundStyle(.green)
                 }
@@ -123,19 +121,46 @@ private struct ProjectDetailView: View {
     @ObservedObject var model: WorkerSessionModel
     @State private var stopRequest: StopRequest?
 
+    private var sessions: [WorkerSessionSnapshot] {
+        model.sessions
+            .filter { $0.repositoryName == repositoryName }
+            .sorted { $0.kind.rawValue < $1.kind.rawValue }
+    }
+
+    private var canStartTerminal: Bool {
+        AgentKind.allCases.contains { model.session(for: $0) == nil }
+    }
+
     var body: some View {
         List {
-            ForEach(AgentKind.allCases) { kind in
-                agentSection(kind)
+            if sessions.isEmpty {
+                ContentUnavailableView {
+                    Label("No Active Terminals", systemImage: "terminal")
+                } description: {
+                    Text("Start a terminal for this project to work from your iPhone.")
+                } actions: {
+                    newTerminalMenu
+                        .buttonStyle(.borderedProminent)
+                }
+                .listRowBackground(Color.clear)
+            } else {
+                ForEach(sessions) { session in
+                    terminalRow(session)
+                }
             }
         }
         .navigationTitle(repositoryName)
         .refreshable { await model.refresh() }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                newTerminalMenu
+            }
+        }
         .alert(item: $stopRequest) { request in
             Alert(
-                title: Text("Stop \(request.kind.displayName)?"),
+                title: Text("Stop Terminal?"),
                 message: Text("This ends the agent running in \(request.repositoryName) for every attached client. Disconnect if you only want to leave this device."),
-                primaryButton: .destructive(Text("Stop Agent")) {
+                primaryButton: .destructive(Text("Stop Terminal")) {
                     Task {
                         await model.stop(
                             kind: request.kind,
@@ -150,60 +175,103 @@ private struct ProjectDetailView: View {
     }
 
     @ViewBuilder
-    private func agentSection(_ kind: AgentKind) -> some View {
-        let session = model.session(for: kind)
-        let isHere = session?.repositoryName == repositoryName
-        let isOccupiedElsewhere = session != nil && !isHere
+    private func terminalRow(_ session: WorkerSessionSnapshot) -> some View {
+        Button {
+            model.openTerminal(kind: session.kind, repositoryName: repositoryName)
+        } label: {
+            HStack(spacing: 12) {
+                AgentTaskIcon(kind: session.kind)
 
-        Section {
-            LabeledContent {
-                if isHere, let session {
-                    Text("\(session.attachedClientCount) attached")
-                        .foregroundStyle(.green)
-                } else if let session {
-                    Text(session.repositoryName)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("Not running")
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(session.kind.displayName)
+                        .font(.body.weight(.medium))
+                        .foregroundStyle(.primary)
+
+                    Text(attachedClientLabel(session.attachedClientCount))
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-            } label: {
-                Label("Status", systemImage: kind.systemImage)
-            }
 
-            Button {
-                model.openTerminal(kind: kind, repositoryName: repositoryName)
-            } label: {
-                Label(
-                    isHere ? "Attach to \(kind.displayName)" : "Start \(kind.displayName)",
-                    systemImage: isHere ? "rectangle.connected.to.line.below" : "play.fill"
+                Spacer()
+
+                Circle()
+                    .fill(Color.green)
+                    .frame(width: 8, height: 8)
+                    .accessibilityLabel("Active")
+
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .swipeActions {
+            Button(role: .destructive) {
+                stopRequest = StopRequest(
+                    kind: session.kind,
+                    repositoryName: repositoryName,
+                    instanceToken: session.instanceToken
                 )
-            }
-            .disabled(isOccupiedElsewhere)
-
-            if isHere, let session {
-                Button(role: .destructive) {
-                    stopRequest = StopRequest(
-                        kind: session.kind,
-                        repositoryName: repositoryName,
-                        instanceToken: session.instanceToken
-                    )
-                } label: {
-                    Label("Stop \(kind.displayName)", systemImage: "stop.fill")
-                }
-            }
-        } header: {
-            Text(kind.displayName)
-        } footer: {
-            if isHere, let session {
-                if session.attachedClientCount == 1 {
-                    Text("This session has one attached client.")
-                } else {
-                    Text("This session has \(session.attachedClientCount) attached clients.")
-                }
-            } else if let session {
-                Text("\(kind.displayName) is already running in \(session.repositoryName).")
+            } label: {
+                Label("Stop", systemImage: "stop.fill")
             }
         }
+        .contextMenu {
+            Button(role: .destructive) {
+                stopRequest = StopRequest(
+                    kind: session.kind,
+                    repositoryName: repositoryName,
+                    instanceToken: session.instanceToken
+                )
+            } label: {
+                Label("Stop Terminal", systemImage: "stop.fill")
+            }
+        }
+    }
+
+    private var newTerminalMenu: some View {
+        Menu {
+            ForEach(AgentKind.allCases) { kind in
+                Button {
+                    model.openTerminal(kind: kind, repositoryName: repositoryName)
+                } label: {
+                    Label(kind.displayName, systemImage: kind.systemImage)
+                }
+                .disabled(model.session(for: kind) != nil)
+            }
+        } label: {
+            Label("New Terminal", systemImage: "plus")
+        }
+        .disabled(!canStartTerminal)
+    }
+
+    private func attachedClientLabel(_ count: Int) -> String {
+        switch count {
+        case 0: "Ready"
+        case 1: "1 client attached"
+        default: "\(count) clients attached"
+        }
+    }
+}
+
+private struct AgentTaskIcon: View {
+    let kind: AgentKind
+
+    private var tint: Color {
+        switch kind {
+        case .codex: .blue
+        case .claude: .orange
+        }
+    }
+
+    var body: some View {
+        Image(systemName: kind.systemImage)
+            .font(.system(size: 16, weight: .semibold))
+            .foregroundStyle(tint)
+            .frame(width: 32, height: 32)
+            .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 8))
+            .accessibilityHidden(true)
     }
 }
