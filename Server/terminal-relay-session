@@ -873,6 +873,8 @@ if tool == "codex":
         except (OSError, sqlite3.Error):
             pass
 elif tool == "claude":
+    custom_title = ""
+    ai_title = ""
     candidates = glob.glob(
         os.path.join(home, ".claude", "projects", "**", f"{instance}.jsonl"),
         recursive=True,
@@ -885,25 +887,18 @@ elif tool == "claude":
                         record = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    custom = record.get("customTitle")
-                    if isinstance(custom, str) and custom.strip():
-                        title = custom
-                    message = record.get("message")
-                    if not title and record.get("type") == "user" and isinstance(message, dict):
-                        content = message.get("content")
-                        if isinstance(content, str):
-                            title = content
-                        elif isinstance(content, list):
-                            title = " ".join(
-                                item.get("text", "")
-                                for item in content
-                                if isinstance(item, dict) and item.get("type") == "text"
-                            )
+                    if record.get("type") == "custom-title":
+                        custom = record.get("customTitle")
+                        if isinstance(custom, str) and custom.strip():
+                            custom_title = custom
+                    elif record.get("type") == "ai-title":
+                        generated = record.get("aiTitle")
+                        if isinstance(generated, str) and generated.strip():
+                            ai_title = generated
+                title = custom_title or ai_title
         except OSError:
             pass
 
-if not title:
-    title = re.sub(r"\s*\|\s*(Ready|Working|Thinking).*$", "", pane_title, flags=re.I)
 title = "".join(character if character.isprintable() else " " for character in title)
 title = re.sub(r"\s+", " ", title).strip()
 print(title[:200])

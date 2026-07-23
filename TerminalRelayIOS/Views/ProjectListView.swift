@@ -90,6 +90,7 @@ struct ProjectListView: View {
             }
         }
         .navigationTitle("Projects")
+        .navigationBarTitleDisplayMode(.inline)
         .task(id: refreshTaskID) {
             if let workerFilterID,
                !model.profiles.contains(where: { $0.id == workerFilterID }) {

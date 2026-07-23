@@ -92,6 +92,14 @@ instance_from_line() {
     printf '%s\n' "$1" | /usr/bin/awk -F'|' '$1 == "session" { print $5; exit }'
 }
 
+title_hex_from_line() {
+    printf '%s\n' "$1" | /usr/bin/awk -F'|' '$1 == "session" { print $7; exit }'
+}
+
+encode_title() {
+    "$python_path" -c 'import sys; print(sys.argv[1].encode("utf-8").hex())' "$1"
+}
+
 wait_for_session() {
     local tool="$1"
     local repository="$2"
@@ -403,6 +411,31 @@ sleep 0.2
 assert_equal "2" "$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")" "concurrent launch count"
 /bin/bash "$helper" stop codex alpha "$parallel_instance"
 
+codex_thread_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+mkdir -p "$test_home/.codex"
+"$python_path" - "$test_home/.codex/state_5.sqlite" "$codex_thread_id" <<'PYTHON_CODEX_TITLE'
+import sqlite3
+import sys
+
+database, thread_id = sys.argv[1:]
+connection = sqlite3.connect(database)
+connection.execute("create table threads (id text primary key, title text not null)")
+connection.execute(
+    "insert into threads (id, title) values (?, ?)",
+    (thread_id, "Generated Codex title"),
+)
+connection.commit()
+connection.close()
+PYTHON_CODEX_TITLE
+"$tmux_path" -f /dev/null -L "$tmux_socket" \
+    select-pane -t "terminal-relay-codex-$first_instance" \
+    -T "$codex_thread_id | Ready"
+codex_title_status="$(wait_for_session codex alpha 0)"
+assert_equal \
+    "$(encode_title "Generated Codex title")" \
+    "$(title_hex_from_line "$codex_title_status")" \
+    "Codex database title"
+
 start_client client-one "$workspace_root/alpha" reattach codex alpha "$first_instance"
 start_client client-two "$workspace_root/alpha" reattach codex alpha "$first_instance"
 wait_for_session codex alpha 2 >/dev/null
@@ -571,6 +604,26 @@ wait_for_log_lines 9
 claude_initial_log="$(/usr/bin/sed -n '9p' "$agent_log")"
 assert_contains "$claude_initial_log" \
     "|--session-id|$claude_reboot_instance|--reboot-claude" "Claude initial session id"
+claude_history_directory="$test_home/.claude/projects/test-project"
+claude_history_file="$claude_history_directory/$claude_reboot_instance.jsonl"
+mkdir -p "$claude_history_directory"
+printf '%s\n' \
+    '{"type":"user","message":{"content":"This is the raw user message"}}' \
+    '{"type":"ai-title","aiTitle":"Generated Claude title"}' \
+    > "$claude_history_file"
+claude_generated_title_status="$(wait_for_session claude beta 0)"
+assert_equal \
+    "$(encode_title "Generated Claude title")" \
+    "$(title_hex_from_line "$claude_generated_title_status")" \
+    "Claude generated title"
+printf '%s\n' \
+    '{"type":"custom-title","customTitle":"Renamed Claude title"}' \
+    >> "$claude_history_file"
+claude_custom_title_status="$(wait_for_session claude beta 0)"
+assert_equal \
+    "$(encode_title "Renamed Claude title")" \
+    "$(title_hex_from_line "$claude_custom_title_status")" \
+    "Claude custom title"
 "$tmux_path" -f /dev/null -L "$tmux_socket" kill-server
 wait_for_agent_lock_free "$claude_reboot_instance"
 printf '%s\n' '44444444-4444-4444-8444-444444444444' > "$boot_id_file"
