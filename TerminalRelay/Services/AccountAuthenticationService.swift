@@ -131,7 +131,7 @@ enum AccountAuthenticationCommand {
 
         let loginCommand = switch kind {
         case .codex:
-            "codex login --device-auth"
+            "\(WorkerSessionProtocol.helperPath) codex-login"
         case .claude:
             "claude auth login --claudeai"
         }

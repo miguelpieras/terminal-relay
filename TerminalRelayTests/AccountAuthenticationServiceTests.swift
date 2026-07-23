@@ -75,7 +75,11 @@ final class AccountAuthenticationServiceTests: XCTestCase {
         XCTAssertEqual(codex.arguments.suffix(2).first, worker.destination)
 
         let codexRemoteCommand = try XCTUnwrap(codex.arguments.last)
-        XCTAssertTrue(codexRemoteCommand.contains("codex login --device-auth"))
+        XCTAssertTrue(
+            codexRemoteCommand.contains(
+                "\(WorkerSessionProtocol.helperPath) codex-login"
+            )
+        )
         XCTAssertTrue(codexRemoteCommand.contains("stty -echo"))
         XCTAssertFalse(codexRemoteCommand.contains("printf should-not-run"))
 

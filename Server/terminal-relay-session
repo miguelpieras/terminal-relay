@@ -70,6 +70,8 @@ if [[ $test_mode -eq 1 ]]; then
     flock_path="${TERMINAL_RELAY_TEST_FLOCK_PATH:-$default_flock_path}"
     signal_path="${TERMINAL_RELAY_TEST_SIGNAL_PATH:-}"
     boot_id_path="${TERMINAL_RELAY_TEST_BOOT_ID_PATH:-$default_boot_id_path}"
+    codex_shared_account_enabled="${TERMINAL_RELAY_TEST_CODEX_SHARED_ACCOUNT:-0}"
+    codex_app_server_socket="${TERMINAL_RELAY_TEST_CODEX_APP_SERVER_SOCKET:-$runtime_directory/codex.sock}"
 else
     if [[ ! -x "$default_getent_path" ]]; then
         echo "Required account database command is unavailable: $default_getent_path" >&2
@@ -93,7 +95,10 @@ else
     flock_path="$default_flock_path"
     signal_path=""
     boot_id_path="$default_boot_id_path"
+    codex_shared_account_enabled=1
+    codex_app_server_socket="$runtime_directory/codex.sock"
 fi
+readonly codex_app_server_session="terminal-relay-account-server"
 
 usage() {
     cat >&2 <<'EOF'
@@ -105,6 +110,9 @@ usage:
   terminal-relay-session attach <codex|claude> <repository> [agent arguments...]
   terminal-relay-session reattach <codex|claude> <repository> <instance>
   terminal-relay-session stop <codex|claude> <repository> <instance>
+  terminal-relay-session codex-account
+  terminal-relay-session codex-login
+  terminal-relay-session codex-reset <idempotency-key> [credit-id]
   terminal-relay-session <codex|claude> [agent arguments...]
 EOF
 }
@@ -132,6 +140,15 @@ validate_absolute_path "Codex executable" "$codex_path"
 validate_absolute_path "Claude executable" "$claude_path"
 validate_absolute_path "flock executable" "$flock_path"
 validate_absolute_path "boot id" "$boot_id_path"
+validate_absolute_path "Codex app-server socket" "$codex_app_server_socket"
+
+if [[ "$codex_shared_account_enabled" == "1" ]]; then
+    codex_socket_bytes="$(printf '%s' "$codex_app_server_socket" | /usr/bin/wc -c | /usr/bin/tr -d '[:space:]')"
+    if [[ ! "$codex_socket_bytes" =~ ^[0-9]+$ || $codex_socket_bytes -gt 100 ]]; then
+        echo "Codex app-server socket path is too long: $codex_app_server_socket" >&2
+        exit 78
+    fi
+fi
 
 if [[ ! "$tmux_socket" =~ ^[A-Za-z0-9._-]+$ || ${#tmux_socket} -gt 64 ]]; then
     echo "Invalid tmux socket label: $tmux_socket" >&2
@@ -155,7 +172,416 @@ fi
 /bin/chmod 700 "$runtime_directory"
 
 tmux_command() {
-    "$tmux_path" -f /dev/null -L "$tmux_socket" "$@" 6>&- 7>&- 8>&-
+    "$tmux_path" -f /dev/null -L "$tmux_socket" "$@" 3>&- 6>&- 7>&- 8>&-
+}
+
+run_codex_rpc() {
+    local mode="$1"
+    shift
+
+    [[ -x "$default_python_path" ]] || {
+        echo "Required Python executable is unavailable: $default_python_path" >&2
+        return 69
+    }
+
+    "$default_python_path" - "$codex_app_server_socket" "$mode" "$@" <<'PYTHON_CODEX_RPC'
+import base64
+import hashlib
+import json
+import os
+import signal
+import socket
+import struct
+import sys
+import time
+
+socket_path, mode, *arguments = sys.argv[1:]
+maximum_frame_bytes = 8 * 1024 * 1024
+
+
+class WebSocket:
+    def __init__(self, path):
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.socket.settimeout(5)
+        self.socket.connect(path)
+        self.buffer = b""
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        request = (
+            "GET / HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n"
+        ).encode("ascii")
+        self.socket.sendall(request)
+        headers = self._read_headers()
+        status_line, *header_lines = headers.split(b"\r\n")
+        if b" 101 " not in status_line:
+            raise RuntimeError("Codex app-server rejected the websocket connection.")
+        response_headers = {}
+        for line in header_lines:
+            name, separator, value = line.partition(b":")
+            if separator:
+                response_headers[name.strip().lower()] = value.strip()
+        expected_accept = base64.b64encode(
+            hashlib.sha1(
+                key.encode("ascii") + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+            ).digest()
+        )
+        if response_headers.get(b"sec-websocket-accept") != expected_accept:
+            raise RuntimeError("Codex app-server returned an invalid websocket handshake.")
+
+    def _read_headers(self):
+        while b"\r\n\r\n" not in self.buffer:
+            chunk = self.socket.recv(4096)
+            if not chunk:
+                raise EOFError("Codex app-server closed during websocket setup.")
+            self.buffer += chunk
+            if len(self.buffer) > 64 * 1024:
+                raise RuntimeError("Codex app-server returned oversized websocket headers.")
+        headers, self.buffer = self.buffer.split(b"\r\n\r\n", 1)
+        return headers
+
+    def _read_exact(self, length):
+        while len(self.buffer) < length:
+            chunk = self.socket.recv(max(4096, length - len(self.buffer)))
+            if not chunk:
+                raise EOFError("Codex app-server closed the connection.")
+            self.buffer += chunk
+        result, self.buffer = self.buffer[:length], self.buffer[length:]
+        return result
+
+    def send_frame(self, opcode, payload=b""):
+        if isinstance(payload, str):
+            payload = payload.encode("utf-8")
+        length = len(payload)
+        header = bytes([0x80 | opcode])
+        if length < 126:
+            header += bytes([0x80 | length])
+        elif length < 65_536:
+            header += bytes([0x80 | 126]) + struct.pack("!H", length)
+        else:
+            header += bytes([0x80 | 127]) + struct.pack("!Q", length)
+        mask = os.urandom(4)
+        masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+        self.socket.sendall(header + mask + masked)
+
+    def send_json(self, value):
+        self.send_frame(1, json.dumps(value, separators=(",", ":")))
+
+    def receive_message(self):
+        fragments = []
+        message_opcode = None
+        while True:
+            first, second = self._read_exact(2)
+            final = bool(first & 0x80)
+            opcode = first & 0x0F
+            masked = bool(second & 0x80)
+            length = second & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", self._read_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", self._read_exact(8))[0]
+            if length > maximum_frame_bytes:
+                raise RuntimeError("Codex app-server returned an oversized websocket frame.")
+            mask = self._read_exact(4) if masked else None
+            payload = self._read_exact(length)
+            if mask is not None:
+                payload = bytes(
+                    value ^ mask[index % 4] for index, value in enumerate(payload)
+                )
+            if opcode == 8:
+                raise EOFError("Codex app-server closed the connection.")
+            if opcode == 9:
+                self.send_frame(10, payload)
+                continue
+            if opcode in (1, 2):
+                message_opcode = opcode
+                fragments = [payload]
+            elif opcode == 0 and message_opcode is not None:
+                fragments.append(payload)
+            else:
+                continue
+            if final:
+                return message_opcode, b"".join(fragments)
+
+    def receive_json(self, deadline):
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Timed out waiting for Codex app-server.")
+            self.socket.settimeout(min(remaining, 2))
+            try:
+                opcode, payload = self.receive_message()
+            except socket.timeout:
+                continue
+            if opcode == 1:
+                return json.loads(payload)
+
+    def close(self):
+        try:
+            self.send_frame(8)
+        except (OSError, RuntimeError):
+            pass
+        self.socket.close()
+
+
+def initialize(client):
+    client.send_json(
+        {
+            "method": "initialize",
+            "id": 0,
+            "params": {
+                "clientInfo": {
+                    "name": "terminal_relay",
+                    "title": "Terminal Relay",
+                    "version": "1.0.0",
+                }
+            },
+        }
+    )
+    client.send_json({"method": "initialized", "params": {}})
+
+
+def wait_for_response(client, request_id, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        value = client.receive_json(deadline)
+        if value.get("id") == request_id:
+            return value
+
+
+def account_is_available(response):
+    result = response.get("result")
+    return isinstance(result, dict) and (
+        isinstance(result.get("account"), dict)
+        or result.get("requiresOpenaiAuth") is False
+    )
+
+
+client = None
+pending_login_id = None
+login_completed = False
+
+
+def interrupt_login(_signal_number, _frame):
+    raise InterruptedError
+
+
+try:
+    client = WebSocket(socket_path)
+    if mode == "ready":
+        raise SystemExit(0)
+
+    initialize(client)
+
+    if mode == "account":
+        client.send_json(
+            {"method": "account/rateLimits/read", "id": 1, "params": None}
+        )
+        client.send_json(
+            {
+                "method": "account/read",
+                "id": 2,
+                "params": {"refreshToken": False},
+            }
+        )
+        pending = {1, 2}
+        deadline = time.monotonic() + 15
+        while pending:
+            response = client.receive_json(deadline)
+            response_id = response.get("id")
+            if response_id in (0, 1, 2):
+                print(json.dumps(response, separators=(",", ":")), flush=True)
+            if response_id in pending:
+                pending.remove(response_id)
+    elif mode == "require-account":
+        client.send_json(
+            {
+                "method": "account/read",
+                "id": 2,
+                "params": {"refreshToken": False},
+            }
+        )
+        response = wait_for_response(client, 2, 15)
+        if not account_is_available(response):
+            print(
+                "Codex is not authenticated for this worker account. "
+                "Sign in before opening a terminal.",
+                file=sys.stderr,
+            )
+            raise SystemExit(77)
+    elif mode == "reset":
+        if not (1 <= len(arguments) <= 2):
+            raise RuntimeError("Invalid Codex reset request.")
+        params = {"idempotencyKey": arguments[0]}
+        if len(arguments) == 2:
+            params["creditId"] = arguments[1]
+        client.send_json(
+            {
+                "method": "account/rateLimitResetCredit/consume",
+                "id": 2,
+                "params": params,
+            }
+        )
+        response = wait_for_response(client, 2, 30)
+        print(json.dumps(response, separators=(",", ":")), flush=True)
+        if "error" in response:
+            raise SystemExit(1)
+    elif mode == "login":
+        signal.signal(signal.SIGINT, interrupt_login)
+        signal.signal(signal.SIGTERM, interrupt_login)
+        signal.signal(signal.SIGHUP, interrupt_login)
+        client.send_json(
+            {
+                "method": "account/login/start",
+                "id": 1,
+                "params": {"type": "chatgptDeviceCode"},
+            }
+        )
+        response = wait_for_response(client, 1, 30)
+        result = response.get("result")
+        if not isinstance(result, dict):
+            print("Codex could not start device authorization.", file=sys.stderr)
+            raise SystemExit(77)
+        pending_login_id = result.get("loginId")
+        verification_url = result.get("verificationUrl")
+        user_code = result.get("userCode")
+        if not all(
+            isinstance(value, str) and value
+            for value in (pending_login_id, verification_url, user_code)
+        ):
+            print("Codex returned an invalid device authorization.", file=sys.stderr)
+            raise SystemExit(77)
+        print(f"Open {verification_url}", flush=True)
+        print(f"Enter this one-time code: {user_code}", flush=True)
+
+        deadline = time.monotonic() + 15 * 60
+        while True:
+            notification = client.receive_json(deadline)
+            if notification.get("method") != "account/login/completed":
+                continue
+            params = notification.get("params")
+            if not isinstance(params, dict) or params.get("loginId") != pending_login_id:
+                continue
+            login_completed = True
+            if params.get("success") is True:
+                print("Codex sign-in complete.", flush=True)
+                break
+            print("Codex sign-in was not completed.", file=sys.stderr)
+            raise SystemExit(77)
+    else:
+        raise RuntimeError("Unsupported Codex account operation.")
+except InterruptedError:
+    raise SystemExit(130)
+except SystemExit:
+    raise
+except (
+    AttributeError,
+    EOFError,
+    OSError,
+    RuntimeError,
+    TimeoutError,
+    TypeError,
+    ValueError,
+    json.JSONDecodeError,
+):
+    print("Codex account service is unavailable.", file=sys.stderr)
+    raise SystemExit(70)
+finally:
+    if client is not None:
+        if pending_login_id is not None and not login_completed:
+            try:
+                client.send_json(
+                    {
+                        "method": "account/login/cancel",
+                        "id": 99,
+                        "params": {"loginId": pending_login_id},
+                    }
+                )
+            except (OSError, RuntimeError):
+                pass
+        client.close()
+PYTHON_CODEX_RPC
+}
+
+codex_app_server_ready() {
+    [[ -S "$codex_app_server_socket" ]] \
+        && run_codex_rpc ready >/dev/null 2>&1
+}
+
+ensure_codex_app_server() {
+    local launch_file
+    local launch_command
+    local attempt
+
+    [[ -x "$codex_path" ]] || {
+        echo "Required Codex executable is unavailable: $codex_path" >&2
+        return 69
+    }
+    [[ -x "$tmux_path" ]] || {
+        echo "Required tmux executable is unavailable: $tmux_path" >&2
+        return 69
+    }
+    require_flock
+    exec 3>"$runtime_directory/codex-app-server.lock"
+    "$flock_path" 3
+
+    if codex_app_server_ready; then
+        exec 3>&-
+        return 0
+    fi
+
+    if tmux_command has-session -t "$codex_app_server_session" 2>/dev/null; then
+        tmux_command kill-session -t "$codex_app_server_session" 2>/dev/null || true
+    fi
+    if [[ -e "$codex_app_server_socket" || -L "$codex_app_server_socket" ]]; then
+        /bin/rm -f -- "$codex_app_server_socket"
+    fi
+
+    launch_file="$runtime_directory/codex-app-server.launch.$$.$RANDOM"
+    {
+        printf '#!/bin/bash\n'
+        printf '/bin/rm -f -- %q\n' "$launch_file"
+        printf 'exec %q app-server --listen %q\n' \
+            "$codex_path" "unix://$codex_app_server_socket"
+    } > "$launch_file"
+    /bin/chmod 700 "$launch_file"
+    printf -v launch_command '%q' "$launch_file"
+    if ! tmux_command new-session -d -s "$codex_app_server_session" \
+        -c "${runtime_home:-${HOME:-/}}" "$launch_command"; then
+        /bin/rm -f -- "$launch_file"
+        exec 3>&-
+        echo "Unable to start the shared Codex account service." >&2
+        return 70
+    fi
+    configure_tmux || true
+
+    for attempt in $(seq 1 100); do
+        if [[ -S "$codex_app_server_socket" ]]; then
+            break
+        fi
+        if ! tmux_command has-session -t "$codex_app_server_session" 2>/dev/null; then
+            break
+        fi
+        sleep 0.05
+    done
+    if ! codex_app_server_ready; then
+        tmux_command kill-session -t "$codex_app_server_session" 2>/dev/null || true
+        /bin/rm -f -- "$codex_app_server_socket"
+        exec 3>&-
+        echo "The shared Codex account service did not become ready." >&2
+        return 70
+    fi
+
+    exec 3>&-
+}
+
+require_codex_account() {
+    ensure_codex_app_server || return $?
+    run_codex_rpc require-account
 }
 
 validate_tool() {
@@ -409,7 +835,9 @@ validate_launch_arguments() {
             return 64
         }
         case "$tool:$argument" in
-            codex:resume|codex:--last|codex:--include-non-interactive)
+            codex:resume|codex:--last|codex:--include-non-interactive \
+                |codex:--remote|codex:--remote=* \
+                |codex:--remote-auth-token-env|codex:--remote-auth-token-env=*)
                 echo "Terminal Relay manages Codex resume arguments itself: $argument" >&2
                 return 64
                 ;;
@@ -1320,6 +1748,17 @@ restore_sessions() {
                 overall_status="$load_status"
                 continue
             fi
+        elif [[ "$codex_shared_account_enabled" == "1" ]]; then
+            set +e
+            require_codex_account
+            load_status=$?
+            set -e
+            if [[ $load_status -ne 0 ]]; then
+                unlock_tool_metadata
+                unlock_tool_control
+                overall_status="$load_status"
+                continue
+            fi
         fi
         if session_exists "$tool" "$instance" || {
             load_metadata_unlocked "$tool" "$instance" \
@@ -1872,6 +2311,8 @@ start_instance_session() {
     require_lifetime_signal_support || exit $?
     if [[ "$tool" == "claude" ]]; then
         prepare_claude_onboarding || exit $?
+    elif [[ "$codex_shared_account_enabled" == "1" ]]; then
+        require_codex_account || exit $?
     fi
     instance="$(generate_instance)" || {
         echo "Unable to generate a launch instance token." >&2
@@ -2157,7 +2598,22 @@ run_agent_instance() {
                         "$config_file"
                 )
             done
-            if [[ "$launch_mode" == "resume" ]]; then
+            if [[ "$codex_shared_account_enabled" == "1" ]]; then
+                if [[ "$launch_mode" == "resume" ]]; then
+                    agent_command=(
+                        "$executable"
+                        --remote "unix://$codex_app_server_socket"
+                        resume --last
+                        "${agent_arguments[@]}"
+                    )
+                else
+                    agent_command=(
+                        "$executable"
+                        --remote "unix://$codex_app_server_socket"
+                        "${agent_arguments[@]}"
+                    )
+                fi
+            elif [[ "$launch_mode" == "resume" ]]; then
                 agent_command=("$executable" resume --last "${agent_arguments[@]}")
             else
                 agent_command=("$executable" "${agent_arguments[@]}")
@@ -2512,6 +2968,24 @@ case "$command_name" in
     stop)
         [[ $# -eq 3 ]] || fail_usage "stop requires a tool, repository, and instance."
         stop_instance_session "$1" "$2" "$3"
+        ;;
+    codex-account)
+        [[ $# -eq 0 ]] || fail_usage "codex-account does not accept arguments."
+        ensure_codex_app_server
+        run_codex_rpc account
+        ;;
+    codex-login)
+        [[ $# -eq 0 ]] || fail_usage "codex-login does not accept arguments."
+        ensure_codex_app_server
+        run_codex_rpc login
+        ;;
+    codex-reset)
+        [[ $# -ge 1 && $# -le 2 ]] \
+            || fail_usage "codex-reset requires an idempotency key and optional credit id."
+        [[ "$1" =~ ^[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$ ]] \
+            || fail_usage "codex-reset requires a UUID idempotency key."
+        ensure_codex_app_server
+        run_codex_rpc reset "$@"
         ;;
     codex|claude)
         legacy_tool="$command_name"

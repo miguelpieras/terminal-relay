@@ -275,11 +275,29 @@ final class AccountUsageService: ObservableObject {
                accountResult?.requiresOpenaiAuth == true {
                 throw AccountUsageError.signInRequired(.codex)
             }
+            if let account = accountResult?.account {
+                return AccountUsageSnapshot(
+                    account: account.email?.nilIfEmpty ?? fallbackAccount?.nilIfEmpty,
+                    plan: account.planType?.nilIfEmpty,
+                    limits: [],
+                    codexResetCredits: nil,
+                    fetchedAt: fetchedAt
+                )
+            }
             throw AccountUsageError.invalidResponse(.codex)
         }
 
         let windows = [snapshot.primary, snapshot.secondary].compactMap { $0 }
         guard !windows.isEmpty else {
+            if let account = accountResult?.account {
+                return AccountUsageSnapshot(
+                    account: account.email?.nilIfEmpty ?? fallbackAccount?.nilIfEmpty,
+                    plan: account.planType?.nilIfEmpty ?? snapshot.planType?.nilIfEmpty,
+                    limits: [],
+                    codexResetCredits: rateLimitResult?.rateLimitResetCredits,
+                    fetchedAt: fetchedAt
+                )
+            }
             throw AccountUsageError.invalidResponse(.codex)
         }
 
@@ -463,51 +481,29 @@ final class AccountUsageService: ObservableObject {
     }
 
     private static var codexProbeScript: String {
-        let requests = [
-            #"{"method":"initialize","id":0,"params":{"clientInfo":{"name":"terminal_relay","title":"Terminal Relay","version":"1.0.0"}}}"#,
-            #"{"method":"initialized","params":{}}"#,
-            #"{"method":"account/rateLimits/read","id":1,"params":null}"#,
-            #"{"method":"account/read","id":2,"params":{"refreshToken":false}}"#
+        [
+            WorkerSessionProtocol.helperPath,
+            "codex-account"
         ]
-        let quotedRequests = requests
             .map(GitHubProjectService.shellQuote)
             .joined(separator: " ")
-        return """
-        cd "$HOME" || exit 1
-        { printf '%s\\n' \(quotedRequests); sleep 2; } | timeout 10s codex app-server 2>/dev/null
-        """
     }
 
     private static func codexResetScript(
         creditID: String?,
         idempotencyKey: UUID
     ) throws -> String {
-        var params: [String: String] = ["idempotencyKey": idempotencyKey.uuidString]
+        var arguments = [
+            WorkerSessionProtocol.helperPath,
+            "codex-reset",
+            idempotencyKey.uuidString
+        ]
         if let creditID {
-            params["creditId"] = creditID
+            arguments.append(creditID)
         }
-        let requestObject: [String: Any] = [
-            "method": "account/rateLimitResetCredit/consume",
-            "id": codexResetRequestID,
-            "params": params
-        ]
-        let requestData = try JSONSerialization.data(withJSONObject: requestObject, options: [.sortedKeys])
-        guard let consumeRequest = String(data: requestData, encoding: .utf8) else {
-            throw AccountUsageError.resetRedemptionFailed
-        }
-
-        let requests = [
-            #"{"method":"initialize","id":0,"params":{"clientInfo":{"name":"terminal_relay","title":"Terminal Relay","version":"1.0.0"}}}"#,
-            #"{"method":"initialized","params":{}}"#,
-            consumeRequest
-        ]
-        let quotedRequests = requests
+        return arguments
             .map(GitHubProjectService.shellQuote)
             .joined(separator: " ")
-        return """
-        cd "$HOME" || exit 1
-        { printf '%s\\n' \(quotedRequests); sleep 2; } | timeout 10s codex app-server 2>/dev/null
-        """
     }
 
     private static let claudeProbeScript = """

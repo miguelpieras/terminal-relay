@@ -487,7 +487,9 @@ struct ProjectWorkspaceView: View {
                                 || workerSessionService.isStarting(worker: worker, kind: kind)
                                 || workerSessionService.isStopping(worker: worker, kind: kind)
                                 || (requiresNewSessionSignIn && !hasActiveAgent),
-                            isAccountActionDisabled: hasActiveAgent
+                            isAccountActionDisabled: (
+                                hasActiveAgent && !requiresNewSessionSignIn
+                            )
                                 || workerSessionService.isStarting(worker: worker, kind: kind)
                                 || workerSessionService.isStopping(worker: worker, kind: kind),
                             onViewResets: kind == .codex ? { isShowingCodexResets = true } : nil,
@@ -805,9 +807,15 @@ private struct AccountUsageCard: View {
             Divider()
 
             if let snapshot {
-                VStack(spacing: 14) {
-                    ForEach(snapshot.limits) { limit in
-                        usageLimit(limit)
+                if snapshot.limits.isEmpty {
+                    Text("Usage limits are temporarily unavailable.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                } else {
+                    VStack(spacing: 14) {
+                        ForEach(snapshot.limits) { limit in
+                            usageLimit(limit)
+                        }
                     }
                 }
             } else if isLoading {
@@ -924,10 +932,11 @@ private struct AccountUsageCard: View {
     }
 
     private var accountActionHelp: String {
+        if requiresNewSessionSignIn, hasActiveAgent {
+            return "Sign in once, then restart this active \(productName) terminal to finish its account migration."
+        }
         if hasActiveAgent {
-            return snapshot == nil
-                ? "Stop the active \(productName) agent before signing in again."
-                : "Stop the active \(productName) agent before changing its account."
+            return "Stop the active \(productName) agent before changing its account."
         }
         if isAccountActionDisabled {
             return "Wait for the \(productName) session operation to finish."
@@ -939,13 +948,13 @@ private struct AccountUsageCard: View {
 
     private var accountStateLabel: String {
         if snapshot != nil { return "Account connected" }
-        if hasActiveAgent { return "Active session; account details unavailable" }
+        if requiresNewSessionSignIn { return "Sign in required" }
         return "Usage unavailable"
     }
 
     private var accountUnavailableMessage: String {
         if requiresNewSessionSignIn, hasActiveAgent {
-            return "Account details are unavailable outside this active \(productName) session."
+            return "Sign in once, then restart this terminal to use the worker's shared \(productName) account."
         }
         return errorMessage ?? "Usage limits are unavailable."
     }

@@ -81,6 +81,28 @@ final class AccountUsageServiceTests: XCTestCase {
         }
     }
 
+    func testKeepsCodexAccountWhenRateLimitsAreTemporarilyUnavailable() throws {
+        let fetchedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let output = Data(
+            """
+            {"id":1,"error":{"code":-32603,"message":"rate limits unavailable"}}
+            {"id":2,"result":{"account":{"type":"chatgpt","email":"codex@example.com","planType":"pro"},"requiresOpenaiAuth":true}}
+            """.utf8
+        )
+
+        let snapshot = try AccountUsageService.parseCodex(
+            output,
+            fallbackAccount: "Worker Codex",
+            fetchedAt: fetchedAt
+        )
+
+        XCTAssertEqual(snapshot.account, "codex@example.com")
+        XCTAssertEqual(snapshot.plan, "pro")
+        XCTAssertEqual(snapshot.fetchedAt, fetchedAt)
+        XCTAssertTrue(snapshot.limits.isEmpty)
+        XCTAssertNil(snapshot.codexResetCredits)
+    }
+
     func testParsesEveryCodexResetConsumeOutcomeAmidNotifications() throws {
         let cases: [(rawValue: String, outcome: CodexResetConsumeOutcome)] = [
             ("reset", .reset),

@@ -545,7 +545,7 @@ private struct WorkerAccountStatus: View {
     private var connectionState: (label: String, color: Color) {
         if requiresNewSessionSignIn {
             return hasActiveAgent
-                ? ("Active · account unavailable", .orange)
+                ? ("Sign-in migration", .orange)
                 : ("Signed out", .orange)
         }
         if errorMessage != nil { return ("Unavailable", .red) }
@@ -559,7 +559,7 @@ private struct WorkerAccountStatus: View {
     }
 
     private var isAccountActionDisabled: Bool {
-        hasActiveAgent
+        hasActiveAgent && !requiresNewSessionSignIn
     }
 
     var body: some View {
@@ -630,7 +630,7 @@ private struct WorkerAccountStatus: View {
         } else if let errorMessage {
             lines.append(
                 requiresNewSessionSignIn && hasActiveAgent
-                    ? "Account details are unavailable outside this active \(productName) session."
+                    ? "Sign in once, then restart this terminal to use the worker's shared \(productName) account."
                     : errorMessage
             )
         }
@@ -638,10 +638,11 @@ private struct WorkerAccountStatus: View {
     }
 
     private var accountActionHelp: String {
+        if requiresNewSessionSignIn, hasActiveAgent {
+            return "Sign in once, then restart the active \(productName) terminal to finish its account migration."
+        }
         if isAccountActionDisabled {
-            return snapshot == nil
-                ? "Stop the active \(productName) agent before signing in again."
-                : "Stop the active \(productName) agent before changing its account."
+            return "Stop the active \(productName) agent before changing its account."
         }
         return snapshot == nil
             ? "Sign in to \(productName) on \(worker.displayName)"

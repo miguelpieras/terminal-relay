@@ -66,6 +66,28 @@ Install the tested repository helper on an existing worker with:
 The installer verifies that both SSH targets reach the same machine, installs
 atomically, preserves the systemd service state, and prints a rollback command.
 
+## Codex account and terminal disagree
+
+Terminal Relay uses one persistent Codex app-server per worker as the account
+authority. Account reads, device login, rate-limit reads, reset redemption, and
+every Codex terminal all connect to that same process. A new Codex terminal is
+refused when that shared process is signed out.
+
+Check the shared account response without printing or copying it into an issue:
+
+```bash
+ssh terminal-relay-worker-N \
+  '/usr/local/bin/terminal-relay-session codex-account'
+```
+
+The response can include the account email and reset-credit identifiers. It
+must never include OAuth tokens or API keys.
+
+Workers with a Codex terminal started by an older helper need a one-time
+migration: use **Sign In** in Terminal Relay, then stop and restart the old
+terminal. New terminals and all later account reads then use the shared
+app-server automatically.
+
 ## Claude reports signed in but opens login
 
 Check Claude's own authentication result without printing its credentials:
