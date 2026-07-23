@@ -33,7 +33,7 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(manager.selectedSessionID, firstSession.id)
     }
 
-    func testOpeningAnOccupiedWorkerSlotReportsTheOtherProject() {
+    func testOpeningMultipleSessionsAcrossProjectsAndAgentKinds() {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let firstProject = makeProject(name: "Terminal Relay", server: server)
         let secondProject = makeProject(name: "Website API", server: server)
@@ -43,9 +43,10 @@ final class SessionManagerTests: XCTestCase {
             project: firstProject,
             on: server,
             kind: .codex,
-            launchDefaults: .standard
+            launchDefaults: .standard,
+            instanceToken: "01234567-89ab-" + "4def-8abc-0123456789ab"
         )
-        guard case .opened(let codexSession) = codexResult else {
+        guard case .opened = codexResult else {
             return XCTFail("Expected the first Codex session to open")
         }
 
@@ -53,26 +54,26 @@ final class SessionManagerTests: XCTestCase {
             project: secondProject,
             on: server,
             kind: .claude,
-            launchDefaults: .standard
+            launchDefaults: .standard,
+            instanceToken: "11111111-2222-" + "4333-8444-555555555555"
         )
-        guard case .opened(let claudeSession) = claudeResult else {
+        guard case .opened = claudeResult else {
             return XCTFail("Codex and Claude should be able to share a worker")
         }
 
-        let occupiedResult = manager.open(
+        let secondCodexResult = manager.open(
             project: secondProject,
             on: server,
             kind: .codex,
-            launchDefaults: .standard
+            launchDefaults: .standard,
+            instanceToken: "22222222-3333-" + "4444-8555-666666666666"
         )
-        guard case .occupied(let occupant) = occupiedResult else {
-            return XCTFail("Expected the worker's Codex slot to be occupied")
+        guard case .opened(let secondCodexSession) = secondCodexResult else {
+            return XCTFail("Expected another Codex session to open")
         }
 
-        XCTAssertTrue(occupant.localSession === codexSession)
-        XCTAssertEqual(occupant.projectID, firstProject.id)
-        XCTAssertEqual(manager.selectedSessionID, claudeSession.id)
-        XCTAssertEqual(manager.sessions.count, 2)
+        XCTAssertEqual(manager.selectedSessionID, secondCodexSession.id)
+        XCTAssertEqual(manager.sessions.count, 3)
     }
 
     func testProjectSessionQueriesAndIdentityUseProjectValues() {
@@ -430,7 +431,7 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertTrue(manager.occupant(for: server, kind: .codex)?.localSession === replacement)
     }
 
-    func testRemoteOccupancyBlocksAnotherProjectEvenWithoutALocalMatch() {
+    func testRemoteSessionDoesNotBlockOpeningAnotherProject() {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let project = makeProject(name: "Terminal Relay", server: server)
         let manager = SessionManager()
@@ -456,15 +457,14 @@ final class SessionManagerTests: XCTestCase {
             project: project,
             on: server,
             kind: .claude,
-            launchDefaults: .standard
+            launchDefaults: .standard,
+            instanceToken: "11111111-2222-" + "4333-8444-555555555555"
         )
-        guard case .occupied(let occupant) = result else {
-            return XCTFail("Expected authoritative remote occupancy to block the slot")
+        guard case .opened(let session) = result else {
+            return XCTFail("Expected a separate Claude session to open")
         }
-        XCTAssertEqual(occupant.repositoryName, "unconfigured-project")
-        XCTAssertNil(occupant.projectID)
-        XCTAssertNil(occupant.localSession)
-        XCTAssertTrue(manager.sessions.isEmpty)
+        XCTAssertEqual(session.projectID, project.id)
+        XCTAssertEqual(manager.sessions.count, 1)
     }
 
     func testExplicitStartUsesStatusThenStartAndKeepsReturnedInstanceToken() async {
@@ -555,7 +555,7 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(manager.sessions.count, 2)
         XCTAssertEqual(
             manager.sessions.first(where: { $0.instanceToken == statusToken })?.status,
-            .exited(nil)
+            .remoteRunning
         )
         XCTAssertEqual(recorder.configurations.count, 2)
         XCTAssertEqual(
@@ -569,16 +569,22 @@ final class SessionManagerTests: XCTestCase {
         )
     }
 
-    func testExplicitStartDoesNotRunWhenStatusReportsAnotherRepository() async {
+    func testExplicitStartRunsWhenStatusReportsAnotherRepository() async {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let project = makeProject(name: "Terminal Relay", server: server)
         let manager = SessionManager()
+        let startedToken = "11111111-2222-" + "4333-8444-555555555555"
         let recorder = WorkerSessionCommandRecorder(
             results: [
                 Self.statusResult(
                     kind: .codex,
                     repositoryName: "another-repository",
                     instanceToken: "01234567-89ab-" + "4def-8abc-0123456789ab"
+                ),
+                Self.statusResult(
+                    kind: .codex,
+                    repositoryName: project.displayName,
+                    instanceToken: startedToken
                 )
             ]
         )
@@ -595,15 +601,23 @@ final class SessionManagerTests: XCTestCase {
             using: service
         )
 
-        guard case .occupied(let occupant) = result else {
-            return XCTFail("Expected the other repository to keep the slot")
+        guard case .opened(let session) = result else {
+            return XCTFail("Expected a new Codex session")
         }
-        XCTAssertEqual(occupant.repositoryName, "another-repository")
+        XCTAssertEqual(session.instanceToken, startedToken)
         XCTAssertEqual(
             recorder.configurations,
-            [SSHCommandBuilder.workerSessionStatusConfiguration(for: server)]
+            [
+                SSHCommandBuilder.workerSessionStatusConfiguration(for: server),
+                SSHCommandBuilder.workerSessionStartConfiguration(
+                    for: server,
+                    kind: .codex,
+                    repositoryName: project.displayName,
+                    launchDefaults: .standard
+                )
+            ]
         )
-        XCTAssertTrue(manager.sessions.isEmpty)
+        XCTAssertEqual(manager.sessions.count, 1)
     }
 
     func testReconnectReplacesTheTerminalViewWithoutChangingSidebarIdentity() async {
@@ -1096,7 +1110,8 @@ private extension SessionManager {
         project: ProjectProfile,
         on server: ServerProfile,
         kind: AgentKind,
-        launchDefaults _: AgentLaunchDefaults
+        launchDefaults _: AgentLaunchDefaults,
+        instanceToken: String = "aaaaaaaa-bbbb-" + "4ccc-8ddd-eeeeeeeeeeee"
     ) -> SessionOpenResult {
         guard let result = openConfirmedRemote(
             project: project,
@@ -1105,7 +1120,7 @@ private extension SessionManager {
                 kind: kind,
                 repositoryName: project.displayName,
                 attachedClientCount: 0,
-                instanceToken: "aaaaaaaa-bbbb-" + "4ccc-8ddd-eeeeeeeeeeee"
+                instanceToken: instanceToken
             )
         ) else {
             preconditionFailure("Test snapshot should be valid")

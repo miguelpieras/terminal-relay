@@ -50,7 +50,7 @@ enum SessionOpenResult {
 final class SessionManager: ObservableObject {
     @Published private(set) var sessions: [TerminalSession] = []
     @Published var selectedSessionID: UUID?
-    @Published private var remoteOccupancies: [SessionSlot: WorkerSessionSnapshot] = [:]
+    @Published private var remoteSessions: [RemoteSessionKey: WorkerSessionSnapshot] = [:]
 
     private var lastSequenceNumberByProjectAndKind: [ProjectAgentKey: Int] = [:]
     private var sessionObservers: [UUID: AnyCancellable] = [:]
@@ -77,12 +77,21 @@ final class SessionManager: ObservableObject {
     }
 
     func activeSession(for server: ServerProfile, kind: AgentKind) -> TerminalSession? {
-        occupant(for: server, kind: kind)?.localSession
+        sessions.last {
+            $0.serverKey == server.concurrencyKey
+                && $0.kind == kind
+                && $0.status.occupiesSlot
+        }
     }
 
     func occupant(for server: ServerProfile, kind: AgentKind) -> SessionOccupant? {
-        let slot = SessionSlot(serverKey: server.concurrencyKey, kind: kind)
-        if let snapshot = remoteOccupancies[slot] {
+        if let localSession = activeSession(for: server, kind: kind) {
+            return SessionOccupant(session: localSession)
+        }
+
+        if let snapshot = remoteSessions.first(where: {
+            $0.key.serverKey == server.concurrencyKey && $0.value.kind == kind
+        })?.value {
             let localSession = sessions.last {
                 $0.serverKey == server.concurrencyKey
                     && $0.kind == kind
@@ -97,7 +106,7 @@ final class SessionManager: ObservableObject {
             )
         }
 
-        return occupyingSession(server: server, kind: kind).map(SessionOccupant.init)
+        return nil
     }
 
     @discardableResult
@@ -111,34 +120,6 @@ final class SessionManager: ObservableObject {
     ) async -> SessionOpenResult? {
         guard project.serverID == server.id else { return nil }
 
-        if let existing = activeSession(projectID: project.id, kind: kind) {
-            guard existing.serverKey == server.concurrencyKey else {
-                return .occupied(SessionOccupant(session: existing))
-            }
-            guard existing.status.canReconnect else {
-                selectedSessionID = existing.id
-                return .selectedExisting(existing)
-            }
-            guard await refresh(
-                worker: server,
-                projects: projects,
-                launchDefaults: launchDefaults,
-                using: service
-            ),
-            let current = sessions.first(where: { $0.id == existing.id }),
-            current.status.canReconnect,
-            let snapshot = confirmedRemoteSnapshot(for: current, on: server),
-            let replacement = replaceDetachedSession(
-                sessionID: current.id,
-                project: project,
-                on: server,
-                confirmedSnapshot: snapshot
-            ) else {
-                return nil
-            }
-            return .selectedExisting(replacement)
-        }
-
         guard await refresh(
             worker: server,
             projects: projects,
@@ -146,15 +127,6 @@ final class SessionManager: ObservableObject {
             using: service
         ) else {
             return nil
-        }
-
-        let slot = SessionSlot(serverKey: server.concurrencyKey, kind: kind)
-        if let remote = remoteOccupancies[slot], remote.repositoryName != project.displayName {
-            return .occupied(occupant(for: remote, on: server))
-        }
-        if let occupant = occupyingSession(server: server, kind: kind),
-           occupant.projectID != project.id || occupant.projectName != project.displayName {
-            return .occupied(SessionOccupant(session: occupant))
         }
 
         guard let snapshot = await service.start(
@@ -188,30 +160,22 @@ final class SessionManager: ObservableObject {
             return nil
         }
 
-        let slot = SessionSlot(serverKey: server.concurrencyKey, kind: snapshot.kind)
-        if let remote = remoteOccupancies[slot],
-           remote.repositoryName != snapshot.repositoryName {
-            return .occupied(occupant(for: remote, on: server))
-        }
         if let occupant = sessions.first(where: {
             $0.serverKey == server.concurrencyKey
-                && $0.kind == snapshot.kind
-                && $0.status.occupiesSlot
-                && ($0.projectID != project.id || $0.projectName != project.displayName)
+                && $0.instanceToken == snapshot.instanceToken
+                && ($0.projectID != project.id
+                    || $0.projectName != project.displayName
+                    || $0.kind != snapshot.kind)
         }) {
             return .occupied(SessionOccupant(session: occupant))
         }
 
-        for staleSession in sessions where staleSession.serverKey == server.concurrencyKey
-            && staleSession.kind == snapshot.kind
-            && staleSession.projectID == project.id
-            && staleSession.projectName == project.displayName
-            && staleSession.instanceToken != snapshot.instanceToken
-            && staleSession.status.occupiesSlot {
-            staleSession.markRemoteReplaced()
-        }
-
-        remoteOccupancies[slot] = snapshot
+        remoteSessions[
+            RemoteSessionKey(
+                serverKey: server.concurrencyKey,
+                instanceToken: snapshot.instanceToken
+            )
+        ] = snapshot
         if let existing = sessions.last(where: {
             $0.projectID == project.id
                 && $0.serverKey == server.concurrencyKey
@@ -334,7 +298,7 @@ final class SessionManager: ObservableObject {
             session.requestDisconnect()
             removeSession(id: session.id)
         }
-        remoteOccupancies = remoteOccupancies.filter { $0.key.serverKey != server.concurrencyKey }
+        remoteSessions = remoteSessions.filter { $0.key.serverKey != server.concurrencyKey }
     }
 
     func closeSessions(forProjectID projectID: UUID) {
@@ -375,25 +339,27 @@ final class SessionManager: ObservableObject {
         response: WorkerSessionResponse,
         launchDefaults: AgentLaunchDefaults
     ) {
-        remoteOccupancies = remoteOccupancies.filter {
+        remoteSessions = remoteSessions.filter {
             $0.key.serverKey != worker.concurrencyKey
         }
         for snapshot in response.sessions {
-            remoteOccupancies[
-                SessionSlot(serverKey: worker.concurrencyKey, kind: snapshot.kind)
+            remoteSessions[
+                RemoteSessionKey(
+                    serverKey: worker.concurrencyKey,
+                    instanceToken: snapshot.instanceToken
+                )
             ] = snapshot
         }
 
         for session in sessions(for: worker) where session.status.occupiesSlot {
-            let remote = remoteOccupancies[
-                SessionSlot(serverKey: worker.concurrencyKey, kind: session.kind)
+            let remote = remoteSessions[
+                RemoteSessionKey(
+                    serverKey: worker.concurrencyKey,
+                    instanceToken: session.instanceToken
+                )
             ]
-            if let remote,
-               remote.repositoryName == session.projectName,
-               remote.instanceToken != session.instanceToken {
-                session.markRemoteReplaced()
-            } else if session.status.canReconnect,
-                      remote?.repositoryName != session.projectName {
+            if session.status.canReconnect,
+               (remote?.kind != session.kind || remote?.repositoryName != session.projectName) {
                 session.markRemoteExited()
             }
         }
@@ -441,8 +407,12 @@ final class SessionManager: ObservableObject {
             return false
         }
 
-        let slot = SessionSlot(serverKey: worker.concurrencyKey, kind: session.kind)
-        guard let snapshot = remoteOccupancies[slot],
+        let remoteKey = RemoteSessionKey(
+            serverKey: worker.concurrencyKey,
+            instanceToken: session.instanceToken
+        )
+        guard let snapshot = remoteSessions[remoteKey],
+              snapshot.kind == session.kind,
               snapshot.repositoryName == session.projectName,
               snapshot.instanceToken == session.instanceToken else {
             return false
@@ -468,14 +438,14 @@ final class SessionManager: ObservableObject {
             session.cancelRemoteStop()
             return false
         }
-        if let latestSnapshot = remoteOccupancies[slot],
+        if let latestSnapshot = remoteSessions[remoteKey],
            latestSnapshot.repositoryName != repositoryName
             || latestSnapshot.instanceToken != instanceToken {
             session.cancelRemoteStop()
             return false
         }
 
-        remoteOccupancies.removeValue(forKey: slot)
+        remoteSessions.removeValue(forKey: remoteKey)
         session.completeRemoteStop()
         return true
     }
@@ -529,41 +499,19 @@ final class SessionManager: ObservableObject {
         return nextNumber
     }
 
-    private func occupyingSession(server: ServerProfile, kind: AgentKind) -> TerminalSession? {
-        sessions.first {
-            $0.serverKey == server.concurrencyKey
-                && $0.kind == kind
-                && $0.status.occupiesSlot
-        }
-    }
-
-    private func occupant(
-        for snapshot: WorkerSessionSnapshot,
-        on server: ServerProfile
-    ) -> SessionOccupant {
-        let localSession = sessions.last {
-            $0.serverKey == server.concurrencyKey
-                && $0.kind == snapshot.kind
-                && $0.projectName == snapshot.repositoryName
-                && $0.instanceToken == snapshot.instanceToken
-                && $0.status.occupiesSlot
-        }
-        return SessionOccupant(
-            snapshot: snapshot,
-            projectID: localSession?.projectID,
-            localSession: localSession
-        )
-    }
-
     private func confirmedRemoteSnapshot(
         for session: TerminalSession,
         on server: ServerProfile
     ) -> WorkerSessionSnapshot? {
         guard session.serverKey == server.concurrencyKey else { return nil }
-        let snapshot = remoteOccupancies[
-            SessionSlot(serverKey: server.concurrencyKey, kind: session.kind)
+        let snapshot = remoteSessions[
+            RemoteSessionKey(
+                serverKey: server.concurrencyKey,
+                instanceToken: session.instanceToken
+            )
         ]
-        guard snapshot?.repositoryName == session.projectName,
+        guard snapshot?.kind == session.kind,
+              snapshot?.repositoryName == session.projectName,
               snapshot?.instanceToken == session.instanceToken else {
             return nil
         }
@@ -574,4 +522,9 @@ final class SessionManager: ObservableObject {
 private struct ProjectAgentKey: Hashable {
     let projectID: UUID
     let kind: AgentKind
+}
+
+private struct RemoteSessionKey: Hashable {
+    let serverKey: String
+    let instanceToken: String
 }

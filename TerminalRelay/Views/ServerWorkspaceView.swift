@@ -473,7 +473,6 @@ struct ProjectWorkspaceView: View {
                             errorMessage: accountUsageService.error(for: worker.id, kind: kind),
                             buttonTitle: launchTitle(for: kind),
                             isButtonDisabled: isGitMutationInProgress
-                                || sessionManager.activeSession(for: worker, kind: kind)?.status == .stopping
                                 || workerSessionService.isStarting(worker: worker, kind: kind)
                                 || workerSessionService.isStopping(worker: worker, kind: kind),
                             isAccountActionDisabled: sessionManager.occupant(for: worker, kind: kind) != nil
@@ -635,18 +634,7 @@ struct ProjectWorkspaceView: View {
         if workerSessionService.isStarting(worker: worker, kind: kind) {
             return "Starting \(productName)"
         }
-        guard let occupant = sessionManager.occupant(for: worker, kind: kind) else {
-            return "Start \(productName)"
-        }
-        if occupant.projectID == project.id || occupant.repositoryName == project.displayName {
-            if occupant.localSession?.status == .stopping {
-                return "Stopping \(productName)"
-            }
-            return occupant.localSession?.status.isLocallyAttached == true
-                ? "Show \(productName)"
-                : "Reconnect \(productName)"
-        }
-        return "\(productName) in use"
+        return "Start \(productName)"
     }
 
     private func open(_ kind: AgentKind) {
