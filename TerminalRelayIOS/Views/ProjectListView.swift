@@ -10,64 +10,127 @@ private struct StopRequest: Identifiable {
 
 struct ProjectListView: View {
     @ObservedObject var model: WorkerSessionModel
-    let onEditWorker: () -> Void
+    let onAddWorker: () -> Void
+    @State private var searchText = ""
+
+    private var filteredProjects: [String] {
+        guard !searchText.isEmpty else { return model.projects }
+        return model.projects.filter {
+            $0.localizedCaseInsensitiveContains(searchText)
+        }
+    }
+
+    var body: some View {
+        Group {
+            if model.profile == nil {
+                ContentUnavailableView {
+                    Label("No Projects", systemImage: "folder")
+                } description: {
+                    Text("Add a worker to load its projects and shared agent sessions.")
+                } actions: {
+                    Button("Add Worker", action: onAddWorker)
+                        .buttonStyle(.borderedProminent)
+                }
+            } else {
+                projectList
+            }
+        }
+        .navigationTitle("Projects")
+        .task(id: model.profile?.id) {
+            await model.refresh()
+        }
+    }
+
+    private var projectList: some View {
+        List {
+            if model.projects.isEmpty {
+                if model.isLoading {
+                    HStack {
+                        Spacer()
+                        ProgressView("Loading projects…")
+                        Spacer()
+                    }
+                    .listRowBackground(Color.clear)
+                } else {
+                    ContentUnavailableView(
+                        "No Projects",
+                        systemImage: "folder",
+                        description: Text("Add a repository under /workspace on this worker, then pull to refresh.")
+                    )
+                    .listRowBackground(Color.clear)
+                }
+            } else if filteredProjects.isEmpty {
+                ContentUnavailableView.search(text: searchText)
+                    .listRowBackground(Color.clear)
+            } else {
+                ForEach(filteredProjects, id: \.self) { repositoryName in
+                    NavigationLink {
+                        ProjectDetailView(
+                            repositoryName: repositoryName,
+                            model: model
+                        )
+                    } label: {
+                        ProjectListRow(
+                            repositoryName: repositoryName,
+                            sessions: model.sessions
+                        )
+                    }
+                }
+            }
+        }
+        .refreshable { await model.refresh() }
+        .searchable(text: $searchText, prompt: "Search Projects")
+    }
+}
+
+private struct ProjectListRow: View {
+    let repositoryName: String
+    let sessions: [WorkerSessionSnapshot]
+
+    private var activeKinds: [AgentKind] {
+        sessions
+            .filter { $0.repositoryName == repositoryName }
+            .map(\.kind)
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "folder.fill")
+                .font(.title3)
+                .foregroundStyle(.tint)
+                .frame(width: 28)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(repositoryName)
+                    .font(.body.weight(.medium))
+                if activeKinds.isEmpty {
+                    Text("No active sessions")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text(activeKinds.map(\.displayName).joined(separator: " · "))
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+private struct ProjectDetailView: View {
+    let repositoryName: String
+    @ObservedObject var model: WorkerSessionModel
     @State private var stopRequest: StopRequest?
 
     var body: some View {
         List {
-            if let profile = model.profile {
-                Section("Worker") {
-                    LabeledContent("SSH", value: "\(profile.username)@\(profile.host):\(profile.port)")
-                }
-            }
-
-            Section("Projects") {
-                if model.projects.isEmpty, !model.isLoading {
-                    ContentUnavailableView(
-                        "No projects found",
-                        systemImage: "folder",
-                        description: Text("Add a repository under /workspace on the worker, then refresh.")
-                    )
-                }
-
-                ForEach(model.projects, id: \.self) { repositoryName in
-                    ProjectRow(
-                        repositoryName: repositoryName,
-                        model: model,
-                        onStop: { session in
-                            stopRequest = StopRequest(
-                                kind: session.kind,
-                                repositoryName: repositoryName,
-                                instanceToken: session.instanceToken
-                            )
-                        }
-                    )
-                }
+            ForEach(AgentKind.allCases) { kind in
+                agentSection(kind)
             }
         }
-        .navigationTitle(model.profile?.displayName ?? "Terminal Relay")
-        .navigationBarTitleDisplayMode(.inline)
+        .navigationTitle(repositoryName)
         .refreshable { await model.refresh() }
-        .toolbar {
-            ToolbarItemGroup(placement: .topBarTrailing) {
-                Button(action: onEditWorker) {
-                    Label("Worker settings", systemImage: "gearshape")
-                }
-                Button {
-                    Task { await model.refresh() }
-                } label: {
-                    if model.isLoading {
-                        ProgressView()
-                    } else {
-                        Label("Refresh", systemImage: "arrow.clockwise")
-                    }
-                }
-                .disabled(model.isLoading)
-            }
-        }
-        .task(id: model.profile?.id) {
-            await model.refresh()
-        }
         .alert(item: $stopRequest) { request in
             Alert(
                 title: Text("Stop \(request.kind.displayName)?"),
@@ -85,72 +148,61 @@ struct ProjectListView: View {
             )
         }
     }
-}
-
-private struct ProjectRow: View {
-    let repositoryName: String
-    @ObservedObject var model: WorkerSessionModel
-    let onStop: (WorkerSessionSnapshot) -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Label(repositoryName, systemImage: "shippingbox")
-                .font(.headline)
-
-            ForEach(AgentKind.allCases) { kind in
-                agentRow(kind)
-            }
-        }
-        .padding(.vertical, 6)
-    }
 
     @ViewBuilder
-    private func agentRow(_ kind: AgentKind) -> some View {
+    private func agentSection(_ kind: AgentKind) -> some View {
         let session = model.session(for: kind)
         let isHere = session?.repositoryName == repositoryName
         let isOccupiedElsewhere = session != nil && !isHere
 
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Image(systemName: kind.systemImage)
-                    .frame(width: 20)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(kind.displayName)
-                        .font(.subheadline.weight(.semibold))
-                    if isHere, let session {
-                        Text("Running · \(session.attachedClientCount) attached")
-                            .font(.caption)
-                            .foregroundStyle(.green)
-                    } else if let session {
-                        Text("Running in \(session.repositoryName)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    } else {
-                        Text("Not running")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
+        Section {
+            LabeledContent {
+                if isHere, let session {
+                    Text("\(session.attachedClientCount) attached")
+                        .foregroundStyle(.green)
+                } else if let session {
+                    Text(session.repositoryName)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Not running")
+                        .foregroundStyle(.secondary)
                 }
-                Spacer()
-                Button(isHere ? "Attach" : "Start") {
-                    model.openTerminal(kind: kind, repositoryName: repositoryName)
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .disabled(isOccupiedElsewhere)
+            } label: {
+                Label("Status", systemImage: kind.systemImage)
+            }
 
-                if isHere {
-                    Button(role: .destructive) {
-                        if let session {
-                            onStop(session)
-                        }
-                    } label: {
-                        Image(systemName: "stop.fill")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .accessibilityLabel("Stop \(kind.displayName)")
+            Button {
+                model.openTerminal(kind: kind, repositoryName: repositoryName)
+            } label: {
+                Label(
+                    isHere ? "Attach to \(kind.displayName)" : "Start \(kind.displayName)",
+                    systemImage: isHere ? "rectangle.connected.to.line.below" : "play.fill"
+                )
+            }
+            .disabled(isOccupiedElsewhere)
+
+            if isHere, let session {
+                Button(role: .destructive) {
+                    stopRequest = StopRequest(
+                        kind: session.kind,
+                        repositoryName: repositoryName,
+                        instanceToken: session.instanceToken
+                    )
+                } label: {
+                    Label("Stop \(kind.displayName)", systemImage: "stop.fill")
                 }
+            }
+        } header: {
+            Text(kind.displayName)
+        } footer: {
+            if isHere, let session {
+                if session.attachedClientCount == 1 {
+                    Text("This session has one attached client.")
+                } else {
+                    Text("This session has \(session.attachedClientCount) attached clients.")
+                }
+            } else if let session {
+                Text("\(kind.displayName) is already running in \(session.repositoryName).")
             }
         }
     }

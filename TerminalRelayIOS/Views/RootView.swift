@@ -3,33 +3,43 @@ import SwiftUI
 private struct WorkerEditorRoute: Identifiable {
     let id = UUID()
     let profile: WorkerProfile?
+    let showsProjectsAfterSave: Bool
+}
+
+private enum RootTab: Hashable {
+    case projects
+    case workers
 }
 
 struct RootView: View {
     @ObservedObject var model: WorkerSessionModel
     @Environment(\.scenePhase) private var scenePhase
-    @State private var selectedWorkerID: UUID?
+    @State private var selectedTab = RootTab.projects
     @State private var editorRoute: WorkerEditorRoute?
     @State private var workerPendingDeletion: WorkerProfile?
 
     var body: some View {
-        Group {
-            if model.profiles.isEmpty {
-                NavigationStack {
-                    WorkerOnboardingView(model: model, allowsCancel: false) {
-                        Task { await model.refresh() }
-                    }
-                }
-            } else {
-                NavigationStack {
-                    workerList
-                        .navigationDestination(item: $selectedWorkerID) { _ in
-                            ProjectListView(model: model) {
-                                editorRoute = WorkerEditorRoute(profile: model.profile)
-                            }
-                        }
+        TabView(selection: $selectedTab) {
+            NavigationStack {
+                ProjectListView(model: model) {
+                    editorRoute = WorkerEditorRoute(
+                        profile: nil,
+                        showsProjectsAfterSave: true
+                    )
                 }
             }
+            .tabItem {
+                Label("Projects", systemImage: "folder")
+            }
+            .tag(RootTab.projects)
+
+            NavigationStack {
+                workerList
+            }
+            .tabItem {
+                Label("Workers", systemImage: "server.rack")
+            }
+            .tag(RootTab.workers)
         }
         .sheet(item: $editorRoute) { route in
             NavigationStack {
@@ -39,6 +49,9 @@ struct RootView: View {
                     allowsCancel: true
                 ) {
                     editorRoute = nil
+                    if route.showsProjectsAfterSave {
+                        selectedTab = .projects
+                    }
                     Task { await model.refresh() }
                 }
             }
@@ -52,7 +65,7 @@ struct RootView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active,
-               selectedWorkerID != nil,
+               selectedTab == .projects,
                model.profile != nil,
                model.terminalRoute == nil {
                 Task { await model.refresh() }
@@ -87,48 +100,79 @@ struct RootView: View {
         }
     }
 
+    @ViewBuilder
     private var workerList: some View {
-        List {
-            Section("Workers") {
-                ForEach(model.profiles) { profile in
-                    Button {
-                        model.selectProfile(id: profile.id)
-                        selectedWorkerID = profile.id
-                    } label: {
-                        HStack(spacing: 12) {
-                            Image(systemName: "server.rack")
-                                .foregroundStyle(.secondary)
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(profile.displayName)
-                                    .foregroundStyle(.primary)
-                                Text("\(profile.username)@\(profile.host):\(profile.port)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Image(systemName: "chevron.right")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.tertiary)
-                        }
+        Group {
+            if model.profiles.isEmpty {
+                ContentUnavailableView {
+                    Label("No Workers", systemImage: "server.rack")
+                } description: {
+                    Text("Add a worker to load its projects and shared agent sessions.")
+                } actions: {
+                    Button("Add Worker") {
+                        editorRoute = WorkerEditorRoute(
+                            profile: nil,
+                            showsProjectsAfterSave: true
+                        )
                     }
-                    .buttonStyle(.plain)
-                    .swipeActions(edge: .trailing) {
-                        Button("Remove", role: .destructive) {
-                            workerPendingDeletion = profile
+                    .buttonStyle(.borderedProminent)
+                }
+            } else {
+                List {
+                    Section {
+                        ForEach(model.profiles) { profile in
+                            Button {
+                                model.selectProfile(id: profile.id)
+                                selectedTab = .projects
+                            } label: {
+                                HStack(spacing: 12) {
+                                    Image(systemName: "server.rack")
+                                        .foregroundStyle(.secondary)
+                                        .frame(width: 24)
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(profile.displayName)
+                                            .foregroundStyle(.primary)
+                                        Text("\(profile.username)@\(profile.host):\(profile.port)")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                    }
+                                    Spacer()
+                                    if model.profile?.id == profile.id {
+                                        Image(systemName: "checkmark")
+                                            .fontWeight(.semibold)
+                                            .foregroundStyle(.tint)
+                                    }
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .swipeActions(edge: .trailing) {
+                                Button("Remove", role: .destructive) {
+                                    workerPendingDeletion = profile
+                                }
+                                Button("Edit") {
+                                    editorRoute = WorkerEditorRoute(
+                                        profile: profile,
+                                        showsProjectsAfterSave: false
+                                    )
+                                }
+                                .tint(.blue)
+                            }
                         }
-                        Button("Edit") {
-                            editorRoute = WorkerEditorRoute(profile: profile)
-                        }
-                        .tint(.blue)
+                    } footer: {
+                        Text("The selected worker supplies the Projects tab. Tap another worker to switch.")
                     }
                 }
             }
         }
-        .navigationTitle("Terminal Relay")
+        .navigationTitle("Workers")
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
-                    editorRoute = WorkerEditorRoute(profile: nil)
+                    editorRoute = WorkerEditorRoute(
+                        profile: nil,
+                        showsProjectsAfterSave: true
+                    )
                 } label: {
                     Label("Add Worker", systemImage: "plus")
                 }

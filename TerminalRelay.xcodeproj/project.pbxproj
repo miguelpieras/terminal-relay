@@ -101,6 +101,7 @@
 		0E0A0111A5E62BD133D1B1D8 /* SSHIdentityStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SSHIdentityStore.swift; sourceTree = "<group>"; };
 		15BC6E4EE2D054D19B80B85F /* WorkerRegistrationURLTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerRegistrationURLTests.swift; sourceTree = "<group>"; };
 		1C681D55FCC5367DD2051E01 /* WorkerSessionStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerSessionStateTests.swift; sourceTree = "<group>"; };
+		1DE6522EBC904D332CAE4925 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		20DDC4D787D741BAF50C5483 /* ProjectGitServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectGitServiceTests.swift; sourceTree = "<group>"; };
 		2610AB4602CAB8F3FEC9FB1A /* TerminalRelayTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TerminalRelayTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		2812F2F38DC528ED2610ED2A /* TerminalScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalScreen.swift; sourceTree = "<group>"; };
@@ -261,6 +262,7 @@
 			isa = PBXGroup;
 			children = (
 				63A21456BA43EC66EE90B037 /* Assets.xcassets */,
+				1DE6522EBC904D332CAE4925 /* Info.plist */,
 				939436E54A5B69766421376B /* App */,
 				FBDE745F9CA1FC7C92990705 /* Models */,
 				4F34460357EBB525927648BD /* Services */,
@@ -785,11 +787,8 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_CFBundleDisplayName = "Terminal Relay";
-				INFOPLIST_KEY_CFBundleName = "Terminal Relay";
-				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
-				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Terminal Relay connects to your worker over Tailscale.";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = TerminalRelayIOS/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -800,7 +799,7 @@
 				PRODUCT_NAME = "Terminal Relay";
 				SDKROOT = iphoneos;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Release;
 		};
@@ -837,11 +836,8 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_CFBundleDisplayName = "Terminal Relay";
-				INFOPLIST_KEY_CFBundleName = "Terminal Relay";
-				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
-				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Terminal Relay connects to your worker over Tailscale.";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = TerminalRelayIOS/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -852,7 +848,7 @@
 				PRODUCT_NAME = "Terminal Relay";
 				SDKROOT = iphoneos;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Debug;
 		};
