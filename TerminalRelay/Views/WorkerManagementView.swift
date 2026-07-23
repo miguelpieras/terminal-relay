@@ -288,7 +288,11 @@ private struct WorkerOverviewRow: View {
                             accountFallback: worker.accountLabel(for: kind),
                             snapshot: accountUsageService.snapshot(for: worker.id, kind: kind),
                             errorMessage: accountUsageService.error(for: worker.id, kind: kind),
-                            isLoading: accountUsageService.isLoading(workerID: worker.id, kind: kind)
+                            isLoading: accountUsageService.isLoading(workerID: worker.id, kind: kind),
+                            isSignInRequired: accountUsageService.isSignInRequired(
+                                workerID: worker.id,
+                                kind: kind
+                            )
                         )
                     }
                 }
@@ -526,6 +530,7 @@ private struct WorkerAccountStatus: View {
     let snapshot: AccountUsageSnapshot?
     let errorMessage: String?
     let isLoading: Bool
+    let isSignInRequired: Bool
 
     private var productName: String {
         kind == .claude ? "Claude Code" : "Codex"
@@ -538,6 +543,7 @@ private struct WorkerAccountStatus: View {
     }
 
     private var connectionState: (label: String, color: Color) {
+        if isSignInRequired { return ("Signed out", .orange) }
         if errorMessage != nil { return ("Unavailable", .red) }
         if snapshot != nil { return (isLoading ? "Refreshing" : "Connected", .green) }
         if isLoading { return ("Checking", .orange) }
@@ -546,6 +552,10 @@ private struct WorkerAccountStatus: View {
 
     private var hasActiveAgent: Bool {
         sessionManager.occupant(for: worker, kind: kind) != nil
+    }
+
+    private var isAccountActionDisabled: Bool {
+        hasActiveAgent && !isSignInRequired
     }
 
     var body: some View {
@@ -591,7 +601,7 @@ private struct WorkerAccountStatus: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.mini)
-            .disabled(hasActiveAgent || accountAuthenticationService.isRunning)
+            .disabled(isAccountActionDisabled || accountAuthenticationService.isRunning)
             .help(accountActionHelp)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -620,7 +630,7 @@ private struct WorkerAccountStatus: View {
     }
 
     private var accountActionHelp: String {
-        if hasActiveAgent {
+        if isAccountActionDisabled {
             return "Stop the active \(productName) agent before changing its account."
         }
         return snapshot == nil

@@ -475,7 +475,13 @@ struct ProjectWorkspaceView: View {
                             isButtonDisabled: isGitMutationInProgress
                                 || workerSessionService.isStarting(worker: worker, kind: kind)
                                 || workerSessionService.isStopping(worker: worker, kind: kind),
-                            isAccountActionDisabled: sessionManager.occupant(for: worker, kind: kind) != nil
+                            isAccountActionDisabled: (
+                                sessionManager.occupant(for: worker, kind: kind) != nil
+                                    && !accountUsageService.isSignInRequired(
+                                        workerID: worker.id,
+                                        kind: kind
+                                    )
+                            )
                                 || workerSessionService.isStarting(worker: worker, kind: kind)
                                 || workerSessionService.isStopping(worker: worker, kind: kind),
                             onViewResets: kind == .codex ? { isShowingCodexResets = true } : nil,
