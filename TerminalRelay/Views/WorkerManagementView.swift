@@ -289,7 +289,7 @@ private struct WorkerOverviewRow: View {
                             snapshot: accountUsageService.snapshot(for: worker.id, kind: kind),
                             errorMessage: accountUsageService.error(for: worker.id, kind: kind),
                             isLoading: accountUsageService.isLoading(workerID: worker.id, kind: kind),
-                            isSignInRequired: accountUsageService.isSignInRequired(
+                            requiresNewSessionSignIn: accountUsageService.requiresNewSessionSignIn(
                                 workerID: worker.id,
                                 kind: kind
                             )
@@ -530,7 +530,7 @@ private struct WorkerAccountStatus: View {
     let snapshot: AccountUsageSnapshot?
     let errorMessage: String?
     let isLoading: Bool
-    let isSignInRequired: Bool
+    let requiresNewSessionSignIn: Bool
 
     private var productName: String {
         kind == .claude ? "Claude Code" : "Codex"
@@ -543,7 +543,11 @@ private struct WorkerAccountStatus: View {
     }
 
     private var connectionState: (label: String, color: Color) {
-        if isSignInRequired { return ("Signed out", .orange) }
+        if requiresNewSessionSignIn {
+            return hasActiveAgent
+                ? ("Active · account unavailable", .orange)
+                : ("Signed out", .orange)
+        }
         if errorMessage != nil { return ("Unavailable", .red) }
         if snapshot != nil { return (isLoading ? "Refreshing" : "Connected", .green) }
         if isLoading { return ("Checking", .orange) }
@@ -555,7 +559,7 @@ private struct WorkerAccountStatus: View {
     }
 
     private var isAccountActionDisabled: Bool {
-        hasActiveAgent && !isSignInRequired
+        hasActiveAgent
     }
 
     var body: some View {
@@ -624,14 +628,20 @@ private struct WorkerAccountStatus: View {
                 lines.append("Earned resets: \(resets.availableCount) available")
             }
         } else if let errorMessage {
-            lines.append(errorMessage)
+            lines.append(
+                requiresNewSessionSignIn && hasActiveAgent
+                    ? "Account details are unavailable outside this active \(productName) session."
+                    : errorMessage
+            )
         }
         return lines.joined(separator: "\n")
     }
 
     private var accountActionHelp: String {
         if isAccountActionDisabled {
-            return "Stop the active \(productName) agent before changing its account."
+            return snapshot == nil
+                ? "Stop the active \(productName) agent before signing in again."
+                : "Stop the active \(productName) agent before changing its account."
         }
         return snapshot == nil
             ? "Sign in to \(productName) on \(worker.displayName)"

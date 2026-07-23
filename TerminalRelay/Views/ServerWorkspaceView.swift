@@ -464,6 +464,15 @@ struct ProjectWorkspaceView: View {
 
                 HStack(alignment: .top, spacing: 14) {
                     ForEach(AgentKind.allCases) { kind in
+                        let hasActiveAgent = sessionManager.occupant(
+                            for: worker,
+                            kind: kind
+                        ) != nil
+                        let requiresNewSessionSignIn = accountUsageService
+                            .requiresNewSessionSignIn(
+                                workerID: worker.id,
+                                kind: kind
+                            )
                         AccountUsageCard(
                             worker: worker,
                             kind: kind,
@@ -471,17 +480,14 @@ struct ProjectWorkspaceView: View {
                             snapshot: accountUsageService.snapshot(for: worker.id, kind: kind),
                             isLoading: accountUsageService.isLoading(workerID: worker.id, kind: kind),
                             errorMessage: accountUsageService.error(for: worker.id, kind: kind),
+                            hasActiveAgent: hasActiveAgent,
+                            requiresNewSessionSignIn: requiresNewSessionSignIn,
                             buttonTitle: launchTitle(for: kind),
                             isButtonDisabled: isGitMutationInProgress
                                 || workerSessionService.isStarting(worker: worker, kind: kind)
-                                || workerSessionService.isStopping(worker: worker, kind: kind),
-                            isAccountActionDisabled: (
-                                sessionManager.occupant(for: worker, kind: kind) != nil
-                                    && !accountUsageService.isSignInRequired(
-                                        workerID: worker.id,
-                                        kind: kind
-                                    )
-                            )
+                                || workerSessionService.isStopping(worker: worker, kind: kind)
+                                || (requiresNewSessionSignIn && !hasActiveAgent),
+                            isAccountActionDisabled: hasActiveAgent
                                 || workerSessionService.isStarting(worker: worker, kind: kind)
                                 || workerSessionService.isStopping(worker: worker, kind: kind),
                             onViewResets: kind == .codex ? { isShowingCodexResets = true } : nil,
@@ -728,6 +734,8 @@ private struct AccountUsageCard: View {
     let snapshot: AccountUsageSnapshot?
     let isLoading: Bool
     let errorMessage: String?
+    let hasActiveAgent: Bool
+    let requiresNewSessionSignIn: Bool
     let buttonTitle: String
     let isButtonDisabled: Bool
     let isAccountActionDisabled: Bool
@@ -754,9 +762,13 @@ private struct AccountUsageCard: View {
                         Text(productName)
                             .font(.headline)
                         Circle()
-                            .fill(snapshot == nil ? Color.secondary.opacity(0.35) : Color.green)
+                            .fill(
+                                snapshot == nil
+                                    ? (hasActiveAgent ? Color.orange : Color.secondary.opacity(0.35))
+                                    : Color.green
+                            )
                             .frame(width: 6, height: 6)
-                            .accessibilityLabel(snapshot == nil ? "Usage unavailable" : "Account connected")
+                            .accessibilityLabel(accountStateLabel)
                     }
                     Text(accountDetail)
                         .font(.caption)
@@ -807,7 +819,7 @@ private struct AccountUsageCard: View {
                 }
                 .font(.callout)
             } else {
-                Text(errorMessage ?? "Usage limits are unavailable.")
+                Text(accountUnavailableMessage)
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -912,12 +924,30 @@ private struct AccountUsageCard: View {
     }
 
     private var accountActionHelp: String {
+        if hasActiveAgent {
+            return snapshot == nil
+                ? "Stop the active \(productName) agent before signing in again."
+                : "Stop the active \(productName) agent before changing its account."
+        }
         if isAccountActionDisabled {
-            return "Stop the active \(productName) agent before changing its account."
+            return "Wait for the \(productName) session operation to finish."
         }
         return snapshot == nil
             ? "Sign in to \(productName) on \(worker.displayName)"
             : "Change the \(productName) account on \(worker.displayName)"
+    }
+
+    private var accountStateLabel: String {
+        if snapshot != nil { return "Account connected" }
+        if hasActiveAgent { return "Active session; account details unavailable" }
+        return "Usage unavailable"
+    }
+
+    private var accountUnavailableMessage: String {
+        if requiresNewSessionSignIn, hasActiveAgent {
+            return "Account details are unavailable outside this active \(productName) session."
+        }
+        return errorMessage ?? "Usage limits are unavailable."
     }
 }
 

@@ -66,7 +66,7 @@ final class AccountUsageServiceTests: XCTestCase {
         XCTAssertNil(resetCredits.credits)
     }
 
-    func testRecognizesCodexSignedOutResponse() {
+    func testRecognizesCodexSignInRequiredForNewSession() {
         let output = Data(
             """
             {"id":0,"result":{"userAgent":"terminal_relay/1.0"}}
@@ -77,7 +77,7 @@ final class AccountUsageServiceTests: XCTestCase {
         XCTAssertThrowsError(
             try AccountUsageService.parseCodex(output)
         ) { error in
-            XCTAssertEqual(error as? AccountUsageError, .notSignedIn(.codex))
+            XCTAssertEqual(error as? AccountUsageError, .signInRequired(.codex))
         }
     }
 

@@ -95,7 +95,7 @@ struct AccountUsageSnapshot: Equatable {
 enum AccountUsageError: LocalizedError, Equatable {
     case commandFailed(AgentKind)
     case invalidResponse(AgentKind)
-    case notSignedIn(AgentKind)
+    case signInRequired(AgentKind)
     case resetRedemptionFailed
 
     var errorDescription: String? {
@@ -104,8 +104,8 @@ enum AccountUsageError: LocalizedError, Equatable {
             return "Could not reach \(kind.displayName) on this worker."
         case .invalidResponse(let kind):
             return "\(kind.displayName) did not return usage limits."
-        case .notSignedIn(let kind):
-            return "\(kind.displayName) is not signed in on this worker."
+        case .signInRequired(let kind):
+            return "\(kind.displayName) must be signed in before starting a new session."
         case .resetRedemptionFailed:
             return "Codex could not redeem this reset."
         }
@@ -122,7 +122,7 @@ final class AccountUsageService: ObservableObject {
     @Published private(set) var snapshots: [Key: AccountUsageSnapshot] = [:]
     @Published private(set) var errors: [Key: String] = [:]
     @Published private(set) var loadingKeys: Set<Key> = []
-    @Published private(set) var signInRequiredKeys: Set<Key> = []
+    @Published private(set) var newSessionSignInRequiredKeys: Set<Key> = []
 
     private let cacheDuration: TimeInterval = 60
     private var resetRedemptionKeys: [ResetRedemptionKey: UUID] = [:]
@@ -140,8 +140,8 @@ final class AccountUsageService: ObservableObject {
         loadingKeys.contains(Key(workerID: workerID, kind: kind))
     }
 
-    func isSignInRequired(workerID: UUID, kind: AgentKind) -> Bool {
-        signInRequiredKeys.contains(Key(workerID: workerID, kind: kind))
+    func requiresNewSessionSignIn(workerID: UUID, kind: AgentKind) -> Bool {
+        newSessionSignInRequiredKeys.contains(Key(workerID: workerID, kind: kind))
     }
 
     func refresh(worker: ServerProfile, force: Bool = false) async {
@@ -182,13 +182,13 @@ final class AccountUsageService: ObservableObject {
                 case .success(let snapshot):
                     snapshots[key] = snapshot
                     errors[key] = nil
-                    signInRequiredKeys.remove(key)
+                    newSessionSignInRequiredKeys.remove(key)
                 case .failure(let error):
-                    if error as? AccountUsageError == .notSignedIn(kind) {
+                    if error as? AccountUsageError == .signInRequired(kind) {
                         snapshots[key] = nil
-                        signInRequiredKeys.insert(key)
+                        newSessionSignInRequiredKeys.insert(key)
                     } else {
-                        signInRequiredKeys.remove(key)
+                        newSessionSignInRequiredKeys.remove(key)
                     }
                     errors[key] = (error as? LocalizedError)?.errorDescription
                         ?? AccountUsageError.commandFailed(kind).localizedDescription
@@ -273,7 +273,7 @@ final class AccountUsageService: ObservableObject {
         guard let snapshot = rateLimitResult?.rateLimits else {
             if accountResult?.account == nil,
                accountResult?.requiresOpenaiAuth == true {
-                throw AccountUsageError.notSignedIn(.codex)
+                throw AccountUsageError.signInRequired(.codex)
             }
             throw AccountUsageError.invalidResponse(.codex)
         }
