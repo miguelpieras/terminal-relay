@@ -21,7 +21,7 @@ struct ProjectWorkspaceView: View {
     let project: ProjectProfile
     let worker: ServerProfile
     let onSelectProject: (UUID) -> Void
-    let onShowWorker: () -> Void
+    let onShowWorkers: () -> Void
 
     @State private var conflictingOccupant: SessionOccupant?
     @State private var isShowingCodexResets = false
@@ -154,7 +154,7 @@ struct ProjectWorkspaceView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     VStack(alignment: .leading, spacing: 5) {
-                        Button(action: onShowWorker) {
+                        Button(action: onShowWorkers) {
                             HStack(spacing: 8) {
                                 Image(systemName: "server.rack")
                                     .foregroundStyle(.secondary)
@@ -168,7 +168,7 @@ struct ProjectWorkspaceView: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                        .help("Open worker details")
+                        .help("Manage workers")
 
                         Text(project.workingDirectory)
                             .font(.system(.caption, design: .monospaced))

@@ -8,9 +8,7 @@ struct WorkersView: View {
     @EnvironmentObject private var accountUsageService: AccountUsageService
     @EnvironmentObject private var workerMetricsService: WorkerMetricsService
 
-    let focusedWorkerID: UUID?
     let onSelectProject: (UUID) -> Void
-    let onShowAllWorkers: () -> Void
 
     @State private var editorProfile: ServerProfile?
     @State private var workerPendingDeletion: ServerProfile?
@@ -18,20 +16,9 @@ struct WorkersView: View {
     @State private var isRefreshingAll = false
 
     private var refreshTaskID: String {
-        displayedWorkers
+        serverStore.servers
             .map { "\($0.id.uuidString)-\($0.destination)-\($0.port)" }
             .joined(separator: "|")
-    }
-
-    private var focusedWorker: ServerProfile? {
-        focusedWorkerID.flatMap(serverStore.server(id:))
-    }
-
-    private var displayedWorkers: [ServerProfile] {
-        if let focusedWorker {
-            return [focusedWorker]
-        }
-        return serverStore.servers
     }
 
     var body: some View {
@@ -86,28 +73,21 @@ struct WorkersView: View {
 
     private var header: some View {
         HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(headerTitle)
-                    .font(.title2.weight(.semibold))
+                    .font(.headline)
                 Text(
                     editorProfile == nil
-                        ? headerSubtitle
+                        ? "Accounts, capacity, and linked apps across every remote worker."
                         : "SSH connection and remote agent accounts"
                 )
-                .font(.callout)
+                .font(.caption)
                 .foregroundStyle(.secondary)
             }
 
             Spacer()
 
             if editorProfile == nil {
-                if focusedWorker != nil {
-                    Button(action: onShowAllWorkers) {
-                        Label("All Workers", systemImage: "server.rack")
-                    }
-                    .buttonStyle(.bordered)
-                }
-
                 Button {
                     Task { await refreshAll(force: true) }
                 } label: {
@@ -119,41 +99,34 @@ struct WorkersView: View {
                     }
                 }
                 .buttonStyle(.bordered)
+                .controlSize(.small)
                 .disabled(isRefreshingAll)
 
-                if focusedWorker == nil {
-                    Button {
-                        workerPendingDeletion = nil
-                        editorProfile = ServerProfile()
-                    } label: {
-                        Label("Add Worker", systemImage: "plus")
-                    }
-                    .buttonStyle(.borderedProminent)
+                Button {
+                    workerPendingDeletion = nil
+                    editorProfile = ServerProfile()
+                } label: {
+                    Label("Add Worker", systemImage: "plus")
                 }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
             }
         }
-        .padding(.horizontal, 24)
-        .frame(minHeight: 72)
+        .padding(.horizontal, 16)
+        .frame(minHeight: 52)
     }
 
     private var headerTitle: String {
-        guard let editorProfile else { return focusedWorker?.displayName ?? "Workers" }
+        guard let editorProfile else { return "Workers" }
         let name = editorProfile.displayName
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return name.isEmpty ? "Add Worker" : "Edit \(name)"
     }
 
-    private var headerSubtitle: String {
-        guard let focusedWorker else {
-            return "Accounts, capacity, and linked apps across every remote worker."
-        }
-        return "Accounts, capacity, and linked apps on \(focusedWorker.destination)."
-    }
-
     private var workerList: some View {
         ScrollView {
-            LazyVStack(spacing: 12) {
-                ForEach(displayedWorkers) { worker in
+            LazyVStack(spacing: 7) {
+                ForEach(serverStore.servers) { worker in
                     WorkerOverviewCard(
                         worker: worker,
                         projects: projectStore.projects(for: worker.id),
@@ -177,8 +150,8 @@ struct WorkersView: View {
                     )
                 }
             }
-            .padding(24)
-            .frame(maxWidth: 980)
+            .padding(12)
+            .frame(maxWidth: 1_060)
             .frame(maxWidth: .infinity)
         }
     }
@@ -197,7 +170,7 @@ struct WorkersView: View {
         defer { isRefreshingAll = false }
 
         await withTaskGroup(of: Void.self) { group in
-            for worker in displayedWorkers {
+            for worker in serverStore.servers {
                 group.addTask {
                     await accountUsageService.refresh(worker: worker, force: force)
                 }
@@ -217,7 +190,7 @@ struct WorkersView: View {
             }
 
             await withTaskGroup(of: Void.self) { group in
-                for worker in displayedWorkers {
+                for worker in serverStore.servers {
                     group.addTask {
                         await workerMetricsService.refresh(worker: worker, force: true)
                     }
@@ -254,35 +227,37 @@ private struct WorkerOverviewCard: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 12) {
+            HStack(spacing: 9) {
                 Image(systemName: "server.rack")
-                    .font(.system(size: 15, weight: .medium))
+                    .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.secondary)
-                    .frame(width: 24, height: 24)
+                    .frame(width: 18, height: 18)
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(worker.displayName)
-                        .font(.headline)
+                        .font(.callout.weight(.semibold))
                     Text(connectionSummary)
-                        .font(.caption)
+                        .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
 
                 Spacer()
 
-                Button("Edit", action: onEdit)
-                    .buttonStyle(.borderless)
-
-                Button("Delete", role: .destructive, action: onRequestDelete)
-                    .buttonStyle(.borderless)
-                    .disabled(!projects.isEmpty)
-                    .help(
-                        projects.isEmpty
-                            ? "Delete worker"
-                            : "Reassign or remove this worker's linked apps first"
-                    )
+                Menu {
+                    Button("Edit", systemImage: "pencil", action: onEdit)
+                    Button("Delete", systemImage: "trash", role: .destructive, action: onRequestDelete)
+                        .disabled(!projects.isEmpty)
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .frame(width: 20, height: 20)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .controlSize(.small)
+                .help("Worker actions")
             }
-            .padding(16)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
 
             Divider()
 
@@ -291,11 +266,12 @@ private struct WorkerOverviewCard: View {
                 errorMessage: workerMetricsService.error(for: worker.id),
                 isLoading: workerMetricsService.isLoading(workerID: worker.id)
             )
-            .padding(16)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
 
             Divider()
 
-            HStack(alignment: .top, spacing: 12) {
+            HStack(alignment: .top, spacing: 7) {
                 ForEach(AgentKind.allCases) { kind in
                     WorkerAccountStatus(
                         kind: kind,
@@ -306,7 +282,8 @@ private struct WorkerOverviewCard: View {
                     )
                 }
             }
-            .padding(16)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
 
             Divider()
 
@@ -317,17 +294,14 @@ private struct WorkerOverviewCard: View {
                         .foregroundStyle(.secondary)
                         .frame(width: 12)
                     Text(linkedAppsTitle)
-                        .font(.callout.weight(.medium))
+                        .font(.caption.weight(.medium))
                     Spacer()
-                    Text("View details")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                 }
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .padding(.horizontal, 16)
-            .frame(height: 42)
+            .padding(.horizontal, 10)
+            .frame(height: 30)
 
             if isExpanded {
                 Divider()
@@ -337,7 +311,7 @@ private struct WorkerOverviewCard: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(16)
+                        .padding(10)
                 } else {
                     VStack(spacing: 0) {
                         ForEach(projects) { project in
@@ -368,19 +342,20 @@ private struct WorkerOverviewCard: View {
                     Button("Cancel", action: onCancelDelete)
                     Button("Delete Worker", role: .destructive, action: onDelete)
                 }
-                .padding(16)
+                .font(.caption)
+                .padding(10)
                 .background(Color.red.opacity(0.055))
             }
         }
         .background(
             Color.primary.opacity(0.035),
-            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
         )
         .overlay {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(Color.primary.opacity(0.09), lineWidth: 1)
         }
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private var linkedAppsTitle: String {
@@ -400,7 +375,7 @@ private struct WorkerResourceSummary: View {
     let isLoading: Bool
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
+        HStack(spacing: 6) {
             WorkerMetricStatus(
                 title: "CPU",
                 systemImage: "cpu",
@@ -451,46 +426,66 @@ private struct WorkerMetricStatus: View {
     let isLoading: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 7) {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 4) {
                 Image(systemName: systemImage)
+                    .font(.system(size: 9))
                     .foregroundStyle(.secondary)
                 Text(title)
-                    .font(.caption.weight(.semibold))
+                    .font(.caption2.weight(.medium))
 
-                Spacer(minLength: 4)
+                Spacer(minLength: 2)
 
                 if isLoading {
                     ProgressView()
                         .controlSize(.mini)
+                } else if let percentage {
+                    Text(percentText(percentage))
+                        .font(.caption2.monospacedDigit().weight(.medium))
+                } else {
+                    Text("—")
+                        .font(.caption2)
+                        .foregroundStyle(errorMessage == nil ? Color.secondary : Color.red)
                 }
             }
 
             if let percentage {
-                Text(percentText(percentage))
-                    .font(.title3.weight(.semibold))
-
-                ProgressView(value: min(max(percentage, 0), 100), total: 100)
-                    .tint(metricTint(percentage))
-
-                Text(detail ?? "")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                GeometryReader { proxy in
+                    ZStack(alignment: .leading) {
+                        Capsule()
+                            .fill(Color.primary.opacity(0.1))
+                        Capsule()
+                            .fill(metricTint(percentage))
+                            .frame(
+                                width: proxy.size.width
+                                    * min(max(percentage, 0), 100) / 100
+                            )
+                    }
+                }
+                .frame(height: 2)
             } else {
-                Text(isLoading ? "Reading…" : errorMessage ?? "Not checked")
-                    .font(.caption)
-                    .foregroundStyle(errorMessage == nil ? Color.secondary : Color.red)
-                    .lineLimit(2)
-                    .frame(maxHeight: .infinity, alignment: .topLeading)
+                Capsule()
+                    .fill(Color.primary.opacity(0.1))
+                    .frame(height: 2)
             }
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, minHeight: 112, alignment: .topLeading)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 5)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             Color.primary.opacity(0.035),
-            in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+            in: RoundedRectangle(cornerRadius: 5, style: .continuous)
         )
+        .help(metricHelp)
+    }
+
+    private var metricHelp: String {
+        if let percentage {
+            return [title, percentText(percentage), detail]
+                .compactMap { $0 }
+                .joined(separator: " · ")
+        }
+        return "\(title) · \(isLoading ? "Reading…" : errorMessage ?? "Not checked")"
     }
 
     private func percentText(_ value: Double) -> String {
@@ -533,70 +528,68 @@ private struct WorkerAccountStatus: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 9) {
-                AgentBrandIcon(kind: kind, size: 28)
+        HStack(spacing: 7) {
+            AgentBrandIcon(kind: kind, size: 20)
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(productName)
-                        .font(.callout.weight(.semibold))
-                    Text(accountDetail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-
-                Spacer(minLength: 4)
-
+            VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 5) {
+                    Text(productName)
+                        .font(.caption.weight(.semibold))
                     Circle()
                         .fill(connectionState.color)
-                        .frame(width: 6, height: 6)
-                    Text(connectionState.label)
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(.secondary)
+                        .frame(width: 5, height: 5)
                 }
+                Text(accountDetail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
+
+            Spacer(minLength: 4)
 
             if let snapshot {
-                VStack(spacing: 5) {
-                    ForEach(snapshot.limits.prefix(2)) { limit in
-                        HStack(alignment: .firstTextBaseline) {
-                            Text(limit.name)
-                                .foregroundStyle(.secondary)
-                            Spacer(minLength: 8)
-                            Text("\(limit.remainingPercentText)% left")
-                                .fontWeight(.medium)
-                        }
-                        .font(.caption)
-                    }
-
-                    if kind == .codex, let resets = snapshot.codexResetCredits {
-                        HStack {
-                            Text("Earned resets")
-                                .foregroundStyle(.secondary)
-                            Spacer(minLength: 8)
-                            Text("\(resets.availableCount) available")
-                                .fontWeight(.medium)
-                        }
-                        .font(.caption)
-                    }
-                }
+                Text(limitSummary(snapshot))
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             } else {
-                Text(errorMessage ?? "Usage limits have not been read yet.")
-                    .font(.caption)
+                Text(connectionState.label)
+                    .font(.caption2)
                     .foregroundStyle(errorMessage == nil ? Color.secondary : Color.red)
-                    .lineLimit(2)
+                    .lineLimit(1)
             }
-
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, minHeight: 126, alignment: .topLeading)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             Color.primary.opacity(0.035),
-            in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+            in: RoundedRectangle(cornerRadius: 5, style: .continuous)
         )
+        .help(accountHelp)
+    }
+
+    private func limitSummary(_ snapshot: AccountUsageSnapshot) -> String {
+        let limits = snapshot.limits.prefix(2).map {
+            "\($0.name) \($0.remainingPercentText)%"
+        }
+        return limits.isEmpty ? connectionState.label : limits.joined(separator: " · ")
+    }
+
+    private var accountHelp: String {
+        var lines = ["\(productName): \(connectionState.label)", accountDetail]
+        if let snapshot {
+            lines.append(contentsOf: snapshot.limits.prefix(2).map {
+                "\($0.name): \($0.remainingPercentText)% left"
+            })
+            if kind == .codex, let resets = snapshot.codexResetCredits {
+                lines.append("Earned resets: \(resets.availableCount) available")
+            }
+        } else if let errorMessage {
+            lines.append(errorMessage)
+        }
+        return lines.joined(separator: "\n")
     }
 }
 
@@ -642,7 +635,7 @@ private struct LinkedAppRow: View {
             Button("Open", action: onOpen)
                 .buttonStyle(.borderless)
         }
-        .padding(.horizontal, 16)
-        .frame(minHeight: 50)
+        .padding(.horizontal, 10)
+        .frame(minHeight: 40)
     }
 }

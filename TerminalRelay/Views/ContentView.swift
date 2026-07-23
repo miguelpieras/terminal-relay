@@ -4,7 +4,6 @@ private enum SidebarDestination: Equatable {
     case project(UUID)
     case session(projectID: UUID, sessionID: UUID)
     case workers
-    case worker(UUID)
     case settings
     case newProject(ProjectProfile)
     case editProject(UUID)
@@ -405,16 +404,8 @@ struct ContentView: View {
     private var destinationDetail: some View {
         switch currentDestination {
         case .workers:
-            WorkersView(focusedWorkerID: nil, onSelectProject: { projectID in
+            WorkersView(onSelectProject: { projectID in
                 navigate(to: .project(projectID))
-            }, onShowAllWorkers: {
-                navigate(to: .workers)
-            })
-        case .worker(let workerID):
-            WorkersView(focusedWorkerID: workerID, onSelectProject: { projectID in
-                navigate(to: .project(projectID))
-            }, onShowAllWorkers: {
-                navigate(to: .workers)
             })
         case .settings:
             AgentDefaultsView()
@@ -443,7 +434,7 @@ struct ContentView: View {
                 project: project,
                 worker: worker,
                 onSelectProject: { navigate(to: .project($0)) },
-                onShowWorker: { navigate(to: .worker(worker.id)) }
+                onShowWorkers: { navigate(to: .workers) }
             )
             .id(project.id)
         } else {
@@ -657,7 +648,7 @@ struct ContentView: View {
             sessionManager.selectedSessionID = sessionManager
                 .sessions(forProjectID: projectID)
                 .contains(where: { $0.id == sessionID }) ? sessionID : nil
-        case .workers, .worker, .settings, .newProject, .editProject:
+        case .workers, .settings, .newProject, .editProject:
             pageDestination = destination
         }
     }
@@ -690,7 +681,7 @@ struct ContentView: View {
                 return projectID == project.id
             case .newProject(let draft):
                 return draft.id == project.id
-            case .workers, .worker, .settings:
+            case .workers, .settings:
                 return false
             }
         }
