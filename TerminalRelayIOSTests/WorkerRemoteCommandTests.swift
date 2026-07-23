@@ -185,7 +185,7 @@ final class WorkerRemoteCommandTests: XCTestCase {
                 repositoryName: "terminal-relay",
                 expectedInstanceToken: replacementID
             ),
-            .replaced
+            .ended
         )
         XCTAssertEqual(
             TerminalSessionController.confirmation(

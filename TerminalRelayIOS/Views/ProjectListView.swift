@@ -23,6 +23,7 @@ struct ProjectListView: View {
     @ObservedObject var model: WorkerSessionModel
     let onAddWorker: () -> Void
     @State private var searchText = ""
+    @State private var showsSearch = false
     @State private var workerFilterID: UUID?
 
     private var projects: [WorkerProject] {
@@ -95,54 +96,91 @@ struct ProjectListView: View {
                 self.workerFilterID = nil
             }
             await model.refreshProjectCatalogs()
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: .seconds(4))
+                } catch {
+                    return
+                }
+                if model.terminalRoute == nil {
+                    await model.refreshProjectActivity()
+                }
+            }
         }
     }
 
+    @ViewBuilder
     private var projectList: some View {
-        VStack(spacing: 0) {
-            workerFilter
-
-            List {
-                if projects.isEmpty {
-                    if !model.projectLoadingIDs.isEmpty {
-                        HStack {
-                            Spacer()
-                            ProgressView("Loading projects…")
-                            Spacer()
+        if #available(iOS 18.0, *) {
+            if showsSearch {
+                projectListContent
+                    .searchable(
+                        text: $searchText,
+                        placement: .navigationBarDrawer(displayMode: .automatic),
+                        prompt: "Search Projects"
+                    )
+            } else {
+                projectListContent
+                    .onScrollPhaseChange { _, newPhase in
+                        if newPhase == .tracking || newPhase == .interacting {
+                            showsSearch = true
                         }
-                        .listRowBackground(Color.clear)
-                    } else {
-                        ContentUnavailableView(
-                            "No Projects",
-                            systemImage: "folder",
-                            description: Text(emptyProjectsDescription)
-                        )
-                        .listRowBackground(Color.clear)
                     }
-                } else if filteredProjects.isEmpty {
-                    ContentUnavailableView.search(text: searchText)
-                        .listRowBackground(Color.clear)
+            }
+        } else {
+            projectListContent
+                .searchable(
+                    text: $searchText,
+                    placement: .navigationBarDrawer(displayMode: .automatic),
+                    prompt: "Search Projects"
+                )
+        }
+    }
+
+    private var projectListContent: some View {
+        List {
+            if projects.isEmpty {
+                if !model.projectLoadingIDs.isEmpty {
+                    HStack {
+                        Spacer()
+                        ProgressView("Loading projects…")
+                        Spacer()
+                    }
+                    .listRowBackground(Color.clear)
                 } else {
-                    ForEach(filteredProjects) { project in
-                        NavigationLink {
-                            ProjectDetailView(
-                                workerID: project.workerID,
-                                repositoryName: project.repositoryName,
-                                model: model
-                            )
-                        } label: {
-                            ProjectListRow(
-                                repositoryName: project.repositoryName,
-                                workerName: project.workerName,
-                                sessions: project.sessions
-                            )
-                        }
+                    ContentUnavailableView(
+                        "No Projects",
+                        systemImage: "folder",
+                        description: Text(emptyProjectsDescription)
+                    )
+                    .listRowBackground(Color.clear)
+                }
+            } else if filteredProjects.isEmpty {
+                ContentUnavailableView.search(text: searchText)
+                    .listRowBackground(Color.clear)
+            } else {
+                ForEach(filteredProjects) { project in
+                    NavigationLink {
+                        ProjectDetailView(
+                            workerID: project.workerID,
+                            repositoryName: project.repositoryName,
+                            model: model
+                        )
+                    } label: {
+                        ProjectListRow(
+                            repositoryName: project.repositoryName,
+                            sessions: project.sessions
+                        )
                     }
                 }
             }
-            .refreshable { await model.refreshProjectCatalogs() }
         }
-        .searchable(text: $searchText, prompt: "Search Projects")
+        .refreshable { await model.refreshProjectCatalogs() }
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                workerFilter
+            }
+        }
     }
 
     private var workerFilter: some View {
@@ -177,25 +215,10 @@ struct ProjectListView: View {
                 Label("Add Worker", systemImage: "plus")
             }
         } label: {
-            HStack(spacing: 7) {
-                Image(systemName: "line.3.horizontal.decrease")
-                Text(workerFilterName)
-                    .lineLimit(1)
-                Image(systemName: "chevron.up.chevron.down")
-                    .font(.caption.weight(.semibold))
-            }
-            .font(.subheadline.weight(.semibold))
-            .padding(.horizontal, 14)
-            .padding(.vertical, 9)
-            .background(.thinMaterial, in: Capsule())
-            .contentShape(Rectangle())
-        }
-        .padding(.horizontal)
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(uiColor: .systemBackground))
-        .overlay(alignment: .bottom) {
-            Divider()
+            Image(systemName: workerFilterID == nil
+                ? "line.3.horizontal.decrease.circle"
+                : "line.3.horizontal.decrease.circle.fill"
+            )
         }
         .accessibilityLabel("Filter projects by worker")
         .accessibilityValue(workerFilterName)
@@ -211,38 +234,26 @@ struct ProjectListView: View {
 
 private struct ProjectListRow: View {
     let repositoryName: String
-    let workerName: String
     let sessions: [WorkerSessionSnapshot]
 
-    private var activeTerminalCount: Int {
-        sessions.filter { $0.repositoryName == repositoryName }.count
+    private var isWorking: Bool {
+        sessions.contains { $0.isWorking() }
     }
 
     var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "folder.fill")
-                .font(.title3)
-                .foregroundStyle(.tint)
-                .frame(width: 28)
+        HStack(spacing: 10) {
+            Text(repositoryName)
+                .font(.body.weight(.medium))
 
-            VStack(alignment: .leading, spacing: 3) {
-                Text(repositoryName)
-                    .font(.body.weight(.medium))
-                HStack(spacing: 5) {
-                    Text(workerName)
-                    Text("·")
-                    if activeTerminalCount == 0 {
-                        Text("No active terminals")
-                    } else {
-                        Text("\(activeTerminalCount) active \(activeTerminalCount == 1 ? "terminal" : "terminals")")
-                            .foregroundStyle(.green)
-                    }
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Spacer()
+
+            if isWorking {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityLabel("Working")
             }
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 2)
     }
 }
 
@@ -257,18 +268,20 @@ private struct ProjectDetailView: View {
         guard model.profile?.id == workerID else { return [] }
         return model.sessions
             .filter { $0.repositoryName == repositoryName }
-            .sorted { $0.kind.rawValue < $1.kind.rawValue }
-    }
-
-    private var canStartTerminal: Bool {
-        AgentKind.allCases.contains { model.session(for: $0) == nil }
+            .sorted {
+                let titleOrder = ($0.title ?? "").localizedStandardCompare($1.title ?? "")
+                if titleOrder == .orderedSame {
+                    return $0.instanceToken < $1.instanceToken
+                }
+                return titleOrder == .orderedAscending
+            }
     }
 
     var body: some View {
         List {
             if sessions.isEmpty {
                 ContentUnavailableView {
-                    Label("No Active Terminals", systemImage: "terminal")
+                    Label("No Terminals", systemImage: "terminal")
                 } description: {
                     Text("Start a terminal for this project to work from your iPhone.")
                 }
@@ -294,7 +307,6 @@ private struct ProjectDetailView: View {
                 } label: {
                     Label("New Terminal", systemImage: "plus")
                 }
-                .disabled(!canStartTerminal)
             }
         }
         .confirmationDialog(
@@ -304,9 +316,8 @@ private struct ProjectDetailView: View {
         ) {
             ForEach(AgentKind.allCases) { kind in
                 Button(kind.displayName) {
-                    model.openTerminal(kind: kind, repositoryName: repositoryName)
+                    model.startTerminal(kind: kind, repositoryName: repositoryName)
                 }
-                .disabled(model.session(for: kind) != nil)
             }
         }
         .alert(item: $stopRequest) { request in
@@ -330,33 +341,30 @@ private struct ProjectDetailView: View {
     @ViewBuilder
     private func terminalRow(_ session: WorkerSessionSnapshot) -> some View {
         Button {
-            model.openTerminal(kind: session.kind, repositoryName: repositoryName)
+            model.openTerminal(session)
         } label: {
             HStack(spacing: 12) {
                 AgentTaskIcon(kind: session.kind)
 
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(session.kind.displayName)
-                        .font(.body.weight(.medium))
-                        .foregroundStyle(.primary)
-
-                    Text(attachedClientLabel(session.attachedClientCount))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                Text(session.title ?? "Untitled terminal")
+                    .font(.body.weight(.medium))
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
 
                 Spacer()
 
-                Circle()
-                    .fill(Color.green)
-                    .frame(width: 8, height: 8)
-                    .accessibilityLabel("Active")
-
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.tertiary)
+                if session.isWorking() {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel("Working")
+                } else if model.isUnread(session) {
+                    Circle()
+                        .fill(Color.blue)
+                        .frame(width: 8, height: 8)
+                        .accessibilityLabel("New activity")
+                }
             }
-            .padding(.vertical, 4)
+            .padding(.vertical, 3)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -381,14 +389,6 @@ private struct ProjectDetailView: View {
             } label: {
                 Label("Stop Terminal", systemImage: "stop.fill")
             }
-        }
-    }
-
-    private func attachedClientLabel(_ count: Int) -> String {
-        switch count {
-        case 0: "Ready"
-        case 1: "1 client attached"
-        default: "\(count) clients attached"
         }
     }
 }

@@ -74,7 +74,10 @@ struct RootView: View {
             }
         }
         .fullScreenCover(item: $model.terminalRoute, onDismiss: {
-            Task { await model.refresh() }
+            Task {
+                await model.refresh()
+                model.markLastOpenedTerminalRead()
+            }
         }) { route in
             if let profile = model.profile {
                 TerminalScreen(profile: profile, route: route)

@@ -139,9 +139,16 @@ final class WorkerSessionService: ObservableObject {
             let projects = Set(previousResponse?.projects ?? [])
                 .union(response.projects)
                 .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
-            let sessions = ((previousResponse?.sessions ?? []).filter { $0.kind != kind }
-                + [snapshot])
-                .sorted { $0.kind.rawValue < $1.kind.rawValue }
+            let sessions = ((previousResponse?.sessions ?? []).filter {
+                $0.instanceToken != snapshot.instanceToken
+            } + [snapshot])
+                .sorted {
+                    if $0.repositoryName != $1.repositoryName {
+                        return $0.repositoryName.localizedStandardCompare($1.repositoryName)
+                            == .orderedAscending
+                    }
+                    return $0.instanceToken < $1.instanceToken
+                }
             responses[worker.id] = WorkerSessionResponse(
                 projects: projects,
                 sessions: sessions

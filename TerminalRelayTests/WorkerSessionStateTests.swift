@@ -19,16 +19,16 @@ final class WorkerSessionStateTests: XCTestCase {
             response.sessions,
             [
                 WorkerSessionSnapshot(
-                    kind: .claude,
-                    repositoryName: "website-api",
-                    attachedClientCount: 0,
-                    instanceToken: "11111111-2222-" + "4333-8444-555555555555"
-                ),
-                WorkerSessionSnapshot(
                     kind: .codex,
                     repositoryName: "terminal-relay",
                     attachedClientCount: 2,
                     instanceToken: "01234567-89ab-" + "4def-8abc-0123456789ab"
+                ),
+                WorkerSessionSnapshot(
+                    kind: .claude,
+                    repositoryName: "website-api",
+                    attachedClientCount: 0,
+                    instanceToken: "11111111-2222-" + "4333-8444-555555555555"
                 )
             ]
         )
@@ -40,13 +40,30 @@ final class WorkerSessionStateTests: XCTestCase {
         }
     }
 
-    func testRejectsDuplicateAgentSlotsAndUnsafeProjectNames() {
-        let duplicateSlot = """
+    func testAllowsMultipleAgentSessionsAndParsesTitleAndActivity() throws {
+        let response = try WorkerSessionProtocol.parse(
+            """
+            __TERMINAL_RELAY_SESSION_V1__
+            session|codex|terminal-relay|1|01234567-89ab-4def-8abc-0123456789ab|123|466978206c6f67696e
+            session|codex|terminal-relay|0|11111111-2222-4333-8444-555555555555|120|
+            """
+        )
+
+        XCTAssertEqual(response.sessions.count, 2)
+        XCTAssertEqual(response.sessions.first?.title, nil)
+        XCTAssertEqual(response.sessions.last?.title, "Fix login")
+        XCTAssertEqual(response.sessions.last?.lastActivityAt, 123)
+        XCTAssertTrue(response.sessions.last?.isWorking(now: Date(timeIntervalSince1970: 127)) == true)
+        XCTAssertTrue(response.sessions.last?.isWorking(now: Date(timeIntervalSince1970: 132)) == false)
+    }
+
+    func testRejectsDuplicateInstancesAndUnsafeProjectNames() {
+        let duplicateInstance = """
         __TERMINAL_RELAY_SESSION_V1__
         session|codex|terminal-relay|1|01234567-89ab-4def-8abc-0123456789ab
-        session|codex|website-api|0|11111111-2222-4333-8444-555555555555
+        session|claude|website-api|0|01234567-89ab-4def-8abc-0123456789ab
         """
-        XCTAssertThrowsError(try WorkerSessionProtocol.parse(duplicateSlot)) {
+        XCTAssertThrowsError(try WorkerSessionProtocol.parse(duplicateInstance)) {
             XCTAssertEqual($0 as? WorkerSessionProtocolError, .invalidRecord)
         }
 

@@ -271,25 +271,33 @@ any_tool_session_exists() {
 
 load_metadata_unlocked() {
     local tool="$1"
+    local instance="$2"
     local metadata_file
     local key
     local value
     local extra
+    local tool_seen=0
     local repository_seen=0
     local instance_seen=0
     local pid_seen=0
     local start_seen=0
 
+    metadata_tool=""
     metadata_repository=""
     metadata_instance=""
     metadata_pid=""
     metadata_start=""
-    metadata_file="$(metadata_file_for "$tool")"
+    metadata_file="$(metadata_file_for "$instance")"
     [[ -f "$metadata_file" && ! -L "$metadata_file" ]] || return 1
 
     while IFS='|' read -r key value extra; do
         [[ -z "${extra:-}" ]] || return 1
         case "$key" in
+            tool)
+                [[ $tool_seen -eq 0 ]] || return 1
+                metadata_tool="$value"
+                tool_seen=1
+                ;;
             repository)
                 [[ $repository_seen -eq 0 ]] || return 1
                 metadata_repository="$value"
@@ -314,12 +322,15 @@ load_metadata_unlocked() {
         esac
     done < "$metadata_file"
 
-    [[ $repository_seen -eq 1 \
+    [[ $tool_seen -eq 1 \
+        && $repository_seen -eq 1 \
         && $instance_seen -eq 1 \
         && $pid_seen -eq 1 \
         && $start_seen -eq 1 ]] || return 1
+    [[ "$metadata_tool" == "$tool" ]] || return 1
     is_valid_repository_name "$metadata_repository" || return 1
     is_valid_instance "$metadata_instance" || return 1
+    [[ "$metadata_instance" == "$instance" ]] || return 1
     [[ "$metadata_pid" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
     if [[ "$metadata_pid" == "0" ]]; then
         [[ "$metadata_start" == "pending" ]] || return 1
@@ -337,10 +348,10 @@ write_metadata_unlocked() {
     local metadata_file
     local temporary_file
 
-    metadata_file="$(metadata_file_for "$tool")"
+    metadata_file="$(metadata_file_for "$instance")"
     temporary_file="$metadata_file.$$.$RANDOM.tmp"
-    printf 'repository|%s\ninstance|%s\npid|%s\nstart|%s\n' \
-        "$repository" "$instance" "$pid" "$start" > "$temporary_file"
+    printf 'tool|%s\nrepository|%s\ninstance|%s\npid|%s\nstart|%s\n' \
+        "$tool" "$repository" "$instance" "$pid" "$start" > "$temporary_file"
     /bin/chmod 600 "$temporary_file"
     /bin/mv -f "$temporary_file" "$metadata_file"
 }
@@ -504,7 +515,7 @@ load_intent_path_unlocked() {
 }
 
 load_intent_unlocked() {
-    load_intent_path_unlocked "$1" "$(intent_file_for "$1")"
+    load_intent_path_unlocked "$1" "$(intent_file_for "$2")"
 }
 
 write_intent_unlocked() {
@@ -519,7 +530,7 @@ write_intent_unlocked() {
 
     validate_launch_arguments "$tool" "$@" || return $?
     is_valid_boot_id "$boot_id" || return 70
-    intent_file="$(intent_file_for "$tool")"
+    intent_file="$(intent_file_for "$instance")"
     temporary_file="$intent_file.$$.$RANDOM.tmp"
     {
         printf 'version|1\ntool|%s\nrepository|%s\ninstance|%s\nboot|%s\nargc|%s\n' \
@@ -538,7 +549,7 @@ remove_intent_if_matches_unlocked() {
     local instance="$3"
     local intent_file
 
-    intent_file="$(intent_file_for "$tool")"
+    intent_file="$(intent_file_for "$instance")"
     if load_intent_path_unlocked "$tool" "$intent_file" \
         && [[ "$intent_repository" == "$repository" && "$intent_instance" == "$instance" ]]; then
         /bin/rm -f -- "$intent_file"
@@ -547,11 +558,12 @@ remove_intent_if_matches_unlocked() {
 
 clear_same_boot_stale_intent_unlocked() {
     local tool="$1"
-    local boot_id="$2"
+    local instance="$2"
+    local boot_id="$3"
     local intent_file
     local load_status
 
-    intent_file="$(intent_file_for "$tool")"
+    intent_file="$(intent_file_for "$instance")"
     [[ -e "$intent_file" || -L "$intent_file" ]] || return 0
     set +e
     load_intent_path_unlocked "$tool" "$intent_file"
@@ -570,11 +582,12 @@ clear_same_boot_stale_intent_unlocked() {
 
 prune_dead_same_boot_intent_unlocked() {
     local tool="$1"
-    local boot_id="$2"
+    local instance="$2"
+    local boot_id="$3"
     local intent_file
     local load_status
 
-    intent_file="$(intent_file_for "$tool")"
+    intent_file="$(intent_file_for "$instance")"
     [[ -e "$intent_file" || -L "$intent_file" ]] || return 0
     set +e
     load_intent_path_unlocked "$tool" "$intent_file"
@@ -752,12 +765,12 @@ agent_lock_is_free() {
 }
 
 metadata_launch_is_running() {
-    local tool="$1"
+    local instance="$1"
     if [[ "$metadata_pid" != "0" ]] \
         && process_matches "$metadata_pid" "$metadata_start"; then
         return 0
     fi
-    ! agent_lock_is_free "$tool"
+    ! agent_lock_is_free "$instance"
 }
 
 configure_tmux() {
@@ -825,77 +838,154 @@ list_projects() {
     fi
 }
 
+resolve_session_title() {
+    local tool="$1"
+    local instance="$2"
+    local pane_title="$3"
+    local home_directory="${runtime_home:-${HOME:-}}"
+
+    if [[ -x "$default_python_path" ]]; then
+        "$default_python_path" - "$tool" "$instance" "$pane_title" "$home_directory" <<'PYTHON_TITLE'
+import glob
+import json
+import os
+import re
+import sqlite3
+import sys
+
+tool, instance, pane_title, home = sys.argv[1:]
+title = ""
+if tool == "codex":
+    match = re.search(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        pane_title.lower(),
+    )
+    if match:
+        database = os.path.join(home, ".codex", "state_5.sqlite")
+        try:
+            connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+            row = connection.execute(
+                "select title from threads where id = ? limit 1", (match.group(0),)
+            ).fetchone()
+            connection.close()
+            if row and isinstance(row[0], str):
+                title = row[0]
+        except (OSError, sqlite3.Error):
+            pass
+elif tool == "claude":
+    candidates = glob.glob(
+        os.path.join(home, ".claude", "projects", "**", f"{instance}.jsonl"),
+        recursive=True,
+    )
+    if candidates:
+        try:
+            with open(candidates[0], encoding="utf-8") as history:
+                for line in history:
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    custom = record.get("customTitle")
+                    if isinstance(custom, str) and custom.strip():
+                        title = custom
+                    message = record.get("message")
+                    if not title and record.get("type") == "user" and isinstance(message, dict):
+                        content = message.get("content")
+                        if isinstance(content, str):
+                            title = content
+                        elif isinstance(content, list):
+                            title = " ".join(
+                                item.get("text", "")
+                                for item in content
+                                if isinstance(item, dict) and item.get("type") == "text"
+                            )
+        except OSError:
+            pass
+
+if not title:
+    title = re.sub(r"\s*\|\s*(Ready|Working|Thinking).*$", "", pane_title, flags=re.I)
+title = "".join(character if character.isprintable() else " " for character in title)
+title = re.sub(r"\s+", " ", title).strip()
+print(title[:200])
+PYTHON_TITLE
+        return
+    fi
+    printf '%s\n' "$pane_title" | /usr/bin/tr '\r\n' '  ' | /usr/bin/cut -c1-200
+}
+
+session_display_fields() {
+    local tool="$1"
+    local instance="$2"
+    local session_name
+    local display
+    local pane_title
+
+    session_activity=0
+    session_title_hex=""
+    session_name="$(session_name_for "$tool" "$instance")"
+    display="$(tmux_command display-message -p -t "$session_name" \
+        '#{window_activity}|#{pane_title}' 2>/dev/null)" || return 1
+    session_activity="${display%%|*}"
+    pane_title="${display#*|}"
+    [[ "$session_activity" =~ ^[0-9]+$ ]] || session_activity=0
+    session_title_hex="$(encode_argument_hex "$(resolve_session_title "$tool" "$instance" "$pane_title")")"
+}
+
 status_sessions() {
+    local metadata_file
+    local instance
     local tool
     local repository
-    local instance
     local session_name
     local attached_client_count
     local boot_id
     local intent_status
+    local -a records=()
 
-    if [[ ! -x "$tmux_path" ]]; then
+    [[ -x "$tmux_path" ]] || {
         echo "Required tmux executable is unavailable: $tmux_path" >&2
         return 69
-    fi
+    }
     require_flock
     boot_id="$(current_boot_id)" || {
         echo "Unable to read the worker boot identity from $boot_id_path." >&2
         return 69
     }
 
-    printf '%s\n' "$protocol_marker"
-    for tool in codex claude; do
-        lock_tool_control "$tool"
-        lock_tool_metadata "$tool"
-        if ! load_metadata_unlocked "$tool"; then
-            if any_tool_session_exists "$tool"; then
-                unlock_tool_metadata
-                unlock_tool_control
-                echo "The active $tool session has no valid launch metadata." >&2
-                return 70
-            fi
-            intent_status=0
-            prune_dead_same_boot_intent_unlocked "$tool" "$boot_id" || intent_status=$?
+    shopt -s nullglob
+    for metadata_file in "$runtime_directory"/*.session; do
+        instance="${metadata_file##*/}"
+        instance="${instance%.session}"
+        is_valid_instance "$instance" || continue
+        tool="$(/usr/bin/sed -n 's/^tool|//p' "$metadata_file")"
+        validate_tool "$tool"
+
+        lock_tool_control "$instance"
+        lock_tool_metadata "$instance"
+        if ! load_metadata_unlocked "$tool" "$instance"; then
             unlock_tool_metadata
             unlock_tool_control
-            if [[ $intent_status -ne 0 ]]; then
-                echo "The saved $tool restart intent is invalid." >&2
-                return "$intent_status"
-            fi
-            continue
+            echo "The saved terminal metadata for '$instance' is invalid." >&2
+            return 70
         fi
-
         repository="$metadata_repository"
-        instance="$metadata_instance"
+        session_name="$(session_name_for "$tool" "$instance")"
         if session_exists "$tool" "$instance"; then
-            session_name="$(session_name_for "$tool" "$instance")"
-            if ! attached_client_count="$(tmux_command display-message -p -t "$session_name" '#{session_attached}' 2>/dev/null)"; then
-                if metadata_launch_is_running "$tool"; then
-                    attached_client_count=0
-                else
-                    remove_metadata_unlocked "$tool"
-                    intent_status=0
-                    prune_dead_same_boot_intent_unlocked "$tool" "$boot_id" || intent_status=$?
-                    unlock_tool_metadata
-                    unlock_tool_control
-                    if [[ $intent_status -ne 0 ]]; then
-                        echo "The saved $tool restart intent is invalid." >&2
-                        return "$intent_status"
-                    fi
-                    continue
-                fi
+            if ! attached_client_count="$(tmux_command display-message -p -t "$session_name" \
+                '#{session_attached}' 2>/dev/null)"; then
+                attached_client_count=0
             fi
-        elif metadata_launch_is_running "$tool"; then
+        elif metadata_launch_is_running "$instance"; then
             attached_client_count=0
         else
-            remove_metadata_unlocked "$tool"
+            remove_metadata_unlocked "$instance"
             intent_status=0
-            prune_dead_same_boot_intent_unlocked "$tool" "$boot_id" || intent_status=$?
+            prune_dead_same_boot_intent_unlocked "$tool" "$instance" "$boot_id" \
+                || intent_status=$?
             unlock_tool_metadata
             unlock_tool_control
             if [[ $intent_status -ne 0 ]]; then
-                echo "The saved $tool restart intent is invalid." >&2
+                echo "The saved $tool restart intent for '$instance' is invalid." >&2
                 return "$intent_status"
             fi
             continue
@@ -903,13 +993,22 @@ status_sessions() {
         unlock_tool_metadata
         unlock_tool_control
 
-        if [[ ! "$attached_client_count" =~ ^[0-9]+$ ]]; then
+        [[ "$attached_client_count" =~ ^[0-9]+$ ]] || {
             echo "tmux returned an invalid attached-client count for $tool." >&2
             return 70
+        }
+        if ! session_display_fields "$tool" "$instance"; then
+            session_activity=0
+            session_title_hex=""
         fi
-        printf 'session|%s|%s|%s|%s\n' \
-            "$tool" "$repository" "$attached_client_count" "$instance"
+        records+=("session|$tool|$repository|$attached_client_count|$instance|$session_activity|$session_title_hex")
     done
+    shopt -u nullglob
+
+    printf '%s\n' "$protocol_marker"
+    if [[ ${#records[@]} -gt 0 ]]; then
+        printf '%s\n' "${records[@]}" | LC_ALL=C /usr/bin/sort
+    fi
 }
 
 wait_for_recorded_pid() {
@@ -921,8 +1020,8 @@ wait_for_recorded_pid() {
     stop_pid=0
     stop_start="pending"
     for attempt in $(seq 1 40); do
-        lock_tool_metadata "$tool"
-        if ! load_metadata_unlocked "$tool"; then
+        lock_tool_metadata "$instance"
+        if ! load_metadata_unlocked "$tool" "$instance"; then
             unlock_tool_metadata
             return 75
         fi
@@ -942,7 +1041,7 @@ wait_for_recorded_pid() {
 }
 
 wait_for_launch_end() {
-    local tool="$1"
+    local instance="$1"
     local pid="$2"
     local start="$3"
     local attempts="$4"
@@ -952,7 +1051,7 @@ wait_for_launch_end() {
     while [[ $attempt -lt $attempts ]]; do
         attempt=$((attempt + 1))
         if { [[ "$pid" == "0" ]] || ! process_matches "$pid" "$start"; } \
-            && agent_lock_is_free "$tool"; then
+            && agent_lock_is_free "$instance"; then
             return 0
         fi
         sleep 0.1
@@ -980,7 +1079,7 @@ terminate_launch() {
         fi
     fi
 
-    if ! wait_for_launch_end "$tool" "$stop_pid" "$stop_start" 20; then
+    if ! wait_for_launch_end "$instance" "$stop_pid" "$stop_start" 20; then
         if [[ "$stop_pid" != "0" ]]; then
             signal_status=0
             signal_recorded_process "$stop_pid" "$stop_start" TERM || signal_status=$?
@@ -989,7 +1088,7 @@ terminate_launch() {
                 *) return 70 ;;
             esac
         fi
-        if ! wait_for_launch_end "$tool" "$stop_pid" "$stop_start" 20; then
+        if ! wait_for_launch_end "$instance" "$stop_pid" "$stop_start" 20; then
             if [[ "$stop_pid" != "0" ]]; then
                 signal_status=0
                 signal_recorded_process "$stop_pid" "$stop_start" KILL || signal_status=$?
@@ -998,7 +1097,7 @@ terminate_launch() {
                     *) return 70 ;;
                 esac
             fi
-            wait_for_launch_end "$tool" "$stop_pid" "$stop_start" 30 || return 70
+            wait_for_launch_end "$instance" "$stop_pid" "$stop_start" 30 || return 70
         fi
     fi
 
@@ -1007,14 +1106,14 @@ terminate_launch() {
         session_exists "$tool" "$instance" && return 70
     fi
 
-    lock_tool_metadata "$tool"
-    if ! load_metadata_unlocked "$tool" \
+    lock_tool_metadata "$instance"
+    if ! load_metadata_unlocked "$tool" "$instance" \
         || [[ "$metadata_repository" != "$repository" \
             || "$metadata_instance" != "$instance" ]]; then
         unlock_tool_metadata
         return 75
     fi
-    remove_metadata_unlocked "$tool"
+    remove_metadata_unlocked "$instance"
     unlock_tool_metadata
 }
 
@@ -1023,10 +1122,10 @@ restore_sessions() {
     local tool
     local intent_file
     local stopping_file
+    local instance
     local load_status
     local project_directory
     local repository
-    local instance
     local launch_file
     local launch_command
     local session_name
@@ -1043,43 +1142,43 @@ restore_sessions() {
         return 69
     }
 
-    for tool in codex claude; do
-        lock_tool_control "$tool"
-        lock_tool_metadata "$tool"
-        intent_file="$(intent_file_for "$tool")"
-        stopping_file="$(stopping_intent_file_for "$tool")"
-        if [[ -e "$stopping_file" || -L "$stopping_file" ]]; then
-            set +e
-            load_intent_path_unlocked "$tool" "$stopping_file"
-            load_status=$?
-            set -e
-            if [[ $load_status -ne 0 ]]; then
-                unlock_tool_metadata
-                unlock_tool_control
-                echo "The saved $tool stop transition is invalid; recovery was skipped." >&2
-                overall_status=70
-                continue
-            fi
-            remove_metadata_unlocked "$tool"
+    shopt -s nullglob
+    for stopping_file in "$runtime_directory"/*.intent.stopping; do
+        instance="${stopping_file##*/}"
+        instance="${instance%.intent.stopping}"
+        is_valid_instance "$instance" || continue
+        tool="$(/usr/bin/sed -n 's/^tool|//p' "$stopping_file")"
+        validate_tool "$tool"
+        lock_tool_control "$instance"
+        lock_tool_metadata "$instance"
+        if ! load_intent_path_unlocked "$tool" "$stopping_file"; then
+            echo "The saved $tool stop transition for '$instance' is invalid." >&2
+            overall_status=70
+        else
+            remove_metadata_unlocked "$instance"
             /bin/rm -f -- "$stopping_file"
-            unlock_tool_metadata
-            unlock_tool_control
-            continue
         fi
-        if [[ ! -e "$intent_file" && ! -L "$intent_file" ]]; then
-            unlock_tool_metadata
-            unlock_tool_control
-            continue
-        fi
+        unlock_tool_metadata
+        unlock_tool_control
+    done
+
+    for intent_file in "$runtime_directory"/*.intent; do
+        instance="${intent_file##*/}"
+        instance="${instance%.intent}"
+        is_valid_instance "$instance" || continue
+        tool="$(/usr/bin/sed -n 's/^tool|//p' "$intent_file")"
+        validate_tool "$tool"
+        lock_tool_control "$instance"
+        lock_tool_metadata "$instance"
 
         set +e
         load_intent_path_unlocked "$tool" "$intent_file"
         load_status=$?
         set -e
-        if [[ $load_status -ne 0 ]]; then
+        if [[ $load_status -ne 0 || "$intent_instance" != "$instance" ]]; then
             unlock_tool_metadata
             unlock_tool_control
-            echo "The saved $tool restart intent is invalid; recovery was skipped." >&2
+            echo "The saved $tool restart intent for '$instance' is invalid; recovery was skipped." >&2
             overall_status=70
             continue
         fi
@@ -1090,7 +1189,6 @@ restore_sessions() {
         fi
 
         repository="$intent_repository"
-        instance="$intent_instance"
         if ! project_directory="$(project_directory_for "$repository")"; then
             unlock_tool_metadata
             unlock_tool_control
@@ -1098,21 +1196,20 @@ restore_sessions() {
             overall_status=66
             continue
         fi
-        if any_tool_session_exists "$tool" || {
-            load_metadata_unlocked "$tool" && metadata_launch_is_running "$tool";
+        if session_exists "$tool" "$instance" || {
+            load_metadata_unlocked "$tool" "$instance" \
+                && metadata_launch_is_running "$instance";
         }; then
             unlock_tool_metadata
             unlock_tool_control
-            echo "Refusing to restore $tool while another launch is active." >&2
-            overall_status=75
             continue
         fi
 
-        remove_metadata_unlocked "$tool"
+        remove_metadata_unlocked "$instance"
         write_metadata_unlocked "$tool" "$repository" "$instance" 0 pending
         if ! write_intent_unlocked \
             "$tool" "$repository" "$instance" "$boot_id" "${intent_arguments[@]}"; then
-            remove_metadata_unlocked "$tool"
+            remove_metadata_unlocked "$instance"
             unlock_tool_metadata
             unlock_tool_control
             echo "Unable to advance the saved $tool restart intent." >&2
@@ -1122,16 +1219,14 @@ restore_sessions() {
         unlock_tool_metadata
 
         session_name="$(session_name_for "$tool" "$instance")"
-        launch_file="$runtime_directory/$tool.restore.$$.$RANDOM"
+        launch_file="$runtime_directory/$instance.restore.$$.$RANDOM"
         write_launch_script \
             "$launch_file" "$tool" "$repository" "$instance" resume "${intent_arguments[@]}"
         printf -v launch_command '%q' "$launch_file"
         if ! tmux_command new-session -d -s "$session_name" -c "$project_directory" "$launch_command"; then
             /bin/rm -f -- "$launch_file"
-            lock_tool_metadata "$tool"
-            if load_metadata_unlocked "$tool" && [[ "$metadata_instance" == "$instance" ]]; then
-                remove_metadata_unlocked "$tool"
-            fi
+            lock_tool_metadata "$instance"
+            remove_metadata_unlocked "$instance"
             remove_intent_if_matches_unlocked "$tool" "$repository" "$instance"
             unlock_tool_metadata
             unlock_tool_control
@@ -1141,7 +1236,7 @@ restore_sessions() {
         fi
         if ! configure_tmux || ! session_exists "$tool" "$instance"; then
             terminate_launch "$tool" "$repository" "$instance" || true
-            lock_tool_metadata "$tool"
+            lock_tool_metadata "$instance"
             remove_intent_if_matches_unlocked "$tool" "$repository" "$instance"
             unlock_tool_metadata
             unlock_tool_control
@@ -1152,6 +1247,7 @@ restore_sessions() {
         unlock_tool_control
         printf 'Restored %s session %s for repository %s.\n' "$tool" "$instance" "$repository"
     done
+    shopt -u nullglob
 
     return "$overall_status"
 }
@@ -1484,8 +1580,8 @@ stage_stop_intent_unlocked() {
     local stopping_file
 
     stop_intent_staged=0
-    intent_file="$(intent_file_for "$tool")"
-    stopping_file="$(stopping_intent_file_for "$tool")"
+    intent_file="$(intent_file_for "$instance")"
+    stopping_file="$(stopping_intent_file_for "$instance")"
     if [[ -e "$stopping_file" || -L "$stopping_file" ]]; then
         echo "A previous $tool stop transition is incomplete." >&2
         return 70
@@ -1511,8 +1607,8 @@ restore_staged_stop_intent_unlocked() {
     local stopping_file
 
     [[ ${stop_intent_staged:-0} -eq 1 ]] || return 0
-    intent_file="$(intent_file_for "$tool")"
-    stopping_file="$(stopping_intent_file_for "$tool")"
+    intent_file="$(intent_file_for "$instance")"
+    stopping_file="$(stopping_intent_file_for "$instance")"
     [[ ! -e "$intent_file" && ! -L "$intent_file" ]] || return 70
     if ! load_intent_path_unlocked "$tool" "$stopping_file" \
         || [[ "$intent_repository" != "$repository" \
@@ -1529,7 +1625,7 @@ remove_staged_stop_intent_unlocked() {
     local stopping_file
 
     [[ ${stop_intent_staged:-0} -eq 1 ]] || return 0
-    stopping_file="$(stopping_intent_file_for "$tool")"
+    stopping_file="$(stopping_intent_file_for "$instance")"
     if load_intent_path_unlocked "$tool" "$stopping_file" \
         && [[ "$intent_repository" == "$repository" \
             && "$intent_instance" == "$instance" ]]; then
@@ -1622,6 +1718,398 @@ stop_session() {
             exit 70
             ;;
     esac
+}
+
+start_instance_session() {
+    local tool="$1"
+    local repository="$2"
+    shift 2
+    local project_directory
+    local session_name
+    local instance
+    local launch_file
+    local launch_command
+    local attached_client_count
+    local boot_id
+
+    validate_tool "$tool"
+    validate_launch_arguments "$tool" "$@" || exit $?
+    boot_id="$(current_boot_id)" || {
+        echo "Unable to read the worker boot identity from $boot_id_path." >&2
+        exit 69
+    }
+    project_directory="$(project_directory_for "$repository")" || exit $?
+    [[ -x "$tmux_path" ]] || {
+        echo "Required tmux executable is unavailable: $tmux_path" >&2
+        exit 69
+    }
+    require_flock
+    require_lifetime_signal_support || exit $?
+    instance="$(generate_instance)" || {
+        echo "Unable to generate a launch instance token." >&2
+        exit 70
+    }
+    session_name="$(session_name_for "$tool" "$instance")"
+
+    lock_tool_control "$instance"
+    lock_tool_metadata "$instance"
+    write_metadata_unlocked "$tool" "$repository" "$instance" 0 pending
+    if ! write_intent_unlocked "$tool" "$repository" "$instance" "$boot_id" "$@"; then
+        remove_metadata_unlocked "$instance"
+        unlock_tool_metadata
+        unlock_tool_control
+        echo "Unable to persist the $tool restart intent." >&2
+        exit 70
+    fi
+    unlock_tool_metadata
+
+    launch_file="$runtime_directory/$instance.launch.$$.$RANDOM"
+    write_launch_script "$launch_file" "$tool" "$repository" "$instance" initial "$@"
+    printf -v launch_command '%q' "$launch_file"
+    if ! tmux_command new-session -d -s "$session_name" -c "$project_directory" "$launch_command"; then
+        /bin/rm -f -- "$launch_file"
+        lock_tool_metadata "$instance"
+        remove_metadata_unlocked "$instance"
+        remove_intent_if_matches_unlocked "$tool" "$repository" "$instance"
+        unlock_tool_metadata
+        unlock_tool_control
+        echo "Unable to start the $tool tmux session." >&2
+        exit 70
+    fi
+    if ! configure_tmux; then
+        terminate_launch "$tool" "$repository" "$instance" || true
+        lock_tool_metadata "$instance"
+        remove_intent_if_matches_unlocked "$tool" "$repository" "$instance"
+        unlock_tool_metadata
+        unlock_tool_control
+        echo "Unable to configure tmux for the $tool launch." >&2
+        exit 70
+    fi
+    if ! attached_client_count="$(tmux_command display-message -p -t "$session_name" \
+        '#{session_attached}' 2>/dev/null)" \
+        || [[ ! "$attached_client_count" =~ ^[0-9]+$ ]]; then
+        unlock_tool_control
+        echo "The $tool tmux session ended before start completed." >&2
+        exit 75
+    fi
+    unlock_tool_control
+
+    if ! session_display_fields "$tool" "$instance"; then
+        session_activity=0
+        session_title_hex=""
+    fi
+    printf '%s\n' "$protocol_marker"
+    printf 'session|%s|%s|%s|%s|%s|%s\n' \
+        "$tool" "$repository" "$attached_client_count" "$instance" \
+        "$session_activity" "$session_title_hex"
+}
+
+reattach_instance_session() {
+    local tool="$1"
+    local repository="$2"
+    local instance="$3"
+    local session_name
+    local pause_file
+
+    validate_tool "$tool"
+    is_valid_repository_name "$repository" || fail_usage "Invalid reattach repository: $repository"
+    is_valid_instance "$instance" || fail_usage "Invalid reattach instance: $instance"
+    [[ -x "$tmux_path" ]] || {
+        echo "Required tmux executable is unavailable: $tmux_path" >&2
+        exit 69
+    }
+    require_flock
+
+    lock_tool_control "$instance"
+    lock_tool_metadata "$instance"
+    if ! load_metadata_unlocked "$tool" "$instance" \
+        || [[ "$metadata_repository" != "$repository" ]]; then
+        unlock_tool_metadata
+        unlock_tool_control
+        echo "The requested $tool launch has ended and cannot be reattached." >&2
+        exit 75
+    fi
+    unlock_tool_metadata
+
+    session_name="$(session_name_for "$tool" "$instance")"
+    if ! session_exists "$tool" "$instance"; then
+        unlock_tool_control
+        echo "The requested $tool launch has ended and cannot be reattached." >&2
+        exit 75
+    fi
+    if ! configure_tmux || ! session_exists "$tool" "$instance"; then
+        unlock_tool_control
+        echo "The requested $tool launch ended before it could be reattached." >&2
+        exit 75
+    fi
+    unlock_tool_control
+
+    if [[ $test_mode -eq 1 && -n "${TERMINAL_RELAY_TEST_PAUSE_BEFORE_ATTACH:-}" ]]; then
+        pause_file="$TERMINAL_RELAY_TEST_PAUSE_BEFORE_ATTACH"
+        [[ "$pause_file" == /* && "$pause_file" != *$'\n'* ]] || exit 78
+        printf 'ready\n' > "$pause_file.ready"
+        while [[ -e "$pause_file" ]]; do sleep 0.05; done
+        session_exists "$tool" "$instance" || {
+            echo "The requested $tool launch ended before it could be reattached." >&2
+            exit 75
+        }
+    fi
+    exec "$tmux_path" -f /dev/null -L "$tmux_socket" attach-session -t "$session_name"
+}
+
+attach_instance_session() {
+    local tool="$1"
+    local repository="$2"
+    shift 2
+    local metadata_file
+    local candidate
+    local candidate_tool
+    local start_output
+    local instance=""
+
+    validate_tool "$tool"
+    validate_launch_arguments "$tool" "$@" || exit $?
+    project_directory_for "$repository" >/dev/null || exit $?
+
+    shopt -s nullglob
+    for metadata_file in "$runtime_directory"/*.session; do
+        candidate="${metadata_file##*/}"
+        candidate="${candidate%.session}"
+        is_valid_instance "$candidate" || continue
+        candidate_tool="$(/usr/bin/sed -n 's/^tool|//p' "$metadata_file")"
+        [[ "$candidate_tool" == "$tool" ]] || continue
+        lock_tool_control "$candidate"
+        lock_tool_metadata "$candidate"
+        if load_metadata_unlocked "$tool" "$candidate" \
+            && [[ "$metadata_repository" == "$repository" ]] \
+            && session_exists "$tool" "$candidate"; then
+            instance="$candidate"
+        fi
+        unlock_tool_metadata
+        unlock_tool_control
+        [[ -z "$instance" ]] || break
+    done
+    shopt -u nullglob
+
+    if [[ -z "$instance" ]]; then
+        start_output="$(start_instance_session "$tool" "$repository" "$@")" || exit $?
+        instance="$(printf '%s\n' "$start_output" | /usr/bin/awk -F'|' \
+            '$1 == "session" { print $5; exit }')"
+        is_valid_instance "$instance" || {
+            echo "The worker returned an invalid new $tool terminal instance." >&2
+            exit 70
+        }
+    fi
+    reattach_instance_session "$tool" "$repository" "$instance"
+}
+
+stop_instance_session() {
+    local tool="$1"
+    local repository="$2"
+    local instance="$3"
+    local terminate_status
+    local stage_status=0
+    local stop_intent_staged=0
+
+    validate_tool "$tool"
+    is_valid_repository_name "$repository" || fail_usage "Invalid stop repository: $repository"
+    is_valid_instance "$instance" || fail_usage "Invalid stop instance: $instance"
+    [[ -x "$tmux_path" ]] || {
+        echo "Required tmux executable is unavailable: $tmux_path" >&2
+        exit 69
+    }
+    require_flock
+    require_lifetime_signal_support || exit $?
+
+    lock_tool_control "$instance"
+    lock_tool_metadata "$instance"
+    if ! load_metadata_unlocked "$tool" "$instance" \
+        || [[ "$metadata_repository" != "$repository" ]]; then
+        unlock_tool_metadata
+        unlock_tool_control
+        echo "No matching $tool launch is active; the stop request is stale." >&2
+        exit 75
+    fi
+    stage_stop_intent_unlocked "$tool" "$repository" "$instance" || stage_status=$?
+    unlock_tool_metadata
+    if [[ $stage_status -ne 0 ]]; then
+        unlock_tool_control
+        exit "$stage_status"
+    fi
+
+    set +e
+    terminate_launch "$tool" "$repository" "$instance"
+    terminate_status=$?
+    set -e
+    lock_tool_metadata "$instance"
+    if [[ $terminate_status -eq 0 ]]; then
+        if ! remove_staged_stop_intent_unlocked "$tool" "$repository" "$instance"; then
+            unlock_tool_metadata
+            unlock_tool_control
+            echo "The $tool launch stopped, but its restart intent could not be finalized." >&2
+            exit 70
+        fi
+    elif ! restore_staged_stop_intent_unlocked "$tool" "$repository" "$instance"; then
+        unlock_tool_metadata
+        unlock_tool_control
+        echo "The $tool stop failed and its restart intent could not be restored." >&2
+        exit 70
+    fi
+    unlock_tool_metadata
+    unlock_tool_control
+    case "$terminate_status" in
+        0) ;;
+        75)
+            echo "The $tool launch changed while stopping; the request is stale." >&2
+            exit 75
+            ;;
+        *)
+            echo "The $tool launch did not terminate or release its agent lock." >&2
+            exit 70
+            ;;
+    esac
+}
+
+finalize_instance_launch_state() {
+    local tool="$1"
+    local repository="$2"
+    local instance="$3"
+
+    lock_tool_control "$instance"
+    lock_tool_metadata "$instance"
+    if load_metadata_unlocked "$tool" "$instance" \
+        && [[ "$metadata_repository" == "$repository" ]]; then
+        remove_metadata_unlocked "$instance"
+    fi
+    remove_intent_if_matches_unlocked "$tool" "$repository" "$instance"
+    unlock_tool_metadata
+    unlock_tool_control
+}
+
+run_agent_instance() {
+    local tool="$1"
+    local repository="$2"
+    local instance="$3"
+    local launch_mode="$4"
+    shift 4
+    local project_directory
+    local executable
+    local config_file
+    local mcp_server
+    local lock_file
+    local gate_file
+    local agent_pid
+    local agent_status
+    local start_identity
+    local preserve_intent=0
+    local -a agent_arguments=("$@")
+    local -a agent_command
+
+    validate_tool "$tool"
+    is_valid_instance "$instance" || fail_usage "Invalid internal launch instance."
+    case "$launch_mode" in
+        initial|resume) ;;
+        *) fail_usage "Invalid internal launch mode." ;;
+    esac
+    validate_launch_arguments "$tool" "${agent_arguments[@]}" || exit $?
+    project_directory="$(project_directory_for "$repository")" || exit $?
+    cd "$project_directory"
+
+    case "$tool" in
+        codex)
+            executable="$codex_path"
+            for config_file in "/etc/codex/config.toml" "$HOME/.codex/config.toml" ".codex/config.toml"; do
+                [[ -f "$config_file" ]] || continue
+                while IFS= read -r mcp_server; do
+                    [[ -n "$mcp_server" && "$mcp_server" =~ ^[A-Za-z0-9_-]+$ ]] || continue
+                    agent_arguments+=(--config "mcp_servers.$mcp_server={enabled=false}")
+                done < <(
+                    /usr/bin/sed -n \
+                        's/^[[:space:]]*\[mcp_servers\.\([A-Za-z0-9_-]*\)\][[:space:]]*$/\1/p' \
+                        "$config_file"
+                )
+            done
+            if [[ "$launch_mode" == "resume" ]]; then
+                agent_command=("$executable" resume --last "${agent_arguments[@]}")
+            else
+                agent_command=("$executable" "${agent_arguments[@]}")
+            fi
+            ;;
+        claude)
+            executable="$claude_path"
+            if [[ "$launch_mode" == "resume" ]]; then
+                agent_command=("$executable" --resume "$instance" "${agent_arguments[@]}")
+            else
+                agent_command=("$executable" --session-id "$instance" "${agent_arguments[@]}")
+            fi
+            ;;
+    esac
+
+    [[ -x "$executable" ]] || {
+        echo "Required $tool executable is unavailable: $executable" >&2
+        exit 69
+    }
+    require_flock
+    lock_file="$(agent_lock_file_for "$instance")"
+    exec 9>"$lock_file"
+    if ! "$flock_path" --nonblock 9; then
+        echo "This $tool agent process is already running on this server." >&2
+        exit 75
+    fi
+
+    lock_tool_metadata "$instance"
+    if ! load_metadata_unlocked "$tool" "$instance" \
+        || [[ "$metadata_repository" != "$repository" ]] \
+        || ! load_intent_unlocked "$tool" "$instance" \
+        || [[ "$intent_repository" != "$repository" \
+            || "$intent_instance" != "$instance" ]]; then
+        unlock_tool_metadata
+        echo "The $tool terminal state changed before the agent started." >&2
+        exit 75
+    fi
+    unlock_tool_metadata
+
+    gate_file="$runtime_directory/$instance.gate.$$.$RANDOM"
+    (
+        while [[ ! -e "$gate_file" ]]; do sleep 0.01; done
+        /bin/rm -f -- "$gate_file"
+        exec "${agent_command[@]}" </dev/tty
+    ) &
+    agent_pid=$!
+    start_identity="$(process_start_identity "$agent_pid")" || {
+        /bin/kill -KILL "$agent_pid" 2>/dev/null || true
+        wait "$agent_pid" 2>/dev/null || true
+        echo "Unable to record the $tool process start identity." >&2
+        exit 70
+    }
+
+    lock_tool_metadata "$instance"
+    if ! load_metadata_unlocked "$tool" "$instance" \
+        || [[ "$metadata_repository" != "$repository" ]]; then
+        unlock_tool_metadata
+        /bin/kill -KILL "$agent_pid" 2>/dev/null || true
+        wait "$agent_pid" 2>/dev/null || true
+        echo "The $tool terminal state changed before the agent process was released." >&2
+        exit 75
+    fi
+    write_metadata_unlocked "$tool" "$repository" "$instance" "$agent_pid" "$start_identity"
+    unlock_tool_metadata
+
+    trap 'preserve_intent=1; /bin/rm -f -- "$gate_file"; /bin/kill -TERM "$agent_pid" 2>/dev/null || true' \
+        HUP INT TERM
+    : > "$gate_file"
+    set +e
+    wait "$agent_pid"
+    agent_status=$?
+    set -e
+    trap - HUP INT TERM
+    /bin/rm -f -- "$gate_file"
+    exec 9>&-
+
+    if [[ $preserve_intent -eq 0 ]]; then
+        finalize_instance_launch_state "$tool" "$repository" "$instance"
+    fi
+    exit "$agent_status"
 }
 
 infer_repository_from_working_directory() {
@@ -1789,6 +2277,81 @@ run_agent() {
     exit "$agent_status"
 }
 
+migrate_legacy_state() {
+    local migration_lock="$runtime_directory/migration.lock"
+    local tool
+    local legacy_metadata
+    local legacy_intent
+    local legacy_stopping
+    local key
+    local value
+    local extra
+    local repository
+    local instance
+    local pid
+    local start
+
+    require_flock
+    exec 5>"$migration_lock"
+    "$flock_path" 5
+    for tool in codex claude; do
+        legacy_metadata="$runtime_directory/$tool.session"
+        [[ -e "$legacy_metadata" || -L "$legacy_metadata" ]] || continue
+        [[ -f "$legacy_metadata" && ! -L "$legacy_metadata" ]] || {
+            echo "The legacy $tool terminal metadata is invalid." >&2
+            exec 5>&-
+            return 70
+        }
+        repository=""
+        instance=""
+        pid=""
+        start=""
+        while IFS='|' read -r key value extra; do
+            [[ -z "${extra:-}" ]] || {
+                echo "The legacy $tool terminal metadata is invalid." >&2
+                exec 5>&-
+                return 70
+            }
+            case "$key" in
+                repository) repository="$value" ;;
+                instance) instance="$value" ;;
+                pid) pid="$value" ;;
+                start) start="$value" ;;
+                *)
+                    echo "The legacy $tool terminal metadata is invalid." >&2
+                    exec 5>&-
+                    return 70
+                    ;;
+            esac
+        done < "$legacy_metadata"
+        if ! is_valid_repository_name "$repository" \
+            || ! is_valid_instance "$instance" \
+            || [[ ! "$pid" =~ ^(0|[1-9][0-9]*)$ ]] \
+            || { [[ "$pid" == "0" ]] && [[ "$start" != "pending" ]]; } \
+            || { [[ "$pid" != "0" ]] && ! is_valid_process_identity "$start"; }; then
+            echo "The legacy $tool terminal metadata is invalid." >&2
+            exec 5>&-
+            return 70
+        fi
+        if [[ ! -e "$(metadata_file_for "$instance")" ]]; then
+            write_metadata_unlocked "$tool" "$repository" "$instance" "$pid" "$start"
+        fi
+        legacy_intent="$runtime_directory/$tool.intent"
+        legacy_stopping="$runtime_directory/$tool.intent.stopping"
+        if [[ -f "$legacy_intent" && ! -e "$(intent_file_for "$instance")" ]]; then
+            /bin/mv -f "$legacy_intent" "$(intent_file_for "$instance")"
+        fi
+        if [[ -f "$legacy_stopping" \
+            && ! -e "$(stopping_intent_file_for "$instance")" ]]; then
+            /bin/mv -f "$legacy_stopping" "$(stopping_intent_file_for "$instance")"
+        fi
+        /bin/rm -f -- "$legacy_metadata"
+    done
+    exec 5>&-
+}
+
+migrate_legacy_state || exit $?
+
 [[ $# -ge 1 ]] || { usage; exit 64; }
 command_name="$1"
 shift
@@ -1808,28 +2371,28 @@ case "$command_name" in
         ;;
     start)
         [[ $# -ge 2 ]] || fail_usage "start requires a tool and repository."
-        start_session "$@"
+        start_instance_session "$@"
         ;;
     attach)
         [[ $# -ge 2 ]] || fail_usage "attach requires a tool and repository."
-        attach_session "$@"
+        attach_instance_session "$@"
         ;;
     reattach)
         [[ $# -eq 3 ]] || fail_usage "reattach requires a tool, repository, and instance."
-        reattach_session "$1" "$2" "$3"
+        reattach_instance_session "$1" "$2" "$3"
         ;;
     stop)
         [[ $# -eq 3 ]] || fail_usage "stop requires a tool, repository, and instance."
-        stop_session "$1" "$2" "$3"
+        stop_instance_session "$1" "$2" "$3"
         ;;
     codex|claude)
         legacy_tool="$command_name"
         legacy_repository="$(infer_repository_from_working_directory)" || exit $?
-        attach_session "$legacy_tool" "$legacy_repository" "$@"
+        attach_instance_session "$legacy_tool" "$legacy_repository" "$@"
         ;;
     __run-agent)
         [[ $# -ge 4 ]] || fail_usage "Invalid internal launch request."
-        run_agent "$@"
+        run_agent_instance "$@"
         ;;
     *) fail_usage "Unknown command: $command_name" ;;
 esac

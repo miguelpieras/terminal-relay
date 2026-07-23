@@ -2,11 +2,10 @@ import Combine
 import Foundation
 
 struct TerminalRoute: Identifiable, Equatable {
+    let id = UUID()
     let kind: AgentKind
     let repositoryName: String
     let instanceToken: String?
-
-    var id: String { "\(kind.rawValue):\(repositoryName)" }
 }
 
 enum WorkerSessionModelError: LocalizedError, Equatable {
@@ -53,15 +52,22 @@ final class WorkerSessionModel: ObservableObject {
     private let profileStore: WorkerProfileStore
     private let identityStore: SSHIdentityStore
     private let workerClient: SSHWorkerClient
+    private let readStateDefaults: UserDefaults
+    private var readActivityBySession: [String: Int]
+    private var lastOpenedTerminalRoute: TerminalRoute?
     private var refreshToken = UUID()
+    private static let readStateKey = "workerSessionReadActivity.v1"
 
     init(
         profileStore: WorkerProfileStore = WorkerProfileStore(),
-        identityStore: SSHIdentityStore = SSHIdentityStore()
+        identityStore: SSHIdentityStore = SSHIdentityStore(),
+        readStateDefaults: UserDefaults = .standard
     ) {
         self.profileStore = profileStore
         self.identityStore = identityStore
         self.workerClient = SSHWorkerClient(identityStore: identityStore)
+        self.readStateDefaults = readStateDefaults
+        self.readActivityBySession = Self.loadReadState(from: readStateDefaults)
         let profiles = profileStore.load()
         self.profiles = profiles
         self.profile = profileStore.selectedProfileID()
@@ -174,19 +180,29 @@ final class WorkerSessionModel: ObservableObject {
         }
     }
 
-    func openTerminal(kind: AgentKind, repositoryName: String) {
+    func startTerminal(kind: AgentKind, repositoryName: String) {
         guard WorkerSessionProtocol.isValidRepositoryName(repositoryName) else {
             errorMessage = WorkerRemoteCommandError.invalidRepositoryName.localizedDescription
             return
         }
-        let instanceToken = sessions.first {
-            $0.kind == kind && $0.repositoryName == repositoryName
-        }?.instanceToken
-        terminalRoute = TerminalRoute(
+        let route = TerminalRoute(
             kind: kind,
             repositoryName: repositoryName,
-            instanceToken: instanceToken
+            instanceToken: nil
         )
+        lastOpenedTerminalRoute = route
+        terminalRoute = route
+    }
+
+    func openTerminal(_ session: WorkerSessionSnapshot) {
+        let route = TerminalRoute(
+            kind: session.kind,
+            repositoryName: session.repositoryName,
+            instanceToken: session.instanceToken
+        )
+        markSessionRead(session)
+        lastOpenedTerminalRoute = route
+        terminalRoute = route
     }
 
     func stop(
@@ -199,7 +215,9 @@ final class WorkerSessionModel: ObservableObject {
             let statusData = try await workerClient.execute(WorkerRemoteCommand.status, on: profile)
             let response = try WorkerSessionProtocol.parse(statusData)
             guard let session = response.sessions.first(where: {
-                $0.kind == kind && $0.repositoryName == repositoryName
+                $0.kind == kind
+                    && $0.repositoryName == repositoryName
+                    && $0.instanceToken == expectedInstanceToken
             }) else {
                 throw WorkerSessionModelError.sessionEnded(kind: kind, repositoryName: repositoryName)
             }
@@ -219,8 +237,33 @@ final class WorkerSessionModel: ObservableObject {
         }
     }
 
-    func session(for kind: AgentKind) -> WorkerSessionSnapshot? {
-        sessions.first { $0.kind == kind }
+    func isUnread(_ session: WorkerSessionSnapshot) -> Bool {
+        guard let profile,
+              let lastActivityAt = session.lastActivityAt else {
+            return false
+        }
+        return lastActivityAt > (readActivityBySession[readKey(
+            profileID: profile.id,
+            instanceToken: session.instanceToken
+        )] ?? 0)
+    }
+
+    func markLastOpenedTerminalRead() {
+        guard let route = lastOpenedTerminalRoute,
+              let profile else {
+            return
+        }
+        let matchingSessions = sessions.filter {
+            $0.kind == route.kind
+                && $0.repositoryName == route.repositoryName
+                && (route.instanceToken == nil || $0.instanceToken == route.instanceToken)
+        }
+        guard let session = matchingSessions.max(by: {
+            ($0.lastActivityAt ?? 0) < ($1.lastActivityAt ?? 0)
+        }) else {
+            return
+        }
+        markSessionRead(session, profileID: profile.id)
     }
 
     func refreshWorkerOverviews() async {
@@ -268,6 +311,49 @@ final class WorkerSessionModel: ObservableObject {
             for await (profileID, overview) in group {
                 workerOverviews[profileID] = overview
                 projectLoadingIDs.remove(profileID)
+            }
+        }
+    }
+
+    func refreshProjectActivity() async {
+        let profilesToRefresh = profiles.filter { !projectLoadingIDs.contains($0.id) }
+        guard !profilesToRefresh.isEmpty else { return }
+
+        await withTaskGroup(of: (UUID, Result<Data, Error>).self) { group in
+            for profile in profilesToRefresh {
+                group.addTask { [workerClient] in
+                    (
+                        profile.id,
+                        await Self.commandResult(
+                            WorkerRemoteCommand.status,
+                            profile: profile,
+                            workerClient: workerClient
+                        )
+                    )
+                }
+            }
+
+            for await (profileID, result) in group {
+                guard let currentOverview = workerOverviews[profileID],
+                      let data = try? result.get(),
+                      let response = try? WorkerSessionProtocol.parse(data) else {
+                    continue
+                }
+                let visibleProjects = Set(currentOverview.projects)
+                let refreshedSessions = response.sessions.filter {
+                    visibleProjects.contains($0.repositoryName)
+                }
+                workerOverviews[profileID] = WorkerOverviewSnapshot(
+                    projects: currentOverview.projects,
+                    sessions: refreshedSessions,
+                    resources: currentOverview.resources,
+                    accounts: currentOverview.accounts,
+                    accountErrors: currentOverview.accountErrors,
+                    connectionError: nil
+                )
+                if profile?.id == profileID, !isLoading {
+                    sessions = refreshedSessions
+                }
             }
         }
     }
@@ -419,5 +505,34 @@ final class WorkerSessionModel: ObservableObject {
         } catch {
             return .failure(error)
         }
+    }
+
+    private func markSessionRead(
+        _ session: WorkerSessionSnapshot,
+        profileID: UUID? = nil
+    ) {
+        guard let profileID = profileID ?? profile?.id,
+              let lastActivityAt = session.lastActivityAt else {
+            return
+        }
+        readActivityBySession[readKey(
+            profileID: profileID,
+            instanceToken: session.instanceToken
+        )] = lastActivityAt
+        if let data = try? JSONEncoder().encode(readActivityBySession) {
+            readStateDefaults.set(data, forKey: Self.readStateKey)
+        }
+    }
+
+    private func readKey(profileID: UUID, instanceToken: String) -> String {
+        "\(profileID.uuidString.lowercased()):\(instanceToken)"
+    }
+
+    private static func loadReadState(from defaults: UserDefaults) -> [String: Int] {
+        guard let data = defaults.data(forKey: readStateKey),
+              let state = try? JSONDecoder().decode([String: Int].self, from: data) else {
+            return [:]
+        }
+        return state
     }
 }

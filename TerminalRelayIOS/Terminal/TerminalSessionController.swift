@@ -353,14 +353,16 @@ final class TerminalSessionController: ObservableObject, RelayTerminalIO {
         repositoryName: String,
         expectedInstanceToken: String
     ) -> WorkerSessionConfirmation {
-        guard let session = response.sessions.first(where: { $0.kind == kind }) else {
+        guard let session = response.sessions.first(where: {
+            $0.instanceToken == expectedInstanceToken
+        }) else {
+            return .ended
+        }
+        guard session.kind == kind else {
             return .ended
         }
         guard session.repositoryName == repositoryName else {
             return .moved(repositoryName: session.repositoryName)
-        }
-        if session.instanceToken != expectedInstanceToken {
-            return .replaced
         }
         return .active(instanceToken: session.instanceToken)
     }

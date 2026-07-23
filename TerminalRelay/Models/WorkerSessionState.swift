@@ -5,8 +5,31 @@ struct WorkerSessionSnapshot: Equatable, Identifiable {
     let repositoryName: String
     let attachedClientCount: Int
     let instanceToken: String
+    let title: String?
+    let lastActivityAt: Int?
 
-    var id: AgentKind { kind }
+    var id: String { instanceToken }
+
+    init(
+        kind: AgentKind,
+        repositoryName: String,
+        attachedClientCount: Int,
+        instanceToken: String,
+        title: String? = nil,
+        lastActivityAt: Int? = nil
+    ) {
+        self.kind = kind
+        self.repositoryName = repositoryName
+        self.attachedClientCount = attachedClientCount
+        self.instanceToken = instanceToken
+        self.title = title
+        self.lastActivityAt = lastActivityAt
+    }
+
+    func isWorking(now: Date = Date()) -> Bool {
+        guard let lastActivityAt else { return false }
+        return now.timeIntervalSince1970 - Double(lastActivityAt) < 8
+    }
 }
 
 struct WorkerSessionResponse: Equatable {
@@ -48,7 +71,7 @@ enum WorkerSessionProtocol {
         var projects: [String] = []
         var sessions: [WorkerSessionSnapshot] = []
         var seenProjects: Set<String> = []
-        var seenKinds: Set<AgentKind> = []
+        var seenInstances: Set<String> = []
 
         for line in lines.dropFirst(markerIndex + 1) where !line.isEmpty {
             let fields = line.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
@@ -62,22 +85,40 @@ enum WorkerSessionProtocol {
                 }
                 projects.append(fields[1])
             case "session":
-                guard fields.count == 5,
+                guard fields.count == 5 || fields.count == 7,
                       let kind = AgentKind(rawValue: fields[1]),
                       isValidRepositoryName(fields[2]),
                       let attachedClientCount = Int(fields[3]),
                       attachedClientCount >= 0,
-                      let instanceToken = UUID(uuidString: fields[4]),
-                      seenKinds.insert(kind).inserted else {
+                      let instanceToken = UUID(uuidString: fields[4]) else {
                     throw WorkerSessionProtocolError.invalidRecord
                 }
                 let canonicalInstanceID = instanceToken.uuidString.lowercased()
+                guard seenInstances.insert(canonicalInstanceID).inserted else {
+                    throw WorkerSessionProtocolError.invalidRecord
+                }
+                let lastActivityAt: Int?
+                let title: String?
+                if fields.count == 7 {
+                    guard let activity = Int(fields[5]), activity >= 0,
+                          let decodedTitle = decodeHexUTF8(fields[6]),
+                          decodedTitle.count <= 200 else {
+                        throw WorkerSessionProtocolError.invalidRecord
+                    }
+                    lastActivityAt = activity
+                    title = decodedTitle.isEmpty ? nil : decodedTitle
+                } else {
+                    lastActivityAt = nil
+                    title = nil
+                }
                 sessions.append(
                     WorkerSessionSnapshot(
                         kind: kind,
                         repositoryName: fields[2],
                         attachedClientCount: attachedClientCount,
-                        instanceToken: canonicalInstanceID
+                        instanceToken: canonicalInstanceID,
+                        title: title,
+                        lastActivityAt: lastActivityAt
                     )
                 )
             default:
@@ -87,7 +128,20 @@ enum WorkerSessionProtocol {
 
         return WorkerSessionResponse(
             projects: projects.sorted { $0.localizedStandardCompare($1) == .orderedAscending },
-            sessions: sessions.sorted { $0.kind.rawValue < $1.kind.rawValue }
+            sessions: sessions.sorted {
+                let repositoryOrder = $0.repositoryName.localizedStandardCompare($1.repositoryName)
+                if repositoryOrder != .orderedSame {
+                    return repositoryOrder == .orderedAscending
+                }
+                let titleOrder = ($0.title ?? "").localizedStandardCompare($1.title ?? "")
+                if titleOrder != .orderedSame {
+                    return titleOrder == .orderedAscending
+                }
+                if $0.kind != $1.kind {
+                    return $0.kind.rawValue < $1.kind.rawValue
+                }
+                return $0.instanceToken < $1.instanceToken
+            }
         )
     }
 
@@ -97,5 +151,21 @@ enum WorkerSessionProtocol {
             && value != "."
             && value != ".."
             && value.range(of: #"^[A-Za-z0-9._-]+$"#, options: .regularExpression) != nil
+    }
+
+    private static func decodeHexUTF8(_ value: String) -> String? {
+        guard value.count.isMultiple(of: 2),
+              value.range(of: #"^[a-f0-9]*$"#, options: .regularExpression) != nil else {
+            return nil
+        }
+        var data = Data()
+        var index = value.startIndex
+        while index < value.endIndex {
+            let next = value.index(index, offsetBy: 2)
+            guard let byte = UInt8(value[index..<next], radix: 16) else { return nil }
+            data.append(byte)
+            index = next
+        }
+        return String(data: data, encoding: .utf8)
     }
 }
