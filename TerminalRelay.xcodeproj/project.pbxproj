@@ -39,6 +39,7 @@
 		643FB349DC4C4DF21D981030 /* SSHTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00575E9F28F8065673E390D8 /* SSHTransport.swift */; };
 		6DC711689B3A23294963F406 /* TerminalRelayApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0A02BB8092DDF8AED8C6F603 /* TerminalRelayApp.swift */; };
 		6E6A403E6EF7AD583D6EF0A1 /* NIOPosix in Frameworks */ = {isa = PBXBuildFile; productRef = DFCE7DA6948B7424BFC5FCC0 /* NIOPosix */; };
+		70C95D75AC809406ECF764AF /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 63A21456BA43EC66EE90B037 /* Assets.xcassets */; };
 		7176098820B3653E154BB020 /* WorkerMetricsServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3E452EE1DE95DB629F3FFB13 /* WorkerMetricsServiceTests.swift */; };
 		74E7BBE2E5DE43DB6016A4AB /* WorkerProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 564D16B412E4E650C5D4DB1C /* WorkerProfile.swift */; };
 		788027947BFEA620BCC4C08A /* TerminalSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F6DC0C9B63E27A8EBF45AAD /* TerminalSession.swift */; };
@@ -113,6 +114,7 @@
 		564D16B412E4E650C5D4DB1C /* WorkerProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerProfile.swift; sourceTree = "<group>"; };
 		5D234BB37623139880A1137F /* TerminalRelayIOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = TerminalRelayIOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		5EC9ECCFD1C5FE64E51E46B2 /* AgentDefaultsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentDefaultsView.swift; sourceTree = "<group>"; };
+		63A21456BA43EC66EE90B037 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		64572D7519667D0D25972D57 /* TerminalRepresentable.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalRepresentable.swift; sourceTree = "<group>"; };
 		675F9940751324F22144EEB7 /* WorkerProfileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerProfileStore.swift; sourceTree = "<group>"; };
 		6B5726E0516AF1EBD1B801ED /* AgentBrandIcon.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentBrandIcon.swift; sourceTree = "<group>"; };
@@ -258,6 +260,7 @@
 		527F5B34231262FB3C2B494D /* TerminalRelayIOS */ = {
 			isa = PBXGroup;
 			children = (
+				63A21456BA43EC66EE90B037 /* Assets.xcassets */,
 				939436E54A5B69766421376B /* App */,
 				FBDE745F9CA1FC7C92990705 /* Models */,
 				4F34460357EBB525927648BD /* Services */,
@@ -396,6 +399,7 @@
 			buildConfigurationList = 16D33051CB2222D395074175 /* Build configuration list for PBXNativeTarget "TerminalRelayIOS" */;
 			buildPhases = (
 				563A79A20CA7D357A0845464 /* Sources */,
+				7FD214E4661EAEC6561F03A4 /* Resources */,
 				26457B8E41DCC46F341D655E /* Frameworks */,
 			);
 			buildRules = (
@@ -499,6 +503,14 @@
 			buildActionMask = 2147483647;
 			files = (
 				E3E4645D18A532417C160831 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		7FD214E4661EAEC6561F03A4 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				70C95D75AC809406ECF764AF /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
