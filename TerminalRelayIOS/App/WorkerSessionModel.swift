@@ -25,6 +25,7 @@ enum WorkerSessionModelError: LocalizedError, Equatable {
 
 @MainActor
 final class WorkerSessionModel: ObservableObject {
+    @Published private(set) var profiles: [WorkerProfile]
     @Published private(set) var profile: WorkerProfile?
     @Published private(set) var projects: [String] = []
     @Published private(set) var sessions: [WorkerSessionSnapshot] = []
@@ -36,6 +37,7 @@ final class WorkerSessionModel: ObservableObject {
     private let profileStore: WorkerProfileStore
     private let identityStore: SSHIdentityStore
     private let workerClient: SSHWorkerClient
+    private var refreshToken = UUID()
 
     init(
         profileStore: WorkerProfileStore = WorkerProfileStore(),
@@ -44,7 +46,11 @@ final class WorkerSessionModel: ObservableObject {
         self.profileStore = profileStore
         self.identityStore = identityStore
         self.workerClient = SSHWorkerClient(identityStore: identityStore)
-        self.profile = profileStore.load()
+        let profiles = profileStore.load()
+        self.profiles = profiles
+        self.profile = profileStore.selectedProfileID()
+            .flatMap { selectedID in profiles.first { $0.id == selectedID } }
+            ?? profiles.first
 
         do {
             self.publicKey = try identityStore.publicKeyForAuthorizedKeys()
@@ -53,33 +59,67 @@ final class WorkerSessionModel: ObservableObject {
         }
     }
 
-    func saveProfile(host: String, portText: String, username: String, fingerprint: String) throws {
+    @discardableResult
+    func saveProfile(
+        id: UUID? = nil,
+        name: String,
+        host: String,
+        portText: String,
+        username: String,
+        fingerprint: String
+    ) throws -> WorkerProfile {
         guard let port = Int(portText) else {
             throw WorkerProfileValidationError.invalidPort
         }
         let profile = try WorkerProfile.validated(
+            id: id ?? UUID(),
+            name: name,
             host: host,
             port: port,
             username: username,
             expectedHostKeyFingerprint: fingerprint
         )
         try profileStore.save(profile)
+        profiles = profileStore.load()
+        profileStore.setSelectedProfileID(profile.id)
         self.profile = profile
-        projects = []
-        sessions = []
+        resetWorkerState()
+        return profile
     }
 
-    func clearProfile() {
-        profileStore.clear()
-        profile = nil
+    func selectProfile(id: UUID) {
+        guard let selectedProfile = profiles.first(where: { $0.id == id }) else { return }
+        profileStore.setSelectedProfileID(id)
+        profile = selectedProfile
+        resetWorkerState()
+    }
+
+    func deleteProfile(id: UUID) {
+        profileStore.delete(id: id)
+        profiles = profileStore.load()
+        profile = profileStore.selectedProfileID()
+            .flatMap { selectedID in profiles.first { $0.id == selectedID } }
+            ?? profiles.first
+        resetWorkerState()
+    }
+
+    private func resetWorkerState() {
+        refreshToken = UUID()
+        isLoading = false
         projects = []
         sessions = []
     }
 
     func refresh() async {
         guard let profile, !isLoading else { return }
+        let token = UUID()
+        refreshToken = token
         isLoading = true
-        defer { isLoading = false }
+        defer {
+            if refreshToken == token {
+                isLoading = false
+            }
+        }
 
         do {
             async let projectData = workerClient.execute(WorkerRemoteCommand.listProjects, on: profile)
@@ -88,11 +128,13 @@ final class WorkerSessionModel: ObservableObject {
             let projectResponse = try WorkerSessionProtocol.parse(projectsOutput)
             let statusResponse = try WorkerSessionProtocol.parse(statusOutput)
 
+            guard refreshToken == token else { return }
             sessions = statusResponse.sessions
             let names = Set(projectResponse.projects + statusResponse.sessions.map(\.repositoryName))
             projects = names.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
             errorMessage = nil
         } catch {
+            guard refreshToken == token else { return }
             errorMessage = error.localizedDescription
         }
     }

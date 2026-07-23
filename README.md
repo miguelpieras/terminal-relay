@@ -193,9 +193,10 @@ ordinary terminal output are unaffected.
 
 ## iPhone client
 
-The iOS 17 app manages existing workers and `/workspace` projects. Repository
-creation, Git operations, deployment, account usage, and worker administration
-remain Mac-only. Build and run the **TerminalRelayIOS** scheme from
+The iOS 17 app keeps a local worker list and manages each worker's `/workspace`
+projects and shared Codex and Claude sessions. Repository creation, Git
+operations, deployment, account usage, and worker administration remain
+Mac-only. Build and run the **TerminalRelayIOS** scheme from
 `TerminalRelay.xcodeproj` on an iPhone with Tailscale installed and connected.
 
 On first launch, the app creates a dedicated Ed25519 key and keeps its private
@@ -209,10 +210,12 @@ ssh terminal-relay-worker-1 \
   '/usr/bin/ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256'
 ```
 
-Enter the worker's Tailscale hostname or IP, SSH port, username, and the reported
-`SHA256:...` fingerprint in iPhone setup. Every connection pins that fingerprint
-and rejects a different host key. Worker connection fields are stored locally;
-the generated private key never leaves Keychain.
+Add each worker with its display name, Tailscale hostname or IP, SSH port,
+username, and reported `SHA256:...` fingerprint. Every connection pins the
+selected worker's fingerprint and rejects a different host key. Swipe a worker
+row to edit or remove it. Worker connection fields are stored locally; one
+device-specific public key can be authorized on every worker, while its private
+key never leaves Keychain.
 
 A normal handoff is: start or attach on the Mac, disconnect or quit the Mac app,
 attach to the same project and tool on iPhone, disconnect the iPhone, then choose

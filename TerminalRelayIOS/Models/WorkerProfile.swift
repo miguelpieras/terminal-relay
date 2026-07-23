@@ -1,17 +1,27 @@
 import Foundation
 
-struct WorkerProfile: Codable, Equatable {
+struct WorkerProfile: Codable, Equatable, Identifiable {
+    let id: UUID
+    let name: String
     let host: String
     let port: Int
     let username: String
     let expectedHostKeyFingerprint: String
 
+    var displayName: String {
+        let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalizedName.isEmpty ? host : normalizedName
+    }
+
     static func validated(
+        id: UUID = UUID(),
+        name: String = "",
         host: String,
         port: Int,
         username: String,
         expectedHostKeyFingerprint: String
     ) throws -> WorkerProfile {
+        let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedUsername = username.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedFingerprint = try HostKeyFingerprint.normalized(expectedHostKeyFingerprint)
@@ -30,6 +40,8 @@ struct WorkerProfile: Codable, Equatable {
         }
 
         return WorkerProfile(
+            id: id,
+            name: normalizedName,
             host: normalizedHost,
             port: port,
             username: normalizedUsername,

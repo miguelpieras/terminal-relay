@@ -10,81 +10,79 @@ private struct StopRequest: Identifiable {
 
 struct ProjectListView: View {
     @ObservedObject var model: WorkerSessionModel
-    @Binding var showsSettings: Bool
+    let onEditWorker: () -> Void
     @State private var stopRequest: StopRequest?
 
     var body: some View {
-        NavigationStack {
-            List {
-                if let profile = model.profile {
-                    Section("Worker") {
-                        LabeledContent("SSH", value: "\(profile.username)@\(profile.host):\(profile.port)")
-                    }
-                }
-
-                Section("Projects") {
-                    if model.projects.isEmpty, !model.isLoading {
-                        ContentUnavailableView(
-                            "No projects found",
-                            systemImage: "folder",
-                            description: Text("Add a repository under /workspace on the worker, then refresh.")
-                        )
-                    }
-
-                    ForEach(model.projects, id: \.self) { repositoryName in
-                        ProjectRow(
-                            repositoryName: repositoryName,
-                            model: model,
-                            onStop: { session in
-                                stopRequest = StopRequest(
-                                    kind: session.kind,
-                                    repositoryName: repositoryName,
-                                    instanceToken: session.instanceToken
-                                )
-                            }
-                        )
-                    }
+        List {
+            if let profile = model.profile {
+                Section("Worker") {
+                    LabeledContent("SSH", value: "\(profile.username)@\(profile.host):\(profile.port)")
                 }
             }
-            .navigationTitle("Terminal Relay")
-            .refreshable { await model.refresh() }
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button {
-                        showsSettings = true
-                    } label: {
-                        Label("Worker settings", systemImage: "gearshape")
-                    }
+
+            Section("Projects") {
+                if model.projects.isEmpty, !model.isLoading {
+                    ContentUnavailableView(
+                        "No projects found",
+                        systemImage: "folder",
+                        description: Text("Add a repository under /workspace on the worker, then refresh.")
+                    )
                 }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        Task { await model.refresh() }
-                    } label: {
-                        if model.isLoading {
-                            ProgressView()
-                        } else {
-                            Label("Refresh", systemImage: "arrow.clockwise")
-                        }
-                    }
-                    .disabled(model.isLoading)
-                }
-            }
-            .alert(item: $stopRequest) { request in
-                Alert(
-                    title: Text("Stop \(request.kind.displayName)?"),
-                    message: Text("This ends the agent running in \(request.repositoryName) for every attached client. Disconnect if you only want to leave this device."),
-                    primaryButton: .destructive(Text("Stop Agent")) {
-                        Task {
-                            await model.stop(
-                                kind: request.kind,
-                                repositoryName: request.repositoryName,
-                                expectedInstanceToken: request.instanceToken
+
+                ForEach(model.projects, id: \.self) { repositoryName in
+                    ProjectRow(
+                        repositoryName: repositoryName,
+                        model: model,
+                        onStop: { session in
+                            stopRequest = StopRequest(
+                                kind: session.kind,
+                                repositoryName: repositoryName,
+                                instanceToken: session.instanceToken
                             )
                         }
-                    },
-                    secondaryButton: .cancel()
-                )
+                    )
+                }
             }
+        }
+        .navigationTitle(model.profile?.displayName ?? "Terminal Relay")
+        .navigationBarTitleDisplayMode(.inline)
+        .refreshable { await model.refresh() }
+        .toolbar {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Button(action: onEditWorker) {
+                    Label("Worker settings", systemImage: "gearshape")
+                }
+                Button {
+                    Task { await model.refresh() }
+                } label: {
+                    if model.isLoading {
+                        ProgressView()
+                    } else {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                    }
+                }
+                .disabled(model.isLoading)
+            }
+        }
+        .task(id: model.profile?.id) {
+            await model.refresh()
+        }
+        .alert(item: $stopRequest) { request in
+            Alert(
+                title: Text("Stop \(request.kind.displayName)?"),
+                message: Text("This ends the agent running in \(request.repositoryName) for every attached client. Disconnect if you only want to leave this device."),
+                primaryButton: .destructive(Text("Stop Agent")) {
+                    Task {
+                        await model.stop(
+                            kind: request.kind,
+                            repositoryName: request.repositoryName,
+                            expectedInstanceToken: request.instanceToken
+                        )
+                    }
+                },
+                secondaryButton: .cancel()
+            )
         }
     }
 }

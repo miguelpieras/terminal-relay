@@ -6,12 +6,15 @@ final class WorkerProfileTests: XCTestCase {
 
     func testValidProfileIsNormalized() throws {
         let profile = try WorkerProfile.validated(
+            name: " Worker 1 ",
             host: " worker.tailnet.ts.net \n",
             port: 22,
             username: " relay ",
             expectedHostKeyFingerprint: " \(fingerprint)= "
         )
 
+        XCTAssertEqual(profile.name, "Worker 1")
+        XCTAssertEqual(profile.displayName, "Worker 1")
         XCTAssertEqual(profile.host, "worker.tailnet.ts.net")
         XCTAssertEqual(profile.port, 22)
         XCTAssertEqual(profile.username, "relay")

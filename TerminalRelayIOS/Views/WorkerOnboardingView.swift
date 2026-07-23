@@ -3,29 +3,41 @@ import UIKit
 
 struct WorkerOnboardingView: View {
     @ObservedObject var model: WorkerSessionModel
+    let profile: WorkerProfile?
     let allowsCancel: Bool
     let onSaved: () -> Void
 
     @Environment(\.dismiss) private var dismiss
+    @State private var name: String
     @State private var host: String
     @State private var port: String
     @State private var username: String
     @State private var fingerprint: String
     @State private var validationMessage: String?
 
-    init(model: WorkerSessionModel, allowsCancel: Bool, onSaved: @escaping () -> Void) {
+    init(
+        model: WorkerSessionModel,
+        profile: WorkerProfile? = nil,
+        allowsCancel: Bool,
+        onSaved: @escaping () -> Void
+    ) {
         self.model = model
+        self.profile = profile
         self.allowsCancel = allowsCancel
         self.onSaved = onSaved
-        _host = State(initialValue: model.profile?.host ?? "")
-        _port = State(initialValue: model.profile.map { String($0.port) } ?? "22")
-        _username = State(initialValue: model.profile?.username ?? "")
-        _fingerprint = State(initialValue: model.profile?.expectedHostKeyFingerprint ?? "")
+        _name = State(initialValue: profile?.name ?? "")
+        _host = State(initialValue: profile?.host ?? "")
+        _port = State(initialValue: profile.map { String($0.port) } ?? "22")
+        _username = State(initialValue: profile?.username ?? "")
+        _fingerprint = State(initialValue: profile?.expectedHostKeyFingerprint ?? "")
     }
 
     var body: some View {
         Form {
             Section {
+                TextField("Worker name", text: $name)
+                    .textInputAutocapitalization(.words)
+                    .autocorrectionDisabled()
                 TextField("worker.tailnet.ts.net", text: $host)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
@@ -49,6 +61,10 @@ struct WorkerOnboardingView: View {
                     .font(.system(.footnote, design: .monospaced))
                     .textSelection(.enabled)
 
+                Text("Authorize this device key on every worker you add.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                 Button {
                     UIPasteboard.general.string = model.publicKey
                 } label: {
@@ -71,17 +87,17 @@ struct WorkerOnboardingView: View {
                 .frame(maxWidth: .infinity)
             }
 
-            if allowsCancel {
+            if allowsCancel, let profile {
                 Section {
-                    Button("Forget worker", role: .destructive) {
-                        model.clearProfile()
+                    Button("Remove worker", role: .destructive) {
+                        model.deleteProfile(id: profile.id)
                         dismiss()
                     }
                     .frame(maxWidth: .infinity)
                 }
             }
         }
-        .navigationTitle("Worker setup")
+        .navigationTitle(profile == nil ? "Add Worker" : "Worker setup")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             if allowsCancel {
@@ -94,7 +110,14 @@ struct WorkerOnboardingView: View {
 
     private func save() {
         do {
-            try model.saveProfile(host: host, portText: port, username: username, fingerprint: fingerprint)
+            try model.saveProfile(
+                id: profile?.id,
+                name: name,
+                host: host,
+                portText: port,
+                username: username,
+                fingerprint: fingerprint
+            )
             validationMessage = nil
             onSaved()
         } catch {
