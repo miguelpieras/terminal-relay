@@ -330,6 +330,11 @@ cat > "$stub_agent" <<'STUB_AGENT'
 #!/bin/bash
 set -euo pipefail
 
+if [[ "${1:-}" == "auth" && "${2:-}" == "status" && "${3:-}" == "--json" ]]; then
+    printf '%s\n' '{"loggedIn":true}'
+    exit 0
+fi
+
 printf 'start|pid=%s|cwd=%s' "$$" "$PWD" >> "$TERMINAL_RELAY_TEST_AGENT_LOG"
 if [[ -n "${ConEmuANSI:-}" ]]; then
     printf '|ConEmuANSI=%s' "$ConEmuANSI" >> "$TERMINAL_RELAY_TEST_AGENT_LOG"
@@ -537,12 +542,25 @@ wait_for_session codex alpha 0 >/dev/null
 
 echo "10/17 legacy Claude launch infers its repository, preserves environment, and exits cleanly"
 export ConEmuANSI=1
+printf '%s\n' '{"theme":"dark","oauthAccount":{"test":true}}' > "$test_home/.claude.json"
+/bin/chmod 600 "$test_home/.claude.json"
 start_client clean-client "$workspace_root/beta" claude --exit-cleanly
 wait_for_log_lines 6
 wait_for_no_session claude
 clean_log="$(/usr/bin/sed -n '6p' "$agent_log")"
 assert_contains "$clean_log" "cwd=$workspace_root/beta" "legacy inferred repository"
 assert_contains "$clean_log" "ConEmuANSI=1" "Claude terminal environment"
+"$python_path" - "$test_home/.claude.json" <<'PYTHON_VERIFY_CLAUDE_ONBOARDING'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as config_file:
+    config = json.load(config_file)
+assert config["hasCompletedOnboarding"] is True
+assert config["theme"] == "dark"
+assert config["oauthAccount"] == {"test": True}
+PYTHON_VERIFY_CLAUDE_ONBOARDING
+assert_equal "600" "$(path_mode "$test_home/.claude.json")" "Claude global config mode"
 assert_equal "1" "$(/usr/bin/find "$runtime_root" -maxdepth 1 -name '*.intent' | /usr/bin/wc -l | /usr/bin/tr -d ' ')" \
     "clean Claude exit retained restart intent"
 

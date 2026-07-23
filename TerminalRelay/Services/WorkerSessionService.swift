@@ -1,5 +1,11 @@
 import Combine
 import Foundation
+import OSLog
+
+private let workerSessionLogger = Logger(
+    subsystem: "com.mpieras.TerminalRelay",
+    category: "worker-session"
+)
 
 struct WorkerSessionCommandResult {
     let exitCode: Int32
@@ -79,21 +85,34 @@ final class WorkerSessionService: ObservableObject {
         guard !loadingWorkerIDs.contains(worker.id) else { return nil }
         loadingWorkerIDs.insert(worker.id)
         defer { loadingWorkerIDs.remove(worker.id) }
+        workerSessionLogger.info(
+            "Refreshing sessions on \(worker.destination, privacy: .public)"
+        )
 
         do {
             let result = try await runCommand(
                 SSHCommandBuilder.workerSessionStatusConfiguration(for: worker)
             )
             guard result.exitCode == 0 else {
+                workerSessionLogger.error(
+                    "Session refresh failed on \(worker.destination, privacy: .public) with status \(result.exitCode, privacy: .public): \(Self.logDetail(result.standardError), privacy: .public)"
+                )
                 throw WorkerSessionServiceError.statusFailed
             }
 
             let response = try WorkerSessionProtocol.parse(result.standardOutput)
             responses[worker.id] = response
             errors[worker.id] = nil
+            workerSessionLogger.info(
+                "Session refresh succeeded on \(worker.destination, privacy: .public); found \(response.sessions.count, privacy: .public) sessions"
+            )
             return response
         } catch {
-            errors[worker.id] = message(for: error, fallback: .statusFailed)
+            let message = message(for: error, fallback: .statusFailed)
+            workerSessionLogger.error(
+                "Session refresh failed on \(worker.destination, privacy: .public): \(message, privacy: .public)"
+            )
+            errors[worker.id] = message
             return nil
         }
     }
@@ -113,6 +132,9 @@ final class WorkerSessionService: ObservableObject {
         guard !startingSlots.contains(slot), !stoppingSlots.contains(slot) else { return nil }
         startingSlots.insert(slot)
         defer { startingSlots.remove(slot) }
+        workerSessionLogger.notice(
+            "Starting \(kind.rawValue, privacy: .public) for \(repositoryName, privacy: .public) on \(worker.destination, privacy: .public)"
+        )
 
         do {
             let result = try await runCommand(
@@ -124,6 +146,9 @@ final class WorkerSessionService: ObservableObject {
                 )
             )
             guard result.exitCode == 0 else {
+                workerSessionLogger.error(
+                    "Session start failed for \(kind.rawValue, privacy: .public) on \(worker.destination, privacy: .public) with status \(result.exitCode, privacy: .public): \(Self.logDetail(result.standardError), privacy: .public)"
+                )
                 throw WorkerSessionServiceError.startFailed
             }
 
@@ -154,9 +179,16 @@ final class WorkerSessionService: ObservableObject {
                 sessions: sessions
             )
             errors[worker.id] = nil
+            workerSessionLogger.notice(
+                "Started \(kind.rawValue, privacy: .public) session \(snapshot.instanceToken, privacy: .public) for \(repositoryName, privacy: .public) on \(worker.destination, privacy: .public)"
+            )
             return snapshot
         } catch {
-            errors[worker.id] = message(for: error, fallback: .startFailed)
+            let message = message(for: error, fallback: .startFailed)
+            workerSessionLogger.error(
+                "Session start failed for \(kind.rawValue, privacy: .public) on \(worker.destination, privacy: .public): \(message, privacy: .public)"
+            )
+            errors[worker.id] = message
             return nil
         }
     }
@@ -179,6 +211,9 @@ final class WorkerSessionService: ObservableObject {
         guard !stoppingSlots.contains(slot), !startingSlots.contains(slot) else { return false }
         stoppingSlots.insert(slot)
         defer { stoppingSlots.remove(slot) }
+        workerSessionLogger.notice(
+            "Stopping \(kind.rawValue, privacy: .public) session \(instanceToken, privacy: .public) on \(worker.destination, privacy: .public)"
+        )
 
         do {
             let result = try await runCommand(
@@ -190,6 +225,9 @@ final class WorkerSessionService: ObservableObject {
                 )
             )
             guard result.exitCode == 0 else {
+                workerSessionLogger.error(
+                    "Session stop failed for \(instanceToken, privacy: .public) on \(worker.destination, privacy: .public) with status \(result.exitCode, privacy: .public): \(Self.logDetail(result.standardError), privacy: .public)"
+                )
                 throw WorkerSessionServiceError.stopFailed
             }
 
@@ -205,11 +243,25 @@ final class WorkerSessionService: ObservableObject {
                 responses[worker.id] = response
             }
             errors[worker.id] = nil
+            workerSessionLogger.notice(
+                "Stopped \(kind.rawValue, privacy: .public) session \(instanceToken, privacy: .public) on \(worker.destination, privacy: .public)"
+            )
             return true
         } catch {
-            errors[worker.id] = message(for: error, fallback: .stopFailed)
+            let message = message(for: error, fallback: .stopFailed)
+            workerSessionLogger.error(
+                "Session stop failed for \(instanceToken, privacy: .public) on \(worker.destination, privacy: .public): \(message, privacy: .public)"
+            )
+            errors[worker.id] = message
             return false
         }
+    }
+
+    private static func logDetail(_ data: Data) -> String {
+        let detail = String(decoding: data, as: UTF8.self)
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+        return detail.isEmpty ? "no stderr" : String(detail.prefix(1_000))
     }
 
     private func message(

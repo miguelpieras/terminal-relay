@@ -1,7 +1,13 @@
 import AppKit
 import Combine
 import Darwin
+import OSLog
 import SwiftTerm
+
+private let terminalSessionLogger = Logger(
+    subsystem: "com.mpieras.TerminalRelay",
+    category: "terminal-session"
+)
 
 enum TerminalSessionStatus: Equatable {
     case connecting
@@ -229,6 +235,9 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
               !isExited else { return }
         hasStarted = true
         status = .connecting
+        terminalSessionLogger.notice(
+            "Attaching \(self.kind.rawValue, privacy: .public) session \(self.instanceToken, privacy: .public) for \(self.projectName, privacy: .public) on \(self.serverName, privacy: .public)"
+        )
         terminalView.startProcess(
             executable: configuration.executable,
             args: configuration.arguments,
@@ -237,8 +246,14 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
 
         if terminalView.process.shellPid > 0 {
             status = .running
+            terminalSessionLogger.info(
+                "Terminal attachment started for session \(self.instanceToken, privacy: .public) with pid \(self.terminalView.process.shellPid, privacy: .public)"
+            )
             updateWorkingState()
         } else {
+            terminalSessionLogger.error(
+                "Terminal attachment failed to start for session \(self.instanceToken, privacy: .public)"
+            )
             finish(exitCode: nil)
         }
     }
@@ -386,6 +401,9 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         titleIndicatesWorking = false
         progressIndicatesWorking = false
         updateWorkingState()
+        terminalSessionLogger.notice(
+            "Terminal attachment finished for session \(self.instanceToken, privacy: .public); status=\(self.status.label, privacy: .public)"
+        )
     }
 
     private func setProgressIndicatesWorking(_ indicatesWorking: Bool) {

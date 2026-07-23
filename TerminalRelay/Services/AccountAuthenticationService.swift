@@ -1,6 +1,12 @@
 import AppKit
 import Combine
 import Foundation
+import OSLog
+
+private let accountAuthenticationLogger = Logger(
+    subsystem: "com.mpieras.TerminalRelay",
+    category: "account-authentication"
+)
 
 struct AccountAuthenticationPresentation: Identifiable, Equatable {
     let id: UUID
@@ -166,6 +172,9 @@ final class AccountAuthenticationService: ObservableObject {
         kind: AgentKind,
         currentAccount: String?
     ) {
+        accountAuthenticationLogger.notice(
+            "Beginning \(kind.rawValue, privacy: .public) sign-in on \(worker.destination, privacy: .public)"
+        )
         cancelCurrentRun()
         presentation = AccountAuthenticationPresentation(
             worker: worker,
@@ -177,7 +186,10 @@ final class AccountAuthenticationService: ObservableObject {
     }
 
     func retry() {
-        guard presentation != nil else { return }
+        guard let presentation else { return }
+        accountAuthenticationLogger.notice(
+            "Retrying \(presentation.kind.rawValue, privacy: .public) sign-in on \(presentation.worker.destination, privacy: .public)"
+        )
         cancelCurrentRun()
         resetTransientState()
         start()
@@ -195,6 +207,9 @@ final class AccountAuthenticationService: ObservableObject {
         do {
             try inputHandle.write(contentsOf: data)
             phase = .finishing
+            accountAuthenticationLogger.info(
+                "Submitted Claude authorization response to \(self.presentation?.worker.destination ?? "unknown", privacy: .public)"
+            )
         } catch {
             fail("The authorization code could not be sent to the worker.")
         }
@@ -256,10 +271,16 @@ final class AccountAuthenticationService: ObservableObject {
         self.errorPipe = errorPipe
         activeRunID = runID
         phase = .connecting
+        accountAuthenticationLogger.info(
+            "Starting secure sign-in process for \(presentation.kind.rawValue, privacy: .public) on \(presentation.worker.destination, privacy: .public)"
+        )
 
         do {
             try process.run()
         } catch {
+            accountAuthenticationLogger.error(
+                "Could not start sign-in process for \(presentation.kind.rawValue, privacy: .public) on \(presentation.worker.destination, privacy: .public): \(error.localizedDescription, privacy: .public)"
+            )
             activeRunID = nil
             cleanUpProcess()
             fail("Terminal Relay could not start the secure worker sign-in.")
@@ -279,6 +300,9 @@ final class AccountAuthenticationService: ObservableObject {
         )
         if authorizationURL == nil, let url = parsed.authorizationURL {
             authorizationURL = url
+            accountAuthenticationLogger.info(
+                "Received authorization URL for \(self.presentation?.kind.rawValue ?? "unknown", privacy: .public) on \(self.presentation?.worker.destination ?? "unknown", privacy: .public)"
+            )
         }
         if deviceCode == nil, let code = parsed.deviceCode {
             deviceCode = code
@@ -299,9 +323,15 @@ final class AccountAuthenticationService: ObservableObject {
         activeRunID = nil
         cleanUpProcess()
         if status == 0 {
+            accountAuthenticationLogger.notice(
+                "Sign-in process succeeded for \(self.presentation?.kind.rawValue ?? "unknown", privacy: .public) on \(self.presentation?.worker.destination ?? "unknown", privacy: .public)"
+            )
             phase = .succeeded
             outputBuffer = ""
         } else {
+            accountAuthenticationLogger.error(
+                "Sign-in process exited with status \(status, privacy: .public) for \(self.presentation?.kind.rawValue ?? "unknown", privacy: .public) on \(self.presentation?.worker.destination ?? "unknown", privacy: .public)"
+            )
             fail(failureMessage(for: outputBuffer))
         }
     }
@@ -322,6 +352,7 @@ final class AccountAuthenticationService: ObservableObject {
     }
 
     private func fail(_ message: String) {
+        accountAuthenticationLogger.error("\(message, privacy: .public)")
         phase = .failed(message)
         outputBuffer = ""
     }
@@ -337,6 +368,7 @@ final class AccountAuthenticationService: ObservableObject {
     private func cancelCurrentRun() {
         activeRunID = nil
         if let process, process.isRunning {
+            accountAuthenticationLogger.info("Cancelling active sign-in process")
             process.terminate()
         }
         cleanUpProcess()
