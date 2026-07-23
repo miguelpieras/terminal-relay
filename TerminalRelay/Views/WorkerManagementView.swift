@@ -283,6 +283,7 @@ private struct WorkerOverviewRow: View {
                 HStack(alignment: .top, spacing: 18) {
                     ForEach(AgentKind.allCases) { kind in
                         WorkerAccountStatus(
+                            worker: worker,
                             kind: kind,
                             accountFallback: worker.accountLabel(for: kind),
                             snapshot: accountUsageService.snapshot(for: worker.id, kind: kind),
@@ -516,6 +517,10 @@ private struct WorkerMetricStatus: View {
 }
 
 private struct WorkerAccountStatus: View {
+    @EnvironmentObject private var sessionManager: SessionManager
+    @EnvironmentObject private var accountAuthenticationService: AccountAuthenticationService
+
+    let worker: ServerProfile
     let kind: AgentKind
     let accountFallback: String
     let snapshot: AccountUsageSnapshot?
@@ -539,6 +544,10 @@ private struct WorkerAccountStatus: View {
         return ("Not checked", .secondary)
     }
 
+    private var hasActiveAgent: Bool {
+        sessionManager.occupant(for: worker, kind: kind) != nil
+    }
+
     var body: some View {
         HStack(spacing: 7) {
             AgentBrandIcon(kind: kind, size: 18)
@@ -557,6 +566,7 @@ private struct WorkerAccountStatus: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
+            .help(accountHelp)
 
             Spacer(minLength: 4)
 
@@ -571,9 +581,20 @@ private struct WorkerAccountStatus: View {
                     .foregroundStyle(errorMessage == nil ? Color.secondary : Color.red)
                     .lineLimit(1)
             }
+
+            Button(snapshot == nil ? "Sign In" : "Change") {
+                accountAuthenticationService.begin(
+                    worker: worker,
+                    kind: kind,
+                    currentAccount: snapshot?.account
+                )
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.mini)
+            .disabled(hasActiveAgent || accountAuthenticationService.isRunning)
+            .help(accountActionHelp)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .help(accountHelp)
     }
 
     private func limitSummary(_ snapshot: AccountUsageSnapshot) -> String {
@@ -596,6 +617,15 @@ private struct WorkerAccountStatus: View {
             lines.append(errorMessage)
         }
         return lines.joined(separator: "\n")
+    }
+
+    private var accountActionHelp: String {
+        if hasActiveAgent {
+            return "Stop the active \(productName) agent before changing its account."
+        }
+        return snapshot == nil
+            ? "Sign in to \(productName) on \(worker.displayName)"
+            : "Change the \(productName) account on \(worker.displayName)"
     }
 }
 

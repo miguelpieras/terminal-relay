@@ -14,6 +14,7 @@
 		082BC076502E8924C6DE81FF /* ProjectStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C058A6638300575CC7AF0914 /* ProjectStoreTests.swift */; };
 		084B8CA06CDB2012759B2CBB /* AgentBrandIcon.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6B5726E0516AF1EBD1B801ED /* AgentBrandIcon.swift */; };
 		0A334173723C46E1B0AB789E /* ServerWorkspaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EFB8C7DD5FBA09DF4BB4A6EF /* ServerWorkspaceView.swift */; };
+		0B655D83254E99E09A67371B /* AccountAuthenticationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5161546B08D86620C7D1B9A1 /* AccountAuthenticationView.swift */; };
 		0B69126CE70C815298882288 /* SSHCommandBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2B8C4489491EF49B7822E03A /* SSHCommandBuilder.swift */; };
 		11CC230FC23C4396DE674214 /* WorkerProfileTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35F10890C7A7B20CEA93E345 /* WorkerProfileTests.swift */; };
 		149A0AA1438A64937313424E /* WorkerProfileStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBB07D879D1A8101A648ACE6 /* WorkerProfileStoreTests.swift */; };
@@ -34,6 +35,7 @@
 		4F7EDC395EECB2A7942F567D /* AgentDefaultsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5EC9ECCFD1C5FE64E51E46B2 /* AgentDefaultsView.swift */; };
 		57DFC1FA07366333D4D4CE46 /* WorkerProfileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 675F9940751324F22144EEB7 /* WorkerProfileStore.swift */; };
 		5826EAA6E50EE377AF85D994 /* AgentKind.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95F329024A646D63DF51C026 /* AgentKind.swift */; };
+		593C933AB3BE9FB6C82968D5 /* AccountAuthenticationServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C71350FF53C3388E6DC058B6 /* AccountAuthenticationServiceTests.swift */; };
 		5A8B4C6996C6AB625EB6DA1A /* SessionSlot.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CD64E85F20330019303C926 /* SessionSlot.swift */; };
 		5FFF07C89F2D695D5506B7CD /* ProjectProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CFE8C91CC1888C223E4ABCC /* ProjectProfile.swift */; };
 		643FB349DC4C4DF21D981030 /* SSHTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00575E9F28F8065673E390D8 /* SSHTransport.swift */; };
@@ -78,6 +80,7 @@
 		F54E906C1BD44DCB15A4F89E /* WorkerOverview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9B82967FBC08D0A3EDD8DB9C /* WorkerOverview.swift */; };
 		F6693B26956A1182277D3400 /* WorkerSessionServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7BA492BA581F2C2B0C2AF051 /* WorkerSessionServiceTests.swift */; };
 		FB4A6F2362CE2E84DD4A957D /* ServerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 93E0F148244B4D209F63EB35 /* ServerStore.swift */; };
+		FBBC4D4AF4F128602EFD9112 /* AccountAuthenticationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 273C71F1BE8EDFC5433EB578 /* AccountAuthenticationService.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -106,6 +109,7 @@
 		1DE6522EBC904D332CAE4925 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		20DDC4D787D741BAF50C5483 /* ProjectGitServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectGitServiceTests.swift; sourceTree = "<group>"; };
 		2610AB4602CAB8F3FEC9FB1A /* TerminalRelayTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TerminalRelayTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		273C71F1BE8EDFC5433EB578 /* AccountAuthenticationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountAuthenticationService.swift; sourceTree = "<group>"; };
 		2812F2F38DC528ED2610ED2A /* TerminalScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalScreen.swift; sourceTree = "<group>"; };
 		2B8C4489491EF49B7822E03A /* SSHCommandBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SSHCommandBuilder.swift; sourceTree = "<group>"; };
 		33296AC0DEAC65DE9C252205 /* TerminalSessionController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalSessionController.swift; sourceTree = "<group>"; };
@@ -114,6 +118,7 @@
 		3E452EE1DE95DB629F3FFB13 /* WorkerMetricsServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerMetricsServiceTests.swift; sourceTree = "<group>"; };
 		4A206B67C5A2B0B64D46F4A2 /* RelayTerminalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayTerminalView.swift; sourceTree = "<group>"; };
 		5064842EB86544CB74E12A08 /* WorkerSessionModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerSessionModel.swift; sourceTree = "<group>"; };
+		5161546B08D86620C7D1B9A1 /* AccountAuthenticationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountAuthenticationView.swift; sourceTree = "<group>"; };
 		564D16B412E4E650C5D4DB1C /* WorkerProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerProfile.swift; sourceTree = "<group>"; };
 		5D234BB37623139880A1137F /* TerminalRelayIOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = TerminalRelayIOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		5EC9ECCFD1C5FE64E51E46B2 /* AgentDefaultsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentDefaultsView.swift; sourceTree = "<group>"; };
@@ -150,6 +155,7 @@
 		C058A6638300575CC7AF0914 /* ProjectStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectStoreTests.swift; sourceTree = "<group>"; };
 		C0678D0C9803DB05DEFD31A0 /* WorkerMetricsService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerMetricsService.swift; sourceTree = "<group>"; };
 		C563B44090011E0A80AE65E6 /* AgentLaunchDefaults.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentLaunchDefaults.swift; sourceTree = "<group>"; };
+		C71350FF53C3388E6DC058B6 /* AccountAuthenticationServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountAuthenticationServiceTests.swift; sourceTree = "<group>"; };
 		C873751F82394CA5B3125CE3 /* SessionManagerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionManagerTests.swift; sourceTree = "<group>"; };
 		C960F483C9C9B2DA0E97774D /* WorkerRemoteCommandTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerRemoteCommandTests.swift; sourceTree = "<group>"; };
 		CBB3BF44468D527C634FE65A /* TerminalRelay.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TerminalRelay.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -216,6 +222,7 @@
 		0A7260A2DDF3143904B16831 /* TerminalRelayTests */ = {
 			isa = PBXGroup;
 			children = (
+				C71350FF53C3388E6DC058B6 /* AccountAuthenticationServiceTests.swift */,
 				DBCA9937CC101C673C39E7CF /* AccountUsageServiceTests.swift */,
 				724443C3BB207BBC277FD61F /* GitHubProjectServiceTests.swift */,
 				20DDC4D787D741BAF50C5483 /* ProjectGitServiceTests.swift */,
@@ -237,6 +244,7 @@
 		26148FB26C95BCDAEEF01846 /* Services */ = {
 			isa = PBXGroup;
 			children = (
+				273C71F1BE8EDFC5433EB578 /* AccountAuthenticationService.swift */,
 				A102C8E7164EE18CC3FDF9AD /* AccountUsageService.swift */,
 				BCB0B7C502410EF96FA04410 /* GitHubProjectService.swift */,
 				E162AC5ABBC627C51BD1D70A /* ProjectGitService.swift */,
@@ -279,6 +287,7 @@
 		586AC571CA6720ED167DB5EF /* Views */ = {
 			isa = PBXGroup;
 			children = (
+				5161546B08D86620C7D1B9A1 /* AccountAuthenticationView.swift */,
 				6B5726E0516AF1EBD1B801ED /* AgentBrandIcon.swift */,
 				5EC9ECCFD1C5FE64E51E46B2 /* AgentDefaultsView.swift */,
 				F2459D0DFD20B6A437841971 /* AgentKindStyle.swift */,
@@ -529,6 +538,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				FBBC4D4AF4F128602EFD9112 /* AccountAuthenticationService.swift in Sources */,
+				0B655D83254E99E09A67371B /* AccountAuthenticationView.swift in Sources */,
 				792F8E347226F81E6C0264D9 /* AccountUsageService.swift in Sources */,
 				084B8CA06CDB2012759B2CBB /* AgentBrandIcon.swift in Sources */,
 				4F7EDC395EECB2A7942F567D /* AgentDefaultsView.swift in Sources */,
@@ -589,6 +600,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				593C933AB3BE9FB6C82968D5 /* AccountAuthenticationServiceTests.swift in Sources */,
 				B4C6BDEAD7BD0A7E5A85C161 /* AccountUsageServiceTests.swift in Sources */,
 				DC092AA9C4E650C702FC9302 /* GitHubProjectServiceTests.swift in Sources */,
 				9271FF5CDD1B8FDF00EA1FE6 /* ProjectGitServiceTests.swift in Sources */,

@@ -37,6 +37,9 @@ struct ContentView: View {
     @EnvironmentObject private var projectStore: ProjectStore
     @EnvironmentObject private var sessionManager: SessionManager
     @EnvironmentObject private var workerSessionService: WorkerSessionService
+    @EnvironmentObject private var accountUsageService: AccountUsageService
+
+    @StateObject private var accountAuthenticationService = AccountAuthenticationService()
 
     @AppStorage(AgentLaunchDefaults.StorageKey.codexModel)
     private var codexModel = AgentLaunchDefaults.standard.codexModel
@@ -110,6 +113,7 @@ struct ContentView: View {
         } detail: {
             detail
         }
+        .environmentObject(accountAuthenticationService)
         .navigationSplitViewStyle(.balanced)
         .toolbar {
             if let project = projectForActions {
@@ -166,6 +170,14 @@ struct ContentView: View {
                     return
                 }
             } while !Task.isCancelled
+        }
+        .sheet(
+            item: $accountAuthenticationService.presentation,
+            onDismiss: accountAuthenticationService.dismiss
+        ) { presentation in
+            AccountAuthenticationView(presentation: presentation)
+                .environmentObject(accountAuthenticationService)
+                .environmentObject(accountUsageService)
         }
     }
 

@@ -465,6 +465,7 @@ struct ProjectWorkspaceView: View {
                 HStack(alignment: .top, spacing: 14) {
                     ForEach(AgentKind.allCases) { kind in
                         AccountUsageCard(
+                            worker: worker,
                             kind: kind,
                             accountFallback: worker.accountLabel(for: kind),
                             snapshot: accountUsageService.snapshot(for: worker.id, kind: kind),
@@ -473,6 +474,9 @@ struct ProjectWorkspaceView: View {
                             buttonTitle: launchTitle(for: kind),
                             isButtonDisabled: isGitMutationInProgress
                                 || sessionManager.activeSession(for: worker, kind: kind)?.status == .stopping
+                                || workerSessionService.isStarting(worker: worker, kind: kind)
+                                || workerSessionService.isStopping(worker: worker, kind: kind),
+                            isAccountActionDisabled: sessionManager.occupant(for: worker, kind: kind) != nil
                                 || workerSessionService.isStarting(worker: worker, kind: kind)
                                 || workerSessionService.isStopping(worker: worker, kind: kind),
                             onViewResets: kind == .codex ? { isShowingCodexResets = true } : nil,
@@ -722,6 +726,9 @@ struct ProjectWorkspaceView: View {
 }
 
 private struct AccountUsageCard: View {
+    @EnvironmentObject private var accountAuthenticationService: AccountAuthenticationService
+
+    let worker: ServerProfile
     let kind: AgentKind
     let accountFallback: String
     let snapshot: AccountUsageSnapshot?
@@ -729,6 +736,7 @@ private struct AccountUsageCard: View {
     let errorMessage: String?
     let buttonTitle: String
     let isButtonDisabled: Bool
+    let isAccountActionDisabled: Bool
     let onViewResets: (() -> Void)?
     let action: () -> Void
 
@@ -762,6 +770,30 @@ private struct AccountUsageCard: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
+
+                Spacer(minLength: 8)
+
+                Button {
+                    accountAuthenticationService.begin(
+                        worker: worker,
+                        kind: kind,
+                        currentAccount: snapshot?.account
+                    )
+                } label: {
+                    Label(
+                        snapshot == nil ? "Sign In" : "Change",
+                        systemImage: snapshot == nil
+                            ? "person.crop.circle.badge.plus"
+                            : "arrow.triangle.2.circlepath"
+                    )
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(
+                    isAccountActionDisabled
+                        || accountAuthenticationService.isRunning
+                )
+                .help(accountActionHelp)
             }
 
             Divider()
@@ -883,6 +915,15 @@ private struct AccountUsageCard: View {
             return "Unavailable"
         }
         return count == 1 ? "1 available" : "\(count) available"
+    }
+
+    private var accountActionHelp: String {
+        if isAccountActionDisabled {
+            return "Stop the active \(productName) agent before changing its account."
+        }
+        return snapshot == nil
+            ? "Sign in to \(productName) on \(worker.displayName)"
+            : "Change the \(productName) account on \(worker.displayName)"
     }
 }
 
