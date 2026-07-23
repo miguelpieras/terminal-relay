@@ -61,12 +61,55 @@ final class GitHubProjectServiceTests: XCTestCase {
             ]
         )
         XCTAssertEqual(
-            GitHubProjectService.createRepositoryArguments(name: "terminal-relay"),
+            GitHubProjectService.createRepositoryArguments(repository: "worklific/terminal-relay"),
             [
-                "repo", "create", "miguelpieras/terminal-relay",
+                "repo", "create", "worklific/terminal-relay",
                 "--private",
                 "--add-readme"
             ]
+        )
+    }
+
+    func testBuildsOwnerScopedRepositoryCommands() {
+        XCTAssertEqual(
+            GitHubProjectService.listRepositoryArguments(owner: "miguelpieras"),
+            [
+                "api", "user/repos",
+                "--method", "GET",
+                "--paginate",
+                "--slurp",
+                "-f", "affiliation=owner",
+                "-f", "per_page=100"
+            ]
+        )
+        XCTAssertEqual(
+            GitHubProjectService.listRepositoryArguments(owner: "worklific"),
+            [
+                "api", "orgs/worklific/repos",
+                "--method", "GET",
+                "--paginate",
+                "--slurp",
+                "-f", "type=all",
+                "-f", "per_page=100"
+            ]
+        )
+    }
+
+    func testParsesOrganizationPages() throws {
+        let data = Data(
+            """
+            [
+              [
+                { "login": "worklific" },
+                { "login": "CloudBrowser-AI" }
+              ]
+            ]
+            """.utf8
+        )
+
+        XCTAssertEqual(
+            try GitHubProjectService.parseOrganizationPages(data),
+            ["CloudBrowser-AI", "worklific"]
         )
     }
 

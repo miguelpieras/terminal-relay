@@ -16,6 +16,8 @@ private enum ProjectSource: String, CaseIterable, Identifiable {
 
 struct ProjectEditorView: View {
     @EnvironmentObject private var githubService: GitHubProjectService
+    @AppStorage("githubRepositoryOwner") private var selectedRepositoryOwner =
+        ProjectProfile.defaultRepositoryOwner
 
     @State private var draft: ProjectProfile
     @State private var source: ProjectSource
@@ -58,7 +60,9 @@ struct ProjectEditorView: View {
         if !isCreatingProject { return draft.githubRepository }
         switch source {
         case .new:
-            return normalizedProjectName.isEmpty ? nil : normalizedProjectName
+            return normalizedProjectName.isEmpty
+                ? nil
+                : "\(selectedRepositoryOwner)/\(normalizedProjectName)"
         case .existing:
             return selectedRepositoryReference
         }
@@ -94,11 +98,35 @@ struct ProjectEditorView: View {
         workers.first { $0.id == draft.serverID }
     }
 
+    private var repositoryOwners: [String] {
+        var owners = [ProjectProfile.defaultRepositoryOwner]
+        owners.append(contentsOf: githubService.organizations)
+        if !selectedRepositoryOwner.isEmpty {
+            owners.append(selectedRepositoryOwner)
+        }
+
+        var seen: Set<String> = []
+        return owners.filter { seen.insert($0.lowercased()).inserted }
+    }
+
+    private var selectedRepositoryLoadOwner: String? {
+        selectedRepositoryOwner.isEmpty ? nil : selectedRepositoryOwner
+    }
+
+    private var repositoryLoadID: String {
+        "\(isCreatingProject)|\(source.rawValue)|\(selectedRepositoryOwner.lowercased())"
+    }
+
     private var canSave: Bool {
-        repositoryReference != nil
-            && selectedWorker != nil
-            && !isSaving
-            && !githubService.isLoading
+        guard selectedWorker != nil, !isSaving else { return false }
+        if !isCreatingProject { return repositoryReference != nil }
+
+        switch source {
+        case .new:
+            return repositoryReference != nil
+        case .existing:
+            return selectedRepository != nil && !githubService.isLoadingRepositories
+        }
     }
 
     var body: some View {
@@ -154,7 +182,25 @@ struct ProjectEditorView: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .navigationTitle(isCreatingProject ? "New Project" : draft.displayName)
         .task {
-            await githubService.refreshRepositories()
+            guard isCreatingProject else { return }
+            if selectedRepositoryOwner.isEmpty {
+                selectedRepositoryOwner = ProjectProfile.defaultRepositoryOwner
+            }
+            await githubService.loadOrganizationsIfNeeded()
+        }
+        .task(id: repositoryLoadID) {
+            guard isCreatingProject, source == .existing else { return }
+            await githubService.loadRepositories(owner: selectedRepositoryLoadOwner)
+        }
+        .onChange(of: source) { _, newSource in
+            if newSource == .new && selectedRepositoryOwner.isEmpty {
+                selectedRepositoryOwner = ProjectProfile.defaultRepositoryOwner
+            }
+        }
+        .onChange(of: selectedRepositoryOwner) { _, _ in
+            guard isCreatingProject, source == .existing else { return }
+            selectedRepositoryReference = nil
+            repositorySearch = ""
         }
     }
 
@@ -179,8 +225,10 @@ struct ProjectEditorView: View {
         Section("New project") {
             TextField("Project name", text: $projectName, prompt: Text("terminal-relay"))
 
+            ownerPicker(includeAllAccessible: false)
+
             LabeledContent("Repository") {
-                Text("miguelpieras/\(normalizedProjectName.isEmpty ? "…" : normalizedProjectName)")
+                Text("\(selectedRepositoryOwner)/\(normalizedProjectName.isEmpty ? "…" : normalizedProjectName)")
                     .font(.system(.body, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
@@ -194,22 +242,31 @@ struct ProjectEditorView: View {
             Text("Terminal Relay creates a private repository initialized with a README.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+            organizationError
         }
     }
 
     private var existingRepositorySection: some View {
         Section("GitHub repositories") {
+            ownerPicker(includeAllAccessible: true)
+
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass")
                     .foregroundStyle(.secondary)
                 TextField("Find a repository", text: $repositorySearch)
                     .textFieldStyle(.plain)
-                if githubService.isLoading {
+                if githubService.isLoadingRepositories {
                     ProgressView()
                         .controlSize(.small)
                 } else {
                     Button {
-                        Task { await githubService.refreshRepositories() }
+                        Task {
+                            await githubService.loadRepositories(
+                                owner: selectedRepositoryLoadOwner,
+                                force: true
+                            )
+                        }
                     } label: {
                         Image(systemName: "arrow.clockwise")
                     }
@@ -231,7 +288,7 @@ struct ProjectEditorView: View {
             }
             .frame(minHeight: 180)
             .overlay {
-                if !githubService.isLoading && filteredRepositories.isEmpty {
+                if !githubService.isLoadingRepositories && filteredRepositories.isEmpty {
                     ContentUnavailableView(
                         "No Repositories",
                         systemImage: "folder",
@@ -245,6 +302,29 @@ struct ProjectEditorView: View {
                     .font(.caption)
                     .foregroundStyle(.red)
             }
+
+            organizationError
+        }
+    }
+
+    private func ownerPicker(includeAllAccessible: Bool) -> some View {
+        Picker("Owner", selection: $selectedRepositoryOwner) {
+            ForEach(repositoryOwners, id: \.self) { owner in
+                Text(owner).tag(owner)
+            }
+            if includeAllAccessible {
+                Divider()
+                Text("All accessible repositories").tag("")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var organizationError: some View {
+        if let error = githubService.organizationErrorMessage {
+            Label(error, systemImage: "exclamationmark.triangle")
+                .font(.caption)
+                .foregroundStyle(.red)
         }
     }
 
@@ -318,7 +398,10 @@ struct ProjectEditorView: View {
         } catch {
             saveError = error.localizedDescription
             if isCreatingProject && source == .new {
-                await githubService.refreshRepositories()
+                await githubService.loadRepositories(
+                    owner: selectedRepositoryLoadOwner,
+                    force: true
+                )
             }
         }
     }

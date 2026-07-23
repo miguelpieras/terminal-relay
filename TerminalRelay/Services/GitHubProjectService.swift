@@ -39,6 +39,10 @@ private struct GitHubAPIRepository: Decodable {
     }
 }
 
+private struct GitHubAPIOrganization: Decodable {
+    let login: String
+}
+
 enum GitHubProjectError: LocalizedError, Equatable {
     case invalidRepositoryName
     case ghNotInstalled
@@ -63,19 +67,63 @@ enum GitHubProjectError: LocalizedError, Equatable {
 final class GitHubProjectService: ObservableObject {
     static let repositoryOwner = ProjectProfile.defaultRepositoryOwner
 
+    @Published private(set) var organizations: [String] = []
     @Published private(set) var repositories: [GitHubRepository] = []
-    @Published private(set) var isLoading = false
+    @Published private(set) var isLoadingRepositories = false
+    @Published private(set) var organizationErrorMessage: String?
     @Published private(set) var errorMessage: String?
 
-    func refreshRepositories() async {
-        isLoading = true
-        errorMessage = nil
-        defer { isLoading = false }
+    private var didLoadOrganizations = false
+    private var isLoadingOrganizations = false
+    private var repositoryCache: [String: [GitHubRepository]] = [:]
+    private var repositoryRequestID: UUID?
+    private var displayedRepositoryCacheKey: String?
+
+    func loadOrganizationsIfNeeded() async {
+        guard !didLoadOrganizations, !isLoadingOrganizations else { return }
+
+        isLoadingOrganizations = true
+        organizationErrorMessage = nil
+        defer { isLoadingOrganizations = false }
 
         do {
-            repositories = try await fetchRepositories()
+            organizations = try Self.parseOrganizationPages(
+                await runGH(arguments: Self.listOrganizationArguments())
+            )
+            didLoadOrganizations = true
         } catch {
+            organizationErrorMessage = Self.message(for: error)
+        }
+    }
+
+    func loadRepositories(owner: String?, force: Bool = false) async {
+        let owner = owner?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cacheKey = Self.repositoryCacheKey(owner: owner)
+        let requestID = UUID()
+        repositoryRequestID = requestID
+        displayedRepositoryCacheKey = cacheKey
+
+        if !force, let cachedRepositories = repositoryCache[cacheKey] {
+            repositories = cachedRepositories
+            isLoadingRepositories = false
+            errorMessage = nil
+            return
+        }
+
+        repositories = []
+        isLoadingRepositories = true
+        errorMessage = nil
+
+        do {
+            let fetchedRepositories = try await fetchRepositories(owner: owner)
+            repositoryCache[cacheKey] = fetchedRepositories
+            guard repositoryRequestID == requestID else { return }
+            repositories = fetchedRepositories
+            isLoadingRepositories = false
+        } catch {
+            guard repositoryRequestID == requestID else { return }
             errorMessage = Self.message(for: error)
+            isLoadingRepositories = false
         }
     }
 
@@ -85,31 +133,25 @@ final class GitHubProjectService: ObservableObject {
         create: Bool,
         on worker: ServerProfile
     ) async throws -> GitHubRepository {
-        let preparedReference: String
+        let preparedReference = repositoryReference
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
         if create {
-            let name = Self.normalizedRepositoryName(from: repositoryReference)
-            guard Self.isSafeRepositoryName(name) else {
+            let components = preparedReference.split(separator: "/", omittingEmptySubsequences: false)
+            guard components.count == 2 else {
                 throw GitHubProjectError.invalidRepositoryName
             }
-            preparedReference = "\(Self.repositoryOwner)/\(name)"
-        } else {
-            preparedReference = repositoryReference
-                .trimmingCharacters(in: .whitespacesAndNewlines)
         }
         guard Self.isSafeRepositoryReference(preparedReference) else {
             throw GitHubProjectError.invalidRepositoryName
         }
 
-        isLoading = true
         errorMessage = nil
-        defer { isLoading = false }
 
         do {
             if create {
                 _ = try await runGH(
-                    arguments: Self.createRepositoryArguments(
-                        name: String(preparedReference.split(separator: "/", maxSplits: 1)[1])
-                    )
+                    arguments: Self.createRepositoryArguments(repository: preparedReference)
                 )
             }
 
@@ -141,13 +183,10 @@ final class GitHubProjectService: ObservableObject {
                 "--default-branch", "main"
             ])
 
-            if let existingIndex = repositories.firstIndex(where: {
-                $0.nameWithOwner.caseInsensitiveCompare(repository.nameWithOwner) == .orderedSame
-            }) {
-                repositories[existingIndex] = repository
-            } else {
-                repositories.append(repository)
-                repositories.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            updateRepositoryCache(with: repository)
+            if let displayedRepositoryCacheKey,
+               let displayedRepositories = repositoryCache[displayedRepositoryCacheKey] {
+                repositories = displayedRepositories
             }
 
             return repository
@@ -169,18 +208,54 @@ final class GitHubProjectService: ObservableObject {
             && value.range(of: #"^[A-Za-z0-9._-]+$"#, options: .regularExpression) != nil
     }
 
+    static func isSafeRepositoryOwner(_ value: String) -> Bool {
+        !value.isEmpty
+            && value.count <= 100
+            && value.range(of: #"^[A-Za-z0-9-]+$"#, options: .regularExpression) != nil
+    }
+
     static func isSafeRepositoryReference(_ value: String) -> Bool {
         let components = value.split(separator: "/", omittingEmptySubsequences: false)
         guard components.count == 2 else { return false }
         let owner = String(components[0])
-        return !owner.isEmpty
-            && owner.count <= 100
-            && owner.range(of: #"^[A-Za-z0-9-]+$"#, options: .regularExpression) != nil
+        return isSafeRepositoryOwner(owner)
             && isSafeRepositoryName(String(components[1]))
     }
 
-    static func listRepositoryArguments() -> [String] {
+    static func listOrganizationArguments() -> [String] {
         [
+            "api", "user/orgs",
+            "--method", "GET",
+            "--paginate",
+            "--slurp",
+            "-f", "per_page=100"
+        ]
+    }
+
+    static func listRepositoryArguments(owner: String? = nil) -> [String] {
+        if let owner {
+            if owner.caseInsensitiveCompare(repositoryOwner) == .orderedSame {
+                return [
+                    "api", "user/repos",
+                    "--method", "GET",
+                    "--paginate",
+                    "--slurp",
+                    "-f", "affiliation=owner",
+                    "-f", "per_page=100"
+                ]
+            }
+
+            return [
+                "api", "orgs/\(owner)/repos",
+                "--method", "GET",
+                "--paginate",
+                "--slurp",
+                "-f", "type=all",
+                "-f", "per_page=100"
+            ]
+        }
+
+        return [
             "api", "user/repos",
             "--method", "GET",
             "--paginate",
@@ -190,9 +265,9 @@ final class GitHubProjectService: ObservableObject {
         ]
     }
 
-    static func createRepositoryArguments(name: String) -> [String] {
+    static func createRepositoryArguments(repository: String) -> [String] {
         [
-            "repo", "create", "\(repositoryOwner)/\(name)",
+            "repo", "create", repository,
             "--private",
             "--add-readme"
         ]
@@ -226,6 +301,18 @@ final class GitHubProjectService: ObservableObject {
             return try JSONDecoder()
                 .decode([[GitHubAPIRepository]].self, from: data)
                 .flatMap { $0.map(\.repository) }
+        } catch {
+            throw GitHubProjectError.invalidGitHubResponse
+        }
+    }
+
+    static func parseOrganizationPages(_ data: Data) throws -> [String] {
+        do {
+            return try JSONDecoder()
+                .decode([[GitHubAPIOrganization]].self, from: data)
+                .flatMap { $0.map(\.login) }
+                .filter(Self.isSafeRepositoryOwner)
+                .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
         } catch {
             throw GitHubProjectError.invalidGitHubResponse
         }
@@ -403,13 +490,40 @@ final class GitHubProjectService: ObservableObject {
         "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
     }
 
-    private func fetchRepositories() async throws -> [GitHubRepository] {
-        let data = try await runGH(arguments: Self.listRepositoryArguments())
+    private func fetchRepositories(owner: String?) async throws -> [GitHubRepository] {
+        if let owner, !Self.isSafeRepositoryOwner(owner) {
+            throw GitHubProjectError.invalidRepositoryName
+        }
+
+        let data = try await runGH(arguments: Self.listRepositoryArguments(owner: owner))
         return try Self.parseRepositoryPages(data)
             .filter { !$0.isArchived }
             .sorted {
                 $0.nameWithOwner.localizedCaseInsensitiveCompare($1.nameWithOwner) == .orderedAscending
             }
+    }
+
+    private static func repositoryCacheKey(owner: String?) -> String {
+        owner?.lowercased() ?? "*"
+    }
+
+    private func updateRepositoryCache(with repository: GitHubRepository) {
+        for cacheKey in [
+            Self.repositoryCacheKey(owner: repository.owner),
+            Self.repositoryCacheKey(owner: nil)
+        ] where repositoryCache[cacheKey] != nil {
+            var cachedRepositories = repositoryCache[cacheKey] ?? []
+            if let index = cachedRepositories.firstIndex(where: {
+                $0.nameWithOwner.caseInsensitiveCompare(repository.nameWithOwner) == .orderedSame
+            }) {
+                cachedRepositories[index] = repository
+            } else {
+                cachedRepositories.append(repository)
+            }
+            repositoryCache[cacheKey] = cachedRepositories.sorted {
+                $0.nameWithOwner.localizedCaseInsensitiveCompare($1.nameWithOwner) == .orderedAscending
+            }
+        }
     }
 
     private func ensureWorkerKey(
