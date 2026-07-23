@@ -475,7 +475,11 @@ final class WorkerSessionModel: ObservableObject {
         var accounts: [AgentKind: WorkerAccountSnapshot] = [:]
         var accountErrors: Set<AgentKind> = []
         do {
-            accounts[.codex] = try WorkerOverviewParser.codexAccount(results.3.get())
+            accounts[.codex] = try await loadCodexAccount(
+                initialResult: results.3,
+                profile: profile,
+                workerClient: workerClient
+            )
         } catch {
             accountErrors.insert(.codex)
         }
@@ -493,6 +497,22 @@ final class WorkerSessionModel: ObservableObject {
             accountErrors: accountErrors,
             connectionError: nil
         )
+    }
+
+    private static func loadCodexAccount(
+        initialResult: Result<Data, Error>,
+        profile: WorkerProfile,
+        workerClient: SSHWorkerClient
+    ) async throws -> WorkerAccountSnapshot {
+        do {
+            return try WorkerOverviewParser.codexAccount(initialResult.get())
+        } catch {
+            let retryData = try await workerClient.execute(
+                WorkerRemoteCommand.codexAccount,
+                on: profile
+            )
+            return try WorkerOverviewParser.codexAccount(retryData)
+        }
     }
 
     private static func commandResult(
