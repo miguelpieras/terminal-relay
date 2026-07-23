@@ -2,7 +2,7 @@ import Combine
 import Foundation
 
 struct WorkerMetricsSnapshot: Equatable {
-    let cpuUsedPercent: Double
+    let cpuUsedPercent: Double?
     let memoryUsedBytes: Int64
     let memoryTotalBytes: Int64
     let diskUsedBytes: Int64
@@ -21,6 +21,15 @@ struct WorkerMetricsSnapshot: Equatable {
         guard total > 0 else { return 0 }
         return min(max(Double(used) / Double(total) * 100, 0), 100)
     }
+}
+
+struct WorkerMetricsReading: Equatable {
+    let cpuTotalCentiseconds: UInt64
+    let cpuIdleCentiseconds: UInt64
+    let memoryTotalKiB: UInt64
+    let memoryAvailableKiB: UInt64
+    let diskTotalKiB: UInt64
+    let diskUsedKiB: UInt64
 }
 
 enum WorkerMetricsError: LocalizedError, Equatable {
@@ -44,6 +53,7 @@ final class WorkerMetricsService: ObservableObject {
     @Published private(set) var loadingWorkerIDs: Set<UUID> = []
 
     private let cacheDuration: TimeInterval = 15
+    private var previousReadings: [UUID: WorkerMetricsReading] = [:]
 
     func snapshot(for workerID: UUID) -> WorkerMetricsSnapshot? {
         snapshots[workerID]
@@ -70,7 +80,14 @@ final class WorkerMetricsService: ObservableObject {
         defer { loadingWorkerIDs.remove(worker.id) }
 
         do {
-            snapshots[worker.id] = try await Self.fetch(worker: worker)
+            let fetchedAt = Date()
+            let reading = try await Self.fetch(worker: worker)
+            snapshots[worker.id] = try Self.snapshot(
+                reading: reading,
+                previousReading: previousReadings[worker.id],
+                fetchedAt: fetchedAt
+            )
+            previousReadings[worker.id] = reading
         } catch {
             errors[worker.id] = (error as? LocalizedError)?.errorDescription
                 ?? WorkerMetricsError.commandFailed.localizedDescription
@@ -79,72 +96,135 @@ final class WorkerMetricsService: ObservableObject {
 
     static func parse(
         _ data: Data,
+        previousReading: WorkerMetricsReading? = nil,
         fetchedAt: Date = Date()
     ) throws -> WorkerMetricsSnapshot {
+        try snapshot(
+            reading: parseReading(data),
+            previousReading: previousReading,
+            fetchedAt: fetchedAt
+        )
+    }
+
+    static func parseReading(_ data: Data) throws -> WorkerMetricsReading {
         let lines = String(decoding: data, as: UTF8.self)
             .split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
 
-        guard let markerIndex = lines.firstIndex(of: outputMarker) else {
-            throw WorkerMetricsError.invalidResponse
-        }
+        var cpuTotalSeconds = 0.0
+        var cpuIdleSeconds = 0.0
+        var memoryTotalBytes: Double?
+        var memoryAvailableBytes: Double?
+        var diskTotalBytes: Double?
+        var diskFreeBytes: Double?
 
-        var cpu: (used: UInt64, total: UInt64)?
-        var memory: (totalKiB: UInt64, availableKiB: UInt64)?
-        var disk: (totalKiB: UInt64, usedKiB: UInt64)?
-
-        for line in lines.dropFirst(markerIndex + 1) {
-            let fields = line
-                .split(separator: "|", omittingEmptySubsequences: false)
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            guard fields.count == 3 else {
+        for line in lines where !line.hasPrefix("#") {
+            let fields = line.split(whereSeparator: \.isWhitespace)
+            guard let metricField = fields.first else { continue }
+            let metric = String(metricField)
+            let isCPU = metric.hasPrefix("node_cpu_seconds_total{")
+            let isMemoryTotal = metric == "node_memory_MemTotal_bytes"
+            let isMemoryAvailable = metric == "node_memory_MemAvailable_bytes"
+            let isDiskTotal = metric.hasPrefix("node_filesystem_size_bytes{")
+                && metric.contains(#"mountpoint="/""#)
+            let isDiskFree = metric.hasPrefix("node_filesystem_free_bytes{")
+                && metric.contains(#"mountpoint="/""#)
+            guard isCPU || isMemoryTotal || isMemoryAvailable || isDiskTotal || isDiskFree else {
+                continue
+            }
+            guard fields.count == 2,
+                  let value = Double(fields[1]),
+                  value.isFinite,
+                  value >= 0 else {
                 throw WorkerMetricsError.invalidResponse
             }
 
-            switch fields[0] {
-            case "cpu":
-                guard cpu == nil,
-                      let used = UInt64(fields[1]),
-                      let total = UInt64(fields[2]),
-                      total > 0,
-                      used <= total else {
-                    throw WorkerMetricsError.invalidResponse
+            if isCPU {
+                guard !metric.contains(#"mode="guest""#),
+                      !metric.contains(#"mode="guest_nice""#) else {
+                    continue
                 }
-                cpu = (used, total)
-            case "memory":
-                guard memory == nil,
-                      let total = UInt64(fields[1]),
-                      let available = UInt64(fields[2]),
-                      total > 0,
-                      available <= total else {
-                    throw WorkerMetricsError.invalidResponse
+                cpuTotalSeconds += value
+                if metric.contains(#"mode="idle""#)
+                    || metric.contains(#"mode="iowait""#) {
+                    cpuIdleSeconds += value
                 }
-                memory = (total, available)
-            case "disk":
-                guard disk == nil,
-                      let total = UInt64(fields[1]),
-                      let used = UInt64(fields[2]),
-                      total > 0,
-                      used <= total else {
-                    throw WorkerMetricsError.invalidResponse
-                }
-                disk = (total, used)
-            default:
-                throw WorkerMetricsError.invalidResponse
+            } else if isMemoryTotal {
+                memoryTotalBytes = value
+            } else if isMemoryAvailable {
+                memoryAvailableBytes = value
+            } else if isDiskTotal {
+                diskTotalBytes = value
+            } else if isDiskFree {
+                diskFreeBytes = value
             }
         }
 
-        guard let cpu, let memory, let disk,
-              let memoryTotalBytes = bytes(fromKiB: memory.totalKiB),
-              let memoryAvailableBytes = bytes(fromKiB: memory.availableKiB),
-              let diskTotalBytes = bytes(fromKiB: disk.totalKiB),
-              let diskUsedBytes = bytes(fromKiB: disk.usedKiB) else {
+        guard let cpuTotalCentiseconds = uint64(cpuTotalSeconds, scale: 100),
+              let cpuIdleCentiseconds = uint64(cpuIdleSeconds, scale: 100),
+              cpuTotalCentiseconds > 0,
+              cpuIdleCentiseconds <= cpuTotalCentiseconds,
+              let memoryTotalBytes,
+              let memoryAvailableBytes,
+              memoryTotalBytes > 0,
+              memoryAvailableBytes <= memoryTotalBytes,
+              let diskTotalBytes,
+              let diskFreeBytes,
+              diskTotalBytes > 0,
+              diskFreeBytes <= diskTotalBytes,
+              let memoryTotalKiB = uint64(memoryTotalBytes, scale: 1.0 / 1_024),
+              let memoryAvailableKiB = uint64(
+                  memoryAvailableBytes,
+                  scale: 1.0 / 1_024
+              ),
+              let diskTotalKiB = uint64(diskTotalBytes, scale: 1.0 / 1_024),
+              let diskUsedKiB = uint64(
+                  diskTotalBytes - diskFreeBytes,
+                  scale: 1.0 / 1_024
+              ) else {
             throw WorkerMetricsError.invalidResponse
+        }
+
+        return WorkerMetricsReading(
+            cpuTotalCentiseconds: cpuTotalCentiseconds,
+            cpuIdleCentiseconds: cpuIdleCentiseconds,
+            memoryTotalKiB: memoryTotalKiB,
+            memoryAvailableKiB: memoryAvailableKiB,
+            diskTotalKiB: diskTotalKiB,
+            diskUsedKiB: diskUsedKiB
+        )
+    }
+
+    static func snapshot(
+        reading: WorkerMetricsReading,
+        previousReading: WorkerMetricsReading?,
+        fetchedAt: Date = Date()
+    ) throws -> WorkerMetricsSnapshot {
+        guard
+              let memoryTotalBytes = bytes(fromKiB: reading.memoryTotalKiB),
+              let memoryAvailableBytes = bytes(fromKiB: reading.memoryAvailableKiB),
+              let diskTotalBytes = bytes(fromKiB: reading.diskTotalKiB),
+              let diskUsedBytes = bytes(fromKiB: reading.diskUsedKiB) else {
+            throw WorkerMetricsError.invalidResponse
+        }
+
+        let cpuUsedPercent: Double?
+        if let previousReading,
+           reading.cpuTotalCentiseconds > previousReading.cpuTotalCentiseconds,
+           reading.cpuIdleCentiseconds >= previousReading.cpuIdleCentiseconds {
+            let total = reading.cpuTotalCentiseconds - previousReading.cpuTotalCentiseconds
+            let idle = reading.cpuIdleCentiseconds - previousReading.cpuIdleCentiseconds
+            guard idle <= total else {
+                throw WorkerMetricsError.invalidResponse
+            }
+            cpuUsedPercent = Double(total - idle) / Double(total) * 100
+        } else {
+            cpuUsedPercent = nil
         }
 
         return WorkerMetricsSnapshot(
-            cpuUsedPercent: Double(cpu.used) / Double(cpu.total) * 100,
+            cpuUsedPercent: cpuUsedPercent,
             memoryUsedBytes: memoryTotalBytes - memoryAvailableBytes,
             memoryTotalBytes: memoryTotalBytes,
             diskUsedBytes: diskUsedBytes,
@@ -159,63 +239,46 @@ final class WorkerMetricsService: ObservableObject {
         return result.overflow ? nil : result.partialValue
     }
 
-    private static func fetch(worker: ServerProfile) async throws -> WorkerMetricsSnapshot {
+    private static func uint64(_ value: Double, scale: Double) -> UInt64? {
+        let scaled = value * scale
+        guard scaled.isFinite,
+              scaled >= 0,
+              scaled <= Double(UInt64.max) else {
+            return nil
+        }
+        return UInt64(scaled.rounded())
+    }
+
+    private static func fetch(worker: ServerProfile) async throws -> WorkerMetricsReading {
+        guard let url = metricsURL(for: worker) else {
+            throw WorkerMetricsError.commandFailed
+        }
         let result = try await Subprocess.run(
-            executable: URL(fileURLWithPath: "/usr/bin/ssh"),
-            arguments: ["-o", "ConnectTimeout=5"]
-                + GitHubProjectService.sshArguments(for: worker, script: probeScript)
+            executable: URL(fileURLWithPath: "/usr/bin/curl"),
+            arguments: [
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--connect-timeout", "3",
+                "--max-time", "5",
+                "--",
+                url.absoluteString
+            ]
         )
         guard result.exitCode == 0 else {
             throw WorkerMetricsError.commandFailed
         }
-        return try parse(result.standardOutput)
+        return try parseReading(result.standardOutput)
     }
 
-    private static let outputMarker = "__TERMINAL_RELAY_METRICS_V1__"
-
-    private static let probeScript = """
-    set -eu
-
-    read_cpu() {
-      awk '/^cpu / {
-        total = $2 + $3 + $4 + $5 + $6 + $7 + $8 + $9
-        idle = $5 + $6
-        printf "%.0f %.0f\\n", total, idle
-        exit
-      }' /proc/stat
+    static func metricsURL(for worker: ServerProfile) -> URL? {
+        let host = worker.host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !host.isEmpty else { return nil }
+        var components = URLComponents()
+        components.scheme = "http"
+        components.host = host
+        components.port = 9_100
+        components.path = "/metrics"
+        return components.url
     }
-
-    cpu_before=$(read_cpu)
-    sleep 1
-    cpu_after=$(read_cpu)
-
-    set -- $cpu_before
-    cpu_total_before=$1
-    cpu_idle_before=$2
-    set -- $cpu_after
-    cpu_total_after=$1
-    cpu_idle_after=$2
-    cpu_total=$((cpu_total_after - cpu_total_before))
-    cpu_idle=$((cpu_idle_after - cpu_idle_before))
-    cpu_used=$((cpu_total - cpu_idle))
-
-    set -- $(awk '
-      /^MemTotal:/ { total = $2 }
-      /^MemAvailable:/ { available = $2 }
-      END { print total, available }
-    ' /proc/meminfo)
-    memory_total=$1
-    memory_available=$2
-
-    disk_path=/workspace
-    [ -d "$disk_path" ] || disk_path=/
-    set -- $(df -Pk "$disk_path" | awk 'NR == 2 { print $2, $3 }')
-    disk_total=$1
-    disk_used=$2
-
-    printf '%s\\n' '__TERMINAL_RELAY_METRICS_V1__'
-    printf 'cpu|%s|%s\\n' "$cpu_used" "$cpu_total"
-    printf 'memory|%s|%s\\n' "$memory_total" "$memory_available"
-    printf 'disk|%s|%s\\n' "$disk_total" "$disk_used"
-    """
 }

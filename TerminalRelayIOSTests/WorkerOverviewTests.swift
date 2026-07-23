@@ -20,6 +20,15 @@ final class WorkerOverviewTests: XCTestCase {
         XCTAssertEqual(snapshot.diskUsedPercent, 25, accuracy: 0.001)
     }
 
+    func testWorkerResourceCommandUsesPrivateNodeExporter() {
+        XCTAssertTrue(
+            WorkerRemoteCommand.resources.contains("http://$exporter_address:9100/metrics")
+        )
+        XCTAssertTrue(WorkerRemoteCommand.resources.contains("node_cpu_seconds_total"))
+        XCTAssertTrue(WorkerRemoteCommand.resources.contains(#"$1 !~ /mode="guest"/"#))
+        XCTAssertFalse(WorkerRemoteCommand.resources.contains("cpu_before=$(read_cpu)"))
+    }
+
     func testParsesCodexAccountAndLimits() throws {
         let snapshot = try WorkerOverviewParser.codexAccount(
             Data(

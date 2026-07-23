@@ -19,40 +19,77 @@ enum WorkerRemoteCommand {
     static let status = "\(WorkerSessionProtocol.helperPath) status"
     static let resources = """
         set -eu
-        read_cpu() {
-          awk '/^cpu / {
-            total = $2 + $3 + $4 + $5 + $6 + $7 + $8 + $9
-            idle = $5 + $6
-            printf "%.0f %.0f\\n", total, idle
-            exit
-          }' /proc/stat
+
+        exporter_address=$(/usr/bin/tailscale ip -4 | /usr/bin/awk 'NR == 1 { print; exit }')
+        [ -n "$exporter_address" ]
+
+        read_metrics() {
+          /usr/bin/curl --fail --silent --show-error --max-time 3 \
+            "http://$exporter_address:9100/metrics" \
+            | /usr/bin/awk '
+              index($1, "node_cpu_seconds_total{") == 1 \
+                  && $1 !~ /mode="guest"/ \
+                  && $1 !~ /mode="guest_nice"/ {
+                cpu_total += $2
+                if ($1 ~ /mode="idle"/ || $1 ~ /mode="iowait"/) {
+                  cpu_idle += $2
+                }
+              }
+              $1 == "node_memory_MemTotal_bytes" {
+                memory_total = $2
+              }
+              $1 == "node_memory_MemAvailable_bytes" {
+                memory_available = $2
+              }
+              index($1, "node_filesystem_size_bytes{") == 1 \
+                  && $1 ~ /mountpoint="\\/"}/ {
+                disk_total = $2
+              }
+              index($1, "node_filesystem_free_bytes{") == 1 \
+                  && $1 ~ /mountpoint="\\/"}/ {
+                disk_free = $2
+              }
+              END {
+                if (cpu_total <= 0 || cpu_idle < 0 || cpu_idle > cpu_total \
+                    || memory_total <= 0 || memory_available < 0 \
+                    || memory_available > memory_total || disk_total <= 0 \
+                    || disk_free < 0 || disk_free > disk_total) {
+                  exit 1
+                }
+                printf "%.0f %.0f %.0f %.0f %.0f %.0f\\n", \
+                  cpu_total * 100, cpu_idle * 100, \
+                  memory_total / 1024, memory_available / 1024, \
+                  disk_total / 1024, (disk_total - disk_free) / 1024
+              }
+            '
         }
-        cpu_before=$(read_cpu)
-        sleep 1
-        cpu_after=$(read_cpu)
-        set -- $cpu_before
+
+        metrics_before=$(read_metrics)
+        /bin/sleep 2
+        metrics_after=$(read_metrics)
+
+        set -- $metrics_before
         cpu_total_before=$1
         cpu_idle_before=$2
-        set -- $cpu_after
+        set -- $metrics_after
         cpu_total_after=$1
         cpu_idle_after=$2
+        memory_total=$3
+        memory_available=$4
+        disk_total=$5
+        disk_used=$6
         cpu_total=$((cpu_total_after - cpu_total_before))
         cpu_idle=$((cpu_idle_after - cpu_idle_before))
         cpu_used=$((cpu_total - cpu_idle))
-        set -- $(awk '
-          /^MemTotal:/ { total = $2 }
-          /^MemAvailable:/ { available = $2 }
-          END { print total, available }
-        ' /proc/meminfo)
-        memory_total=$1
-        memory_available=$2
-        disk_path=/workspace
-        [ -d "$disk_path" ] || disk_path=/
-        set -- $(df -Pk "$disk_path" | awk 'NR == 2 { print $2, $3 }')
+
+        [ "$cpu_total" -gt 0 ]
+        [ "$cpu_idle" -ge 0 ]
+        [ "$cpu_idle" -le "$cpu_total" ]
+
         printf '%s\\n' '__TERMINAL_RELAY_METRICS_V1__'
         printf 'cpu|%s|%s\\n' "$cpu_used" "$cpu_total"
         printf 'memory|%s|%s\\n' "$memory_total" "$memory_available"
-        printf 'disk|%s|%s\\n' "$1" "$2"
+        printf 'disk|%s|%s\\n' "$disk_total" "$disk_used"
         """
     static let codexAccount = """
         cd "$HOME" || exit 1
