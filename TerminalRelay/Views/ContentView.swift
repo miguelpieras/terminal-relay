@@ -1,6 +1,5 @@
 import AppKit
 import SwiftUI
-import UniformTypeIdentifiers
 
 private enum SidebarDestination: Equatable {
     case project(UUID)
@@ -20,7 +19,6 @@ private enum SidebarDragItem: Equatable {
     private static let projectPrefix = "terminal-relay-project:"
     private static let folderPrefix = "terminal-relay-folder:"
     private static let sessionPrefix = "terminal-relay-session:"
-    static let typeIdentifier = UTType.utf8PlainText.identifier
 
     case project(UUID)
     case folder(UUID)
@@ -54,6 +52,7 @@ private enum SidebarDragItem: Equatable {
 private final class SidebarDragCoordinator: ObservableObject {
     private struct DropTarget {
         let frame: CGRect
+        let accepts: (SidebarDragItem) -> Bool
         let onDrop: ([String], CGPoint) -> Bool
         let setTargeted: (Bool) -> Void
     }
@@ -64,11 +63,13 @@ private final class SidebarDragCoordinator: ObservableObject {
     func register(
         id: UUID,
         frame: CGRect,
+        accepts: @escaping (SidebarDragItem) -> Bool,
         onDrop: @escaping ([String], CGPoint) -> Bool,
         setTargeted: @escaping (Bool) -> Void
     ) {
         targets[id] = DropTarget(
             frame: frame,
+            accepts: accepts,
             onDrop: onDrop,
             setTargeted: setTargeted
         )
@@ -83,12 +84,11 @@ private final class SidebarDragCoordinator: ObservableObject {
     }
 
     func update(item: SidebarDragItem, at location: CGPoint) {
-        _ = item
-        setTargetedID(target(at: location)?.key)
+        setTargetedID(target(at: location, accepting: item)?.key)
     }
 
     func finish(item: SidebarDragItem, at location: CGPoint) {
-        if let (id, target) = target(at: location) {
+        if let (id, target) = target(at: location, accepting: item) {
             let localLocation = CGPoint(
                 x: location.x - target.frame.minX,
                 y: location.y - target.frame.minY
@@ -105,9 +105,15 @@ private final class SidebarDragCoordinator: ObservableObject {
         setTargetedID(nil)
     }
 
-    private func target(at location: CGPoint) -> (key: UUID, value: DropTarget)? {
+    private func target(
+        at location: CGPoint,
+        accepting item: SidebarDragItem
+    ) -> (key: UUID, value: DropTarget)? {
         targets
-            .filter { $0.value.frame.contains(location) }
+            .filter {
+                $0.value.frame.contains(location)
+                    && $0.value.accepts(item)
+            }
             .min {
                 ($0.value.frame.width * $0.value.frame.height)
                     < ($1.value.frame.width * $1.value.frame.height)
@@ -129,6 +135,7 @@ private final class SidebarDragCoordinator: ObservableObject {
 private struct SidebarDropModifier: ViewModifier {
     @EnvironmentObject private var dragCoordinator: SidebarDragCoordinator
     @Binding var isTargeted: Bool
+    let accepts: (SidebarDragItem) -> Bool
     let onDrop: ([String], CGPoint) -> Bool
 
     @State private var targetID = UUID()
@@ -150,24 +157,6 @@ private struct SidebarDropModifier: ViewModifier {
             .onDisappear {
                 dragCoordinator.unregister(id: targetID)
             }
-            .onDrop(
-                of: [SidebarDragItem.typeIdentifier],
-                isTargeted: $isTargeted
-            ) { providers, location in
-                guard let provider = providers.first(where: {
-                    $0.canLoadObject(ofClass: NSString.self)
-                }) else {
-                    return false
-                }
-
-                provider.loadObject(ofClass: NSString.self) { object, _ in
-                    guard let value = object as? NSString else { return }
-                    DispatchQueue.main.async {
-                        _ = onDrop([value as String], location)
-                    }
-                }
-                return true
-            }
     }
 
     private func register(frame: CGRect) {
@@ -175,6 +164,7 @@ private struct SidebarDropModifier: ViewModifier {
         dragCoordinator.register(
             id: targetID,
             frame: frame,
+            accepts: accepts,
             onDrop: onDrop,
             setTargeted: { targeted.wrappedValue = $0 }
         )
@@ -216,9 +206,16 @@ private extension View {
 
     func sidebarDropDestination(
         isTargeted: Binding<Bool>,
+        accepts: @escaping (SidebarDragItem) -> Bool,
         onDrop: @escaping ([String], CGPoint) -> Bool
     ) -> some View {
-        modifier(SidebarDropModifier(isTargeted: isTargeted, onDrop: onDrop))
+        modifier(
+            SidebarDropModifier(
+                isTargeted: isTargeted,
+                accepts: accepts,
+                onDrop: onDrop
+            )
+        )
     }
 }
 
@@ -486,6 +483,10 @@ struct ContentView: View {
                     isExpanded: isRootProjectsExpanded,
                     isRoot: true,
                     onToggle: { isRootProjectsExpanded.toggle() },
+                    acceptsDrop: { item in
+                        guard case .project = item else { return false }
+                        return true
+                    },
                     onDrop: handleRootFolderDrop
                 )
                 .contextMenu {
@@ -506,6 +507,16 @@ struct ContentView: View {
                     isRoot: false,
                     onToggle: {
                         toggleSidebarFolder(folder.id)
+                    },
+                    acceptsDrop: { item in
+                        switch item {
+                        case .project:
+                            return true
+                        case .folder(let movingFolderID):
+                            return movingFolderID != folder.id
+                        case .session:
+                            return false
+                        }
                     },
                     onDrop: { values, location in
                         handleSidebarFolderDrop(
@@ -563,6 +574,13 @@ struct ContentView: View {
             onNewParentFolder: beginCreatingSidebarFolder,
             onEdit: { navigate(to: .editProject(project.id)) },
             onRemove: { projectPendingDeletion = project },
+            acceptsProjectDrop: { item in
+                guard case .project(let movingProjectID) = item,
+                      movingProjectID != project.id else {
+                    return false
+                }
+                return projectStore.sidebarFolderID(containing: movingProjectID) == folderID
+            },
             onDropProject: { values, location in
                 handleProjectDrop(
                     values,
@@ -1348,6 +1366,7 @@ private struct SidebarFolderRow: View {
     let isExpanded: Bool
     let isRoot: Bool
     let onToggle: () -> Void
+    let acceptsDrop: (SidebarDragItem) -> Bool
     let onDrop: ([String], CGPoint) -> Bool
 
     @State private var isHovering = false
@@ -1393,7 +1412,11 @@ private struct SidebarFolderRow: View {
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.isButton)
         .accessibilityAction { onToggle() }
-        .sidebarDropDestination(isTargeted: $isDropTargeted, onDrop: onDrop)
+        .sidebarDropDestination(
+            isTargeted: $isDropTargeted,
+            accepts: acceptsDrop,
+            onDrop: onDrop
+        )
         .help(
             isRoot
                 ? "Drop a project folder here to move it out of a parent folder"
@@ -1418,6 +1441,7 @@ private struct ProjectSidebarSection: View {
     let onNewParentFolder: () -> Void
     let onEdit: () -> Void
     let onRemove: () -> Void
+    let acceptsProjectDrop: (SidebarDragItem) -> Bool
     let onDropProject: ([String], CGPoint) -> Bool
 
     @State private var isExpanded = false
@@ -1500,6 +1524,7 @@ private struct ProjectSidebarSection: View {
             .sidebarDragSource(.project(project.id))
             .sidebarDropDestination(
                 isTargeted: $isProjectDropTargeted,
+                accepts: acceptsProjectDrop,
                 onDrop: onDropProject
             )
             .contextMenu {
@@ -1538,6 +1563,16 @@ private struct ProjectSidebarSection: View {
                         },
                         onArchive: {
                             onArchiveSession(session.id)
+                        },
+                        acceptsDrop: { item in
+                            guard case .session(let movingSessionID) = item,
+                                  movingSessionID != session.id,
+                                  let movingSession = sessionManager.sessions.first(where: {
+                                      $0.id == movingSessionID
+                                  }) else {
+                                return false
+                            }
+                            return movingSession.projectID == project.id
                         },
                         onDrop: { values, location in
                             handleSessionDrop(
@@ -1628,6 +1663,7 @@ private struct ProjectSessionRow: View {
     let archiveCount: Int
     let onSelect: () -> Void
     let onArchive: () -> Void
+    let acceptsDrop: (SidebarDragItem) -> Bool
     let onDrop: ([String], CGPoint) -> Bool
 
     @State private var isHovering = false
@@ -1707,7 +1743,11 @@ private struct ProjectSessionRow: View {
         .contentShape(Rectangle())
         .onHover { isHovering = $0 }
         .sidebarDragSource(.session(session.id))
-        .sidebarDropDestination(isTargeted: $isDropTargeted, onDrop: onDrop)
+        .sidebarDropDestination(
+            isTargeted: $isDropTargeted,
+            accepts: acceptsDrop,
+            onDrop: onDrop
+        )
         .accessibilityLabel("\(session.displayTitle), \(sessionStateLabel.lowercased())")
     }
 
