@@ -24,6 +24,8 @@ readonly claude_source_destination="/etc/apt/sources.list.d/claude-code.list"
 readonly claude_key_url="https://downloads.claude.ai/keys/claude-code.asc"
 readonly claude_key_fingerprint="31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE"
 readonly claude_repository="deb [signed-by=/etc/apt/keyrings/claude-code.asc] https://downloads.claude.ai/claude-code/apt/stable stable main"
+readonly bwrap_profile_source="/usr/share/apparmor/extra-profiles/bwrap-userns-restrict"
+readonly bwrap_profile_destination="/etc/apparmor.d/bwrap-userns-restrict"
 readonly codex_installer_url="https://chatgpt.com/codex/install.sh"
 readonly CODEX_RELEASE="${CODEX_RELEASE:-latest}"
 readonly minimum_memory_kib=3900000
@@ -598,7 +600,10 @@ install_dependencies() {
     export DEBIAN_FRONTEND=noninteractive
     /usr/bin/apt-get update
     /usr/bin/apt-get install -y --no-install-recommends \
+        apparmor-profiles \
+        apparmor-utils \
         bash \
+        bubblewrap \
         ca-certificates \
         coreutils \
         curl \
@@ -616,6 +621,10 @@ install_dependencies() {
         tar \
         tmux \
         util-linux
+    [[ -f "$bwrap_profile_source" && ! -L "$bwrap_profile_source" ]] \
+        || fail "The bubblewrap AppArmor profile is unavailable."
+    install_managed_file "$bwrap_profile_source" "$bwrap_profile_destination" 644
+    /usr/sbin/apparmor_parser -r "$bwrap_profile_destination"
 }
 
 install_codex() {
@@ -801,7 +810,7 @@ verify_readiness() {
     [[ "$(/usr/bin/stat -c '%U:%G:%a' "$runtime_home/.ssh/authorized_keys")" == "$runtime_user:$runtime_group:600" ]] \
         || fail "Unexpected ownership or mode on worker authorized keys."
 
-    for required_command in git ssh awk df nproc flock tmux python3 codex claude terminal-relay-session; do
+    for required_command in git ssh awk df nproc flock tmux python3 bwrap codex claude terminal-relay-session; do
         login_command_path="$(run_as_worker /bin/bash -lc \
             "cd \"\$HOME\" && command -v $required_command")" \
             || fail "$required_command is unavailable in the worker login shell."
@@ -812,6 +821,13 @@ verify_readiness() {
         || fail "Codex does not resolve to $codex_destination in the worker login shell."
     [[ "$(run_as_worker /bin/bash -lc "cd \"\$HOME\" && command -v claude")" == "$claude_destination" ]] \
         || fail "Claude does not resolve to $claude_destination in the worker login shell."
+    [[ "$(run_as_worker /bin/bash -lc "cd \"\$HOME\" && command -v bwrap")" == "/usr/bin/bwrap" ]] \
+        || fail "Bubblewrap does not resolve to /usr/bin/bwrap in the worker login shell."
+    run_as_worker /usr/bin/bwrap \
+        --ro-bind / / \
+        --proc /proc \
+        --dev /dev \
+        /bin/true
     run_as_worker "$codex_destination" --version >/dev/null
     run_as_worker "$claude_destination" --version >/dev/null
     run_as_worker /usr/bin/git --version >/dev/null
