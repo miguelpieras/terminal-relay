@@ -285,6 +285,32 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         }
     }
 
+    func selectCodexModel(pickerIndex: Int, effort: AgentReasoningEffort) {
+        guard status == .running, kind == .codex else { return }
+
+        terminalView.send(txt: "/model")
+        pressReturn { [weak self] in
+            guard let self else { return }
+            self.scheduleTerminalKey(
+                #selector(NSResponder.moveToBeginningOfLine(_:)),
+                after: 0.3
+            )
+            for step in 0..<pickerIndex {
+                self.scheduleTerminalKey(
+                    #selector(NSResponder.moveDown(_:)),
+                    after: 0.34 + (Double(step) * 0.025)
+                )
+            }
+
+            let modelSelectionDelay = 0.34 + (Double(pickerIndex) * 0.025)
+            self.scheduleTerminalKey(
+                #selector(NSResponder.insertNewline(_:)),
+                after: modelSelectionDelay
+            )
+            self.scheduleReasoningSelection(effort, after: modelSelectionDelay + 0.22)
+        }
+    }
+
     func interrupt() {
         guard status == .running else { return }
         sendEscape()
@@ -308,6 +334,60 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
             guard let self else { return }
             self.terminalView.doCommand(by: #selector(NSResponder.insertNewline(_:)))
             action?()
+        }
+    }
+
+    private func scheduleReasoningSelection(
+        _ effort: AgentReasoningEffort,
+        after delay: TimeInterval
+    ) {
+        switch effort {
+        case .low, .medium, .high, .xhigh:
+            let index: Int = switch effort {
+            case .low: 0
+            case .medium: 1
+            case .high: 2
+            case .xhigh: 3
+            case .max, .ultra: 0
+            }
+            scheduleTerminalKey(#selector(NSResponder.moveToBeginningOfLine(_:)), after: delay)
+            for step in 0..<index {
+                scheduleTerminalKey(
+                    #selector(NSResponder.moveDown(_:)),
+                    after: delay + 0.04 + (Double(step) * 0.025)
+                )
+            }
+            scheduleTerminalKey(
+                #selector(NSResponder.insertNewline(_:)),
+                after: delay + 0.04 + (Double(index) * 0.025)
+            )
+
+        case .max, .ultra:
+            scheduleTerminalKey(#selector(NSResponder.moveToEndOfLine(_:)), after: delay)
+            scheduleTerminalKey(
+                #selector(NSResponder.insertNewline(_:)),
+                after: delay + 0.04
+            )
+            scheduleTerminalKey(
+                #selector(NSResponder.moveToBeginningOfLine(_:)),
+                after: delay + 0.24
+            )
+            if effort == .ultra {
+                scheduleTerminalKey(
+                    #selector(NSResponder.moveDown(_:)),
+                    after: delay + 0.28
+                )
+            }
+            scheduleTerminalKey(
+                #selector(NSResponder.insertNewline(_:)),
+                after: delay + (effort == .ultra ? 0.32 : 0.28)
+            )
+        }
+    }
+
+    private func scheduleTerminalKey(_ selector: Selector, after delay: TimeInterval) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.terminalView.doCommand(by: selector)
         }
     }
 

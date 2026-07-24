@@ -24,13 +24,32 @@ struct AgentComposerView: View {
     @State private var isEditorFocused = false
     @State private var isShowingModelPanel = false
     @State private var isAdvancedExpanded = true
-    @State private var isSelectingSpeed = false
+    @State private var selectedModelSection: ModelPanelSection?
+
+    private static let codexModels = [
+        CodexModelOption(id: "gpt-5.6-sol", name: "5.6 Sol", pickerIndex: 0),
+        CodexModelOption(id: "gpt-5.6-terra", name: "5.6 Terra", pickerIndex: 1),
+        CodexModelOption(
+            id: "gpt-5.6-luna",
+            name: "5.6 Luna",
+            pickerIndex: 2,
+            supportsUltra: false
+        )
+    ]
 
     private var canSend: Bool {
         session.status == .running
             && !attachments.contains(where: \.isUploading)
             && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 || attachments.contains(where: \.isUploaded))
+    }
+
+    private var editorHeight: CGFloat {
+        let lineCount = max(
+            1,
+            draft.split(separator: "\n", omittingEmptySubsequences: false).count
+        )
+        return min(72, 30 + (CGFloat(lineCount - 1) * 20))
     }
 
     var body: some View {
@@ -49,11 +68,11 @@ struct AgentComposerView: View {
                         .font(.system(size: 16))
                         .foregroundStyle(.tertiary)
                         .padding(.leading, 10)
-                        .padding(.top, 7)
+                        .padding(.top, 5)
                         .allowsHitTesting(false)
                 }
             }
-            .frame(minHeight: 98, maxHeight: 148)
+            .frame(height: editorHeight)
 
             if !attachments.isEmpty {
                 attachmentStrip
@@ -68,22 +87,20 @@ struct AgentComposerView: View {
                     .padding(.bottom, 8)
             }
 
-            HStack(spacing: 16) {
-                pasteButton
+            HStack(spacing: 10) {
                 commandMenu
-                Spacer(minLength: 12)
+                Spacer(minLength: 8)
 
                 modelControls
-                microphoneButton
 
                 if session.isWorking {
                     Button {
                         session.interrupt()
                     } label: {
                         Image(systemName: "stop.fill")
-                            .font(.system(size: 13, weight: .bold))
+                            .font(.system(size: 11, weight: .bold))
                             .foregroundStyle(Color.black.opacity(0.72))
-                            .frame(width: 44, height: 44)
+                            .frame(width: 30, height: 30)
                             .background(Color.white.opacity(0.58), in: Circle())
                     }
                     .buttonStyle(.plain)
@@ -91,9 +108,9 @@ struct AgentComposerView: View {
                 } else {
                     Button(action: send) {
                         Image(systemName: "arrow.up")
-                            .font(.system(size: 18, weight: .medium))
+                            .font(.system(size: 15, weight: .medium))
                             .foregroundStyle(Color.black.opacity(canSend ? 0.9 : 0.62))
-                            .frame(width: 44, height: 44)
+                            .frame(width: 30, height: 30)
                             .background(
                                 Color.white.opacity(canSend ? 0.92 : 0.58),
                                 in: Circle()
@@ -105,22 +122,22 @@ struct AgentComposerView: View {
                     .help("Send message (Return)")
                 }
             }
-            .frame(height: 48)
+            .frame(height: 30)
         }
-        .padding(.top, 18)
-        .padding(.leading, 22)
-        .padding(.trailing, 16)
-        .padding(.bottom, 14)
+        .padding(.top, 6)
+        .padding(.leading, 12)
+        .padding(.trailing, 10)
+        .padding(.bottom, 5)
         .background(
             Color(red: 0.165, green: 0.165, blue: 0.165),
-            in: RoundedRectangle(cornerRadius: 28, style: .continuous)
+            in: RoundedRectangle(cornerRadius: 18, style: .continuous)
         )
         .overlay {
-            RoundedRectangle(cornerRadius: 28, style: .continuous)
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .stroke(Color.white.opacity(0.08), lineWidth: 1)
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 14)
+        .padding(.vertical, 6)
         .background(Color(red: 0.071, green: 0.071, blue: 0.078))
         .onExitCommand {
             session.sendEscape()
@@ -190,9 +207,9 @@ struct AgentComposerView: View {
         } label: {
             HStack(spacing: 8) {
                 Image(systemName: "gearshape")
-                    .font(.system(size: 16))
+                    .font(.system(size: 14))
                 Text("Custom")
-                    .font(.system(size: 15))
+                    .font(.system(size: 13))
             }
             .foregroundStyle(.secondary)
         }
@@ -203,30 +220,11 @@ struct AgentComposerView: View {
         .help("Agent commands")
     }
 
-    private var pasteButton: some View {
-        Button {
-            let images = ClipboardImage.read()
-            if images.isEmpty {
-                pasteNotice = "Copy an image, then paste it here."
-            } else {
-                addImages(images)
-            }
-        } label: {
-            Image(systemName: "plus")
-                .font(.system(size: 20, weight: .regular))
-                .frame(width: 24, height: 24)
-        }
-        .buttonStyle(.plain)
-        .foregroundStyle(.primary)
-        .disabled(session.status != .running)
-        .help("Paste image from clipboard (⌘V)")
-    }
-
     private var modelControls: some View {
         Button {
             withAnimation(.easeOut(duration: 0.14)) {
                 isShowingModelPanel.toggle()
-                isSelectingSpeed = false
+                selectedModelSection = nil
             }
         } label: {
             ZStack {
@@ -236,30 +234,35 @@ struct AgentComposerView: View {
                     + Text(" \(selectedReasoningEffort.displayName.capitalized)")
                         .foregroundColor(.secondary)
                 )
-                .font(.system(size: 15))
+                .font(.system(size: 13))
                 .lineLimit(1)
 
                 HStack {
                     Spacer()
                     Image(systemName: isShowingModelPanel ? "chevron.up" : "chevron.down")
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.system(size: 9, weight: .semibold))
                         .foregroundStyle(.secondary)
                 }
-                .padding(.trailing, 14)
+                .padding(.trailing, 11)
             }
-            .frame(width: 225, height: 44)
+            .frame(width: 190, height: 30)
             .background(
                 Color.white.opacity(isShowingModelPanel ? 0.1 : 0),
                 in: Capsule()
             )
+            .contentShape(Capsule())
         }
         .buttonStyle(.plain)
+        .textSelection(.disabled)
+        .onHover { isHovering in
+            (isHovering ? NSCursor.pointingHand : NSCursor.arrow).set()
+        }
         .disabled(session.status != .running)
         .help("Change \(session.kind.displayName) model or reasoning effort")
         .overlay(alignment: .bottomTrailing) {
             if isShowingModelPanel {
                 modelSelectionPanel
-                    .offset(y: -58)
+                    .offset(y: -38)
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
                     .zIndex(20)
             }
@@ -268,33 +271,8 @@ struct AgentComposerView: View {
     }
 
     private var modelSelectionPanel: some View {
-        VStack(spacing: 0) {
-            if isSelectingSpeed {
-                Button {
-                    withAnimation(.easeOut(duration: 0.14)) {
-                        isSelectingSpeed = false
-                    }
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "chevron.left")
-                            .font(.system(size: 11, weight: .semibold))
-                        Text("Speed")
-                        Spacer()
-                    }
-                    .font(.system(size: 15))
-                    .frame(height: 48)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-
-                speedChoice(title: "Standard", isSelected: !codexFastModeEnabled) {
-                    setCodexFastMode(false)
-                }
-
-                speedChoice(title: "Fast", isSelected: codexFastModeEnabled) {
-                    setCodexFastMode(true)
-                }
-            } else {
+        HStack(alignment: .bottom, spacing: 8) {
+            VStack(spacing: 0) {
                 if isAdvancedExpanded {
                     panelModelControl
                     panelEffortControl
@@ -312,106 +290,62 @@ struct AgentComposerView: View {
                     HStack(spacing: 8) {
                         Text("Advanced")
                         Image(systemName: isAdvancedExpanded ? "chevron.up" : "chevron.down")
-                            .font(.system(size: 11, weight: .semibold))
+                            .font(.system(size: 9, weight: .semibold))
                         Spacer()
                     }
-                    .font(.system(size: 15))
+                    .font(.system(size: 13))
                     .foregroundStyle(.secondary)
-                    .frame(height: 48)
+                    .frame(height: 36)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
             }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .frame(width: 215)
+            .panelSurface()
+
+            if let selectedModelSection {
+                sectionPanel(selectedModelSection)
+                    .transition(.opacity.combined(with: .move(edge: .leading)))
+            }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
-        .frame(width: 225)
-        .background(
-            Color(red: 0.165, green: 0.165, blue: 0.165),
-            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
-        )
-        .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(Color.white.opacity(0.16), lineWidth: 1)
-        }
-        .shadow(color: .black.opacity(0.28), radius: 18, y: 8)
+        .textSelection(.disabled)
     }
 
-    @ViewBuilder
     private var panelModelControl: some View {
-        if session.kind == .claude {
-            Menu {
-                ForEach(["fable", "opus", "sonnet"], id: \.self) { model in
-                    Button {
-                        claudeModel = model
-                        sendCommand("/model \(model)")
-                    } label: {
-                        if claudeModel == model {
-                            Label(model.capitalized, systemImage: "checkmark")
-                        } else {
-                            Text(model.capitalized)
-                        }
-                    }
-                }
-            } label: {
-                panelRow(title: "Model", value: modelDisplayName)
+        Button {
+            withAnimation(.easeOut(duration: 0.14)) {
+                selectedModelSection = selectedModelSection == .model ? nil : .model
             }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-        } else {
-            Button {
-                isShowingModelPanel = false
-                session.sendCommand("/model", focusesTerminal: true)
-            } label: {
-                panelRow(title: "Model", value: modelDisplayName)
-            }
-            .buttonStyle(.plain)
+        } label: {
+            panelRow(title: "Model", value: modelDisplayName, section: .model)
         }
+        .buttonStyle(.plain)
+        .modelPanelCursor()
     }
 
-    @ViewBuilder
     private var panelEffortControl: some View {
-        if session.kind == .claude {
-            Menu {
-                ForEach(AgentReasoningEffort.allCases) { effort in
-                    Button {
-                        claudeReasoningEffort = effort
-                        sendCommand("/effort \(effort.rawValue)")
-                    } label: {
-                        if claudeReasoningEffort == effort {
-                            Label(effort.displayName, systemImage: "checkmark")
-                        } else {
-                            Text(effort.displayName)
-                        }
-                    }
-                }
-            } label: {
-                panelRow(
-                    title: "Effort",
-                    value: selectedReasoningEffort.displayName.capitalized
-                )
+        Button {
+            withAnimation(.easeOut(duration: 0.14)) {
+                selectedModelSection = selectedModelSection == .effort ? nil : .effort
             }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-        } else {
-            Button {
-                isShowingModelPanel = false
-                session.sendCommand("/model", focusesTerminal: true)
-            } label: {
-                panelRow(
-                    title: "Effort",
-                    value: selectedReasoningEffort.displayName.capitalized
-                )
-            }
-            .buttonStyle(.plain)
+        } label: {
+            panelRow(
+                title: "Effort",
+                value: selectedReasoningEffort.displayName.capitalized,
+                section: .effort
+            )
         }
+        .buttonStyle(.plain)
+        .modelPanelCursor()
     }
 
     private var panelSpeedControl: some View {
         Button {
             if session.kind == .codex {
                 withAnimation(.easeOut(duration: 0.14)) {
-                    isSelectingSpeed = true
+                    selectedModelSection = selectedModelSection == .speed ? nil : .speed
                 }
             } else {
                 pasteNotice = "Speed control is available for Codex sessions."
@@ -419,13 +353,19 @@ struct AgentComposerView: View {
         } label: {
             panelRow(
                 title: "Speed",
-                value: codexFastModeEnabled ? "Fast" : "Standard"
+                value: codexFastModeEnabled ? "Fast" : "Standard",
+                section: .speed
             )
         }
         .buttonStyle(.plain)
+        .modelPanelCursor()
     }
 
-    private func panelRow(title: String, value: String) -> some View {
+    private func panelRow(
+        title: String,
+        value: String,
+        section: ModelPanelSection
+    ) -> some View {
         HStack(spacing: 8) {
             Text(title)
                 .foregroundStyle(.primary)
@@ -435,24 +375,76 @@ struct AgentComposerView: View {
                     .foregroundColor(.secondary)
                 + Text("  ")
                 + Text(Image(systemName: "chevron.right"))
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: 9, weight: .semibold))
                     .foregroundColor(.secondary)
             )
         }
-        .font(.system(size: 15))
-        .frame(height: 48)
+        .font(.system(size: 13))
+        .padding(.horizontal, 8)
+        .frame(height: 36)
+        .background(
+            Color.white.opacity(selectedModelSection == section ? 0.1 : 0),
+            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+        )
         .contentShape(Rectangle())
     }
 
-    private func setCodexFastMode(_ isEnabled: Bool) {
-        codexFastModeEnabled = isEnabled
-        sendCommand(isEnabled ? "/fast on" : "/fast off")
-        withAnimation(.easeOut(duration: 0.14)) {
-            isSelectingSpeed = false
+    @ViewBuilder
+    private func sectionPanel(_ section: ModelPanelSection) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(section.title)
+                .font(.system(size: 13))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                .frame(height: 34)
+
+            switch section {
+            case .model:
+                ForEach(modelOptions, id: \.id) { model in
+                    selectionRow(
+                        title: model.name,
+                        isSelected: selectedModelID == model.id
+                    ) {
+                        setModel(model.id)
+                    }
+                }
+
+            case .effort:
+                ForEach(availableReasoningEfforts) { effort in
+                    selectionRow(
+                        title: effort.displayName.capitalized,
+                        isSelected: selectedReasoningEffort == effort
+                    ) {
+                        setReasoningEffort(effort)
+                    }
+                }
+
+                if session.kind == .codex,
+                   availableReasoningEfforts.contains(where: { $0 == .max || $0 == .ultra }) {
+                    Text("Consumes usage limits faster")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 8)
+                        .padding(.top, 2)
+                        .padding(.bottom, 6)
+                }
+
+            case .speed:
+                selectionRow(title: "Standard", isSelected: !codexFastModeEnabled) {
+                    setCodexFastMode(false)
+                }
+                selectionRow(title: "Fast", isSelected: codexFastModeEnabled) {
+                    setCodexFastMode(true)
+                }
+            }
         }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .frame(width: 205)
+        .panelSurface()
     }
 
-    private func speedChoice(
+    private func selectionRow(
         title: String,
         isSelected: Bool,
         action: @escaping () -> Void
@@ -463,27 +455,78 @@ struct AgentComposerView: View {
                 Spacer()
                 if isSelected {
                     Image(systemName: "checkmark")
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(.system(size: 11, weight: .semibold))
                 }
             }
-            .font(.system(size: 15))
-            .frame(height: 48)
+            .font(.system(size: 13))
+            .padding(.horizontal, 8)
+            .frame(height: 36)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .modelPanelCursor()
     }
 
-    private var microphoneButton: some View {
-        Button {
-            pasteNotice = "Voice input is not available yet."
-        } label: {
-            Image(systemName: "mic")
-                .font(.system(size: 19, weight: .medium))
-                .frame(width: 26, height: 26)
+    private var modelOptions: [(id: String, name: String)] {
+        if session.kind == .codex {
+            return Self.codexModels.map { ($0.id, $0.name) }
         }
-        .buttonStyle(.plain)
-        .foregroundStyle(.primary)
-        .help("Voice input")
+        return ["fable", "opus", "sonnet"].map { ($0, $0.capitalized) }
+    }
+
+    private var selectedModelID: String {
+        session.kind == .codex ? codexModel : claudeModel
+    }
+
+    private var availableReasoningEfforts: [AgentReasoningEffort] {
+        if session.kind == .claude {
+            return AgentReasoningEffort.allCases.filter { $0 != .ultra }
+        }
+        guard let selectedModel = Self.codexModels.first(where: { $0.id == codexModel }),
+              !selectedModel.supportsUltra else {
+            return AgentReasoningEffort.allCases
+        }
+        return AgentReasoningEffort.allCases.filter { $0 != .ultra }
+    }
+
+    private func setModel(_ model: String) {
+        if session.kind == .claude {
+            claudeModel = model
+            sendCommand("/model \(model)")
+        } else if let option = Self.codexModels.first(where: { $0.id == model }) {
+            let effort: AgentReasoningEffort =
+                codexReasoningEffort == .ultra && !option.supportsUltra
+                ? .max
+                : codexReasoningEffort
+            codexModel = option.id
+            codexReasoningEffort = effort
+            session.selectCodexModel(pickerIndex: option.pickerIndex, effort: effort)
+        }
+        closeModelPanel()
+    }
+
+    private func setReasoningEffort(_ effort: AgentReasoningEffort) {
+        if session.kind == .claude {
+            claudeReasoningEffort = effort
+            sendCommand("/effort \(effort.rawValue)")
+        } else if let option = Self.codexModels.first(where: { $0.id == codexModel }) {
+            codexReasoningEffort = effort
+            session.selectCodexModel(pickerIndex: option.pickerIndex, effort: effort)
+        }
+        closeModelPanel()
+    }
+
+    private func setCodexFastMode(_ isEnabled: Bool) {
+        codexFastModeEnabled = isEnabled
+        sendCommand(isEnabled ? "/fast on" : "/fast off")
+        closeModelPanel()
+    }
+
+    private func closeModelPanel() {
+        withAnimation(.easeOut(duration: 0.14)) {
+            selectedModelSection = nil
+            isShowingModelPanel = false
+        }
     }
 
     private var modelDisplayName: String {
@@ -553,6 +596,48 @@ struct AgentComposerView: View {
                 }
             }
         }
+    }
+}
+
+private enum ModelPanelSection {
+    case model
+    case effort
+    case speed
+
+    var title: String {
+        switch self {
+        case .model: "Model"
+        case .effort: "Effort"
+        case .speed: "Speed"
+        }
+    }
+}
+
+private struct CodexModelOption {
+    let id: String
+    let name: String
+    let pickerIndex: Int
+    var supportsUltra = true
+}
+
+private extension View {
+    func panelSurface() -> some View {
+        background(
+            Color(red: 0.165, green: 0.165, blue: 0.165),
+            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.white.opacity(0.16), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.28), radius: 18, y: 8)
+    }
+
+    func modelPanelCursor() -> some View {
+        contentShape(Rectangle())
+            .onHover { isHovering in
+                (isHovering ? NSCursor.pointingHand : NSCursor.arrow).set()
+            }
     }
 }
 
@@ -651,8 +736,8 @@ private struct PromptEditor: NSViewRepresentable {
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticTextReplacementEnabled = false
         textView.font = .systemFont(ofSize: 16)
-        textView.textContainerInset = NSSize(width: 5, height: 7)
-        textView.minSize = NSSize(width: 0, height: 36)
+        textView.textContainerInset = NSSize(width: 5, height: 5)
+        textView.minSize = NSSize(width: 0, height: 30)
         textView.maxSize = NSSize(
             width: CGFloat.greatestFiniteMagnitude,
             height: CGFloat.greatestFiniteMagnitude

@@ -6,6 +6,7 @@ enum AgentReasoningEffort: String, CaseIterable, Identifiable {
     case high
     case xhigh
     case max
+    case ultra
 
     var id: String { rawValue }
 
@@ -16,6 +17,7 @@ enum AgentReasoningEffort: String, CaseIterable, Identifiable {
         case .high: "High"
         case .xhigh: "Extra high"
         case .max: "Max"
+        case .ultra: "Ultra"
         }
     }
 }

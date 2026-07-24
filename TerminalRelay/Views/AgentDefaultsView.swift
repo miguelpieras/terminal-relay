@@ -96,7 +96,7 @@ struct AgentDefaultsView: View {
                     Text("Reasoning")
                         .foregroundStyle(.secondary)
                     Picker("Reasoning", selection: effort) {
-                        ForEach(AgentReasoningEffort.allCases) { option in
+                        ForEach(reasoningEfforts(for: kind)) { option in
                             Text(option.displayName).tag(option)
                         }
                     }
@@ -120,5 +120,12 @@ struct AgentDefaultsView: View {
         claudeModel = AgentLaunchDefaults.standard.claudeModel
         claudeReasoningEffort = AgentLaunchDefaults.standard.claudeReasoningEffort
         fullAccessEnabled = AgentLaunchDefaults.standard.fullAccessEnabled
+    }
+
+    private func reasoningEfforts(for kind: AgentKind) -> [AgentReasoningEffort] {
+        if kind == .claude {
+            return AgentReasoningEffort.allCases.filter { $0 != .ultra }
+        }
+        return AgentReasoningEffort.allCases
     }
 }
