@@ -108,4 +108,43 @@ final class ProjectStoreTests: XCTestCase {
         store.dismissPersistenceError()
         XCTAssertNil(store.persistenceError)
     }
+
+    func testSidebarFoldersProjectOrderingAndMovesPersist() {
+        let suiteName = "TerminalRelayTests.ProjectStore.Sidebar.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let server = ServerProfile(name: "Worker", host: "worker")
+        let first = ProjectProfile(serverID: server.id, repositoryName: "first")
+        let second = ProjectProfile(serverID: server.id, repositoryName: "second")
+        let third = ProjectProfile(serverID: server.id, repositoryName: "third")
+        let store = ProjectStore(defaults: defaults, servers: [server], initialProjects: [])
+
+        XCTAssertTrue(store.save(first))
+        XCTAssertTrue(store.save(second))
+        XCTAssertTrue(store.save(third))
+
+        let work = try! XCTUnwrap(store.createSidebarFolder(named: "Work"))
+        let later = try! XCTUnwrap(store.createSidebarFolder(named: "Later"))
+        store.moveProject(id: second.id, intoSidebarFolder: work.id)
+        store.moveProject(id: third.id, before: second.id, intoSidebarFolder: work.id)
+        store.moveSidebarFolder(id: later.id, before: work.id)
+
+        XCTAssertEqual(store.rootProjects.map(\.id), [first.id])
+        XCTAssertEqual(store.projects(inSidebarFolder: work.id).map(\.id), [third.id, second.id])
+        XCTAssertEqual(store.sidebarFolders.map(\.id), [later.id, work.id])
+
+        let reloadedStore = ProjectStore(defaults: defaults, servers: [server])
+        XCTAssertEqual(reloadedStore.rootProjects.map(\.id), [first.id])
+        XCTAssertEqual(
+            reloadedStore.projects(inSidebarFolder: work.id).map(\.id),
+            [third.id, second.id]
+        )
+        XCTAssertEqual(reloadedStore.sidebarFolders.map(\.id), [later.id, work.id])
+
+        reloadedStore.moveProject(id: third.id, intoSidebarFolder: nil)
+        reloadedStore.deleteSidebarFolder(id: work.id)
+        XCTAssertEqual(reloadedStore.rootProjects.map(\.id), [first.id, third.id, second.id])
+        XCTAssertEqual(reloadedStore.sidebarFolders.map(\.id), [later.id])
+    }
 }

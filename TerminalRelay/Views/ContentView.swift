@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 private enum SidebarDestination: Equatable {
@@ -7,6 +8,38 @@ private enum SidebarDestination: Equatable {
     case settings
     case newProject(ProjectProfile)
     case editProject(UUID)
+}
+
+private struct SessionArchiveRequest: Identifiable {
+    let id = UUID()
+    let sessionIDs: Set<UUID>
+}
+
+private enum SidebarDragItem {
+    private static let projectPrefix = "terminal-relay-project:"
+    private static let folderPrefix = "terminal-relay-folder:"
+
+    case project(UUID)
+    case folder(UUID)
+
+    var value: String {
+        switch self {
+        case .project(let id): Self.projectPrefix + id.uuidString
+        case .folder(let id): Self.folderPrefix + id.uuidString
+        }
+    }
+
+    init?(value: String) {
+        if value.hasPrefix(Self.projectPrefix),
+           let id = UUID(uuidString: String(value.dropFirst(Self.projectPrefix.count))) {
+            self = .project(id)
+        } else if value.hasPrefix(Self.folderPrefix),
+                  let id = UUID(uuidString: String(value.dropFirst(Self.folderPrefix.count))) {
+            self = .folder(id)
+        } else {
+            return nil
+        }
+    }
 }
 
 private enum SidebarPalette {
@@ -59,6 +92,12 @@ struct ContentView: View {
     @State private var searchQuery = ""
     @State private var navigationHistory: [SidebarDestination] = []
     @State private var navigationIndex = -1
+    @State private var selectedSessionIDs: Set<UUID> = []
+    @State private var sessionArchiveRequest: SessionArchiveRequest?
+    @State private var isNamingSidebarFolder = false
+    @State private var newSidebarFolderName = ""
+    @State private var expandedSidebarFolderIDs: Set<UUID> = []
+    @State private var isRootProjectsExpanded = true
 
     private var launchDefaults: AgentLaunchDefaults {
         AgentLaunchDefaults(
@@ -72,7 +111,7 @@ struct ContentView: View {
 
     private var visibleProjects: [ProjectProfile] {
         let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return projectStore.projects }
+        guard !query.isEmpty else { return projectStore.sidebarProjects }
 
         return projectStore.projects.filter { project in
             project.displayName.localizedCaseInsensitiveContains(query)
@@ -104,6 +143,84 @@ struct ContentView: View {
     }
 
     var body: some View {
+        presentedContent
+            .sheet(
+                item: $accountAuthenticationService.presentation,
+                onDismiss: accountAuthenticationService.dismiss
+            ) { presentation in
+                AccountAuthenticationView(presentation: presentation)
+                    .environmentObject(accountAuthenticationService)
+                    .environmentObject(accountUsageService)
+            }
+    }
+
+    private var presentedContent: some View {
+        lifecycleContent
+            .alert("New Folder", isPresented: $isNamingSidebarFolder) {
+                TextField("Folder name", text: $newSidebarFolderName)
+                Button("Cancel", role: .cancel) {
+                    newSidebarFolderName = ""
+                }
+                Button("Create") {
+                    createSidebarFolder()
+                }
+            } message: {
+                Text("Create a parent folder for projects in the sidebar.")
+            }
+            .confirmationDialog(
+                archiveConfirmationTitle,
+                isPresented: isShowingArchiveConfirmation,
+                titleVisibility: .visible
+            ) {
+                if let request = sessionArchiveRequest {
+                    Button(
+                        request.sessionIDs.count == 1 ? "Archive" : "Archive All",
+                        role: .destructive
+                    ) {
+                        sessionArchiveRequest = nil
+                        archiveSessions(request.sessionIDs)
+                    }
+                }
+                Button("Cancel", role: .cancel) {
+                    sessionArchiveRequest = nil
+                }
+            } message: {
+                Text(
+                    "Running agents will be stopped and the selected terminal rows will be removed. Project files are not deleted."
+                )
+            }
+    }
+
+    private var lifecycleContent: some View {
+        navigationContent
+            .onAppear(perform: selectFirstProjectIfNeeded)
+            .onChange(of: projectStore.projects) { _, _ in selectFirstProjectIfNeeded() }
+            .onChange(of: sessionManager.sessions.map(\.id)) { _, sessionIDs in
+                selectedSessionIDs.formIntersection(sessionIDs)
+            }
+            .onChange(of: serverStore.servers) { _, workers in
+                projectStore.updateServers(workers)
+            }
+            .onChange(of: selectedProjectID) { _, projectID in
+                updateSelectedSession(for: projectID)
+            }
+            .onChange(of: scenePhase) { _, phase in
+                guard phase == .active else { return }
+                Task { await refreshWorkerSessions() }
+            }
+            .task(id: workerStatusTaskID) {
+                repeat {
+                    await refreshWorkerSessions()
+                    do {
+                        try await Task.sleep(for: .seconds(15))
+                    } catch {
+                        return
+                    }
+                } while !Task.isCancelled
+            }
+    }
+
+    private var navigationContent: some View {
         NavigationSplitView {
             sidebar
                 .navigationSplitViewColumnWidth(min: 268, ideal: 268, max: 268)
@@ -139,52 +256,12 @@ struct ContentView: View {
                 }
             }
         }
-        .onAppear(perform: selectFirstProjectIfNeeded)
-        .onChange(of: projectStore.projects) { _, _ in selectFirstProjectIfNeeded() }
-        .onChange(of: serverStore.servers) { _, workers in
-            projectStore.updateServers(workers)
-        }
-        .onChange(of: selectedProjectID) { _, projectID in
-            guard let projectID else {
-                sessionManager.selectedSessionID = nil
-                return
-            }
-
-            let selectedSessionBelongsToProject = sessionManager
-                .sessions(forProjectID: projectID)
-                .contains { $0.id == sessionManager.selectedSessionID }
-            if !selectedSessionBelongsToProject {
-                sessionManager.selectedSessionID = nil
-            }
-        }
-        .onChange(of: scenePhase) { _, phase in
-            guard phase == .active else { return }
-            Task { await refreshWorkerSessions() }
-        }
-        .task(id: workerStatusTaskID) {
-            repeat {
-                await refreshWorkerSessions()
-                do {
-                    try await Task.sleep(for: .seconds(15))
-                } catch {
-                    return
-                }
-            } while !Task.isCancelled
-        }
-        .sheet(
-            item: $accountAuthenticationService.presentation,
-            onDismiss: accountAuthenticationService.dismiss
-        ) { presentation in
-            AccountAuthenticationView(presentation: presentation)
-                .environmentObject(accountAuthenticationService)
-                .environmentObject(accountUsageService)
-        }
     }
 
     private var sidebar: some View {
         VStack(spacing: 0) {
             sidebarHeader
-            newProjectButton
+            sidebarCreationButtons
 
             Rectangle()
                 .fill(SidebarPalette.separator)
@@ -192,24 +269,7 @@ struct ContentView: View {
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(visibleProjects) { project in
-                        ProjectSidebarSection(
-                            project: project,
-                            searchQuery: searchQuery,
-                            selectedSessionID: sessionManager.selectedSessionID,
-                            onSelectProject: {
-                                navigate(to: .project(project.id))
-                            },
-                            onSelectSession: { sessionID in
-                                selectSession(sessionID, for: project)
-                            },
-                            onOpenTerminal: { kind in
-                                openTerminal(kind, for: project)
-                            },
-                            onEdit: { navigate(to: .editProject(project.id)) },
-                            onRemove: { projectPendingDeletion = project }
-                        )
-                    }
+                    sidebarProjectList
 
                     if !searchQuery.isEmpty && visibleProjects.isEmpty {
                         Text("No matching projects or sessions")
@@ -226,6 +286,95 @@ struct ContentView: View {
             sidebarFooter
         }
         .background(SidebarPalette.background)
+    }
+
+    @ViewBuilder
+    private var sidebarProjectList: some View {
+        if !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            ForEach(visibleProjects) { project in
+                projectSidebarSection(project, folderID: nil, indentLevel: 0)
+            }
+        } else {
+            if !projectStore.sidebarFolders.isEmpty {
+                SidebarFolderRow(
+                    title: "Projects",
+                    isExpanded: isRootProjectsExpanded,
+                    isRoot: true,
+                    onToggle: { isRootProjectsExpanded.toggle() },
+                    onDrop: handleRootFolderDrop
+                )
+            }
+
+            if isRootProjectsExpanded || projectStore.sidebarFolders.isEmpty {
+                ForEach(projectStore.rootProjects) { project in
+                    projectSidebarSection(project, folderID: nil, indentLevel: 0)
+                }
+            }
+
+            ForEach(projectStore.sidebarFolders) { folder in
+                SidebarFolderRow(
+                    title: folder.name,
+                    isExpanded: expandedSidebarFolderIDs.contains(folder.id),
+                    isRoot: false,
+                    onToggle: {
+                        toggleSidebarFolder(folder.id)
+                    },
+                    onDrop: { values in
+                        handleSidebarFolderDrop(values, into: folder.id)
+                    }
+                )
+                .draggable(SidebarDragItem.folder(folder.id).value)
+                .contextMenu {
+                    Button("Delete Folder", role: .destructive) {
+                        projectStore.deleteSidebarFolder(id: folder.id)
+                    }
+                }
+
+                if expandedSidebarFolderIDs.contains(folder.id) {
+                    ForEach(projectStore.projects(inSidebarFolder: folder.id)) { project in
+                        projectSidebarSection(project, folderID: folder.id, indentLevel: 1)
+                    }
+                }
+            }
+        }
+    }
+
+    private func projectSidebarSection(
+        _ project: ProjectProfile,
+        folderID: UUID?,
+        indentLevel: Int
+    ) -> some View {
+        ProjectSidebarSection(
+            project: project,
+            searchQuery: searchQuery,
+            selectedSessionID: sessionManager.selectedSessionID,
+            selectedSessionIDs: selectedSessionIDs,
+            indentLevel: indentLevel,
+            onSelectProject: {
+                selectedSessionIDs.removeAll()
+                navigate(to: .project(project.id))
+            },
+            onSelectSession: { sessionID, usesCommandModifier in
+                selectSession(
+                    sessionID,
+                    for: project,
+                    usesCommandModifier: usesCommandModifier
+                )
+            },
+            onArchiveSession: presentArchiveConfirmation,
+            onOpenTerminal: { kind in
+                openTerminal(kind, for: project)
+            },
+            onEdit: { navigate(to: .editProject(project.id)) },
+            onRemove: { projectPendingDeletion = project },
+            onDropProject: { values in
+                handleProjectDrop(
+                    values,
+                    before: project.id,
+                    intoSidebarFolder: folderID
+                )
+            }
+        )
     }
 
     @ViewBuilder
@@ -290,13 +439,29 @@ struct ContentView: View {
         }
     }
 
-    private var newProjectButton: some View {
-        SidebarActionButton(
-            title: "New project",
-            systemImage: "square.and.pencil",
-            action: addProject
-        )
-        .keyboardShortcut("n", modifiers: .command)
+    private var sidebarCreationButtons: some View {
+        HStack(spacing: 0) {
+            SidebarActionButton(
+                title: "New project",
+                systemImage: "square.and.pencil",
+                action: addProject
+            )
+            .keyboardShortcut("n", modifiers: .command)
+
+            Button {
+                newSidebarFolderName = ""
+                isNamingSidebarFolder = true
+            } label: {
+                Image(systemName: "folder.badge.plus")
+                    .font(.system(size: 13))
+                    .foregroundStyle(SidebarPalette.primary)
+                    .frame(width: 30, height: SidebarRowGeometry.height)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(.trailing, SidebarRowGeometry.horizontalMargin)
+            .help("New parent folder")
+        }
     }
 
     private var titlebarNavigationControls: some View {
@@ -568,7 +733,21 @@ struct ContentView: View {
         }
     }
 
-    private func selectSession(_ sessionID: UUID, for project: ProjectProfile) {
+    private func selectSession(
+        _ sessionID: UUID,
+        for project: ProjectProfile,
+        usesCommandModifier: Bool
+    ) {
+        if usesCommandModifier {
+            if selectedSessionIDs.contains(sessionID) {
+                selectedSessionIDs.remove(sessionID)
+            } else {
+                selectedSessionIDs.insert(sessionID)
+            }
+            return
+        }
+        selectedSessionIDs = [sessionID]
+
         guard let session = sessionManager.sessions(forProjectID: project.id)
             .first(where: { $0.id == sessionID }),
               session.status.canReconnect,
@@ -602,19 +781,160 @@ struct ContentView: View {
     private func refreshWorkerSessions() async {
         for worker in serverStore.servers {
             guard !Task.isCancelled else { return }
-            _ = await sessionManager.refresh(
+            let didRefresh = await sessionManager.refresh(
                 worker: worker,
                 projects: projectStore.projects,
                 launchDefaults: launchDefaults,
                 using: workerSessionService
             )
+            if didRefresh {
+                sessionManager.preloadRemoteSessions(for: worker)
+            }
         }
     }
 
     private func selectFirstProjectIfNeeded() {
         if selectedProjectID == nil || projectStore.project(id: selectedProjectID) == nil {
-            selectedProjectID = projectStore.projects.first?.id
+            selectedProjectID = projectStore.sidebarProjects.first?.id
             sessionManager.selectedSessionID = nil
+        }
+    }
+
+    private func updateSelectedSession(for projectID: UUID?) {
+        guard let projectID else {
+            sessionManager.selectedSessionID = nil
+            return
+        }
+
+        let selectedSessionBelongsToProject = sessionManager
+            .sessions(forProjectID: projectID)
+            .contains { $0.id == sessionManager.selectedSessionID }
+        if !selectedSessionBelongsToProject {
+            sessionManager.selectedSessionID = nil
+        }
+    }
+
+    private var archiveConfirmationTitle: String {
+        guard let count = sessionArchiveRequest?.sessionIDs.count, count > 1 else {
+            return "Archive terminal?"
+        }
+        return "Archive \(count) terminals?"
+    }
+
+    private var isShowingArchiveConfirmation: Binding<Bool> {
+        Binding(
+            get: { sessionArchiveRequest != nil },
+            set: { isPresented in
+                if !isPresented {
+                    sessionArchiveRequest = nil
+                }
+            }
+        )
+    }
+
+    private func createSidebarFolder() {
+        guard let folder = projectStore.createSidebarFolder(named: newSidebarFolderName) else {
+            return
+        }
+        expandedSidebarFolderIDs.insert(folder.id)
+        newSidebarFolderName = ""
+    }
+
+    private func toggleSidebarFolder(_ folderID: UUID) {
+        if expandedSidebarFolderIDs.contains(folderID) {
+            expandedSidebarFolderIDs.remove(folderID)
+        } else {
+            expandedSidebarFolderIDs.insert(folderID)
+        }
+    }
+
+    private func handleRootFolderDrop(_ values: [String]) -> Bool {
+        guard let value = values.first,
+              case .project(let projectID) = SidebarDragItem(value: value) else {
+            return false
+        }
+        projectStore.moveProject(id: projectID, intoSidebarFolder: nil)
+        isRootProjectsExpanded = true
+        return true
+    }
+
+    private func handleSidebarFolderDrop(_ values: [String], into folderID: UUID) -> Bool {
+        guard let value = values.first,
+              let item = SidebarDragItem(value: value) else {
+            return false
+        }
+
+        switch item {
+        case .project(let projectID):
+            projectStore.moveProject(id: projectID, intoSidebarFolder: folderID)
+            expandedSidebarFolderIDs.insert(folderID)
+        case .folder(let movingFolderID):
+            guard movingFolderID != folderID else { return true }
+            projectStore.moveSidebarFolder(id: movingFolderID, before: folderID)
+        }
+        return true
+    }
+
+    private func handleProjectDrop(
+        _ values: [String],
+        before targetProjectID: UUID,
+        intoSidebarFolder folderID: UUID?
+    ) -> Bool {
+        guard let value = values.first,
+              case .project(let projectID) = SidebarDragItem(value: value) else {
+            return false
+        }
+        guard projectID != targetProjectID else { return true }
+        projectStore.moveProject(
+            id: projectID,
+            before: targetProjectID,
+            intoSidebarFolder: folderID
+        )
+        return true
+    }
+
+    private func presentArchiveConfirmation(_ sessionID: UUID) {
+        let sessionIDs = selectedSessionIDs.contains(sessionID)
+            ? selectedSessionIDs
+            : Set([sessionID])
+        sessionArchiveRequest = SessionArchiveRequest(sessionIDs: sessionIDs)
+    }
+
+    private func archiveSessions(_ sessionIDs: Set<UUID>) {
+        Task {
+            var archivedSessionIDs = Set<UUID>()
+
+            for sessionID in sessionIDs {
+                guard let session = sessionManager.sessions.first(where: { $0.id == sessionID }),
+                      let worker = serverStore.servers.first(where: {
+                          $0.concurrencyKey == session.serverKey
+                      }) else {
+                    continue
+                }
+
+                let didArchive: Bool
+                if session.status.occupiesSlot {
+                    didArchive = await sessionManager.stopAgentAfterRefresh(
+                        sessionID: sessionID,
+                        on: worker,
+                        projects: projectStore.projects,
+                        launchDefaults: launchDefaults,
+                        using: workerSessionService
+                    )
+                    if didArchive {
+                        sessionManager.close(sessionID: sessionID)
+                    }
+                } else {
+                    sessionManager.close(sessionID: sessionID)
+                    didArchive = true
+                }
+
+                if didArchive {
+                    archivedSessionIDs.insert(sessionID)
+                }
+            }
+
+            selectedSessionIDs.subtract(archivedSessionIDs)
         }
     }
 
@@ -700,7 +1020,7 @@ struct ContentView: View {
         navigationIndex = min(navigationIndex, navigationHistory.count - 1)
         selectedProjectID = nil
 
-        if let destinationID = nextProjectID ?? projectStore.projects.first?.id {
+        if let destinationID = nextProjectID ?? projectStore.sidebarProjects.first?.id {
             navigate(to: .project(destinationID))
         } else {
             selectedProjectID = nil
@@ -772,7 +1092,54 @@ private struct SidebarActionButton: View {
         }
         .buttonStyle(.plain)
         .padding(.horizontal, SidebarRowGeometry.horizontalMargin)
+        .frame(maxWidth: .infinity)
         .onHover { isHovering = $0 }
+    }
+}
+
+private struct SidebarFolderRow: View {
+    let title: String
+    let isExpanded: Bool
+    let isRoot: Bool
+    let onToggle: () -> Void
+    let onDrop: ([String]) -> Bool
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: onToggle) {
+            HStack(spacing: 7) {
+                Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(SidebarPalette.secondary)
+                    .frame(width: 11)
+
+                Image(systemName: isRoot ? "tray.full" : "folder.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(SidebarPalette.secondary)
+                    .frame(width: 14)
+
+                Text(title)
+                    .font(.system(size: 12.5, weight: .medium))
+                    .foregroundStyle(SidebarPalette.secondary)
+                    .lineLimit(1)
+
+                Spacer()
+            }
+            .padding(.horizontal, SidebarRowGeometry.contentLeadingPadding)
+            .frame(height: 30)
+            .background(
+                isHovering ? SidebarPalette.hover : Color.clear,
+                in: RoundedRectangle(cornerRadius: SidebarRowGeometry.cornerRadius)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, SidebarRowGeometry.horizontalMargin)
+        .onHover { isHovering = $0 }
+        .dropDestination(for: String.self) { values, _ in
+            onDrop(values)
+        }
     }
 }
 
@@ -782,11 +1149,15 @@ private struct ProjectSidebarSection: View {
     let project: ProjectProfile
     let searchQuery: String
     let selectedSessionID: UUID?
+    let selectedSessionIDs: Set<UUID>
+    let indentLevel: Int
     let onSelectProject: () -> Void
-    let onSelectSession: (UUID) -> Void
+    let onSelectSession: (UUID, Bool) -> Void
+    let onArchiveSession: (UUID) -> Void
     let onOpenTerminal: (AgentKind) -> Void
     let onEdit: () -> Void
     let onRemove: () -> Void
+    let onDropProject: ([String]) -> Bool
 
     @State private var isExpanded = false
     @State private var isProjectHovering = false
@@ -855,6 +1226,10 @@ private struct ProjectSidebarSection: View {
             .contentShape(Rectangle())
             .padding(.horizontal, SidebarRowGeometry.horizontalMargin)
             .onHover { isProjectHovering = $0 }
+            .draggable(SidebarDragItem.project(project.id).value)
+            .dropDestination(for: String.self) { values, _ in
+                onDropProject(values)
+            }
             .contextMenu {
                 Button("Open Codex") { onOpenTerminal(.codex) }
                 Button("Open Claude Code") { onOpenTerminal(.claude) }
@@ -873,15 +1248,23 @@ private struct ProjectSidebarSection: View {
                     .frame(height: 35, alignment: .leading)
             } else {
                 ForEach(visibleSessions) { session in
-                    Button {
-                        onSelectSession(session.id)
-                    } label: {
-                        ProjectSessionRow(
-                            session: session,
-                            isSelected: selectedSessionID == session.id
-                        )
-                    }
-                    .buttonStyle(.plain)
+                    ProjectSessionRow(
+                        session: session,
+                        isSelected: selectedSessionID == session.id
+                            || selectedSessionIDs.contains(session.id),
+                        archiveCount: selectedSessionIDs.contains(session.id)
+                            ? max(1, selectedSessionIDs.count)
+                            : 1,
+                        onSelect: {
+                            onSelectSession(
+                                session.id,
+                                NSEvent.modifierFlags.contains(.command)
+                            )
+                        },
+                        onArchive: {
+                            onArchiveSession(session.id)
+                        }
+                    )
                     .contextMenu {
                         Group {
                             if session.status.isLocallyAttached {
@@ -890,7 +1273,7 @@ private struct ProjectSidebarSection: View {
                                 }
                             } else if session.status.canReconnect {
                                 Button("Reconnect") {
-                                    onSelectSession(session.id)
+                                    onSelectSession(session.id, false)
                                 }
                             } else {
                                 Button("Close Session") {
@@ -899,6 +1282,10 @@ private struct ProjectSidebarSection: View {
                             }
                         }
                         .disabled(session.status == .stopping)
+                        Divider()
+                        Button("Archive Terminal", role: .destructive) {
+                            onArchiveSession(session.id)
+                        }
                     }
                 }
 
@@ -914,6 +1301,7 @@ private struct ProjectSidebarSection: View {
                 }
             }
         }
+        .padding(.leading, CGFloat(indentLevel) * 15)
         .padding(.bottom, 8)
     }
 }
@@ -921,32 +1309,59 @@ private struct ProjectSidebarSection: View {
 private struct ProjectSessionRow: View {
     @ObservedObject var session: TerminalSession
     let isSelected: Bool
+    let archiveCount: Int
+    let onSelect: () -> Void
+    let onArchive: () -> Void
 
     @State private var isHovering = false
 
     var body: some View {
         HStack(spacing: 7) {
-            AgentBrandIcon(kind: session.kind, size: 12)
-                .opacity(session.status.occupiesSlot ? 1 : 0.55)
+            Button(action: onSelect) {
+                HStack(spacing: 7) {
+                    AgentBrandIcon(kind: session.kind, size: 12)
+                        .opacity(session.status.occupiesSlot ? 1 : 0.55)
 
-            Text(session.displayTitle)
-                .font(.system(size: 14))
-                .foregroundStyle(
-                    session.status.occupiesSlot
-                        ? SidebarPalette.primary
-                        : SidebarPalette.secondary
+                    Text(session.displayTitle)
+                        .font(.system(size: 14))
+                        .foregroundStyle(
+                            session.status.occupiesSlot
+                                ? SidebarPalette.primary
+                                : SidebarPalette.secondary
+                        )
+                        .lineLimit(1)
+
+                    Spacer(minLength: 5)
+
+                    if session.isWorking {
+                        ProgressView()
+                            .controlSize(.mini)
+                            .tint(SidebarPalette.secondary)
+                            .frame(width: 12, height: 12)
+                            .help("Working")
+                            .accessibilityLabel("\(session.kind.displayName), working")
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isHovering {
+                Button(action: onArchive) {
+                    Image(systemName: "archivebox")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(SidebarPalette.secondary)
+                        .frame(width: 19, height: 25)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(session.status == .stopping)
+                .help(
+                    archiveCount == 1
+                        ? "Archive terminal"
+                        : "Archive \(archiveCount) selected terminals"
                 )
-                .lineLimit(1)
-
-            Spacer(minLength: 5)
-
-            if session.isWorking {
-                ProgressView()
-                    .controlSize(.mini)
-                    .tint(SidebarPalette.secondary)
-                    .frame(width: 12, height: 12)
-                    .help("Working")
-                    .accessibilityLabel("\(session.kind.displayName), working")
             }
         }
         .padding(.leading, 18)

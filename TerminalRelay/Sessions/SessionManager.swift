@@ -54,6 +54,7 @@ final class SessionManager: ObservableObject {
 
     private var lastSequenceNumberByProjectAndKind: [ProjectAgentKey: Int] = [:]
     private var sessionObservers: [UUID: AnyCancellable] = [:]
+    private var backgroundAttachmentAttemptedSessionIDs = Set<UUID>()
 
     func session(projectID: UUID, kind: AgentKind) -> TerminalSession? {
         activeSession(projectID: projectID, kind: kind)
@@ -281,6 +282,7 @@ final class SessionManager: ObservableObject {
     }
 
     func disconnect(sessionID: UUID) {
+        backgroundAttachmentAttemptedSessionIDs.insert(sessionID)
         sessions.first(where: { $0.id == sessionID })?.requestDisconnect()
     }
 
@@ -311,6 +313,14 @@ final class SessionManager: ObservableObject {
     func disconnectAll() {
         for session in sessions where session.status.isLocallyAttached {
             session.requestDisconnect()
+        }
+    }
+
+    func preloadRemoteSessions(for server: ServerProfile) {
+        for session in sessions(for: server)
+        where session.status == .remoteRunning
+            && backgroundAttachmentAttemptedSessionIDs.insert(session.id).inserted {
+            session.startIfNeeded()
         }
     }
 
@@ -485,6 +495,7 @@ final class SessionManager: ObservableObject {
         let removedProjectID = sessions[index].projectID
         sessions.remove(at: index)
         sessionObservers[id] = nil
+        backgroundAttachmentAttemptedSessionIDs.remove(id)
 
         if selectedSessionID == id {
             selectedSessionID = sessions.last(where: { $0.projectID == removedProjectID })?.id

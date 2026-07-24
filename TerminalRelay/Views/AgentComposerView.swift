@@ -17,6 +17,8 @@ struct AgentComposerView: View {
     private var claudeReasoningEffort = AgentLaunchDefaults.standard.claudeReasoningEffort
     @AppStorage("agentComposer.codexFastModeEnabled")
     private var codexFastModeEnabled = false
+    @AppStorage("agentComposer.claudeFastModeEnabled")
+    private var claudeFastModeEnabled = false
 
     @State private var draft = ""
     @State private var attachments: [ComposerAttachment] = []
@@ -25,6 +27,7 @@ struct AgentComposerView: View {
     @State private var isShowingModelPanel = false
     @State private var isAdvancedExpanded = true
     @State private var selectedModelSection: ModelPanelSection?
+    @StateObject private var modelPanelClickMonitor = ModelPanelClickMonitor()
 
     private static let codexModels = [
         CodexModelOption(id: "gpt-5.6-sol", name: "5.6 Sol", pickerIndex: 0),
@@ -46,10 +49,10 @@ struct AgentComposerView: View {
 
     private var editorHeight: CGFloat {
         let lineCount = max(
-            1,
+            2,
             draft.split(separator: "\n", omittingEmptySubsequences: false).count
         )
-        return min(72, 30 + (CGFloat(lineCount - 1) * 20))
+        return min(80, 8 + (CGFloat(lineCount) * 18))
     }
 
     var body: some View {
@@ -65,7 +68,7 @@ struct AgentComposerView: View {
 
                 if draft.isEmpty, !isEditorFocused {
                     Text("Do anything")
-                        .font(.system(size: 16))
+                        .font(.system(size: 14))
                         .foregroundStyle(.tertiary)
                         .padding(.leading, 10)
                         .padding(.top, 5)
@@ -88,7 +91,6 @@ struct AgentComposerView: View {
             }
 
             HStack(spacing: 10) {
-                commandMenu
                 Spacer(minLength: 8)
 
                 modelControls
@@ -142,6 +144,18 @@ struct AgentComposerView: View {
         .onExitCommand {
             session.sendEscape()
         }
+        .onAppear {
+            modelPanelClickMonitor.start {
+                closeModelPanel()
+            }
+            modelPanelClickMonitor.isActive = isShowingModelPanel
+        }
+        .onChange(of: isShowingModelPanel) { _, isShowing in
+            modelPanelClickMonitor.isActive = isShowing
+        }
+        .onDisappear {
+            modelPanelClickMonitor.stop()
+        }
     }
 
     private var attachmentStrip: some View {
@@ -189,37 +203,6 @@ struct AgentComposerView: View {
         .scrollIndicators(.hidden)
     }
 
-    private var commandMenu: some View {
-        Menu {
-            Button("New chat") {
-                sendCommand(session.kind == .codex ? "/new" : "/clear")
-            }
-            Button("Compact context") {
-                sendCommand("/compact")
-            }
-            Divider()
-            Button("Show status") {
-                sendCommand(session.kind == .codex ? "/status" : "/context")
-            }
-            Button("Show usage") {
-                sendCommand("/usage")
-            }
-        } label: {
-            HStack(spacing: 8) {
-                Image(systemName: "gearshape")
-                    .font(.system(size: 14))
-                Text("Custom")
-                    .font(.system(size: 13))
-            }
-            .foregroundStyle(.secondary)
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .disabled(session.status != .running || session.isWorking)
-        .help("Agent commands")
-    }
-
     private var modelControls: some View {
         Button {
             withAnimation(.easeOut(duration: 0.14)) {
@@ -255,6 +238,7 @@ struct AgentComposerView: View {
         .buttonStyle(.plain)
         .textSelection(.disabled)
         .onHover { isHovering in
+            modelPanelClickMonitor.isPointerInsideControl = isHovering
             (isHovering ? NSCursor.pointingHand : NSCursor.arrow).set()
         }
         .disabled(session.status != .running)
@@ -311,6 +295,9 @@ struct AgentComposerView: View {
             }
         }
         .textSelection(.disabled)
+        .onHover { isHovering in
+            modelPanelClickMonitor.isPointerInsidePanel = isHovering
+        }
     }
 
     private var panelModelControl: some View {
@@ -343,17 +330,13 @@ struct AgentComposerView: View {
 
     private var panelSpeedControl: some View {
         Button {
-            if session.kind == .codex {
-                withAnimation(.easeOut(duration: 0.14)) {
-                    selectedModelSection = selectedModelSection == .speed ? nil : .speed
-                }
-            } else {
-                pasteNotice = "Speed control is available for Codex sessions."
+            withAnimation(.easeOut(duration: 0.14)) {
+                selectedModelSection = selectedModelSection == .speed ? nil : .speed
             }
         } label: {
             panelRow(
                 title: "Speed",
-                value: codexFastModeEnabled ? "Fast" : "Standard",
+                value: isFastModeEnabled ? "Fast" : "Standard",
                 section: .speed
             )
         }
@@ -430,11 +413,11 @@ struct AgentComposerView: View {
                 }
 
             case .speed:
-                selectionRow(title: "Standard", isSelected: !codexFastModeEnabled) {
-                    setCodexFastMode(false)
+                selectionRow(title: "Standard", isSelected: !isFastModeEnabled) {
+                    setFastMode(false)
                 }
-                selectionRow(title: "Fast", isSelected: codexFastModeEnabled) {
-                    setCodexFastMode(true)
+                selectionRow(title: "Fast", isSelected: isFastModeEnabled) {
+                    setFastMode(true)
                 }
             }
         }
@@ -492,6 +475,9 @@ struct AgentComposerView: View {
     private func setModel(_ model: String) {
         if session.kind == .claude {
             claudeModel = model
+            if model != "opus" {
+                claudeFastModeEnabled = false
+            }
             sendCommand("/model \(model)")
         } else if let option = Self.codexModels.first(where: { $0.id == model }) {
             let effort: AgentReasoningEffort =
@@ -516,9 +502,25 @@ struct AgentComposerView: View {
         closeModelPanel()
     }
 
-    private func setCodexFastMode(_ isEnabled: Bool) {
-        codexFastModeEnabled = isEnabled
-        sendCommand(isEnabled ? "/fast on" : "/fast off")
+    private func setFastMode(_ isEnabled: Bool) {
+        if session.kind == .codex {
+            guard codexFastModeEnabled != isEnabled else {
+                closeModelPanel()
+                return
+            }
+            codexFastModeEnabled = isEnabled
+            sendCommand(isEnabled ? "/fast on" : "/fast off")
+        } else {
+            guard claudeFastModeEnabled != isEnabled else {
+                closeModelPanel()
+                return
+            }
+            claudeFastModeEnabled = isEnabled
+            if isEnabled {
+                claudeModel = "opus"
+            }
+            sendCommand("/fast")
+        }
         closeModelPanel()
     }
 
@@ -540,6 +542,10 @@ struct AgentComposerView: View {
 
     private var selectedReasoningEffort: AgentReasoningEffort {
         session.kind == .codex ? codexReasoningEffort : claudeReasoningEffort
+    }
+
+    private var isFastModeEnabled: Bool {
+        session.kind == .codex ? codexFastModeEnabled : claudeFastModeEnabled
     }
 
     private func send() {
@@ -641,6 +647,49 @@ private extension View {
     }
 }
 
+@MainActor
+private final class ModelPanelClickMonitor: ObservableObject {
+    var isActive = false
+    var isPointerInsideControl = false
+    var isPointerInsidePanel = false
+
+    private var eventMonitor: Any?
+
+    func start(onOutsideClick: @escaping @MainActor () -> Void) {
+        stop()
+        eventMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]
+        ) { [weak self] event in
+            guard let self,
+                  self.isActive,
+                  !self.isPointerInsideControl,
+                  !self.isPointerInsidePanel else {
+                return event
+            }
+            DispatchQueue.main.async {
+                onOutsideClick()
+            }
+            return event
+        }
+    }
+
+    func stop() {
+        if let eventMonitor {
+            NSEvent.removeMonitor(eventMonitor)
+            self.eventMonitor = nil
+        }
+        isActive = false
+        isPointerInsideControl = false
+        isPointerInsidePanel = false
+    }
+
+    deinit {
+        if let eventMonitor {
+            NSEvent.removeMonitor(eventMonitor)
+        }
+    }
+}
+
 private struct ComposerAttachment: Identifiable {
     enum State {
         case uploading
@@ -735,9 +784,9 @@ private struct PromptEditor: NSViewRepresentable {
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticTextReplacementEnabled = false
-        textView.font = .systemFont(ofSize: 16)
+        textView.font = .systemFont(ofSize: 14)
         textView.textContainerInset = NSSize(width: 5, height: 5)
-        textView.minSize = NSSize(width: 0, height: 30)
+        textView.minSize = NSSize(width: 0, height: 44)
         textView.maxSize = NSSize(
             width: CGFloat.greatestFiniteMagnitude,
             height: CGFloat.greatestFiniteMagnitude
