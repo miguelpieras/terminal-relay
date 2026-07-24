@@ -1131,6 +1131,72 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertTrue(recorder.configurations.isEmpty)
     }
 
+    func testSidebarSessionOrderPersistsByRemoteInstanceToken() {
+        let suiteName = "TerminalRelayTests.SessionManager.SidebarOrder.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let codexToken = "01234567-89ab-" + "4def-8abc-0123456789ab"
+        let claudeToken = "11111111-2222-" + "4333-8444-555555555555"
+        let manager = SessionManager(defaults: defaults)
+        let codex = manager.open(
+            project: project,
+            on: server,
+            kind: .codex,
+            launchDefaults: .standard,
+            instanceToken: codexToken
+        ).localSession!
+        let claude = manager.open(
+            project: project,
+            on: server,
+            kind: .claude,
+            launchDefaults: .standard,
+            instanceToken: claudeToken
+        ).localSession!
+
+        XCTAssertEqual(
+            manager.sidebarSessions(forProjectID: project.id).map(\.id),
+            [claude.id, codex.id]
+        )
+
+        manager.moveSidebarSession(id: codex.id, before: claude.id)
+        XCTAssertEqual(
+            manager.sidebarSessions(forProjectID: project.id).map(\.id),
+            [codex.id, claude.id]
+        )
+
+        let reloadedManager = SessionManager(defaults: defaults)
+        reloadedManager.reconcile(
+            worker: server,
+            projects: [project],
+            response: WorkerSessionResponse(
+                projects: [project.displayName],
+                sessions: [
+                    WorkerSessionSnapshot(
+                        kind: .codex,
+                        repositoryName: project.displayName,
+                        attachedClientCount: 0,
+                        instanceToken: codexToken
+                    ),
+                    WorkerSessionSnapshot(
+                        kind: .claude,
+                        repositoryName: project.displayName,
+                        attachedClientCount: 0,
+                        instanceToken: claudeToken
+                    )
+                ]
+            ),
+            launchDefaults: .standard
+        )
+
+        XCTAssertEqual(
+            reloadedManager.sidebarSessions(forProjectID: project.id).map(\.instanceToken),
+            [codexToken, claudeToken]
+        )
+    }
+
     private static func statusResult(
         kind: AgentKind,
         repositoryName: String,

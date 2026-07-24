@@ -52,9 +52,20 @@ final class SessionManager: ObservableObject {
     @Published var selectedSessionID: UUID?
     @Published private var remoteSessions: [RemoteSessionKey: WorkerSessionSnapshot] = [:]
 
+    private let defaults: UserDefaults
+    private let sidebarSessionOrderStorageKey = "sidebarSessionOrder.v1"
+    private var sidebarSessionInstanceTokensByProject: [String: [String]] = [:]
     private var lastSequenceNumberByProjectAndKind: [ProjectAgentKey: Int] = [:]
     private var sessionObservers: [UUID: AnyCancellable] = [:]
     private var backgroundAttachmentAttemptedSessionIDs = Set<UUID>()
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        if let data = defaults.data(forKey: sidebarSessionOrderStorageKey),
+           let savedOrder = try? JSONDecoder().decode([String: [String]].self, from: data) {
+            sidebarSessionInstanceTokensByProject = savedOrder
+        }
+    }
 
     func session(projectID: UUID, kind: AgentKind) -> TerminalSession? {
         activeSession(projectID: projectID, kind: kind)
@@ -63,6 +74,38 @@ final class SessionManager: ObservableObject {
 
     func sessions(forProjectID projectID: UUID) -> [TerminalSession] {
         sessions.filter { $0.projectID == projectID }
+    }
+
+    func sidebarSessions(forProjectID projectID: UUID) -> [TerminalSession] {
+        let defaultOrder = Array(sessions(forProjectID: projectID).reversed())
+        guard let savedTokens = sidebarSessionInstanceTokensByProject[projectID.uuidString] else {
+            return defaultOrder
+        }
+
+        let sessionsByToken = Dictionary(
+            uniqueKeysWithValues: defaultOrder.map { ($0.instanceToken, $0) }
+        )
+        let savedSessions = savedTokens.compactMap { sessionsByToken[$0] }
+        let savedTokenSet = Set(savedSessions.map(\.instanceToken))
+        return defaultOrder.filter { !savedTokenSet.contains($0.instanceToken) } + savedSessions
+    }
+
+    func moveSidebarSession(id sessionID: UUID, before targetSessionID: UUID?) {
+        guard let movingSession = sessions.first(where: { $0.id == sessionID }) else { return }
+        var orderedSessions = sidebarSessions(forProjectID: movingSession.projectID)
+        guard let movingIndex = orderedSessions.firstIndex(where: { $0.id == sessionID }) else {
+            return
+        }
+
+        let session = orderedSessions.remove(at: movingIndex)
+        let targetIndex = targetSessionID.flatMap { targetID in
+            orderedSessions.firstIndex(where: { $0.id == targetID })
+        } ?? orderedSessions.endIndex
+        orderedSessions.insert(session, at: targetIndex)
+        sidebarSessionInstanceTokensByProject[movingSession.projectID.uuidString] =
+            orderedSessions.map(\.instanceToken)
+        persistSidebarSessionOrder()
+        objectWillChange.send()
     }
 
     func activeSession(projectID: UUID, kind: AgentKind) -> TerminalSession? {
@@ -495,9 +538,14 @@ final class SessionManager: ObservableObject {
     private func removeSession(id: UUID) {
         guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
         let removedProjectID = sessions[index].projectID
+        let removedInstanceToken = sessions[index].instanceToken
         sessions.remove(at: index)
         sessionObservers[id] = nil
         backgroundAttachmentAttemptedSessionIDs.remove(id)
+        sidebarSessionInstanceTokensByProject[removedProjectID.uuidString]?.removeAll {
+            $0 == removedInstanceToken
+        }
+        persistSidebarSessionOrder()
 
         if selectedSessionID == id {
             selectedSessionID = sessions.last(where: { $0.projectID == removedProjectID })?.id
@@ -510,6 +558,13 @@ final class SessionManager: ObservableObject {
         let nextNumber = (lastSequenceNumberByProjectAndKind[key] ?? 0) + 1
         lastSequenceNumberByProjectAndKind[key] = nextNumber
         return nextNumber
+    }
+
+    private func persistSidebarSessionOrder() {
+        guard let data = try? JSONEncoder().encode(sidebarSessionInstanceTokensByProject) else {
+            return
+        }
+        defaults.set(data, forKey: sidebarSessionOrderStorageKey)
     }
 
     private func confirmedRemoteSnapshot(

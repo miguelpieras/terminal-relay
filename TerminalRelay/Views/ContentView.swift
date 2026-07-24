@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 private enum SidebarDestination: Equatable {
     case project(UUID)
@@ -15,17 +16,21 @@ private struct SessionArchiveRequest: Identifiable {
     let sessionIDs: Set<UUID>
 }
 
-private enum SidebarDragItem {
+private enum SidebarDragItem: Equatable {
     private static let projectPrefix = "terminal-relay-project:"
     private static let folderPrefix = "terminal-relay-folder:"
+    private static let sessionPrefix = "terminal-relay-session:"
+    static let typeIdentifier = UTType.utf8PlainText.identifier
 
     case project(UUID)
     case folder(UUID)
+    case session(UUID)
 
     var value: String {
         switch self {
         case .project(let id): Self.projectPrefix + id.uuidString
         case .folder(let id): Self.folderPrefix + id.uuidString
+        case .session(let id): Self.sessionPrefix + id.uuidString
         }
     }
 
@@ -36,9 +41,184 @@ private enum SidebarDragItem {
         } else if value.hasPrefix(Self.folderPrefix),
                   let id = UUID(uuidString: String(value.dropFirst(Self.folderPrefix.count))) {
             self = .folder(id)
+        } else if value.hasPrefix(Self.sessionPrefix),
+                  let id = UUID(uuidString: String(value.dropFirst(Self.sessionPrefix.count))) {
+            self = .session(id)
         } else {
             return nil
         }
+    }
+}
+
+@MainActor
+private final class SidebarDragCoordinator: ObservableObject {
+    private struct DropTarget {
+        let frame: CGRect
+        let onDrop: ([String], CGPoint) -> Bool
+        let setTargeted: (Bool) -> Void
+    }
+
+    private var targets: [UUID: DropTarget] = [:]
+    private var targetedID: UUID?
+
+    func register(
+        id: UUID,
+        frame: CGRect,
+        onDrop: @escaping ([String], CGPoint) -> Bool,
+        setTargeted: @escaping (Bool) -> Void
+    ) {
+        targets[id] = DropTarget(
+            frame: frame,
+            onDrop: onDrop,
+            setTargeted: setTargeted
+        )
+    }
+
+    func unregister(id: UUID) {
+        targets[id]?.setTargeted(false)
+        targets[id] = nil
+        if targetedID == id {
+            targetedID = nil
+        }
+    }
+
+    func update(item: SidebarDragItem, at location: CGPoint) {
+        _ = item
+        setTargetedID(target(at: location)?.key)
+    }
+
+    func finish(item: SidebarDragItem, at location: CGPoint) {
+        if let (id, target) = target(at: location) {
+            let localLocation = CGPoint(
+                x: location.x - target.frame.minX,
+                y: location.y - target.frame.minY
+            )
+            _ = target.onDrop([item.value], localLocation)
+            if targetedID == id {
+                target.setTargeted(false)
+            }
+        }
+        setTargetedID(nil)
+    }
+
+    func cancel() {
+        setTargetedID(nil)
+    }
+
+    private func target(at location: CGPoint) -> (key: UUID, value: DropTarget)? {
+        targets
+            .filter { $0.value.frame.contains(location) }
+            .min {
+                ($0.value.frame.width * $0.value.frame.height)
+                    < ($1.value.frame.width * $1.value.frame.height)
+            }
+    }
+
+    private func setTargetedID(_ id: UUID?) {
+        guard targetedID != id else { return }
+        if let targetedID {
+            targets[targetedID]?.setTargeted(false)
+        }
+        targetedID = id
+        if let id {
+            targets[id]?.setTargeted(true)
+        }
+    }
+}
+
+private struct SidebarDropModifier: ViewModifier {
+    @EnvironmentObject private var dragCoordinator: SidebarDragCoordinator
+    @Binding var isTargeted: Bool
+    let onDrop: ([String], CGPoint) -> Bool
+
+    @State private var targetID = UUID()
+
+    func body(content: Content) -> some View {
+        content
+            .overlay {
+                GeometryReader { proxy in
+                    Color.clear
+                        .allowsHitTesting(false)
+                        .onAppear {
+                            register(frame: proxy.frame(in: .global))
+                        }
+                        .onChange(of: proxy.frame(in: .global)) { _, frame in
+                            register(frame: frame)
+                        }
+                }
+            }
+            .onDisappear {
+                dragCoordinator.unregister(id: targetID)
+            }
+            .onDrop(
+                of: [SidebarDragItem.typeIdentifier],
+                isTargeted: $isTargeted
+            ) { providers, location in
+                guard let provider = providers.first(where: {
+                    $0.canLoadObject(ofClass: NSString.self)
+                }) else {
+                    return false
+                }
+
+                provider.loadObject(ofClass: NSString.self) { object, _ in
+                    guard let value = object as? NSString else { return }
+                    DispatchQueue.main.async {
+                        _ = onDrop([value as String], location)
+                    }
+                }
+                return true
+            }
+    }
+
+    private func register(frame: CGRect) {
+        let targeted = $isTargeted
+        dragCoordinator.register(
+            id: targetID,
+            frame: frame,
+            onDrop: onDrop,
+            setTargeted: { targeted.wrappedValue = $0 }
+        )
+    }
+}
+
+private struct SidebarDragSourceModifier: ViewModifier {
+    @EnvironmentObject private var dragCoordinator: SidebarDragCoordinator
+    let item: SidebarDragItem
+
+    @State private var isDragging = false
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(isDragging ? 0.72 : 1)
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 5, coordinateSpace: .global)
+                    .onChanged { value in
+                        isDragging = true
+                        dragCoordinator.update(item: item, at: value.location)
+                    }
+                    .onEnded { value in
+                        dragCoordinator.finish(item: item, at: value.location)
+                        isDragging = false
+                    }
+            )
+            .onDisappear {
+                if isDragging {
+                    dragCoordinator.cancel()
+                }
+            }
+    }
+}
+
+private extension View {
+    func sidebarDragSource(_ item: SidebarDragItem) -> some View {
+        modifier(SidebarDragSourceModifier(item: item))
+    }
+
+    func sidebarDropDestination(
+        isTargeted: Binding<Bool>,
+        onDrop: @escaping ([String], CGPoint) -> Bool
+    ) -> some View {
+        modifier(SidebarDropModifier(isTargeted: isTargeted, onDrop: onDrop))
     }
 }
 
@@ -73,6 +253,7 @@ struct ContentView: View {
     @EnvironmentObject private var accountUsageService: AccountUsageService
 
     @StateObject private var accountAuthenticationService = AccountAuthenticationService()
+    @StateObject private var sidebarDragCoordinator = SidebarDragCoordinator()
 
     @AppStorage(AgentLaunchDefaults.StorageKey.codexModel)
     private var codexModel = AgentLaunchDefaults.standard.codexModel
@@ -144,6 +325,7 @@ struct ContentView: View {
 
     var body: some View {
         presentedContent
+            .environmentObject(sidebarDragCoordinator)
             .sheet(
                 item: $accountAuthenticationService.presentation,
                 onDismiss: accountAuthenticationService.dismiss
@@ -333,9 +515,7 @@ struct ContentView: View {
                         )
                     }
                 )
-                .draggable(SidebarDragItem.folder(folder.id).value) {
-                    SidebarDragPreview(title: folder.name, systemImage: "folder.fill")
-                }
+                .sidebarDragSource(.folder(folder.id))
                 .contextMenu {
                     sidebarCreationMenu
                     Divider()
@@ -908,6 +1088,8 @@ struct ContentView: View {
                 ? sidebarFolderID(after: targetFolderID)
                 : targetFolderID
             projectStore.moveSidebarFolder(id: movingFolderID, before: targetID)
+        case .session:
+            return false
         }
         return true
     }
@@ -1172,72 +1354,51 @@ private struct SidebarFolderRow: View {
     @State private var isDropTargeted = false
 
     var body: some View {
-        Button(action: onToggle) {
-            HStack(spacing: 7) {
-                Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(SidebarPalette.secondary)
-                    .frame(width: 11)
+        HStack(spacing: 7) {
+            Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(SidebarPalette.secondary)
+                .frame(width: 11)
 
-                Image(systemName: isRoot ? "tray.full" : "folder.fill")
-                    .font(.system(size: 12))
-                    .foregroundStyle(SidebarPalette.secondary)
-                    .frame(width: 14)
+            Image(systemName: isRoot ? "tray.full" : "folder.fill")
+                .font(.system(size: 12))
+                .foregroundStyle(SidebarPalette.secondary)
+                .frame(width: 14)
 
-                Text(title)
-                    .font(.system(size: 12.5, weight: .medium))
-                    .foregroundStyle(SidebarPalette.secondary)
-                    .lineLimit(1)
+            Text(title)
+                .font(.system(size: 12.5, weight: .medium))
+                .foregroundStyle(SidebarPalette.secondary)
+                .lineLimit(1)
 
-                Spacer()
-            }
-            .padding(.horizontal, SidebarRowGeometry.contentLeadingPadding)
-            .frame(height: 30)
-            .background(
-                isDropTargeted
-                    ? Color.accentColor.opacity(0.16)
-                    : (isHovering ? SidebarPalette.hover : Color.clear),
-                in: RoundedRectangle(cornerRadius: SidebarRowGeometry.cornerRadius)
-            )
-            .overlay {
-                if isDropTargeted {
-                    RoundedRectangle(cornerRadius: SidebarRowGeometry.cornerRadius)
-                        .stroke(Color.accentColor.opacity(0.75), lineWidth: 1)
-                }
-            }
-            .contentShape(Rectangle())
+            Spacer()
         }
-        .buttonStyle(.plain)
+        .padding(.horizontal, SidebarRowGeometry.contentLeadingPadding)
+        .frame(height: 30)
+        .background(
+            isDropTargeted
+                ? Color.accentColor.opacity(0.16)
+                : (isHovering ? SidebarPalette.hover : Color.clear),
+            in: RoundedRectangle(cornerRadius: SidebarRowGeometry.cornerRadius)
+        )
+        .overlay {
+            if isDropTargeted {
+                RoundedRectangle(cornerRadius: SidebarRowGeometry.cornerRadius)
+                    .stroke(Color.accentColor.opacity(0.75), lineWidth: 1)
+            }
+        }
+        .contentShape(Rectangle())
         .padding(.horizontal, SidebarRowGeometry.horizontalMargin)
         .onHover { isHovering = $0 }
-        .dropDestination(for: String.self) { values, location in
-            onDrop(values, location)
-        } isTargeted: {
-            isDropTargeted = $0
-        }
+        .onTapGesture(perform: onToggle)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction { onToggle() }
+        .sidebarDropDestination(isTargeted: $isDropTargeted, onDrop: onDrop)
         .help(
             isRoot
                 ? "Drop a project folder here to move it out of a parent folder"
                 : "Drop a project folder here to move it into this parent folder"
         )
-    }
-}
-
-private struct SidebarDragPreview: View {
-    let title: String
-    let systemImage: String
-
-    var body: some View {
-        Label(title, systemImage: systemImage)
-            .font(.system(size: 13, weight: .medium))
-            .foregroundStyle(SidebarPalette.primary)
-            .lineLimit(1)
-            .padding(.horizontal, 10)
-            .frame(height: 30)
-            .background(
-                SidebarPalette.selected,
-                in: RoundedRectangle(cornerRadius: SidebarRowGeometry.cornerRadius)
-            )
     }
 }
 
@@ -1264,7 +1425,7 @@ private struct ProjectSidebarSection: View {
     @State private var isProjectDropTargeted = false
 
     private var allSessions: [TerminalSession] {
-        Array(sessionManager.sessions(forProjectID: project.id).reversed())
+        sessionManager.sidebarSessions(forProjectID: project.id)
     }
 
     private var matchingSessions: [TerminalSession] {
@@ -1284,23 +1445,24 @@ private struct ProjectSidebarSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 4) {
-                Button(action: onSelectProject) {
-                    HStack(spacing: SidebarRowGeometry.iconSpacing) {
-                        Image(systemName: "folder")
-                            .font(.system(size: SidebarRowGeometry.iconSize, weight: .regular))
-                            .foregroundStyle(SidebarPalette.primary)
-                            .frame(width: SidebarRowGeometry.iconFrameWidth)
+                HStack(spacing: SidebarRowGeometry.iconSpacing) {
+                    Image(systemName: "folder")
+                        .font(.system(size: SidebarRowGeometry.iconSize, weight: .regular))
+                        .foregroundStyle(SidebarPalette.primary)
+                        .frame(width: SidebarRowGeometry.iconFrameWidth)
 
-                        Text(project.displayName)
-                            .font(.system(size: 14, weight: .regular))
-                            .foregroundStyle(SidebarPalette.primary)
-                            .lineLimit(1)
+                    Text(project.displayName)
+                        .font(.system(size: 14, weight: .regular))
+                        .foregroundStyle(SidebarPalette.primary)
+                        .lineLimit(1)
 
-                        Spacer(minLength: 6)
-                    }
-                    .contentShape(Rectangle())
+                    Spacer(minLength: 6)
                 }
-                .buttonStyle(.plain)
+                .contentShape(Rectangle())
+                .onTapGesture(perform: onSelectProject)
+                .accessibilityElement(children: .combine)
+                .accessibilityAddTraits(.isButton)
+                .accessibilityAction { onSelectProject() }
 
                 if isProjectHovering {
                     ForEach(AgentKind.allCases) { kind in
@@ -1335,14 +1497,11 @@ private struct ProjectSidebarSection: View {
             .contentShape(Rectangle())
             .padding(.horizontal, SidebarRowGeometry.horizontalMargin)
             .onHover { isProjectHovering = $0 }
-            .draggable(SidebarDragItem.project(project.id).value) {
-                SidebarDragPreview(title: project.displayName, systemImage: "folder")
-            }
-            .dropDestination(for: String.self) { values, location in
-                onDropProject(values, location)
-            } isTargeted: {
-                isProjectDropTargeted = $0
-            }
+            .sidebarDragSource(.project(project.id))
+            .sidebarDropDestination(
+                isTargeted: $isProjectDropTargeted,
+                onDrop: onDropProject
+            )
             .contextMenu {
                 Button("New Project", systemImage: "square.and.pencil", action: onNewProject)
                 Button("New Parent Folder", systemImage: "folder.badge.plus", action: onNewParentFolder)
@@ -1379,6 +1538,13 @@ private struct ProjectSidebarSection: View {
                         },
                         onArchive: {
                             onArchiveSession(session.id)
+                        },
+                        onDrop: { values, location in
+                            handleSessionDrop(
+                                values,
+                                at: location,
+                                before: session.id
+                            )
                         }
                     )
                     .contextMenu {
@@ -1427,6 +1593,33 @@ private struct ProjectSidebarSection: View {
         .padding(.leading, CGFloat(indentLevel) * 15)
         .padding(.bottom, 8)
     }
+
+    private func handleSessionDrop(
+        _ values: [String],
+        at location: CGPoint,
+        before targetSessionID: UUID
+    ) -> Bool {
+        guard let value = values.first,
+              case .session(let sessionID) = SidebarDragItem(value: value),
+              let movingSession = sessionManager.sessions.first(where: { $0.id == sessionID }),
+              movingSession.projectID == project.id else {
+            return false
+        }
+        guard sessionID != targetSessionID else { return true }
+
+        let targetID: UUID?
+        if location.y > SidebarRowGeometry.height / 2,
+           let index = allSessions.firstIndex(where: { $0.id == targetSessionID }) {
+            targetID = allSessions
+                .dropFirst(index + 1)
+                .first(where: { $0.id != sessionID })?
+                .id
+        } else {
+            targetID = targetSessionID
+        }
+        sessionManager.moveSidebarSession(id: sessionID, before: targetID)
+        return true
+    }
 }
 
 private struct ProjectSessionRow: View {
@@ -1435,41 +1628,44 @@ private struct ProjectSessionRow: View {
     let archiveCount: Int
     let onSelect: () -> Void
     let onArchive: () -> Void
+    let onDrop: ([String], CGPoint) -> Bool
 
     @State private var isHovering = false
+    @State private var isDropTargeted = false
 
     var body: some View {
         HStack(spacing: 7) {
-            Button(action: onSelect) {
-                HStack(spacing: 7) {
-                    AgentBrandIcon(kind: session.kind, size: 17)
-                        .frame(width: 18, height: 18)
-                        .opacity(session.status.occupiesSlot ? 1 : 0.55)
+            HStack(spacing: 7) {
+                AgentBrandIcon(kind: session.kind, size: 17)
+                    .frame(width: 18, height: 18)
+                    .opacity(session.status.occupiesSlot ? 1 : 0.55)
 
-                    Text(session.displayTitle)
-                        .font(.system(size: 14))
-                        .foregroundStyle(
-                            session.status.occupiesSlot
-                                ? SidebarPalette.primary
-                                : SidebarPalette.secondary
-                        )
-                        .lineLimit(1)
+                Text(session.displayTitle)
+                    .font(.system(size: 14))
+                    .foregroundStyle(
+                        session.status.occupiesSlot
+                            ? SidebarPalette.primary
+                            : SidebarPalette.secondary
+                    )
+                    .lineLimit(1)
 
-                    Spacer(minLength: 5)
+                Spacer(minLength: 5)
 
-                    if session.isWorking {
-                        ProgressView()
-                            .controlSize(.mini)
-                            .tint(SidebarPalette.secondary)
-                            .frame(width: 12, height: 12)
-                            .help("Working")
-                            .accessibilityLabel("\(session.kind.displayName), working")
-                    }
+                if session.isWorking {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .tint(SidebarPalette.secondary)
+                        .frame(width: 12, height: 12)
+                        .help("Working")
+                        .accessibilityLabel("\(session.kind.displayName), working")
                 }
-                .frame(maxWidth: .infinity)
-                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity)
+            .contentShape(Rectangle())
+            .onTapGesture(perform: onSelect)
+            .accessibilityElement(children: .combine)
+            .accessibilityAddTraits(.isButton)
+            .accessibilityAction { onSelect() }
 
             if isHovering {
                 Button(action: onArchive) {
@@ -1492,14 +1688,26 @@ private struct ProjectSessionRow: View {
         .padding(.trailing, 8)
         .frame(height: 35)
         .background(
-            isSelected
-                ? SidebarPalette.selected
-                : (isHovering ? SidebarPalette.hover : Color.clear),
+            isDropTargeted
+                ? Color.accentColor.opacity(0.16)
+                : (
+                    isSelected
+                        ? SidebarPalette.selected
+                        : (isHovering ? SidebarPalette.hover : Color.clear)
+                ),
             in: RoundedRectangle(cornerRadius: 6)
         )
+        .overlay {
+            if isDropTargeted {
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(Color.accentColor.opacity(0.75), lineWidth: 1)
+            }
+        }
         .padding(.horizontal, 10)
         .contentShape(Rectangle())
         .onHover { isHovering = $0 }
+        .sidebarDragSource(.session(session.id))
+        .sidebarDropDestination(isTargeted: $isDropTargeted, onDrop: onDrop)
         .accessibilityLabel("\(session.displayTitle), \(sessionStateLabel.lowercased())")
     }
 
