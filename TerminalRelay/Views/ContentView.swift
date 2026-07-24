@@ -281,7 +281,6 @@ private enum SidebarRowGeometry {
     static let iconFrameWidth: CGFloat = 14
     static let iconSpacing: CGFloat = 9
     static let cornerRadius: CGFloat = 6
-    static let hierarchyIndent: CGFloat = 32
 }
 
 struct ContentView: View {
@@ -517,7 +516,7 @@ struct ContentView: View {
     private var sidebarProjectList: some View {
         if !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             ForEach(visibleProjects) { project in
-                projectSidebarSection(project, folderID: nil, indentLevel: 0)
+                projectSidebarSection(project, folderID: nil)
             }
         } else {
             if !projectStore.sidebarFolders.isEmpty {
@@ -539,7 +538,7 @@ struct ContentView: View {
 
             if isRootProjectsExpanded || projectStore.sidebarFolders.isEmpty {
                 ForEach(projectStore.rootProjects) { project in
-                    projectSidebarSection(project, folderID: nil, indentLevel: 0)
+                    projectSidebarSection(project, folderID: nil)
                 }
             }
 
@@ -580,7 +579,7 @@ struct ContentView: View {
 
                 if expandedSidebarFolderIDs.contains(folder.id) {
                     ForEach(projectStore.projects(inSidebarFolder: folder.id)) { project in
-                        projectSidebarSection(project, folderID: folder.id, indentLevel: 1)
+                        projectSidebarSection(project, folderID: folder.id)
                     }
                 }
             }
@@ -589,15 +588,13 @@ struct ContentView: View {
 
     private func projectSidebarSection(
         _ project: ProjectProfile,
-        folderID: UUID?,
-        indentLevel: Int
+        folderID: UUID?
     ) -> some View {
         ProjectSidebarSection(
             project: project,
             searchQuery: searchQuery,
             selectedSessionID: sessionManager.selectedSessionID,
             selectedSessionIDs: selectedSessionIDs,
-            indentLevel: indentLevel,
             onSelectProject: {
                 selectedSessionIDs.removeAll()
                 navigate(to: .project(project.id))
@@ -1477,7 +1474,6 @@ private struct ProjectSidebarSection: View {
     let searchQuery: String
     let selectedSessionID: UUID?
     let selectedSessionIDs: Set<UUID>
-    let indentLevel: Int
     let onSelectProject: () -> Void
     let onSelectSession: (UUID, Bool) -> Void
     let onArchiveSession: (UUID) -> Void
@@ -1668,7 +1664,6 @@ private struct ProjectSidebarSection: View {
                 }
             }
         }
-        .padding(.leading, CGFloat(indentLevel) * SidebarRowGeometry.hierarchyIndent)
         .padding(.bottom, 8)
     }
 
