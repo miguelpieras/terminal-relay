@@ -193,6 +193,14 @@ start_client() {
             printf 'export TERMINAL_RELAY_TEST_PAUSE_BEFORE_ATTACH=%q\n' \
                 "$TERMINAL_RELAY_TEST_CLIENT_PAUSE_BEFORE_ATTACH"
         fi
+        if [[ -n "${TERMINAL_RELAY_TEST_CODEX_SHARED_ACCOUNT:-}" ]]; then
+            printf 'export TERMINAL_RELAY_TEST_CODEX_SHARED_ACCOUNT=%q\n' \
+                "$TERMINAL_RELAY_TEST_CODEX_SHARED_ACCOUNT"
+        fi
+        if [[ -n "${TERMINAL_RELAY_TEST_CODEX_APP_SERVER_SOCKET:-}" ]]; then
+            printf 'export TERMINAL_RELAY_TEST_CODEX_APP_SERVER_SOCKET=%q\n' \
+                "$TERMINAL_RELAY_TEST_CODEX_APP_SERVER_SOCKET"
+        fi
         printf 'exec /bin/bash %q' "$helper"
         for argument in "$@"; do
             printf ' %q' "$argument"
@@ -359,7 +367,7 @@ STUB_AGENT
 
 /bin/chmod 700 "$flock_adapter" "$signal_adapter" "$stub_agent"
 
-echo "1/17 test overrides require explicit non-installed test mode; projects are sorted"
+echo "1/18 test overrides require explicit non-installed test mode; projects are sorted"
 set +e
 override_error="$(TERMINAL_RELAY_TEST_WORKSPACE_ROOT="$workspace_root" /bin/bash "$helper" list-projects 2>&1)"
 override_status=$?
@@ -389,7 +397,7 @@ assert_equal \
     "list-projects response"
 assert_equal "700" "$(path_mode "$runtime_root")" "persistent state-root mode"
 
-echo "2/17 concurrent starts create independent terminals with distinct tokens"
+echo "2/18 concurrent starts create independent terminals with distinct tokens"
 start_one_output="$test_root/start-one.out"
 start_two_output="$test_root/start-two.out"
 /bin/bash "$helper" start codex alpha --candidate-one > "$start_one_output" 2>&1 &
@@ -449,7 +457,7 @@ assert_equal "off" "$("$tmux_path" -f /dev/null -L "$tmux_socket" show-options -
 assert_equal "on" "$("$tmux_path" -f /dev/null -L "$tmux_socket" show-options -gv set-titles)" "tmux title setting"
 assert_equal '#{pane_title}' "$("$tmux_path" -f /dev/null -L "$tmux_socket" show-options -gv set-titles-string)" "tmux title format"
 
-echo "3/17 configure failure on a later attach leaves the shared session untouched"
+echo "3/18 configure failure on a later attach leaves the shared session untouched"
 TERMINAL_RELAY_TEST_CLIENT_CONFIGURE_FAIL=1 \
     start_client configure-failure "$workspace_root/alpha" reattach codex alpha "$first_instance"
 wait_for_harness_exit configure-failure
@@ -461,20 +469,20 @@ wait_for_session codex alpha 3 >/dev/null
 "$tmux_path" -f /dev/null -L "$harness_socket" kill-session -t reattach-client
 wait_for_session codex alpha 2 >/dev/null
 
-echo "4/17 the same agent can run concurrently in another repository"
+echo "4/18 the same agent can run concurrently in another repository"
 other_project_output="$(/bin/bash "$helper" start codex beta --other-project)"
 other_project_instance="$(instance_from_line "$other_project_output")"
 [[ "$other_project_instance" != "$first_instance" ]] || fail "other project reused an instance"
 wait_for_log_lines 3
 /bin/bash "$helper" stop codex beta "$other_project_instance"
 
-echo "5/17 both client connections can disappear while the launch survives"
+echo "5/18 both client connections can disappear while the launch survives"
 "$tmux_path" -f /dev/null -L "$harness_socket" kill-session -t client-one
 "$tmux_path" -f /dev/null -L "$harness_socket" kill-session -t client-two 2>/dev/null || true
 detached_status="$(wait_for_session codex alpha 0)"
 assert_equal "$first_instance" "$(instance_from_line "$detached_status")" "instance after detach"
 
-echo "6/17 an arbitrary stale token cannot stop the active launch"
+echo "6/18 an arbitrary stale token cannot stop the active launch"
 stale_instance="00000000-0000-0000-0000-000000000000"
 [[ "$stale_instance" != "$first_instance" ]] \
     || stale_instance="11111111-1111-1111-1111-111111111111"
@@ -485,7 +493,7 @@ assert_contains "$stale_reattach_output" "has ended" "stale reattach diagnostic"
 still_running="$(wait_for_session codex alpha 0)"
 assert_equal "$first_instance" "$(instance_from_line "$still_running")" "instance after stale stop"
 
-echo "7/17 exact stop ends the first launch and a same-repository replacement gets a new token"
+echo "7/18 exact stop ends the first launch and a same-repository replacement gets a new token"
 /bin/bash "$helper" stop codex alpha "$first_instance"
 wait_for_no_session codex
 assert_agent_lock_free "$first_instance"
@@ -498,7 +506,7 @@ second_instance="$(instance_from_line "$second_status")"
 wait_for_log_lines 4
 wait_for_session codex alpha 0 >/dev/null
 
-echo "8/17 the old same-repository token cannot stop its replacement"
+echo "8/18 the old same-repository token cannot stop its replacement"
 old_token_output="$(run_stop_expect_75 codex alpha "$first_instance")"
 assert_contains "$old_token_output" "stop request is stale" "same-repository stale stop"
 old_reattach_output="$(run_reattach_expect_75 codex alpha "$first_instance")"
@@ -506,7 +514,7 @@ assert_contains "$old_reattach_output" "has ended" "same-repository stale reatta
 replacement_status="$(wait_for_session codex alpha 0)"
 assert_equal "$second_instance" "$(instance_from_line "$replacement_status")" "replacement after stale stop"
 
-echo "9/17 paused stale reattach fails closed across stubborn stop and replacement"
+echo "9/18 paused stale reattach fails closed across stubborn stop and replacement"
 pause_file="$test_root/pause-before-attach"
 touch "$pause_file"
 TERMINAL_RELAY_TEST_CLIENT_PAUSE_BEFORE_ATTACH="$pause_file" \
@@ -540,7 +548,7 @@ wait_for_session codex alpha 1 >/dev/null
 "$tmux_path" -f /dev/null -L "$harness_socket" kill-session -t client-three 2>/dev/null || true
 wait_for_session codex alpha 0 >/dev/null
 
-echo "10/17 legacy Claude launch infers its repository, preserves environment, and exits cleanly"
+echo "10/18 legacy Claude launch infers its repository, preserves environment, and exits cleanly"
 export ConEmuANSI=1
 printf '%s\n' '{"theme":"dark","oauthAccount":{"test":true}}' > "$test_home/.claude.json"
 /bin/chmod 600 "$test_home/.claude.json"
@@ -564,7 +572,7 @@ assert_equal "600" "$(path_mode "$test_home/.claude.json")" "Claude global confi
 assert_equal "1" "$(/usr/bin/find "$runtime_root" -maxdepth 1 -name '*.intent' | /usr/bin/wc -l | /usr/bin/tr -d ' ')" \
     "clean Claude exit retained restart intent"
 
-echo "11/17 final exact stop removes metadata only after process and lock release"
+echo "11/18 final exact stop removes metadata only after process and lock release"
 /bin/bash "$helper" stop codex alpha "$third_instance"
 wait_for_no_session codex
 assert_agent_lock_free "$third_instance"
@@ -573,7 +581,7 @@ assert_equal "__TERMINAL_RELAY_SESSION_V1__" "$(session_status)" "final empty st
 repeat_output="$(run_stop_expect_75 codex alpha "$third_instance")"
 assert_contains "$repeat_output" "stop request is stale" "repeated stop diagnostic"
 
-echo "12/17 caller-supplied provider lifecycle flags are rejected"
+echo "12/18 caller-supplied provider lifecycle flags are rejected"
 set +e
 managed_codex_output="$(/bin/bash "$helper" start codex alpha resume 2>&1)"
 managed_codex_status=$?
@@ -585,7 +593,7 @@ assert_contains "$managed_codex_output" "manages Codex resume" "managed Codex re
 assert_equal "64" "$managed_claude_status" "managed Claude resume flag status"
 assert_contains "$managed_claude_output" "manages Claude session" "managed Claude resume diagnostic"
 
-echo "13/17 Codex survives a simulated reboot with one idempotent resume launch"
+echo "13/18 Codex survives a simulated reboot with one idempotent resume launch"
 unset ConEmuANSI
 codex_reboot_output="$(/bin/bash "$helper" start codex alpha --reboot-codex)"
 codex_reboot_instance="$(printf '%s\n' "$codex_reboot_output" \
@@ -607,14 +615,14 @@ codex_resume_log="$(/usr/bin/sed -n '8p' "$agent_log")"
 assert_contains "$codex_resume_log" "|resume|--last|--reboot-codex" "Codex resume arguments"
 assert_equal "8" "$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")" "idempotent restore count"
 
-echo "14/17 explicit stop prevents a later Codex reboot restore"
+echo "14/18 explicit stop prevents a later Codex reboot restore"
 /bin/bash "$helper" stop codex alpha "$codex_reboot_instance"
 wait_for_no_session codex
 printf '%s\n' '33333333-3333-4333-8333-333333333333' > "$boot_id_file"
 /bin/bash "$helper" restore
 assert_equal "8" "$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")" "stopped Codex restore count"
 
-echo "15/17 Claude resumes the UUID-bound provider conversation after reboot"
+echo "15/18 Claude resumes the UUID-bound provider conversation after reboot"
 claude_reboot_output="$(/bin/bash "$helper" start claude beta --reboot-claude)"
 claude_reboot_instance="$(printf '%s\n' "$claude_reboot_output" \
     | /usr/bin/awk -F'|' '$1 == "session" { print $5; exit }')"
@@ -658,7 +666,7 @@ printf '%s\n' '55555555-5555-4555-8555-555555555555' > "$boot_id_file"
 /bin/bash "$helper" restore
 assert_equal "10" "$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")" "stopped Claude restore count"
 
-echo "16/17 a same-boot death is not resurrected now or on a later reboot"
+echo "16/18 a same-boot death is not resurrected now or on a later reboot"
 same_boot_output="$(/bin/bash "$helper" start codex zeta --same-boot-death)"
 same_boot_instance="$(printf '%s\n' "$same_boot_output" \
     | /usr/bin/awk -F'|' '$1 == "session" { print $5; exit }')"
@@ -673,7 +681,7 @@ printf '%s\n' '66666666-6666-4666-8666-666666666666' > "$boot_id_file"
 /bin/bash "$helper" restore
 assert_equal "11" "$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")" "later restore after same-boot cleanup"
 
-echo "17/17 corrupt persistent state fails closed without launching an agent"
+echo "17/18 corrupt persistent state fails closed without launching an agent"
 corrupt_instance="99999999-9999-4999-8999-999999999999"
 printf '%s\n' 'version|1' 'tool|codex' 'repository|alpha' > "$runtime_root/$corrupt_instance.intent"
 /bin/chmod 600 "$runtime_root/$corrupt_instance.intent"
@@ -686,5 +694,38 @@ assert_equal "70" "$corrupt_status" "corrupt restore status"
 assert_contains "$corrupt_output" "restart intent for" "corrupt restore diagnostic"
 assert_equal "11" "$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")" "corrupt restore launch count"
 /bin/rm -f -- "$runtime_root/$corrupt_instance.intent"
+
+echo "18/18 shared Codex launches leave MCP configuration on the app server"
+shared_instance="88888888-8888-4888-8888-888888888888"
+printf '%s\n' \
+    'tool|codex' \
+    'repository|alpha' \
+    "instance|$shared_instance" \
+    'pid|0' \
+    'start|pending' \
+    > "$runtime_root/$shared_instance.session"
+printf '%s\n' \
+    'version|1' \
+    'tool|codex' \
+    'repository|alpha' \
+    "instance|$shared_instance" \
+    'boot|77777777-7777-4777-8777-777777777777' \
+    'argc|1' \
+    'arg|2d2d657869742d636c65616e6c79' \
+    > "$runtime_root/$shared_instance.intent"
+/bin/chmod 600 "$runtime_root/$shared_instance.intent"
+shared_codex_socket="/tmp/terminal-relay-codex-test-$$.sock"
+TERMINAL_RELAY_TEST_CODEX_SHARED_ACCOUNT=1 \
+    TERMINAL_RELAY_TEST_CODEX_APP_SERVER_SOCKET="$shared_codex_socket" \
+    start_client shared-codex "$workspace_root/alpha" \
+        __run-agent codex alpha "$shared_instance" initial --exit-cleanly
+wait_for_harness_exit shared-codex
+wait_for_log_lines 12
+shared_codex_log="$(/usr/bin/sed -n '12p' "$agent_log")"
+assert_contains "$shared_codex_log" \
+    "--remote|unix://$shared_codex_socket" "shared Codex remote arguments"
+if [[ "$shared_codex_log" == *"mcp_servers.test_server"* ]]; then
+    fail "shared Codex launch forwarded client-side MCP overrides"
+fi
 
 echo "PASS: terminal-relay-session integration tests"
