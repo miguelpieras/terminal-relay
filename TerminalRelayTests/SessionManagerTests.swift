@@ -445,6 +445,79 @@ final class SessionManagerTests: XCTestCase {
 
         XCTAssertTrue(manager.session(projectID: project.id, kind: .codex) === session)
         XCTAssertEqual(session?.displayTitle, "Polish terminal titles")
+
+        manager.reconcile(
+            worker: server,
+            projects: [project],
+            response: WorkerSessionResponse(
+                projects: [project.displayName],
+                sessions: [
+                    WorkerSessionSnapshot(
+                        kind: .codex,
+                        repositoryName: project.displayName,
+                        attachedClientCount: 1,
+                        instanceToken: instanceToken,
+                        reportedWorking: false
+                    )
+                ]
+            ),
+            launchDefaults: .standard
+        )
+
+        XCTAssertEqual(session?.displayTitle, "Codex 1")
+    }
+
+    func testRemoteRefreshPreservesLiveCodexWorkingStateAndUsesReportedState() async {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let manager = SessionManager()
+        let instanceToken = "01234567-89ab-" + "4def-8abc-0123456789ab"
+        let session = manager.open(
+            project: project,
+            on: server,
+            kind: .codex,
+            launchDefaults: .standard,
+            instanceToken: instanceToken
+        ).localSession!
+
+        session.setTerminalTitle(
+            source: session.terminalView,
+            title: "Fix spinner state | Working"
+        )
+        await Task.yield()
+        XCTAssertTrue(session.isWorking)
+
+        session.applyRemoteSnapshot(
+            WorkerSessionSnapshot(
+                kind: .codex,
+                repositoryName: project.displayName,
+                attachedClientCount: 1,
+                instanceToken: instanceToken,
+                title: "Fix spinner state",
+                reportedWorking: true
+            )
+        )
+
+        XCTAssertEqual(session.displayTitle, "Fix spinner state")
+        XCTAssertTrue(session.isWorking)
+
+        session.applyRemoteSnapshot(
+            WorkerSessionSnapshot(
+                kind: .codex,
+                repositoryName: project.displayName,
+                attachedClientCount: 1,
+                instanceToken: instanceToken,
+                title: "Fix spinner state",
+                reportedWorking: false
+            )
+        )
+        session.setTerminalTitle(
+            source: session.terminalView,
+            title: "Fix spinner state | Ready"
+        )
+        await Task.yield()
+
+        XCTAssertFalse(session.isWorking)
     }
 
     func testReconcileSameRepositoryReplacementEndsOldInstanceAndCreatesNewSession() {

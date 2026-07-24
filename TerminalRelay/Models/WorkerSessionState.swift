@@ -7,6 +7,7 @@ struct WorkerSessionSnapshot: Equatable, Identifiable {
     let instanceToken: String
     let title: String?
     let lastActivityAt: Int?
+    let reportedWorking: Bool?
 
     var id: String { instanceToken }
 
@@ -16,7 +17,8 @@ struct WorkerSessionSnapshot: Equatable, Identifiable {
         attachedClientCount: Int,
         instanceToken: String,
         title: String? = nil,
-        lastActivityAt: Int? = nil
+        lastActivityAt: Int? = nil,
+        reportedWorking: Bool? = nil
     ) {
         self.kind = kind
         self.repositoryName = repositoryName
@@ -24,9 +26,13 @@ struct WorkerSessionSnapshot: Equatable, Identifiable {
         self.instanceToken = instanceToken
         self.title = title
         self.lastActivityAt = lastActivityAt
+        self.reportedWorking = reportedWorking
     }
 
     func isWorking(now: Date = Date()) -> Bool {
+        if let reportedWorking {
+            return reportedWorking
+        }
         guard let lastActivityAt else { return false }
         return now.timeIntervalSince1970 - Double(lastActivityAt) < 8
     }
@@ -85,7 +91,7 @@ enum WorkerSessionProtocol {
                 }
                 projects.append(fields[1])
             case "session":
-                guard fields.count == 5 || fields.count == 7,
+                guard fields.count == 5 || fields.count == 7 || fields.count == 8,
                       let kind = AgentKind(rawValue: fields[1]),
                       isValidRepositoryName(fields[2]),
                       let attachedClientCount = Int(fields[3]),
@@ -99,7 +105,8 @@ enum WorkerSessionProtocol {
                 }
                 let lastActivityAt: Int?
                 let title: String?
-                if fields.count == 7 {
+                let reportedWorking: Bool?
+                if fields.count >= 7 {
                     guard let activity = Int(fields[5]), activity >= 0,
                           let decodedTitle = decodeHexUTF8(fields[6]),
                           decodedTitle.count <= 200 else {
@@ -107,9 +114,18 @@ enum WorkerSessionProtocol {
                     }
                     lastActivityAt = activity
                     title = decodedTitle.isEmpty ? nil : decodedTitle
+                    if fields.count == 8 {
+                        guard fields[7].isEmpty || fields[7] == "0" || fields[7] == "1" else {
+                            throw WorkerSessionProtocolError.invalidRecord
+                        }
+                        reportedWorking = fields[7].isEmpty ? nil : fields[7] == "1"
+                    } else {
+                        reportedWorking = nil
+                    }
                 } else {
                     lastActivityAt = nil
                     title = nil
+                    reportedWorking = nil
                 }
                 sessions.append(
                     WorkerSessionSnapshot(
@@ -118,7 +134,8 @@ enum WorkerSessionProtocol {
                         attachedClientCount: attachedClientCount,
                         instanceToken: canonicalInstanceID,
                         title: title,
-                        lastActivityAt: lastActivityAt
+                        lastActivityAt: lastActivityAt,
+                        reportedWorking: reportedWorking
                     )
                 )
             default:

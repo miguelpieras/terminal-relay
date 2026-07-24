@@ -1402,22 +1402,34 @@ import sys
 tool, instance, pane_title, home = sys.argv[1:]
 title = ""
 if tool == "codex":
+    display_title = re.sub(
+        r"\s+\|\s+(Ready|Working|Thinking|Waiting|Starting)\s*$",
+        "",
+        pane_title,
+    ).strip()
     match = re.search(
         r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-        pane_title.lower(),
+        display_title.lower(),
     )
     if match:
         database = os.path.join(home, ".codex", "state_5.sqlite")
         try:
             connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+            columns = {
+                row[1] for row in connection.execute("pragma table_info(threads)")
+            }
+            title_column = "name" if "name" in columns else "title"
             row = connection.execute(
-                "select title from threads where id = ? limit 1", (match.group(0),)
+                f"select {title_column} from threads where id = ? limit 1",
+                (match.group(0),),
             ).fetchone()
             connection.close()
             if row and isinstance(row[0], str):
                 title = row[0]
         except (OSError, sqlite3.Error):
             pass
+    else:
+        title = display_title
 elif tool == "claude":
     custom_title = ""
     ai_title = ""
@@ -1463,12 +1475,21 @@ session_display_fields() {
 
     session_activity=0
     session_title_hex=""
+    session_working=""
     session_name="$(session_name_for "$tool" "$instance")"
     display="$(tmux_command display-message -p -t "$session_name" \
         '#{window_activity}|#{pane_title}' 2>/dev/null)" || return 1
     session_activity="${display%%|*}"
     pane_title="${display#*|}"
     [[ "$session_activity" =~ ^[0-9]+$ ]] || session_activity=0
+    if [[ "$tool" == "codex" ]]; then
+        case "$pane_title" in
+            *" | Ready") session_working=0 ;;
+            *" | Working"|*" | Thinking"|*" | Waiting"|*" | Starting")
+                session_working=1
+                ;;
+        esac
+    fi
     session_title_hex="$(encode_argument_hex "$(resolve_session_title "$tool" "$instance" "$pane_title")")"
 }
 
@@ -1541,8 +1562,9 @@ status_sessions() {
         if ! session_display_fields "$tool" "$instance"; then
             session_activity=0
             session_title_hex=""
+            session_working=""
         fi
-        records+=("session|$tool|$repository|$attached_client_count|$instance|$session_activity|$session_title_hex")
+        records+=("session|$tool|$repository|$attached_client_count|$instance|$session_activity|$session_title_hex|$session_working")
     done
     shopt -u nullglob
 
@@ -2366,11 +2388,12 @@ start_instance_session() {
     if ! session_display_fields "$tool" "$instance"; then
         session_activity=0
         session_title_hex=""
+        session_working=""
     fi
     printf '%s\n' "$protocol_marker"
-    printf 'session|%s|%s|%s|%s|%s|%s\n' \
+    printf 'session|%s|%s|%s|%s|%s|%s|%s\n' \
         "$tool" "$repository" "$attached_client_count" "$instance" \
-        "$session_activity" "$session_title_hex"
+        "$session_activity" "$session_title_hex" "$session_working"
 }
 
 reattach_instance_session() {

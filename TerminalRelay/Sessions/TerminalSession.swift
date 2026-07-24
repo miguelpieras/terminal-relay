@@ -150,6 +150,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
     private var processExitSource: DispatchSourceProcess?
     private var titleIndicatesWorking = false
     private var progressIndicatesWorking = false
+    private var remoteIndicatesWorking = false
     private var lastLocalExitCode: Int32?
     private var statusBeforeStopping: TerminalSessionStatus?
     private var remoteStopRequested = false
@@ -458,6 +459,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         hasFinished = true
         titleIndicatesWorking = false
         progressIndicatesWorking = false
+        remoteIndicatesWorking = false
         processExitSource?.cancel()
         processExitSource = nil
         if terminalView.process.shellPid > 0 {
@@ -474,7 +476,12 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         }
         remoteAttachedClientCount = snapshot.attachedClientCount
         if let title = snapshot.title {
-            applyTerminalTitle(title)
+            applyResolvedTerminalTitle(title)
+        } else if kind == .codex, snapshot.reportedWorking != nil {
+            terminalTitle = nil
+        }
+        if let reportedWorking = snapshot.reportedWorking {
+            remoteIndicatesWorking = reportedWorking
         }
         if status.canReconnect || isExited {
             status = .remoteRunning
@@ -492,6 +499,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         hasFinished = true
         titleIndicatesWorking = false
         progressIndicatesWorking = false
+        remoteIndicatesWorking = false
         processExitSource?.cancel()
         processExitSource = nil
         if terminalView.process.shellPid > 0 {
@@ -503,6 +511,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
     func markRemoteExited() {
         guard status.canReconnect else { return }
         remoteAttachedClientCount = nil
+        remoteIndicatesWorking = false
         status = .exited(lastLocalExitCode)
         updateWorkingState()
     }
@@ -540,6 +549,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         }
         titleIndicatesWorking = false
         progressIndicatesWorking = false
+        remoteIndicatesWorking = false
         updateWorkingState()
         terminalSessionLogger.notice(
             "Terminal attachment finished for session \(self.instanceToken, privacy: .public); status=\(self.status.label, privacy: .public)"
@@ -564,11 +574,25 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         updateWorkingState()
     }
 
+    private func applyResolvedTerminalTitle(_ title: String) {
+        if kind == .codex {
+            if let displayableTitle = displayableTerminalTitle(title) {
+                terminalTitle = displayableTitle
+            }
+        } else if let displayableTitle = displayableClaudeTerminalTitle(title) {
+            terminalTitle = displayableTitle
+        }
+    }
+
     private func updateWorkingState() {
         switch status {
         case .connecting, .running:
-            isWorking = titleIndicatesWorking || progressIndicatesWorking
-        case .remoteRunning, .disconnected, .stopping, .exited:
+            isWorking = titleIndicatesWorking
+                || progressIndicatesWorking
+                || remoteIndicatesWorking
+        case .remoteRunning, .disconnected:
+            isWorking = remoteIndicatesWorking
+        case .stopping, .exited:
             isWorking = false
         }
     }

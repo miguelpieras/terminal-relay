@@ -44,8 +44,8 @@ final class WorkerSessionStateTests: XCTestCase {
         let response = try WorkerSessionProtocol.parse(
             """
             __TERMINAL_RELAY_SESSION_V1__
-            session|codex|terminal-relay|1|01234567-89ab-4def-8abc-0123456789ab|123|466978206c6f67696e
-            session|codex|terminal-relay|0|11111111-2222-4333-8444-555555555555|120|
+            session|codex|terminal-relay|1|01234567-89ab-4def-8abc-0123456789ab|123|466978206c6f67696e|1
+            session|codex|terminal-relay|0|11111111-2222-4333-8444-555555555555|120||0
             """
         )
 
@@ -53,8 +53,8 @@ final class WorkerSessionStateTests: XCTestCase {
         XCTAssertEqual(response.sessions.first?.title, nil)
         XCTAssertEqual(response.sessions.last?.title, "Fix login")
         XCTAssertEqual(response.sessions.last?.lastActivityAt, 123)
-        XCTAssertTrue(response.sessions.last?.isWorking(now: Date(timeIntervalSince1970: 127)) == true)
-        XCTAssertTrue(response.sessions.last?.isWorking(now: Date(timeIntervalSince1970: 132)) == false)
+        XCTAssertTrue(response.sessions.last?.isWorking(now: Date(timeIntervalSince1970: 132)) == true)
+        XCTAssertEqual(response.sessions.first?.isWorking(now: Date(timeIntervalSince1970: 121)), false)
     }
 
     func testRejectsDuplicateInstancesAndUnsafeProjectNames() {

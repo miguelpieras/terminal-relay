@@ -111,13 +111,14 @@ wait_for_session() {
     local actual_repository
     local actual_clients
     local instance
+    local working
     local extra
 
     while [[ $attempt -lt 160 ]]; do
         attempt=$((attempt + 1))
         line="$(session_line "$tool" "$repository" 2>/dev/null || true)"
         IFS='|' read -r record_type actual_tool actual_repository actual_clients instance \
-            activity title extra <<< "$line"
+            activity title working extra <<< "$line"
         if [[ "$record_type" == "session" \
             && "$actual_tool" == "$tool" \
             && "$actual_repository" == "$repository" \
@@ -125,6 +126,7 @@ wait_for_session() {
             && "$instance" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ \
             && "$activity" =~ ^[0-9]+$ \
             && "$title" =~ ^([a-f0-9]{2})*$ \
+            && "$working" =~ ^[01]?$ \
             && -z "${extra:-}" ]]; then
             printf '%s\n' "$line"
             return 0
@@ -432,10 +434,12 @@ import sys
 
 database, thread_id = sys.argv[1:]
 connection = sqlite3.connect(database)
-connection.execute("create table threads (id text primary key, title text not null)")
 connection.execute(
-    "insert into threads (id, title) values (?, ?)",
-    (thread_id, "Generated Codex title"),
+    "create table threads (id text primary key, title text not null, name text)"
+)
+connection.execute(
+    "insert into threads (id, title, name) values (?, ?, ?)",
+    (thread_id, "First Codex prompt", "Generated Codex name"),
 )
 connection.commit()
 connection.close()
@@ -445,9 +449,25 @@ PYTHON_CODEX_TITLE
     -T "$codex_thread_id | Ready"
 codex_title_status="$(wait_for_session codex alpha 0)"
 assert_equal \
-    "$(encode_title "Generated Codex title")" \
+    "$(encode_title "Generated Codex name")" \
     "$(title_hex_from_line "$codex_title_status")" \
-    "Codex database title"
+    "Codex database name"
+assert_equal \
+    "0" \
+    "$(printf '%s\n' "$codex_title_status" | /usr/bin/awk -F'|' '$1 == "session" { print $8; exit }')" \
+    "Codex ready state"
+"$tmux_path" -f /dev/null -L "$tmux_socket" \
+    select-pane -t "terminal-relay-codex-$first_instance" \
+    -T "Renamed live thread | Working"
+codex_working_status="$(wait_for_session codex alpha 0)"
+assert_equal \
+    "$(encode_title "Renamed live thread")" \
+    "$(title_hex_from_line "$codex_working_status")" \
+    "Codex live pane name"
+assert_equal \
+    "1" \
+    "$(printf '%s\n' "$codex_working_status" | /usr/bin/awk -F'|' '$1 == "session" { print $8; exit }')" \
+    "Codex working state"
 
 start_client client-one "$workspace_root/alpha" reattach codex alpha "$first_instance"
 start_client client-two "$workspace_root/alpha" reattach codex alpha "$first_instance"
