@@ -179,7 +179,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         self.startedAt = startedAt
         self.instanceToken = instanceToken
         self.status = initialStatus
-        self.terminalTitle = terminalTitle
+        self.terminalTitle = nil
         self.remoteAttachedClientCount = remoteAttachedClientCount
         self.configuration = SSHCommandBuilder.configuration(
             for: server,
@@ -196,6 +196,10 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         terminalView.nativeForegroundColor = NSColor(srgbRed: 0.87, green: 0.89, blue: 0.92, alpha: 1)
         terminalView.optionAsMetaKey = true
         terminalView.allowMouseReporting = true
+
+        if let terminalTitle {
+            applyTerminalTitle(terminalTitle)
+        }
 
         terminalView.getTerminal().registerOscHandler(code: 9) { [weak self, weak terminalView] payload in
             guard let report = progressReport(fromOSC9Payload: payload) else { return }
@@ -469,6 +473,9 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
             return
         }
         remoteAttachedClientCount = snapshot.attachedClientCount
+        if let title = snapshot.title {
+            applyTerminalTitle(title)
+        }
         if status.canReconnect || isExited {
             status = .remoteRunning
         }

@@ -156,7 +156,7 @@ struct ContentView: View {
 
     private var presentedContent: some View {
         lifecycleContent
-            .alert("New Folder", isPresented: $isNamingSidebarFolder) {
+            .alert("New Parent Folder", isPresented: $isNamingSidebarFolder) {
                 TextField("Folder name", text: $newSidebarFolderName)
                 Button("Cancel", role: .cancel) {
                     newSidebarFolderName = ""
@@ -282,6 +282,9 @@ struct ContentView: View {
                 .padding(.vertical, 6)
             }
             .scrollIndicators(.hidden)
+            .contextMenu {
+                sidebarCreationMenu
+            }
 
             sidebarFooter
         }
@@ -303,6 +306,9 @@ struct ContentView: View {
                     onToggle: { isRootProjectsExpanded.toggle() },
                     onDrop: handleRootFolderDrop
                 )
+                .contextMenu {
+                    sidebarCreationMenu
+                }
             }
 
             if isRootProjectsExpanded || projectStore.sidebarFolders.isEmpty {
@@ -319,12 +325,20 @@ struct ContentView: View {
                     onToggle: {
                         toggleSidebarFolder(folder.id)
                     },
-                    onDrop: { values in
-                        handleSidebarFolderDrop(values, into: folder.id)
+                    onDrop: { values, location in
+                        handleSidebarFolderDrop(
+                            values,
+                            at: location,
+                            targetFolderID: folder.id
+                        )
                     }
                 )
-                .draggable(SidebarDragItem.folder(folder.id).value)
+                .draggable(SidebarDragItem.folder(folder.id).value) {
+                    SidebarDragPreview(title: folder.name, systemImage: "folder.fill")
+                }
                 .contextMenu {
+                    sidebarCreationMenu
+                    Divider()
                     Button("Delete Folder", role: .destructive) {
                         projectStore.deleteSidebarFolder(id: folder.id)
                     }
@@ -365,11 +379,14 @@ struct ContentView: View {
             onOpenTerminal: { kind in
                 openTerminal(kind, for: project)
             },
+            onNewProject: addProject,
+            onNewParentFolder: beginCreatingSidebarFolder,
             onEdit: { navigate(to: .editProject(project.id)) },
             onRemove: { projectPendingDeletion = project },
-            onDropProject: { values in
+            onDropProject: { values, location in
                 handleProjectDrop(
                     values,
+                    at: location,
                     before: project.id,
                     intoSidebarFolder: folderID
                 )
@@ -449,8 +466,7 @@ struct ContentView: View {
             .keyboardShortcut("n", modifiers: .command)
 
             Button {
-                newSidebarFolderName = ""
-                isNamingSidebarFolder = true
+                beginCreatingSidebarFolder()
             } label: {
                 Image(systemName: "folder.badge.plus")
                     .font(.system(size: 13))
@@ -461,6 +477,15 @@ struct ContentView: View {
             .buttonStyle(.plain)
             .padding(.trailing, SidebarRowGeometry.horizontalMargin)
             .help("New parent folder")
+            .accessibilityLabel("New Parent Folder")
+        }
+    }
+
+    @ViewBuilder
+    private var sidebarCreationMenu: some View {
+        Button("New Project", systemImage: "square.and.pencil", action: addProject)
+        Button("New Parent Folder", systemImage: "folder.badge.plus") {
+            beginCreatingSidebarFolder()
         }
     }
 
@@ -840,6 +865,11 @@ struct ContentView: View {
         newSidebarFolderName = ""
     }
 
+    private func beginCreatingSidebarFolder() {
+        newSidebarFolderName = ""
+        isNamingSidebarFolder = true
+    }
+
     private func toggleSidebarFolder(_ folderID: UUID) {
         if expandedSidebarFolderIDs.contains(folderID) {
             expandedSidebarFolderIDs.remove(folderID)
@@ -848,7 +878,7 @@ struct ContentView: View {
         }
     }
 
-    private func handleRootFolderDrop(_ values: [String]) -> Bool {
+    private func handleRootFolderDrop(_ values: [String], _: CGPoint) -> Bool {
         guard let value = values.first,
               case .project(let projectID) = SidebarDragItem(value: value) else {
             return false
@@ -858,7 +888,11 @@ struct ContentView: View {
         return true
     }
 
-    private func handleSidebarFolderDrop(_ values: [String], into folderID: UUID) -> Bool {
+    private func handleSidebarFolderDrop(
+        _ values: [String],
+        at location: CGPoint,
+        targetFolderID: UUID
+    ) -> Bool {
         guard let value = values.first,
               let item = SidebarDragItem(value: value) else {
             return false
@@ -866,17 +900,21 @@ struct ContentView: View {
 
         switch item {
         case .project(let projectID):
-            projectStore.moveProject(id: projectID, intoSidebarFolder: folderID)
-            expandedSidebarFolderIDs.insert(folderID)
+            projectStore.moveProject(id: projectID, intoSidebarFolder: targetFolderID)
+            expandedSidebarFolderIDs.insert(targetFolderID)
         case .folder(let movingFolderID):
-            guard movingFolderID != folderID else { return true }
-            projectStore.moveSidebarFolder(id: movingFolderID, before: folderID)
+            guard movingFolderID != targetFolderID else { return true }
+            let targetID = location.y > 15
+                ? sidebarFolderID(after: targetFolderID)
+                : targetFolderID
+            projectStore.moveSidebarFolder(id: movingFolderID, before: targetID)
         }
         return true
     }
 
     private func handleProjectDrop(
         _ values: [String],
+        at location: CGPoint,
         before targetProjectID: UUID,
         intoSidebarFolder folderID: UUID?
     ) -> Bool {
@@ -885,12 +923,38 @@ struct ContentView: View {
             return false
         }
         guard projectID != targetProjectID else { return true }
+        guard projectStore.sidebarFolderID(containing: projectID) == folderID else {
+            return false
+        }
+        let targetID = location.y > SidebarRowGeometry.height / 2
+            ? nextProjectID(after: targetProjectID, inSidebarFolder: folderID)
+            : targetProjectID
         projectStore.moveProject(
             id: projectID,
-            before: targetProjectID,
+            before: targetID,
             intoSidebarFolder: folderID
         )
         return true
+    }
+
+    private func sidebarFolderID(after folderID: UUID) -> UUID? {
+        guard let index = projectStore.sidebarFolders.firstIndex(where: { $0.id == folderID }) else {
+            return nil
+        }
+        let nextIndex = projectStore.sidebarFolders.index(after: index)
+        return nextIndex < projectStore.sidebarFolders.endIndex
+            ? projectStore.sidebarFolders[nextIndex].id
+            : nil
+    }
+
+    private func nextProjectID(after projectID: UUID, inSidebarFolder folderID: UUID?) -> UUID? {
+        let projects = folderID.map(projectStore.projects(inSidebarFolder:))
+            ?? projectStore.rootProjects
+        guard let index = projects.firstIndex(where: { $0.id == projectID }) else {
+            return nil
+        }
+        let nextIndex = projects.index(after: index)
+        return nextIndex < projects.endIndex ? projects[nextIndex].id : nil
     }
 
     private func presentArchiveConfirmation(_ sessionID: UUID) {
@@ -1102,9 +1166,10 @@ private struct SidebarFolderRow: View {
     let isExpanded: Bool
     let isRoot: Bool
     let onToggle: () -> Void
-    let onDrop: ([String]) -> Bool
+    let onDrop: ([String], CGPoint) -> Bool
 
     @State private var isHovering = false
+    @State private var isDropTargeted = false
 
     var body: some View {
         Button(action: onToggle) {
@@ -1129,17 +1194,50 @@ private struct SidebarFolderRow: View {
             .padding(.horizontal, SidebarRowGeometry.contentLeadingPadding)
             .frame(height: 30)
             .background(
-                isHovering ? SidebarPalette.hover : Color.clear,
+                isDropTargeted
+                    ? Color.accentColor.opacity(0.16)
+                    : (isHovering ? SidebarPalette.hover : Color.clear),
                 in: RoundedRectangle(cornerRadius: SidebarRowGeometry.cornerRadius)
             )
+            .overlay {
+                if isDropTargeted {
+                    RoundedRectangle(cornerRadius: SidebarRowGeometry.cornerRadius)
+                        .stroke(Color.accentColor.opacity(0.75), lineWidth: 1)
+                }
+            }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .padding(.horizontal, SidebarRowGeometry.horizontalMargin)
         .onHover { isHovering = $0 }
-        .dropDestination(for: String.self) { values, _ in
-            onDrop(values)
+        .dropDestination(for: String.self) { values, location in
+            onDrop(values, location)
+        } isTargeted: {
+            isDropTargeted = $0
         }
+        .help(
+            isRoot
+                ? "Drop a project folder here to move it out of a parent folder"
+                : "Drop a project folder here to move it into this parent folder"
+        )
+    }
+}
+
+private struct SidebarDragPreview: View {
+    let title: String
+    let systemImage: String
+
+    var body: some View {
+        Label(title, systemImage: systemImage)
+            .font(.system(size: 13, weight: .medium))
+            .foregroundStyle(SidebarPalette.primary)
+            .lineLimit(1)
+            .padding(.horizontal, 10)
+            .frame(height: 30)
+            .background(
+                SidebarPalette.selected,
+                in: RoundedRectangle(cornerRadius: SidebarRowGeometry.cornerRadius)
+            )
     }
 }
 
@@ -1155,12 +1253,15 @@ private struct ProjectSidebarSection: View {
     let onSelectSession: (UUID, Bool) -> Void
     let onArchiveSession: (UUID) -> Void
     let onOpenTerminal: (AgentKind) -> Void
+    let onNewProject: () -> Void
+    let onNewParentFolder: () -> Void
     let onEdit: () -> Void
     let onRemove: () -> Void
-    let onDropProject: ([String]) -> Bool
+    let onDropProject: ([String], CGPoint) -> Bool
 
     @State private var isExpanded = false
     @State private var isProjectHovering = false
+    @State private var isProjectDropTargeted = false
 
     private var allSessions: [TerminalSession] {
         Array(sessionManager.sessions(forProjectID: project.id).reversed())
@@ -1220,17 +1321,32 @@ private struct ProjectSidebarSection: View {
             .padding(.trailing, SidebarRowGeometry.contentTrailingPadding)
             .frame(height: SidebarRowGeometry.height)
             .background(
-                isProjectHovering ? SidebarPalette.hover : Color.clear,
+                isProjectDropTargeted
+                    ? Color.accentColor.opacity(0.12)
+                    : (isProjectHovering ? SidebarPalette.hover : Color.clear),
                 in: RoundedRectangle(cornerRadius: SidebarRowGeometry.cornerRadius)
             )
+            .overlay {
+                if isProjectDropTargeted {
+                    RoundedRectangle(cornerRadius: SidebarRowGeometry.cornerRadius)
+                        .stroke(Color.accentColor.opacity(0.7), lineWidth: 1)
+                }
+            }
             .contentShape(Rectangle())
             .padding(.horizontal, SidebarRowGeometry.horizontalMargin)
             .onHover { isProjectHovering = $0 }
-            .draggable(SidebarDragItem.project(project.id).value)
-            .dropDestination(for: String.self) { values, _ in
-                onDropProject(values)
+            .draggable(SidebarDragItem.project(project.id).value) {
+                SidebarDragPreview(title: project.displayName, systemImage: "folder")
+            }
+            .dropDestination(for: String.self) { values, location in
+                onDropProject(values, location)
+            } isTargeted: {
+                isProjectDropTargeted = $0
             }
             .contextMenu {
+                Button("New Project", systemImage: "square.and.pencil", action: onNewProject)
+                Button("New Parent Folder", systemImage: "folder.badge.plus", action: onNewParentFolder)
+                Divider()
                 Button("Open Codex") { onOpenTerminal(.codex) }
                 Button("Open Claude Code") { onOpenTerminal(.claude) }
                 Divider()
@@ -1266,6 +1382,13 @@ private struct ProjectSidebarSection: View {
                         }
                     )
                     .contextMenu {
+                        Button("New Project", systemImage: "square.and.pencil", action: onNewProject)
+                        Button(
+                            "New Parent Folder",
+                            systemImage: "folder.badge.plus",
+                            action: onNewParentFolder
+                        )
+                        Divider()
                         Group {
                             if session.status.isLocallyAttached {
                                 Button("Disconnect") {
@@ -1319,7 +1442,8 @@ private struct ProjectSessionRow: View {
         HStack(spacing: 7) {
             Button(action: onSelect) {
                 HStack(spacing: 7) {
-                    AgentBrandIcon(kind: session.kind, size: 12)
+                    AgentBrandIcon(kind: session.kind, size: 17)
+                        .frame(width: 18, height: 18)
                         .opacity(session.status.occupiesSlot ? 1 : 0.55)
 
                     Text(session.displayTitle)

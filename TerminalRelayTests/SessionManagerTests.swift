@@ -398,6 +398,55 @@ final class SessionManagerTests: XCTestCase {
         )
     }
 
+    func testReconcileUsesAndRefreshesRemoteConversationTitle() {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let manager = SessionManager()
+        let instanceToken = "01234567-89ab-" + "4def-8abc-0123456789ab"
+
+        manager.reconcile(
+            worker: server,
+            projects: [project],
+            response: WorkerSessionResponse(
+                projects: [project.displayName],
+                sessions: [
+                    WorkerSessionSnapshot(
+                        kind: .codex,
+                        repositoryName: project.displayName,
+                        attachedClientCount: 0,
+                        instanceToken: instanceToken,
+                        title: "Improve terminal titles"
+                    )
+                ]
+            ),
+            launchDefaults: .standard
+        )
+
+        let session = manager.session(projectID: project.id, kind: .codex)
+        XCTAssertEqual(session?.displayTitle, "Improve terminal titles")
+
+        manager.reconcile(
+            worker: server,
+            projects: [project],
+            response: WorkerSessionResponse(
+                projects: [project.displayName],
+                sessions: [
+                    WorkerSessionSnapshot(
+                        kind: .codex,
+                        repositoryName: project.displayName,
+                        attachedClientCount: 1,
+                        instanceToken: instanceToken,
+                        title: "Polish terminal titles"
+                    )
+                ]
+            ),
+            launchDefaults: .standard
+        )
+
+        XCTAssertTrue(manager.session(projectID: project.id, kind: .codex) === session)
+        XCTAssertEqual(session?.displayTitle, "Polish terminal titles")
+    }
+
     func testReconcileSameRepositoryReplacementEndsOldInstanceAndCreatesNewSession() {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let project = makeProject(name: "Terminal Relay", server: server)

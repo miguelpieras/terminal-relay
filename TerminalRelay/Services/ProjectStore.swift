@@ -66,6 +66,12 @@ final class ProjectStore: ObservableObject {
         profiles(for: projectIDsByFolder[folderID] ?? [])
     }
 
+    func sidebarFolderID(containing projectID: UUID) -> UUID? {
+        sidebarFolders.first { folder in
+            projectIDsByFolder[folder.id]?.contains(projectID) == true
+        }?.id
+    }
+
     @discardableResult
     func save(_ profile: ProjectProfile) -> Bool {
         guard profile.isValid else {

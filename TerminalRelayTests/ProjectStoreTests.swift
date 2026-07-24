@@ -133,6 +133,8 @@ final class ProjectStoreTests: XCTestCase {
         XCTAssertEqual(store.rootProjects.map(\.id), [first.id])
         XCTAssertEqual(store.projects(inSidebarFolder: work.id).map(\.id), [third.id, second.id])
         XCTAssertEqual(store.sidebarFolders.map(\.id), [later.id, work.id])
+        XCTAssertNil(store.sidebarFolderID(containing: first.id))
+        XCTAssertEqual(store.sidebarFolderID(containing: second.id), work.id)
 
         let reloadedStore = ProjectStore(defaults: defaults, servers: [server])
         XCTAssertEqual(reloadedStore.rootProjects.map(\.id), [first.id])
@@ -145,6 +147,7 @@ final class ProjectStoreTests: XCTestCase {
         reloadedStore.moveProject(id: third.id, intoSidebarFolder: nil)
         reloadedStore.deleteSidebarFolder(id: work.id)
         XCTAssertEqual(reloadedStore.rootProjects.map(\.id), [first.id, third.id, second.id])
+        XCTAssertNil(reloadedStore.sidebarFolderID(containing: second.id))
         XCTAssertEqual(reloadedStore.sidebarFolders.map(\.id), [later.id])
     }
 }

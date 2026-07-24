@@ -203,6 +203,7 @@ final class SessionManager: ObservableObject {
             kind: snapshot.kind,
             sequenceNumber: nextSequenceNumber(projectID: project.id, kind: snapshot.kind),
             instanceToken: snapshot.instanceToken,
+            terminalTitle: snapshot.title,
             remoteAttachedClientCount: snapshot.attachedClientCount
         )
         append(session)
@@ -396,6 +397,7 @@ final class SessionManager: ObservableObject {
                     sequenceNumber: nextSequenceNumber(projectID: project.id, kind: snapshot.kind),
                     instanceToken: snapshot.instanceToken,
                     initialStatus: .remoteRunning,
+                    terminalTitle: snapshot.title,
                     remoteAttachedClientCount: snapshot.attachedClientCount
                 )
                 append(session)
