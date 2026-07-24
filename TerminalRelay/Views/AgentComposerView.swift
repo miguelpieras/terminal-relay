@@ -25,7 +25,6 @@ struct AgentComposerView: View {
     @State private var pasteNotice: String?
     @State private var isEditorFocused = false
     @State private var isShowingModelPanel = false
-    @State private var isAdvancedExpanded = true
     @State private var selectedModelSection: ModelPanelSection?
     @StateObject private var modelPanelClickMonitor = ModelPanelClickMonitor()
 
@@ -257,32 +256,9 @@ struct AgentComposerView: View {
     private var modelSelectionPanel: some View {
         HStack(alignment: .bottom, spacing: 8) {
             VStack(spacing: 0) {
-                if isAdvancedExpanded {
-                    panelModelControl
-                    panelEffortControl
-                    panelSpeedControl
-
-                    Divider()
-                        .overlay(Color.white.opacity(0.08))
-                }
-
-                Button {
-                    withAnimation(.easeOut(duration: 0.14)) {
-                        isAdvancedExpanded.toggle()
-                    }
-                } label: {
-                    HStack(spacing: 8) {
-                        Text("Advanced")
-                        Image(systemName: isAdvancedExpanded ? "chevron.up" : "chevron.down")
-                            .font(.system(size: 9, weight: .semibold))
-                        Spacer()
-                    }
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
-                    .frame(height: 36)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
+                panelModelControl
+                panelEffortControl
+                panelSpeedControl
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
@@ -811,6 +787,10 @@ private struct PromptEditor: NSViewRepresentable {
         scrollView.autohidesScrollers = true
         scrollView.borderType = .noBorder
         scrollView.documentView = textView
+        DispatchQueue.main.async {
+            guard let window = textView.window else { return }
+            window.makeFirstResponder(textView)
+        }
         return scrollView
     }
 

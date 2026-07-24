@@ -281,6 +281,7 @@ private enum SidebarRowGeometry {
     static let iconFrameWidth: CGFloat = 14
     static let iconSpacing: CGFloat = 9
     static let cornerRadius: CGFloat = 6
+    static let hierarchyIndent: CGFloat = 32
 }
 
 struct ContentView: View {
@@ -1667,7 +1668,7 @@ private struct ProjectSidebarSection: View {
                 }
             }
         }
-        .padding(.leading, CGFloat(indentLevel) * 15)
+        .padding(.leading, CGFloat(indentLevel) * SidebarRowGeometry.hierarchyIndent)
         .padding(.bottom, 8)
     }
 
