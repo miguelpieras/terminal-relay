@@ -128,13 +128,13 @@ struct AgentComposerView: View {
         .padding(.leading, 12)
         .padding(.trailing, 10)
         .padding(.bottom, 5)
-        .background(
-            Color(red: 0.165, green: 0.165, blue: 0.165),
-            in: RoundedRectangle(cornerRadius: 18, style: .continuous)
-        )
-        .overlay {
+        .background {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                .fill(Color(red: 0.165, green: 0.165, blue: 0.165))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 6)
