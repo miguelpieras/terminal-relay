@@ -1395,8 +1395,6 @@ private struct TerminalPane: View {
                 }
             }
 
-            Divider()
-
             AgentComposerView(
                 session: session,
                 worker: worker

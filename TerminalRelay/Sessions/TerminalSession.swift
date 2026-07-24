@@ -271,14 +271,17 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
 
     func sendPrompt(_ prompt: String) {
         guard status == .running, !prompt.isEmpty else { return }
-        terminalView.send(txt: "\u{1B}[200~\(prompt)\u{1B}[201~\r")
+        terminalView.send(txt: "\u{1B}[200~\(prompt)\u{1B}[201~")
+        pressReturn()
     }
 
     func sendCommand(_ command: String, focusesTerminal: Bool = false) {
         guard status == .running, !command.isEmpty else { return }
-        terminalView.send(txt: "\(command)\r")
-        if focusesTerminal {
-            focusTerminal()
+        terminalView.send(txt: command)
+        pressReturn {
+            if focusesTerminal {
+                self.focusTerminal()
+            }
         }
     }
 
@@ -290,6 +293,14 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
     func focusTerminal() {
         guard let window = terminalView.window else { return }
         window.makeFirstResponder(terminalView)
+    }
+
+    private func pressReturn(then action: (() -> Void)? = nil) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.terminalView.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+            action?()
+        }
     }
 
     private var isExited: Bool {

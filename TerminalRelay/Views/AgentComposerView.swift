@@ -7,6 +7,10 @@ struct AgentComposerView: View {
 
     let worker: ServerProfile
 
+    @AppStorage(AgentLaunchDefaults.StorageKey.codexModel)
+    private var codexModel = AgentLaunchDefaults.standard.codexModel
+    @AppStorage(AgentLaunchDefaults.StorageKey.codexReasoningEffort)
+    private var codexReasoningEffort = AgentLaunchDefaults.standard.codexReasoningEffort
     @AppStorage(AgentLaunchDefaults.StorageKey.claudeModel)
     private var claudeModel = AgentLaunchDefaults.standard.claudeModel
     @AppStorage(AgentLaunchDefaults.StorageKey.claudeReasoningEffort)
@@ -24,9 +28,27 @@ struct AgentComposerView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
+        VStack(alignment: .leading, spacing: 0) {
+            ZStack(alignment: .topLeading) {
+                PromptEditor(
+                    text: $draft,
+                    onSubmit: send,
+                    onPasteImages: addImages
+                )
+
+                if draft.isEmpty {
+                    Text("Do anything")
+                        .font(.system(size: 16))
+                        .foregroundStyle(.tertiary)
+                        .padding(.top, 1)
+                        .allowsHitTesting(false)
+                }
+            }
+            .frame(minHeight: 98, maxHeight: 148)
+
             if !attachments.isEmpty {
                 attachmentStrip
+                    .padding(.bottom, 8)
             }
 
             if let pasteNotice {
@@ -34,65 +56,63 @@ struct AgentComposerView: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
                     .lineLimit(1)
+                    .padding(.bottom, 8)
             }
 
-            HStack(alignment: .bottom, spacing: 8) {
-                commandMenu
+            HStack(spacing: 16) {
                 pasteButton
-
-                ZStack(alignment: .topLeading) {
-                    PromptEditor(
-                        text: $draft,
-                        onSubmit: send,
-                        onPasteImages: addImages
-                    )
-
-                    if draft.isEmpty {
-                        Text("Message \(session.kind == .claude ? "Claude" : "Codex")…")
-                            .font(.system(size: 14))
-                            .foregroundStyle(.tertiary)
-                            .padding(.leading, 9)
-                            .padding(.top, 8)
-                            .allowsHitTesting(false)
-                    }
-                }
-                .frame(minHeight: 36, maxHeight: 86)
-                .background(
-                    Color(nsColor: .textBackgroundColor),
-                    in: RoundedRectangle(cornerRadius: 8)
-                )
-                .overlay {
-                    RoundedRectangle(cornerRadius: 8)
-                        .stroke(Color.primary.opacity(0.14), lineWidth: 1)
-                }
+                commandMenu
+                Spacer(minLength: 12)
 
                 modelControls
+                microphoneButton
 
                 if session.isWorking {
                     Button {
                         session.interrupt()
                     } label: {
                         Image(systemName: "stop.fill")
-                            .frame(width: 20, height: 20)
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(Color.black.opacity(0.72))
+                            .frame(width: 44, height: 44)
+                            .background(Color.white.opacity(0.58), in: Circle())
                     }
-                    .buttonStyle(.bordered)
+                    .buttonStyle(.plain)
                     .help("Interrupt current work")
                 } else {
                     Button(action: send) {
                         Image(systemName: "arrow.up")
-                            .font(.system(size: 13, weight: .bold))
-                            .frame(width: 20, height: 20)
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundStyle(Color.black.opacity(canSend ? 0.9 : 0.62))
+                            .frame(width: 44, height: 44)
+                            .background(
+                                Color.white.opacity(canSend ? 0.92 : 0.58),
+                                in: Circle()
+                            )
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.plain)
                     .disabled(!canSend)
                     .keyboardShortcut(.return, modifiers: .command)
                     .help("Send message (Return)")
                 }
             }
+            .frame(height: 48)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 9)
-        .background(.bar)
+        .padding(.top, 18)
+        .padding(.leading, 22)
+        .padding(.trailing, 16)
+        .padding(.bottom, 14)
+        .background(
+            Color(red: 0.165, green: 0.165, blue: 0.165),
+            in: RoundedRectangle(cornerRadius: 28, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .background(Color(red: 0.071, green: 0.071, blue: 0.078))
     }
 
     private var attachmentStrip: some View {
@@ -156,10 +176,16 @@ struct AgentComposerView: View {
                 sendCommand("/usage")
             }
         } label: {
-            Image(systemName: "slider.horizontal.3")
-                .frame(width: 20, height: 20)
+            HStack(spacing: 8) {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 16))
+                Text("Custom")
+                    .font(.system(size: 15))
+            }
+            .foregroundStyle(.secondary)
         }
         .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
         .fixedSize()
         .disabled(session.status != .running || session.isWorking)
         .help("Agent commands")
@@ -174,18 +200,19 @@ struct AgentComposerView: View {
                 addImages(images)
             }
         } label: {
-            Image(systemName: "photo.badge.plus")
-                .frame(width: 20, height: 20)
+            Image(systemName: "plus")
+                .font(.system(size: 20, weight: .regular))
+                .frame(width: 24, height: 24)
         }
-        .buttonStyle(.borderless)
+        .buttonStyle(.plain)
+        .foregroundStyle(.primary)
         .disabled(session.status != .running)
         .help("Paste image from clipboard (⌘V)")
     }
 
-    @ViewBuilder
     private var modelControls: some View {
-        if session.kind == .claude {
-            Menu {
+        Menu {
+            if session.kind == .claude {
                 Section("Model") {
                     ForEach(["fable", "opus", "sonnet"], id: \.self) { model in
                         Button {
@@ -198,10 +225,6 @@ struct AgentComposerView: View {
                                 Text(model.capitalized)
                             }
                         }
-                    }
-
-                    Button("Choose another…") {
-                        session.sendCommand("/model", focusesTerminal: true)
                     }
                 }
 
@@ -219,27 +242,55 @@ struct AgentComposerView: View {
                         }
                     }
                 }
-            } label: {
-                Label(
-                    "\(claudeModel.capitalized) · \(claudeReasoningEffort.displayName)",
-                    systemImage: "dial.medium"
-                )
-                .lineLimit(1)
+            } else {
+                Button("Change model or reasoning…") {
+                    session.sendCommand("/model", focusesTerminal: true)
+                }
             }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .disabled(session.status != .running)
-            .help("Change Claude model or reasoning effort")
-        } else {
-            Button {
-                session.sendCommand("/model", focusesTerminal: true)
-            } label: {
-                Label("Model & effort", systemImage: "dial.medium")
-            }
-            .buttonStyle(.borderless)
-            .disabled(session.status != .running)
-            .help("Change Codex model and reasoning effort")
+        } label: {
+            (
+                Text(modelDisplayName)
+                    .foregroundColor(.primary)
+                + Text(" \(selectedReasoningEffort.displayName.capitalized)  ")
+                    .foregroundColor(.secondary)
+                + Text(Image(systemName: "chevron.down"))
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.secondary)
+            )
+            .font(.system(size: 15))
+            .lineLimit(1)
         }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .disabled(session.status != .running)
+        .help("Change \(session.kind.displayName) model or reasoning effort")
+    }
+
+    private var microphoneButton: some View {
+        Button {
+            pasteNotice = "Voice input is not available yet."
+        } label: {
+            Image(systemName: "mic")
+                .font(.system(size: 19, weight: .medium))
+                .frame(width: 26, height: 26)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.primary)
+        .help("Voice input")
+    }
+
+    private var modelDisplayName: String {
+        let model = session.kind == .codex ? codexModel : claudeModel
+        return model
+            .replacingOccurrences(of: "gpt-", with: "")
+            .split(separator: "-")
+            .map { $0.capitalized }
+            .joined(separator: " ")
+    }
+
+    private var selectedReasoningEffort: AgentReasoningEffort {
+        session.kind == .codex ? codexReasoningEffort : claudeReasoningEffort
     }
 
     private func send() {
