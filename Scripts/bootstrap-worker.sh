@@ -7,7 +7,7 @@ readonly RUNTIME_USER="terminal-relay"
 
 usage() {
     cat <<'EOF'
-Usage: ./Scripts/bootstrap-worker.sh [--identity PATH] [--port N] root@host
+Usage: ./Scripts/bootstrap-worker.sh [--identity PATH] [--port N] [--worker-number N] [--yes] root@host
 
 Provision a fresh Ubuntu 24.04 amd64 worker, authenticate Codex and Claude,
 and register it in Terminal Relay.
@@ -15,6 +15,8 @@ and register it in Terminal Relay.
 Options:
   --identity PATH  SSH private key to use and store in the worker profile
   --port N         SSH port (otherwise use OpenSSH configuration or port 22)
+  --worker-number N  Assign the stable numeric worker name and hostname
+  --yes            Skip this script's confirmation (for the verified lifecycle command)
   -h, --help       Show this help
 EOF
 }
@@ -100,6 +102,8 @@ parse_install_result() {
 
 identity_path=""
 port=""
+worker_number=""
+assume_yes=false
 target=""
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
@@ -112,6 +116,15 @@ while [[ "$#" -gt 0 ]]; do
             [[ "$#" -ge 2 ]] || die "--port requires a value"
             port="$2"
             shift 2
+            ;;
+        --worker-number)
+            [[ "$#" -ge 2 ]] || die "--worker-number requires a value"
+            worker_number="$2"
+            shift 2
+            ;;
+        --yes)
+            assume_yes=true
+            shift
             ;;
         -h|--help)
             usage
@@ -137,6 +150,10 @@ if [[ -n "$port" ]]; then
     if [[ ! "$port" =~ ^[1-9][0-9]{0,4}$ ]] || (( 10#$port > 65535 )); then
         die "SSH port must be an integer from 1 to 65535"
     fi
+fi
+if [[ -n "$worker_number" ]]; then
+    [[ "$worker_number" =~ ^[1-9][0-9]{0,5}$ ]] \
+        || die "worker number must be from 1 to 999999"
 fi
 [[ "$target" == root@* ]] || die "V1 requires an SSH target in the form root@host"
 host="${target#root@}"
@@ -182,7 +199,7 @@ fi
 script_directory="$(cd "$(dirname "$0")" && pwd -P)"
 repository_root="$(cd "$script_directory/.." && pwd -P)"
 server_directory="$repository_root/Server"
-for payload_path in install-worker.sh terminal-relay-session terminal-relay-session-restore@.service worker-config/install.sh worker-config/AGENTS.md worker-config/CLAUDE.md; do
+for payload_path in worker-baseline.env install-worker.sh terminal-relay-session terminal-relay-session-restore@.service terminal-relay-agent-update terminal-relay-agent-update.service terminal-relay-agent-update.timer worker-config/install.sh worker-config/AGENTS.md worker-config/CLAUDE.md; do
     [[ -f "$server_directory/$payload_path" ]] || die "missing bootstrap payload: Server/$payload_path"
 done
 
@@ -249,11 +266,32 @@ architecture=$(uname -m)
 [[ "$architecture" == "x86_64" || "$architecture" == "amd64" ]] || { echo "amd64 is required" >&2; exit 1; }
 memory_kib=$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo)
 [[ "$memory_kib" =~ ^[0-9]+$ && "$memory_kib" -ge 3900000 ]] || { echo "at least 4 GB RAM is required" >&2; exit 1; }
+ssh_route=openssh
+root_key_fingerprint=""
+tailscale_worker_tag=false
+if command -v tailscale >/dev/null 2>&1; then
+    connection_address=$(awk '{ print $3 }' <<< "${SSH_CONNECTION:-}")
+    if tailscale ip 2>/dev/null | grep -Fqx "$connection_address"; then
+        ssh_route=tailscale
+        if tailscale status --json 2>/dev/null \
+            | python3 -c 'import json,sys; print("tag:terminal-relay-worker" in json.load(sys.stdin)["Self"].get("Tags", []))' \
+            | grep -Fqx True; then
+            tailscale_worker_tag=true
+        fi
+    fi
+fi
+if [[ -f /root/.ssh/authorized_keys && ! -L /root/.ssh/authorized_keys ]]; then
+    root_key_fingerprint=$(ssh-keygen -lf /root/.ssh/authorized_keys -E sha256 2>/dev/null \
+        | awk 'NR == 1 { print $2 }')
+fi
 printf '%s\n' 'TERMINAL_RELAY_PREFLIGHT_V1'
 printf 'hostname=%s\n' "$(hostname)"
 printf 'os=%s\n' 'Ubuntu 24.04'
 printf 'architecture=%s\n' 'amd64'
 printf 'memory_kib=%s\n' "$memory_kib"
+printf 'ssh_route=%s\n' "$ssh_route"
+printf 'root_key_fingerprint=%s\n' "$root_key_fingerprint"
+printf 'tailscale_worker_tag=%s\n' "$tailscale_worker_tag"
 printf '%s\n' 'TERMINAL_RELAY_PREFLIGHT_END'
 REMOTE_PREFLIGHT
 
@@ -263,6 +301,9 @@ remote_hostname=$(marker_value hostname "$preflight_file")
 remote_os=$(marker_value os "$preflight_file")
 remote_architecture=$(marker_value architecture "$preflight_file")
 remote_memory_kib=$(marker_value memory_kib "$preflight_file")
+remote_ssh_route=$(marker_value ssh_route "$preflight_file")
+remote_root_key_fingerprint=$(marker_value root_key_fingerprint "$preflight_file")
+remote_tailscale_worker_tag=$(marker_value tailscale_worker_tag "$preflight_file")
 host_key_fingerprint=$(/usr/bin/awk '
     /Server host key:/ {
         for (field_index = 1; field_index <= NF; field_index++) {
@@ -290,28 +331,36 @@ accepted_identity_fingerprint=$(/usr/bin/awk '
 [[ "$remote_memory_kib" =~ ^[0-9]+$ && "$remote_memory_kib" -ge 3900000 ]] || die "remote memory check failed"
 [[ "$host_key_fingerprint" =~ ^SHA256:[A-Za-z0-9+/]+$ ]] || die "remote host-key fingerprint is invalid"
 if [[ -n "$identity_fingerprint" && "$accepted_identity_fingerprint" != "$identity_fingerprint" ]]; then
-    die "SSH did not authenticate with the requested --identity key"
+    if [[ "$remote_ssh_route" != tailscale \
+        || "$remote_tailscale_worker_tag" != true \
+        || "$remote_root_key_fingerprint" != "$identity_fingerprint" ]]; then
+        die "SSH neither used the requested --identity key nor proved the matching tagged Tailscale recovery route"
+    fi
 fi
 
 echo "Terminal Relay worker bootstrap"
 echo "  SSH target:       $target"
 echo "  Resolved target:  $resolved_user@$resolved_host:$resolved_port"
 echo "  Host key:         $host_key_fingerprint"
+echo "  SSH route:        $remote_ssh_route"
 echo "  Current hostname: $remote_hostname"
 echo "  Platform:         $remote_os ($remote_architecture)"
 echo "  Memory:           $remote_memory_kib KiB"
 echo "  Runtime user:     $RUNTIME_USER"
 [[ -z "$identity_path" ]] || echo "  Identity:         $identity_path"
-echo
-echo "This will provision the exact server above and preserve root SSH access."
-printf 'Continue? [y/N] ' >/dev/tty
-IFS= read -r confirmation </dev/tty || die "confirmation was not provided"
-case "$confirmation" in y|Y|yes|YES) ;; *) die "cancelled" ;; esac
+if [[ "$assume_yes" != true ]]; then
+    echo
+    echo "This will provision the exact server above and preserve root SSH access."
+    printf 'Continue? [y/N] ' >/dev/tty
+    IFS= read -r confirmation </dev/tty || die "confirmation was not provided"
+    case "$confirmation" in y|Y|yes|YES) ;; *) die "cancelled" ;; esac
+fi
 
 result_file="$temporary_directory/install-result"
-/usr/bin/tar --no-xattrs -C "$server_directory" -cf - install-worker.sh terminal-relay-session terminal-relay-session-restore@.service worker-config | \
+/usr/bin/tar --no-xattrs -C "$server_directory" -cf - worker-baseline.env install-worker.sh terminal-relay-session terminal-relay-session-restore@.service terminal-relay-agent-update terminal-relay-agent-update.service terminal-relay-agent-update.timer worker-config | \
     /usr/bin/ssh "${ssh_options[@]}" "$target" '
 set -eu
+worker_number='"$worker_number"'
 temporary_root=${TMPDIR:-/tmp}
 case "$temporary_root" in /*) ;; *) echo "invalid remote temporary root" >&2; exit 1 ;; esac
 [ -d "$temporary_root" ] || { echo "remote temporary root does not exist" >&2; exit 1; }
@@ -333,7 +382,11 @@ trap cleanup 0
 chmod 0755 "$temporary_directory"
 tar --no-same-owner --no-same-permissions -xf - -C "$temporary_directory"
 /bin/chown -R root:root "$temporary_directory"
-/bin/bash "$temporary_directory/install-worker.sh"
+if [ -n "$worker_number" ]; then
+    /bin/bash "$temporary_directory/install-worker.sh" --worker-number "$worker_number"
+else
+    /bin/bash "$temporary_directory/install-worker.sh"
+fi
 ' | /usr/bin/tee "$result_file"
 
 parse_install_result "$result_file"
@@ -342,6 +395,10 @@ short_id="${worker_id%%-*}"
 [[ "$worker_name" == "Terminal Relay Worker $short_id" \
     || "$worker_name" =~ ^Terminal\ Relay\ Worker\ [1-9][0-9]{0,5}$ ]] \
     || die "installer returned an invalid worker name"
+if [[ -n "$worker_number" ]]; then
+    [[ "$worker_name" == "Terminal Relay Worker $worker_number" ]] \
+        || die "installer did not apply the requested worker number"
+fi
 
 if ! /usr/bin/ssh "${ssh_options[@]}" "$runtime_target" '/usr/bin/codex login status >/dev/null 2>&1'; then
     echo "Codex authentication is required. Follow the device authorization instructions."
@@ -367,13 +424,18 @@ test "$HOME" = /home/terminal-relay
 test -d /workspace && test -w /workspace
 test -x /usr/local/bin/terminal-relay-session
 test -f /etc/systemd/system/terminal-relay-session-restore@.service
+test -x /usr/local/sbin/terminal-relay-agent-update
+test -f /etc/systemd/system/terminal-relay-agent-update.service
+test -f /etc/systemd/system/terminal-relay-agent-update.timer
 test -x /usr/bin/codex && test -x /usr/bin/claude
 test -r /proc/stat && test -r /proc/meminfo
 systemctl is-enabled --quiet terminal-relay-session-restore@terminal-relay.service
 systemctl is-active --quiet terminal-relay-session-restore@terminal-relay.service
 test "$(systemctl show -p User --value terminal-relay-session-restore@terminal-relay.service)" = terminal-relay
+systemctl is-enabled --quiet terminal-relay-agent-update.timer
+systemctl is-active --quiet terminal-relay-agent-update.timer
 /usr/local/bin/terminal-relay-session status >/dev/null
-runtime_directory="/run/user/$(id -u)/terminal-relay"
+runtime_directory="$HOME/.local/state/terminal-relay"
 /usr/bin/flock "$runtime_directory/codex.control.lock" /bin/sleep 3 &
 lock_holder_pid=$!
 /bin/sleep 1

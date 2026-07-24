@@ -1,0 +1,12 @@
+[Unit]
+Description=Keep Terminal Relay agent CLIs current
+
+[Timer]
+OnBootSec=15min
+OnCalendar=*-*-* 02,08,14,20:00:00 UTC
+RandomizedDelaySec=30min
+Persistent=true
+Unit=terminal-relay-agent-update.service
+
+[Install]
+WantedBy=timers.target

@@ -50,6 +50,30 @@ final class ServerStore: ObservableObject {
         persist()
     }
 
+    func register(_ profile: ServerProfile) {
+        if servers.contains(where: { $0.id == profile.id }) {
+            save(profile)
+            return
+        }
+
+        let matchingNameIndexes = servers.indices.filter {
+            servers[$0].name == profile.name
+        }
+        if matchingNameIndexes.count == 1,
+           profile.name.range(
+               of: #"^Terminal Relay Worker [1-9][0-9]{0,5}$"#,
+               options: .regularExpression
+           ) != nil {
+            var preservingLocalIdentity = profile
+            preservingLocalIdentity.id = servers[matchingNameIndexes[0]].id
+            servers[matchingNameIndexes[0]] = preservingLocalIdentity
+            persist()
+            return
+        }
+
+        save(profile)
+    }
+
     func delete(id: UUID) {
         servers.removeAll { $0.id == id }
         persist()

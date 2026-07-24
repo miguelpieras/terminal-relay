@@ -6,7 +6,30 @@ entry point used by Terminal Relay clients. The worker needs Bash, `flock`,
 tmux 3.4), plus Codex and Claude at their standard `/usr/bin` paths. Projects are
 immediate directories below `/workspace`.
 
-## Bootstrap a fresh worker
+## Standardized fleet lifecycle
+
+From the repository root, the supported top-level interface is:
+
+```bash
+./Scripts/manage-worker.sh configure       # once per Mac
+./Scripts/manage-worker.sh provision 3
+./Scripts/manage-worker.sh reconcile all
+./Scripts/manage-worker.sh verify all
+./Scripts/manage-worker.sh retire 3
+```
+
+`worker-baseline.env` pins the standardizable provider, host, network, runtime,
+and CLI state. `install-worker-host.sh` applies that host state idempotently;
+`install-worker.sh` applies the application state. Tagged numeric Tailscale
+workers are discovered automatically by Prometheus. Worker-specific IPs,
+host keys, Tailscale identities, UUIDs, provider credentials, project
+checkouts, and repository deploy keys remain unique.
+
+The shared operator **public** key and its fingerprint are intentionally the
+same on every worker. Private machine and project identities must never be
+copied between workers.
+
+## Application-only bootstrap
 
 Version 1 supports a fresh Hetzner Ubuntu 24.04 amd64 host with at least 4 GB of
 RAM and key-based `root` SSH access. From the repository root on the Mac, use:
@@ -21,9 +44,11 @@ The local script verifies `/Applications/Terminal Relay.app` (bundle identifier
 `com.mpieras.TerminalRelay`) and the authenticated GitHub CLI, keeps normal
 OpenSSH host-key checks, and asks once for confirmation after showing the
 resolved destination, host-key fingerprint, existing hostname, OS, and
-architecture. It sends this directory's installer and configuration to the host
-without provisioning the Hetzner server or changing `sshd`, root SSH access,
-firewall policy, or Tailscale.
+architecture. It sends this directory's application installer and configuration
+to the host. Use it directly only when the provider and host lifecycle is
+already managed; the top-level lifecycle command also provisions Hetzner,
+Tailscale, firewalls, Docker, monitoring, shared keys, and host OpenSSH
+hardening.
 
 `install-worker.sh` is root-only and idempotent. Before privileged writes it
 requires Ubuntu 24.04, amd64, at least 4 GB of RAM, and no conflicting worker
@@ -38,13 +63,15 @@ account, managed path, or non-empty `/workspace`. It then:
 - creates the password-locked `terminal-relay` login account, copies the root
   account's authorized keys with strict permissions, and creates its writable
   `/workspace`;
-- installs the explicit OS dependencies, Codex's official standalone release,
-  and Claude's signed stable apt package, exposing `/usr/bin/codex` and
+- installs the explicit OS dependencies, the current Codex standalone release,
+  and Claude from its signed latest apt channel, exposing `/usr/bin/codex` and
   `/usr/bin/claude` without using npm;
 - installs this helper as root-owned mode `0755`, installs the root-owned
   `terminal-relay-session-restore@.service` template, enables its instance for
   `terminal-relay`, and installs the worker-wide guidance as the unprivileged
-  account.
+  account;
+- installs and enables the root-owned `terminal-relay-agent-update.timer`,
+  which updates only Claude Code and Codex after boot and four times daily.
 
 After remote readiness checks, the local script reconnects as `terminal-relay`.
 It runs `codex login --device-auth` and `claude auth login` interactively only
@@ -57,15 +84,39 @@ not duplicate the worker or replace valid credentials.
 
 The managed server surface is `/etc/terminal-relay`, `/home/terminal-relay`,
 `/workspace`, the two agent executable paths, this helper, its systemd restore
-unit, and the guidance files beneath the worker's home directory. A changed
-managed file gets a sibling `.backup.<UTC-timestamp>` copy (with a numeric
-suffix when needed), and an install failure restores files changed during that
-run. The UUID and installer marker intentionally remain after a partial failure.
-To recover from an interruption, rerun the exact bootstrap command so it resumes
-the same worker identity. If preflight instead reports an unexpected existing
+unit, the automatic updater and timer, and the guidance files beneath the
+worker's home directory. A changed managed file gets a sibling
+`.backup.<UTC-timestamp>` copy (with a numeric suffix when needed), and an
+install failure restores files changed during that run. The UUID and installer
+marker intentionally remain after a partial failure. To recover from an
+interruption, rerun the exact bootstrap command so it resumes the same worker
+identity. If preflight instead reports an unexpected existing
 user, path, or workspace content, inspect and resolve that conflict rather than
 deleting it blindly; the installer deliberately leaves the root SSH recovery
 route intact.
+
+## Automatic agent updates
+
+Each worker updates its own agent CLIs without the Mac or an interactive agent
+session. `terminal-relay-agent-update.timer` runs 15 minutes after boot and at
+02:00, 08:00, 14:00, and 20:00 UTC with up to 30 minutes of randomized delay.
+The root-owned updater:
+
+- upgrades only `claude-code` from Anthropic's signed `latest` apt channel;
+- runs `codex update` against the root-owned standalone installation with
+  `CODEX_NON_INTERACTIVE=1`;
+- serializes itself with the application installer and reports failures through
+  the service exit status and journal.
+
+An already-running Claude or Codex process continues with the version it
+started. The next agent launch uses the updated executable. Inspect the schedule
+and the last run as root with:
+
+```bash
+systemctl list-timers terminal-relay-agent-update.timer
+systemctl status terminal-relay-agent-update.service
+journalctl -u terminal-relay-agent-update.service
+```
 
 ## Install or update the session runtime
 

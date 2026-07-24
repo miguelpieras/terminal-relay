@@ -15,7 +15,7 @@ Terminal Relay is a native macOS workspace for Codex CLI and Claude Code session
   terminal output, or a local copy of running-session state. Live sessions are
   discovered from the worker.
 
-The first launch includes the dedicated **Terminal Relay Worker 1** profile. Its `terminal-relay-worker-1` SSH alias uses the existing private Tailscale route. The project list starts empty; Terminal Relay never creates or opens a generic Workspace project.
+The first launch includes the dedicated **Terminal Relay Worker 1** profile. Its `terminal-relay-worker-1` SSH alias uses that worker's private Tailscale route. The project list starts empty; Terminal Relay never creates or opens a generic Workspace project.
 
 The current worker-to-host mapping, access commands, trusted fingerprints, and
 recovery details are documented in [`docs/workers.md`](docs/workers.md).
@@ -38,8 +38,9 @@ The concurrency limit applies to sessions started by Terminal Relay. It cannot d
 - `xcodegen` (`brew install xcodegen`)
 - Working SSH access to each configured server
 - GitHub CLI authenticated as `miguelpieras` on the Mac (`gh auth login`)
-- For manually configured legacy workers, `codex` and/or `claude` available to
-  the remote account's login shell; bootstrap installs both on a fresh worker
+- `hcloud`, `tailscale`, and `jq` for the standardized worker lifecycle
+- `codex` and/or `claude` available to the remote account's login shell;
+  bootstrap installs both on a fresh worker
 - Apple's Metal toolchain component, used to compile SwiftTerm's optional renderer (`xcodebuild -downloadComponent MetalToolchain`)
 
 ## Build and install
@@ -55,27 +56,70 @@ To work in Xcode, run `open TerminalRelay.xcodeproj`.
 
 The app target intentionally does not enable App Sandbox because its embedded terminal needs to launch `/usr/bin/ssh` inside a pseudo-terminal.
 
-## Bootstrap a worker
+## Standard worker lifecycle
 
-The supported version 1 starting point is a fresh Hetzner server running Ubuntu
-24.04 on amd64 with at least 4 GB of RAM. It must be reachable as `root` with an
-SSH key. `/Applications/Terminal Relay.app` must already be installed on the
-Mac, and the local GitHub CLI must be authenticated (`gh auth status`).
+`Server/worker-baseline.env` is the single source of truth for every
+standardizable worker setting: Hetzner project and server shape, Ubuntu release,
+provider firewall, shared operator public key, Tailscale version and tag,
+host firewall, Docker stack, monitoring exporter, Codex, Claude, runtime user,
+workspace permissions, session helper, and restore service.
 
-From the repository root, run:
+Configure the project-scoped Hetzner and Tailscale lifecycle credentials once:
+
+```bash
+./Scripts/manage-worker.sh configure
+```
+
+The Tailscale OAuth client needs Auth Keys Write and Devices Core Write,
+restricted to `tag:terminal-relay-worker`. Its secret is stored in macOS
+Keychain; the Hetzner token stays in the project-scoped `terminal-relay`
+`hcloud` context. Neither credential enters the repository.
+
+After that, provisioning Worker 3 is one command:
+
+```bash
+./Scripts/manage-worker.sh provision 3
+```
+
+The command creates the exact Hetzner server, uses a temporary provider
+firewall that admits SSH only from the Mac's current public IPv4, creates a
+single-use tagged Tailscale enrollment, switches to the shared locked-down
+provider firewall, installs the pinned host and application baseline, adds the
+private runtime/root SSH aliases, performs any required Codex and Claude login,
+and registers the stable worker profile in Terminal Relay. The monitoring host
+discovers tagged numeric workers automatically.
+
+Reconcile or verify the complete configured fleet with:
+
+```bash
+./Scripts/manage-worker.sh reconcile all
+./Scripts/manage-worker.sh verify all
+```
+
+Retirement is also standardized:
+
+```bash
+./Scripts/manage-worker.sh retire 3
+```
+
+It refuses active Terminal Relay sessions, dirty checkouts, repositories
+without upstreams, and unpushed commits, then requires the exact provider name
+before deleting the VM and its Tailscale identity.
+
+The operator public key is deliberately identical on every worker. Host SSH
+keys, Tailscale node identities and enrollment keys, worker UUIDs, agent
+credentials, and per-worker/per-project GitHub deploy keys are deliberately
+unique. Project checkouts under `/workspace` are workload state and are not
+part of the common host baseline.
+
+### Lower-level application bootstrap
+
+For an already-created Ubuntu 24.04 amd64 host with at least 4 GB RAM and
+key-based root access, the application-only bootstrap remains available:
 
 ```bash
 ./Scripts/bootstrap-worker.sh [--identity PATH] [--port N] root@host
 ```
-
-For example:
-
-```bash
-./Scripts/bootstrap-worker.sh root@203.0.113.10
-./Scripts/bootstrap-worker.sh --identity ~/.ssh/hetzner --port 2222 root@203.0.113.10
-```
-
-`host` may be an IP address, DNS name, or SSH config alias.
 
 The script keeps normal OpenSSH known-hosts verification. Before changing the
 server, it shows the resolved SSH destination, trusted host-key fingerprint,
@@ -109,17 +153,16 @@ account, managed path, or non-empty `/workspace`, inspect that conflict instead
 of deleting it and retry after resolving it; the unchanged root SSH route
 remains available for recovery.
 
-Bootstrap manages `/etc/terminal-relay` (including `worker-id`, `display-name`,
+Application bootstrap manages `/etc/terminal-relay` (including `worker-id`, `display-name`,
 and the `installer-version` marker), `/home/terminal-relay`, `/workspace`, the
 agent executables, `/usr/local/bin/terminal-relay-session`, its systemd restore
-unit, the worker-wide guidance under the worker's home directory, and the
-consumed local registration handoff. Hetzner provisioning and retirement,
-Tailscale, firewall or `sshd` hardening, and backup services are outside version
-1.
+unit, the root-owned automatic agent updater and timer, the worker-wide guidance
+under the worker's home directory, and the consumed local registration handoff.
+`manage-worker.sh` owns the surrounding provider, Tailscale, firewall, Docker,
+monitoring, SSH-hardening, verification, and retirement lifecycle.
 
-The existing **Terminal Relay Worker 1** predates this flow and remains supported
-unchanged. For session-runtime updates or manual guidance synchronization on
-that worker, see `Server/README.md`.
+Both dedicated workers use this bootstrap and recovery flow. For a helper-only
+repair or manual guidance synchronization, see `Server/README.md`.
 
 When a project is added, Terminal Relay uses the Mac's authenticated `gh` CLI to create or inspect the repository. It generates a dedicated deploy key on the selected worker, grants that key access only to the selected repository, and clones into `/workspace/<repository-name>`. The private key never leaves the worker, the GitHub credential never leaves the Mac, and no credential is stored in the project record or Git remote URL.
 
@@ -151,7 +194,7 @@ example `~/.codex/sessions` and `~/.claude/projects`) to survive. It does not
 restore a conversation from OpenAI or Anthropic after disk or host loss; those
 directories need a separate encrypted off-worker backup for that case.
 
-For a manually managed worker, test and install the current helper with:
+For a helper-only worker repair, test and install the current helper with:
 
 ```bash
 ./Server/Tests/terminal-relay-session-tests.sh

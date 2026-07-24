@@ -1,0 +1,10 @@
+[Unit]
+Description=Update Terminal Relay agent CLIs
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/terminal-relay-agent-update
+PrivateTmp=true
+UMask=0022

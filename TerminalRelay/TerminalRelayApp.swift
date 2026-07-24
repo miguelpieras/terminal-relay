@@ -68,7 +68,7 @@ final class TerminalRelayApplicationDelegate: NSObject, NSApplicationDelegate {
         do {
             let registration = try WorkerRegistrationURL.registration(from: url)
             try registrationAuthorization(registration)
-            serverStore.save(registration.profile)
+            serverStore.register(registration.profile)
             projectStore.updateServers(serverStore.servers)
         } catch {
             let message = (error as? LocalizedError)?.errorDescription

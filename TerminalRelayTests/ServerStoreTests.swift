@@ -119,6 +119,39 @@ final class ServerStoreTests: XCTestCase {
         XCTAssertNotNil(store.server(id: importedID))
     }
 
+    func testAuthorizedNumericRegistrationUpdatesLegacySlotWithoutChangingLocalIdentity() throws {
+        let suiteName = "TerminalRelayTests.ServerStore.LegacyRegistration.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let legacyID = UUID()
+        let serverID = UUID()
+        let legacy = ServerProfile(
+            id: legacyID,
+            name: "Terminal Relay Worker 1",
+            host: "old-route"
+        )
+        let store = ServerStore(defaults: defaults, initialServers: [legacy])
+        let registration = try WorkerRegistrationURL.registration(
+            from: registrationURL(
+                id: serverID,
+                name: "Terminal Relay Worker 1",
+                host: "terminal-relay-worker-1",
+                identity: "/Users/miguel/.ssh/hetzner_key"
+            )
+        ).profile
+
+        store.register(registration)
+
+        XCTAssertEqual(store.servers.count, 1)
+        XCTAssertEqual(store.servers[0].id, legacyID)
+        XCTAssertEqual(store.servers[0].host, "terminal-relay-worker-1")
+        XCTAssertEqual(
+            store.servers[0].identityFile,
+            "/Users/miguel/.ssh/hetzner_key"
+        )
+    }
+
     private func registrationURL(
         id: UUID,
         name: String? = nil,

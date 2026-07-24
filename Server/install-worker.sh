@@ -1,6 +1,15 @@
 #!/bin/bash
 set -euo pipefail
 
+script_directory="$(cd "$(dirname "$0")" && pwd -P)"
+baseline_file="$script_directory/worker-baseline.env"
+[[ -f "$baseline_file" && ! -L "$baseline_file" ]] || {
+    printf '[terminal-relay] ERROR: Missing or unsafe worker baseline: %s\n' "$baseline_file" >&2
+    exit 1
+}
+# shellcheck disable=SC1090
+. "$baseline_file"
+
 readonly installer_version="terminal-relay-worker-v1"
 readonly runtime_user="terminal-relay"
 readonly runtime_group="terminal-relay"
@@ -14,6 +23,10 @@ readonly workspace_directory="/workspace"
 readonly launcher_destination="/usr/local/bin/terminal-relay-session"
 readonly restore_unit_destination="/etc/systemd/system/terminal-relay-session-restore@.service"
 readonly restore_service="terminal-relay-session-restore@$runtime_user.service"
+readonly agent_update_destination="/usr/local/sbin/terminal-relay-agent-update"
+readonly agent_update_service_destination="/etc/systemd/system/terminal-relay-agent-update.service"
+readonly agent_update_timer_destination="/etc/systemd/system/terminal-relay-agent-update.timer"
+readonly agent_update_timer="terminal-relay-agent-update.timer"
 readonly codex_destination="/usr/bin/codex"
 readonly claude_destination="/usr/bin/claude"
 readonly codex_root="/opt/terminal-relay"
@@ -23,16 +36,18 @@ readonly claude_key_destination="/etc/apt/keyrings/claude-code.asc"
 readonly claude_source_destination="/etc/apt/sources.list.d/claude-code.list"
 readonly claude_key_url="https://downloads.claude.ai/keys/claude-code.asc"
 readonly claude_key_fingerprint="31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE"
-readonly claude_repository="deb [signed-by=/etc/apt/keyrings/claude-code.asc] https://downloads.claude.ai/claude-code/apt/stable stable main"
+readonly claude_repository="deb [signed-by=/etc/apt/keyrings/claude-code.asc] https://downloads.claude.ai/claude-code/apt/latest latest main"
 readonly bwrap_profile_source="/usr/share/apparmor/extra-profiles/bwrap-userns-restrict"
 readonly bwrap_profile_destination="/etc/apparmor.d/bwrap-userns-restrict"
 readonly codex_installer_url="https://chatgpt.com/codex/install.sh"
-readonly CODEX_RELEASE="${CODEX_RELEASE:-latest}"
+readonly CODEX_RELEASE="latest"
 readonly minimum_memory_kib=3900000
 
-script_directory="$(cd "$(dirname "$0")" && pwd -P)"
 launcher_source="$script_directory/terminal-relay-session"
 restore_unit_source="$script_directory/terminal-relay-session-restore@.service"
+agent_update_source="$script_directory/terminal-relay-agent-update"
+agent_update_service_source="$script_directory/terminal-relay-agent-update.service"
+agent_update_timer_source="$script_directory/terminal-relay-agent-update.timer"
 worker_config_directory="$script_directory/worker-config"
 backup_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 temporary_directory=""
@@ -42,11 +57,15 @@ worker_id=""
 worker_short_id=""
 worker_name=""
 worker_hostname=""
+requested_worker_number=""
 original_hostname=""
 hostname_was_changed=false
 restore_service_initial_enabled=false
 restore_service_initial_active=false
 restore_service_touched=false
+agent_update_timer_initial_enabled=false
+agent_update_timer_initial_active=false
+agent_update_timer_touched=false
 
 declare -a rollback_destinations=()
 declare -a rollback_backups=()
@@ -191,6 +210,22 @@ rollback_restore_service() {
     fi
 }
 
+rollback_agent_update_timer() {
+    [[ "$agent_update_timer_touched" == true ]] || return 0
+
+    /usr/bin/systemctl stop "$agent_update_timer" >/dev/null 2>&1 || true
+    if [[ "$agent_update_timer_initial_enabled" != true ]]; then
+        /usr/bin/systemctl disable "$agent_update_timer" >/dev/null 2>&1 || true
+    fi
+    /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
+    if [[ "$agent_update_timer_initial_enabled" == true ]]; then
+        /usr/bin/systemctl enable "$agent_update_timer" >/dev/null 2>&1 || true
+    fi
+    if [[ "$agent_update_timer_initial_active" == true ]]; then
+        /usr/bin/systemctl start "$agent_update_timer" >/dev/null 2>&1 || true
+    fi
+}
+
 cleanup() {
     local exit_code=$?
     local temporary_parent
@@ -201,8 +236,12 @@ cleanup() {
         if [[ "$restore_service_touched" == true ]]; then
             /usr/bin/systemctl stop "$restore_service" >/dev/null 2>&1 || true
         fi
+        if [[ "$agent_update_timer_touched" == true ]]; then
+            /usr/bin/systemctl stop "$agent_update_timer" >/dev/null 2>&1 || true
+        fi
         rollback_managed_files || true
         rollback_restore_service || true
+        rollback_agent_update_timer || true
         if [[ "$hostname_was_changed" == true && -n "$original_hostname" ]]; then
             if /bin/hostname "$original_hostname" 2>/dev/null; then
                 log "Restored live hostname after installation failure."
@@ -234,6 +273,10 @@ validate_source_bundle() {
     for required_file in \
         "$launcher_source" \
         "$restore_unit_source" \
+        "$agent_update_source" \
+        "$agent_update_service_source" \
+        "$agent_update_timer_source" \
+        "$baseline_file" \
         "$worker_config_directory/install.sh" \
         "$worker_config_directory/AGENTS.md" \
         "$worker_config_directory/CLAUDE.md"; do
@@ -409,6 +452,9 @@ validate_managed_state() {
         for entry in \
             "$launcher_destination" \
             "$restore_unit_destination" \
+            "$agent_update_destination" \
+            "$agent_update_service_destination" \
+            "$agent_update_timer_destination" \
             "$codex_destination" \
             "$claude_destination" \
             "$codex_root" \
@@ -433,6 +479,9 @@ validate_managed_state() {
         for entry in \
             "$launcher_destination" \
             "$restore_unit_destination" \
+            "$agent_update_destination" \
+            "$agent_update_service_destination" \
+            "$agent_update_timer_destination" \
             "$codex_destination" \
             "$claude_destination" \
             "$claude_key_destination" \
@@ -484,6 +533,8 @@ write_state_file() {
 
 initialize_identity() {
     local initial_hostname
+    local existing_worker_name
+    local requested_worker_name
 
     /usr/bin/install -d -o root -g root -m 0755 "$state_directory"
     if [[ ! -f "$version_file" ]]; then
@@ -519,12 +570,27 @@ initialize_identity() {
         fi
         write_state_file "$display_name_file" "$worker_name"
     fi
+    if [[ -n "$requested_worker_number" ]]; then
+        requested_worker_name="Terminal Relay Worker $requested_worker_number"
+        if [[ "$worker_name" != "$requested_worker_name" ]]; then
+            existing_worker_name="Terminal Relay Worker $worker_short_id"
+            [[ "$worker_name" == "$existing_worker_name" ]] \
+                || fail "Refusing to renumber an existing numeric worker from '$worker_name' to '$requested_worker_name'."
+            worker_name="$requested_worker_name"
+            write_state_file "$display_name_file" "$worker_name"
+            log "Assigned the stable friendly identity $worker_name."
+        fi
+    fi
     is_valid_worker_name "$worker_name" \
         || fail "Invalid persisted worker display name in $display_name_file."
     [[ "$(/usr/bin/wc -c < "$display_name_file" | tr -d '[:space:]')" \
         == "$(( ${#worker_name} + 1 ))" ]] \
         || fail "Worker display name file contains unexpected data."
-    worker_hostname="terminal-relay-worker-$worker_short_id"
+    if [[ -n "$requested_worker_number" ]]; then
+        worker_hostname="terminal-relay-worker-$requested_worker_number"
+    else
+        worker_hostname="terminal-relay-worker-$worker_short_id"
+    fi
 }
 
 validate_or_create_runtime_user() {
@@ -660,9 +726,14 @@ install_claude() {
     local key_file="$temporary_directory/claude-code.asc"
     local source_file="$temporary_directory/claude-code.list"
     local actual_fingerprint
-    local -a apt_install_arguments=(-y --no-install-recommends)
+    local -a apt_install_arguments=(
+        -y
+        --no-install-recommends
+        --allow-downgrades
+        --allow-change-held-packages
+    )
 
-    log "Installing Claude Code from the official signed stable apt channel."
+    log "Installing current Claude Code from the official signed latest apt channel."
     /usr/bin/curl --proto '=https' --tlsv1.2 -fsSL -o "$key_file" "$claude_key_url"
     actual_fingerprint="$(/usr/bin/gpg --batch --show-keys --with-colons "$key_file" \
         | /usr/bin/awk -F: '$1 == "fpr" { print toupper($10); exit }')"
@@ -679,6 +750,7 @@ install_claude() {
         apt_install_arguments+=(--reinstall)
         log "Repairing the installed Claude Code package because its command is unavailable."
     fi
+    /usr/bin/apt-mark unhold claude-code >/dev/null 2>&1 || true
     /usr/bin/apt-get install "${apt_install_arguments[@]}" claude-code
     [[ -x "$claude_destination" ]] || fail "Claude package did not create $claude_destination."
     /usr/bin/dpkg-query -S "$claude_destination" | /bin/grep -q '^claude-code:' \
@@ -713,6 +785,9 @@ install_runtime_files() {
     /usr/bin/install -d -o "$runtime_user" -g "$runtime_group" -m 0750 "$workspace_directory"
     install_managed_file "$launcher_source" "$launcher_destination" 755
     install_managed_file "$restore_unit_source" "$restore_unit_destination" 644
+    install_managed_file "$agent_update_source" "$agent_update_destination" 755
+    install_managed_file "$agent_update_service_source" "$agent_update_service_destination" 644
+    install_managed_file "$agent_update_timer_source" "$agent_update_timer_destination" 644
     prepare_worker_guidance "$worker_config_directory/AGENTS.md" "$runtime_home/AGENTS.md"
     prepare_worker_guidance "$worker_config_directory/CLAUDE.md" "$runtime_home/CLAUDE.md"
     prepare_worker_guidance "$worker_config_directory/AGENTS.md" "$runtime_home/.codex/AGENTS.md"
@@ -750,6 +825,26 @@ configure_restore_service() {
     if [[ "$restore_service_initial_active" != true ]]; then
         /usr/bin/systemctl start "$restore_service"
     fi
+}
+
+configure_agent_update_timer() {
+    if /usr/bin/systemctl is-enabled --quiet "$agent_update_timer" 2>/dev/null; then
+        agent_update_timer_initial_enabled=true
+    fi
+    if /usr/bin/systemctl is-active --quiet "$agent_update_timer" 2>/dev/null; then
+        agent_update_timer_initial_active=true
+    fi
+    agent_update_timer_touched=true
+
+    /usr/bin/systemd-analyze verify \
+        "$agent_update_service_destination" \
+        "$agent_update_timer_destination"
+    /usr/bin/systemctl enable --now "$agent_update_timer"
+}
+
+acquire_agent_update_lock() {
+    exec 9>/run/lock/terminal-relay-agent-update.lock
+    /usr/bin/flock 9
 }
 
 set_worker_hostname() {
@@ -799,10 +894,20 @@ verify_readiness() {
         || fail "Unexpected ownership or mode on $launcher_destination."
     [[ "$(/usr/bin/stat -c '%U:%G:%a' "$restore_unit_destination")" == "root:root:644" ]] \
         || fail "Unexpected ownership or mode on $restore_unit_destination."
+    [[ "$(/usr/bin/stat -c '%U:%G:%a' "$agent_update_destination")" == "root:root:755" ]] \
+        || fail "Unexpected ownership or mode on $agent_update_destination."
+    [[ "$(/usr/bin/stat -c '%U:%G:%a' "$agent_update_service_destination")" == "root:root:644" ]] \
+        || fail "Unexpected ownership or mode on $agent_update_service_destination."
+    [[ "$(/usr/bin/stat -c '%U:%G:%a' "$agent_update_timer_destination")" == "root:root:644" ]] \
+        || fail "Unexpected ownership or mode on $agent_update_timer_destination."
     /usr/bin/systemctl is-enabled --quiet "$restore_service" \
         || fail "$restore_service is not enabled."
     /usr/bin/systemctl is-active --quiet "$restore_service" \
         || fail "$restore_service is not active."
+    /usr/bin/systemctl is-enabled --quiet "$agent_update_timer" \
+        || fail "$agent_update_timer is not enabled."
+    /usr/bin/systemctl is-active --quiet "$agent_update_timer" \
+        || fail "$agent_update_timer is not active."
     [[ "$(/usr/bin/systemctl show -p User --value "$restore_service")" == "$runtime_user" ]] \
         || fail "$restore_service is not running as $runtime_user."
     [[ "$(/usr/bin/stat -c '%U:%G:%a' "$runtime_home/.ssh")" == "$runtime_user:$runtime_group:700" ]] \
@@ -849,7 +954,15 @@ verify_readiness() {
 
 main() {
     [[ "$EUID" -eq 0 ]] || fail "Run this installer as root."
-    [[ "$#" -eq 0 ]] || fail "This installer does not accept arguments."
+    if [[ "$#" -eq 0 ]]; then
+        requested_worker_number=""
+    elif [[ "$#" -eq 2 && "$1" == --worker-number ]]; then
+        requested_worker_number="$2"
+        [[ "$requested_worker_number" =~ ^[1-9][0-9]{0,5}$ ]] \
+            || fail "Worker number must be from 1 to 999999."
+    else
+        fail "Usage: install-worker.sh [--worker-number N]"
+    fi
     validate_source_bundle
     validate_platform
     validate_managed_state
@@ -860,10 +973,12 @@ main() {
     validate_or_create_runtime_user
     /usr/bin/install -d -o "$runtime_user" -g "$runtime_group" -m 0750 "$workspace_directory"
     install_dependencies
+    acquire_agent_update_lock
     install_codex
     install_claude
     install_runtime_files
     configure_restore_service
+    configure_agent_update_timer
     set_worker_hostname
     verify_readiness
 

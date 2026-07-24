@@ -1,0 +1,46 @@
+#!/bin/bash
+set -uo pipefail
+
+readonly lock_path="/run/lock/terminal-relay-agent-update.lock"
+readonly codex_home="/opt/terminal-relay/codex"
+readonly codex_install_directory="/usr/bin"
+
+log() {
+    printf '[terminal-relay-agent-update] %s\n' "$*"
+}
+
+exec 9>"$lock_path"
+if ! /usr/bin/flock -n 9; then
+    log "Another agent update is already running."
+    exit 0
+fi
+
+status=0
+
+log "Updating Claude Code from its signed apt channel."
+/usr/bin/apt-mark unhold claude-code >/dev/null 2>&1 || true
+if DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get update \
+    && DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install \
+        -y \
+        --no-install-recommends \
+        --only-upgrade \
+        claude-code; then
+    log "Claude Code is $(/usr/bin/claude --version | /usr/bin/awk '{ print $1; exit }')."
+else
+    log "Claude Code update failed."
+    status=1
+fi
+
+log "Updating Codex through its standalone self-updater."
+if /usr/bin/env \
+    CODEX_HOME="$codex_home" \
+    CODEX_INSTALL_DIR="$codex_install_directory" \
+    CODEX_NON_INTERACTIVE=1 \
+    /usr/bin/codex update; then
+    log "Codex is $(/usr/bin/codex --version | /usr/bin/awk '{ print $NF; exit }')."
+else
+    log "Codex update failed."
+    status=1
+fi
+
+exit "$status"
