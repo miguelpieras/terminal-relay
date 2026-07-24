@@ -1413,16 +1413,11 @@ private struct SidebarFolderRow: View {
     @State private var dropPosition: SidebarDropPosition?
 
     var body: some View {
-        HStack(spacing: 7) {
-            Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                .font(.system(size: 9, weight: .semibold))
-                .foregroundStyle(SidebarPalette.secondary)
-                .frame(width: 11)
-
+        HStack(spacing: SidebarRowGeometry.iconSpacing) {
             Image(systemName: isRoot ? "tray.full" : "folder.fill")
                 .font(.system(size: 12))
                 .foregroundStyle(SidebarPalette.secondary)
-                .frame(width: 14)
+                .frame(width: SidebarRowGeometry.iconFrameWidth)
 
             Text(title)
                 .font(.system(size: 12.5, weight: .medium))
@@ -1430,6 +1425,11 @@ private struct SidebarFolderRow: View {
                 .lineLimit(1)
 
             Spacer()
+
+            Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(SidebarPalette.secondary)
+                .frame(width: 11)
         }
         .padding(.horizontal, SidebarRowGeometry.contentLeadingPadding)
         .frame(height: 30)
