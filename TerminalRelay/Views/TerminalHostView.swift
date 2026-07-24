@@ -6,7 +6,12 @@ struct TerminalHostView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> LocalProcessTerminalView {
         session.startIfNeeded()
-        return session.terminalView
+        let terminalView = session.terminalView
+        DispatchQueue.main.async {
+            guard let window = terminalView.window else { return }
+            window.makeFirstResponder(terminalView)
+        }
+        return terminalView
     }
 
     func updateNSView(_ nsView: LocalProcessTerminalView, context: Context) {}

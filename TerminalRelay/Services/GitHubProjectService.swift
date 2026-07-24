@@ -673,13 +673,21 @@ enum Subprocess {
         let standardError: Data
     }
 
-    static func run(executable: URL, arguments: [String]) async throws -> Result {
+    static func run(
+        executable: URL,
+        arguments: [String],
+        standardInput: Data? = nil
+    ) async throws -> Result {
         try await Task.detached(priority: .userInitiated) {
             let fileManager = FileManager.default
             let outputURL = fileManager.temporaryDirectory
                 .appendingPathComponent("terminal-relay-output-\(UUID().uuidString)")
             let errorURL = fileManager.temporaryDirectory
                 .appendingPathComponent("terminal-relay-error-\(UUID().uuidString)")
+            let inputURL = standardInput.map { _ in
+                fileManager.temporaryDirectory
+                    .appendingPathComponent("terminal-relay-input-\(UUID().uuidString)")
+            }
 
             guard fileManager.createFile(
                 atPath: outputURL.path,
@@ -688,6 +696,10 @@ enum Subprocess {
             ), fileManager.createFile(
                 atPath: errorURL.path,
                 contents: nil,
+                attributes: [.posixPermissions: 0o600]
+            ), inputURL == nil || fileManager.createFile(
+                atPath: inputURL!.path,
+                contents: standardInput,
                 attributes: [.posixPermissions: 0o600]
             ) else {
                 throw GitHubProjectError.commandFailed(
@@ -698,18 +710,24 @@ enum Subprocess {
             defer {
                 try? fileManager.removeItem(at: outputURL)
                 try? fileManager.removeItem(at: errorURL)
+                if let inputURL {
+                    try? fileManager.removeItem(at: inputURL)
+                }
             }
 
             let outputHandle = try FileHandle(forWritingTo: outputURL)
             let errorHandle = try FileHandle(forWritingTo: errorURL)
+            let inputHandle = try inputURL.map(FileHandle.init(forReadingFrom:))
             defer {
                 try? outputHandle.close()
                 try? errorHandle.close()
+                try? inputHandle?.close()
             }
 
             let process = Process()
             process.executableURL = executable
             process.arguments = arguments
+            process.standardInput = inputHandle
             process.standardOutput = outputHandle
             process.standardError = errorHandle
             try process.run()

@@ -1394,6 +1394,13 @@ private struct TerminalPane: View {
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
                 }
             }
+
+            Divider()
+
+            AgentComposerView(
+                session: session,
+                worker: worker
+            )
         }
         .alert("Stop \(session.kind.displayName) agent?", isPresented: $isConfirmingStop) {
             Button("Cancel", role: .cancel) {}

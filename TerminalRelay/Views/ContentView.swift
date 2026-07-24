@@ -940,12 +940,14 @@ private struct ProjectSessionRow: View {
 
             Spacer(minLength: 5)
 
-            sessionStatusIndicator
-                .frame(width: 12, height: 12)
-                .help(sessionStateLabel)
-                .accessibilityLabel(
-                    "\(session.kind.displayName), \(sessionStateLabel.lowercased())"
-                )
+            if session.isWorking {
+                ProgressView()
+                    .controlSize(.mini)
+                    .tint(SidebarPalette.secondary)
+                    .frame(width: 12, height: 12)
+                    .help("Working")
+                    .accessibilityLabel("\(session.kind.displayName), working")
+            }
         }
         .padding(.leading, 18)
         .padding(.trailing, 8)
@@ -959,6 +961,7 @@ private struct ProjectSessionRow: View {
         .padding(.horizontal, 10)
         .contentShape(Rectangle())
         .onHover { isHovering = $0 }
+        .accessibilityLabel("\(session.displayTitle), \(sessionStateLabel.lowercased())")
     }
 
     private var sessionStateLabel: String {
@@ -967,27 +970,4 @@ private struct ProjectSessionRow: View {
         return session.status.label
     }
 
-    @ViewBuilder
-    private var sessionStatusIndicator: some View {
-        if session.isWorking || session.status == .connecting || session.status == .stopping {
-            ProgressView()
-                .controlSize(.mini)
-                .tint(SidebarPalette.secondary)
-        } else {
-            Circle()
-                .fill(session.status == .running ? session.kind.tint : Color.clear)
-                .overlay {
-                    Circle()
-                        .stroke(
-                            session.status == .remoteRunning
-                                ? session.kind.tint
-                                : (session.status == .running
-                                    ? Color.clear
-                                    : SidebarPalette.secondary),
-                            lineWidth: 1
-                        )
-                }
-                .frame(width: 6, height: 6)
-        }
-    }
 }

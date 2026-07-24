@@ -229,6 +229,51 @@ final class SSHCommandBuilderTests: XCTestCase {
         XCTAssertFalse(configuration.arguments.contains("-tt"))
     }
 
+    func testAttachmentUploadUsesPrivateSessionDirectoryAndStandardSSHOptions() throws {
+        let server = makeServer(port: 2_222, identityFile: "~/Keys/agent key")
+        let configuration = SSHCommandBuilder.attachmentUploadConfiguration(
+            for: server,
+            instanceToken: instanceToken,
+            fileName: "clipboard.png"
+        )
+        let remoteCommand = try XCTUnwrap(configuration.arguments.last)
+
+        XCTAssertEqual(configuration.executable, "/usr/bin/ssh")
+        XCTAssertEqual(
+            configuration.arguments.dropLast(),
+            [
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=5",
+                "-o", "ServerAliveInterval=30",
+                "-o", "ServerAliveCountMax=3",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-p", "2222",
+                "-i", ("~/Keys/agent key" as NSString).expandingTildeInPath,
+                "--",
+                server.destination
+            ]
+        )
+        XCTAssertTrue(remoteCommand.hasPrefix("'/bin/sh' '-c' "))
+        XCTAssertTrue(remoteCommand.contains(".terminal-relay/attachments/\(instanceToken)"))
+        XCTAssertTrue(remoteCommand.contains("clipboard.png"))
+        XCTAssertTrue(remoteCommand.contains("umask 077"))
+        XCTAssertFalse(configuration.arguments.contains("-tt"))
+    }
+
+    func testSubprocessCanStreamStandardInput() async throws {
+        let input = Data("clipboard image bytes".utf8)
+
+        let result = try await Subprocess.run(
+            executable: URL(fileURLWithPath: "/bin/cat"),
+            arguments: [],
+            standardInput: input
+        )
+
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertEqual(result.standardOutput, input)
+        XCTAssertTrue(result.standardError.isEmpty)
+    }
+
     func testShellQuoteProtectsSingleQuotes() {
         XCTAssertEqual(SSHCommandBuilder.shellQuote("plain text"), "'plain text'")
         XCTAssertEqual(SSHCommandBuilder.shellQuote("it's safe"), "'it'\"'\"'s safe'")

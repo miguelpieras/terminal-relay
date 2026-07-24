@@ -96,6 +96,26 @@ enum SSHCommandBuilder {
         )
     }
 
+    static func attachmentUploadConfiguration(
+        for server: ServerProfile,
+        instanceToken: String,
+        fileName: String
+    ) -> SSHLaunchConfiguration {
+        let script = """
+        set -eu
+        umask 077
+        attachment_directory="${HOME:?}/.terminal-relay/attachments/\(instanceToken)"
+        attachment_path="$attachment_directory/\(fileName)"
+        mkdir -p -- "$attachment_directory"
+        cat > "$attachment_path"
+        printf '%s' "$attachment_path"
+        """
+        let remoteCommand = ["/bin/sh", "-c", script]
+            .map(shellQuote)
+            .joined(separator: " ")
+        return batchConfiguration(for: server, remoteCommand: remoteCommand)
+    }
+
     static func shellQuote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
     }
@@ -104,6 +124,20 @@ enum SSHCommandBuilder {
         for server: ServerProfile,
         arguments remoteArguments: [String],
         environment: [String] = []
+    ) -> SSHLaunchConfiguration {
+        let remoteCommand = (
+            (environment.isEmpty ? [] : ["/usr/bin/env"] + environment)
+                + [WorkerSessionProtocol.helperPath]
+                + remoteArguments
+        )
+            .map(shellQuote)
+            .joined(separator: " ")
+        return batchConfiguration(for: server, remoteCommand: remoteCommand)
+    }
+
+    private static func batchConfiguration(
+        for server: ServerProfile,
+        remoteCommand: String
     ) -> SSHLaunchConfiguration {
         var arguments = [
             "-o", "BatchMode=yes",
@@ -124,13 +158,6 @@ enum SSHCommandBuilder {
 
         arguments.append("--")
         arguments.append(server.destination)
-        let remoteCommand = (
-            (environment.isEmpty ? [] : ["/usr/bin/env"] + environment)
-                + [WorkerSessionProtocol.helperPath]
-                + remoteArguments
-        )
-            .map(shellQuote)
-            .joined(separator: " ")
         arguments.append(remoteCommand)
 
         return SSHLaunchConfiguration(executable: "/usr/bin/ssh", arguments: arguments)

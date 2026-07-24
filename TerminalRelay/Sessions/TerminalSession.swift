@@ -86,6 +86,17 @@ private func displayableTerminalTitle(_ title: String) -> String? {
     return normalizedTitle
 }
 
+private func displayableClaudeTerminalTitle(_ title: String) -> String? {
+    var normalizedTitle = normalizedTerminalTitle(title)
+    let activityGlyphs = Set("*✢✣✤✥✦✧✳✶✻✽")
+
+    while let first = normalizedTitle.first, activityGlyphs.contains(first) {
+        normalizedTitle.removeFirst()
+        normalizedTitle = normalizedTitle.trimmingCharacters(in: .whitespaces)
+    }
+    return displayableTerminalTitle(normalizedTitle)
+}
+
 private func progressReport(fromOSC9Payload payload: ArraySlice<UInt8>) -> Terminal.ProgressReport? {
     guard let text = String(bytes: payload, encoding: .ascii) else { return nil }
 
@@ -258,6 +269,29 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         }
     }
 
+    func sendPrompt(_ prompt: String) {
+        guard status == .running, !prompt.isEmpty else { return }
+        terminalView.send(txt: "\u{1B}[200~\(prompt)\u{1B}[201~\r")
+    }
+
+    func sendCommand(_ command: String, focusesTerminal: Bool = false) {
+        guard status == .running, !command.isEmpty else { return }
+        terminalView.send(txt: "\(command)\r")
+        if focusesTerminal {
+            focusTerminal()
+        }
+    }
+
+    func interrupt() {
+        guard status == .running else { return }
+        terminalView.send([0x1B])
+    }
+
+    func focusTerminal() {
+        guard let window = terminalView.window else { return }
+        window.makeFirstResponder(terminalView)
+    }
+
     private var isExited: Bool {
         if case .exited = status { return true }
         return false
@@ -418,7 +452,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
                 terminalTitle = parsedTitle
             }
             titleIndicatesWorking = parsedTitle.isWorking
-        } else if let displayableTitle = displayableTerminalTitle(title) {
+        } else if let displayableTitle = displayableClaudeTerminalTitle(title) {
             terminalTitle = displayableTitle
         }
         updateWorkingState()

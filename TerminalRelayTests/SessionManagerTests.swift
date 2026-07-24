@@ -192,6 +192,27 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(session.displayTitle, "Review release topology")
     }
 
+    func testClaudeDisplayTitleRemovesActivityGlyph() async {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let manager = SessionManager()
+        let session = manager.open(
+            project: project,
+            on: server,
+            kind: .claude,
+            launchDefaults: .standard
+        ).localSession!
+
+        session.setTerminalTitle(
+            source: session.terminalView,
+            title: "✳ Claude Code"
+        )
+        await Task.yield()
+
+        XCTAssertEqual(session.displayTitle, "Claude Code")
+        XCTAssertFalse(session.isWorking)
+    }
+
     func testCodexTerminalTitleTracksWorkingStateWithoutChangingTheChatTitle() async {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let project = makeProject(name: "Terminal Relay", server: server)

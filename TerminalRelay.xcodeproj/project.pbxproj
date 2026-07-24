@@ -28,6 +28,7 @@
 		354AC532DA7ABB9688F98244 /* ServerProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1A2A3C58843B9F9BBDF0B62 /* ServerProfile.swift */; };
 		3F0C3E4D664E8C88BC474F21 /* WorkerMetricsService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0678D0C9803DB05DEFD31A0 /* WorkerMetricsService.swift */; };
 		41518A6B6C29B1CC91B48A43 /* WorkerManagementView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3B1A41DF226105884B36B97 /* WorkerManagementView.swift */; };
+		48382C6268D1E654DDD75B5E /* AgentAttachmentService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51049327A7B10937117459C3 /* AgentAttachmentService.swift */; };
 		4CDD21635AE31893E2FBD28C /* WorkerSessionModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5064842EB86544CB74E12A08 /* WorkerSessionModel.swift */; };
 		4E043EF2DA8AC4358489FE32 /* WorkerRemoteCommand.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A7640C32046044EFC9BE2E /* WorkerRemoteCommand.swift */; };
 		4F01464136D32A3DD20E7ED5 /* WorkerRemoteCommandTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C960F483C9C9B2DA0E97774D /* WorkerRemoteCommandTests.swift */; };
@@ -41,6 +42,7 @@
 		643FB349DC4C4DF21D981030 /* SSHTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00575E9F28F8065673E390D8 /* SSHTransport.swift */; };
 		6DC711689B3A23294963F406 /* TerminalRelayApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0A02BB8092DDF8AED8C6F603 /* TerminalRelayApp.swift */; };
 		6E6A403E6EF7AD583D6EF0A1 /* NIOPosix in Frameworks */ = {isa = PBXBuildFile; productRef = DFCE7DA6948B7424BFC5FCC0 /* NIOPosix */; };
+		70BD78901DA62D88A22DA652 /* AgentComposerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8DE041333DC98C45376F585A /* AgentComposerView.swift */; };
 		70C95D75AC809406ECF764AF /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 63A21456BA43EC66EE90B037 /* Assets.xcassets */; };
 		7176098820B3653E154BB020 /* WorkerMetricsServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3E452EE1DE95DB629F3FFB13 /* WorkerMetricsServiceTests.swift */; };
 		74E7BBE2E5DE43DB6016A4AB /* WorkerProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 564D16B412E4E650C5D4DB1C /* WorkerProfile.swift */; };
@@ -118,6 +120,7 @@
 		3E452EE1DE95DB629F3FFB13 /* WorkerMetricsServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerMetricsServiceTests.swift; sourceTree = "<group>"; };
 		4A206B67C5A2B0B64D46F4A2 /* RelayTerminalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayTerminalView.swift; sourceTree = "<group>"; };
 		5064842EB86544CB74E12A08 /* WorkerSessionModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerSessionModel.swift; sourceTree = "<group>"; };
+		51049327A7B10937117459C3 /* AgentAttachmentService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentAttachmentService.swift; sourceTree = "<group>"; };
 		5161546B08D86620C7D1B9A1 /* AccountAuthenticationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountAuthenticationView.swift; sourceTree = "<group>"; };
 		564D16B412E4E650C5D4DB1C /* WorkerProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerProfile.swift; sourceTree = "<group>"; };
 		5D234BB37623139880A1137F /* TerminalRelayIOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = TerminalRelayIOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -135,6 +138,7 @@
 		7DC204D99814E9F11DA7D053 /* SessionSlotRegistryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionSlotRegistryTests.swift; sourceTree = "<group>"; };
 		865E323F9872A2B96FD0A247 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		86CC14D081ABBDBDC564291F /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		8DE041333DC98C45376F585A /* AgentComposerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentComposerView.swift; sourceTree = "<group>"; };
 		93E0F148244B4D209F63EB35 /* ServerStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerStore.swift; sourceTree = "<group>"; };
 		95F329024A646D63DF51C026 /* AgentKind.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentKind.swift; sourceTree = "<group>"; };
 		97DEABBF57F733EA24665AE8 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
@@ -246,6 +250,7 @@
 			children = (
 				273C71F1BE8EDFC5433EB578 /* AccountAuthenticationService.swift */,
 				A102C8E7164EE18CC3FDF9AD /* AccountUsageService.swift */,
+				51049327A7B10937117459C3 /* AgentAttachmentService.swift */,
 				BCB0B7C502410EF96FA04410 /* GitHubProjectService.swift */,
 				E162AC5ABBC627C51BD1D70A /* ProjectGitService.swift */,
 				9A9FBF0D79F64B491FF61EA8 /* ProjectStore.swift */,
@@ -289,6 +294,7 @@
 			children = (
 				5161546B08D86620C7D1B9A1 /* AccountAuthenticationView.swift */,
 				6B5726E0516AF1EBD1B801ED /* AgentBrandIcon.swift */,
+				8DE041333DC98C45376F585A /* AgentComposerView.swift */,
 				5EC9ECCFD1C5FE64E51E46B2 /* AgentDefaultsView.swift */,
 				F2459D0DFD20B6A437841971 /* AgentKindStyle.swift */,
 				865E323F9872A2B96FD0A247 /* ContentView.swift */,
@@ -541,7 +547,9 @@
 				FBBC4D4AF4F128602EFD9112 /* AccountAuthenticationService.swift in Sources */,
 				0B655D83254E99E09A67371B /* AccountAuthenticationView.swift in Sources */,
 				792F8E347226F81E6C0264D9 /* AccountUsageService.swift in Sources */,
+				48382C6268D1E654DDD75B5E /* AgentAttachmentService.swift in Sources */,
 				084B8CA06CDB2012759B2CBB /* AgentBrandIcon.swift in Sources */,
+				70BD78901DA62D88A22DA652 /* AgentComposerView.swift in Sources */,
 				4F7EDC395EECB2A7942F567D /* AgentDefaultsView.swift in Sources */,
 				5826EAA6E50EE377AF85D994 /* AgentKind.swift in Sources */,
 				C311EC4FEDD437AEBA03C467 /* AgentKindStyle.swift in Sources */,
