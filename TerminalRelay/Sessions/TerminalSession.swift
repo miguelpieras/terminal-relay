@@ -287,7 +287,15 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
 
     func interrupt() {
         guard status == .running else { return }
-        terminalView.send([0x1B])
+        sendEscape()
+        DispatchQueue.main.async { [weak self] in
+            self?.sendEscape()
+        }
+    }
+
+    func sendEscape() {
+        guard status == .running else { return }
+        terminalView.doCommand(by: #selector(NSResponder.cancelOperation(_:)))
     }
 
     func focusTerminal() {

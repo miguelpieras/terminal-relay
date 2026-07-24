@@ -15,10 +15,16 @@ struct AgentComposerView: View {
     private var claudeModel = AgentLaunchDefaults.standard.claudeModel
     @AppStorage(AgentLaunchDefaults.StorageKey.claudeReasoningEffort)
     private var claudeReasoningEffort = AgentLaunchDefaults.standard.claudeReasoningEffort
+    @AppStorage("agentComposer.codexFastModeEnabled")
+    private var codexFastModeEnabled = false
 
     @State private var draft = ""
     @State private var attachments: [ComposerAttachment] = []
     @State private var pasteNotice: String?
+    @State private var isEditorFocused = false
+    @State private var isShowingModelPanel = false
+    @State private var isAdvancedExpanded = true
+    @State private var isSelectingSpeed = false
 
     private var canSend: Bool {
         session.status == .running
@@ -33,14 +39,17 @@ struct AgentComposerView: View {
                 PromptEditor(
                     text: $draft,
                     onSubmit: send,
-                    onPasteImages: addImages
+                    onPasteImages: addImages,
+                    onEscape: session.sendEscape,
+                    onFocusChange: { isEditorFocused = $0 }
                 )
 
-                if draft.isEmpty {
+                if draft.isEmpty, !isEditorFocused {
                     Text("Do anything")
                         .font(.system(size: 16))
                         .foregroundStyle(.tertiary)
-                        .padding(.top, 1)
+                        .padding(.leading, 10)
+                        .padding(.top, 7)
                         .allowsHitTesting(false)
                 }
             }
@@ -113,6 +122,9 @@ struct AgentComposerView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
         .background(Color(red: 0.071, green: 0.071, blue: 0.078))
+        .onExitCommand {
+            session.sendEscape()
+        }
     }
 
     private var attachmentStrip: some View {
@@ -211,60 +223,254 @@ struct AgentComposerView: View {
     }
 
     private var modelControls: some View {
-        Menu {
-            if session.kind == .claude {
-                Section("Model") {
-                    ForEach(["fable", "opus", "sonnet"], id: \.self) { model in
-                        Button {
-                            claudeModel = model
-                            sendCommand("/model \(model)")
-                        } label: {
-                            if claudeModel == model {
-                                Label(model.capitalized, systemImage: "checkmark")
-                            } else {
-                                Text(model.capitalized)
-                            }
-                        }
-                    }
-                }
-
-                Section("Reasoning effort") {
-                    ForEach(AgentReasoningEffort.allCases) { effort in
-                        Button {
-                            claudeReasoningEffort = effort
-                            sendCommand("/effort \(effort.rawValue)")
-                        } label: {
-                            if claudeReasoningEffort == effort {
-                                Label(effort.displayName, systemImage: "checkmark")
-                            } else {
-                                Text(effort.displayName)
-                            }
-                        }
-                    }
-                }
-            } else {
-                Button("Change model or reasoning…") {
-                    session.sendCommand("/model", focusesTerminal: true)
-                }
+        Button {
+            withAnimation(.easeOut(duration: 0.14)) {
+                isShowingModelPanel.toggle()
+                isSelectingSpeed = false
             }
         } label: {
+            ZStack {
+                (
+                    Text(modelDisplayName)
+                        .foregroundColor(.primary)
+                    + Text(" \(selectedReasoningEffort.displayName.capitalized)")
+                        .foregroundColor(.secondary)
+                )
+                .font(.system(size: 15))
+                .lineLimit(1)
+
+                HStack {
+                    Spacer()
+                    Image(systemName: isShowingModelPanel ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.trailing, 14)
+            }
+            .frame(width: 225, height: 44)
+            .background(
+                Color.white.opacity(isShowingModelPanel ? 0.1 : 0),
+                in: Capsule()
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(session.status != .running)
+        .help("Change \(session.kind.displayName) model or reasoning effort")
+        .overlay(alignment: .bottomTrailing) {
+            if isShowingModelPanel {
+                modelSelectionPanel
+                    .offset(y: -58)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+                    .zIndex(20)
+            }
+        }
+        .zIndex(20)
+    }
+
+    private var modelSelectionPanel: some View {
+        VStack(spacing: 0) {
+            if isSelectingSpeed {
+                Button {
+                    withAnimation(.easeOut(duration: 0.14)) {
+                        isSelectingSpeed = false
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text("Speed")
+                        Spacer()
+                    }
+                    .font(.system(size: 15))
+                    .frame(height: 48)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
+                speedChoice(title: "Standard", isSelected: !codexFastModeEnabled) {
+                    setCodexFastMode(false)
+                }
+
+                speedChoice(title: "Fast", isSelected: codexFastModeEnabled) {
+                    setCodexFastMode(true)
+                }
+            } else {
+                if isAdvancedExpanded {
+                    panelModelControl
+                    panelEffortControl
+                    panelSpeedControl
+
+                    Divider()
+                        .overlay(Color.white.opacity(0.08))
+                }
+
+                Button {
+                    withAnimation(.easeOut(duration: 0.14)) {
+                        isAdvancedExpanded.toggle()
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        Text("Advanced")
+                        Image(systemName: isAdvancedExpanded ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 11, weight: .semibold))
+                        Spacer()
+                    }
+                    .font(.system(size: 15))
+                    .foregroundStyle(.secondary)
+                    .frame(height: 48)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .frame(width: 225)
+        .background(
+            Color(red: 0.165, green: 0.165, blue: 0.165),
+            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.white.opacity(0.16), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.28), radius: 18, y: 8)
+    }
+
+    @ViewBuilder
+    private var panelModelControl: some View {
+        if session.kind == .claude {
+            Menu {
+                ForEach(["fable", "opus", "sonnet"], id: \.self) { model in
+                    Button {
+                        claudeModel = model
+                        sendCommand("/model \(model)")
+                    } label: {
+                        if claudeModel == model {
+                            Label(model.capitalized, systemImage: "checkmark")
+                        } else {
+                            Text(model.capitalized)
+                        }
+                    }
+                }
+            } label: {
+                panelRow(title: "Model", value: modelDisplayName)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+        } else {
+            Button {
+                isShowingModelPanel = false
+                session.sendCommand("/model", focusesTerminal: true)
+            } label: {
+                panelRow(title: "Model", value: modelDisplayName)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    @ViewBuilder
+    private var panelEffortControl: some View {
+        if session.kind == .claude {
+            Menu {
+                ForEach(AgentReasoningEffort.allCases) { effort in
+                    Button {
+                        claudeReasoningEffort = effort
+                        sendCommand("/effort \(effort.rawValue)")
+                    } label: {
+                        if claudeReasoningEffort == effort {
+                            Label(effort.displayName, systemImage: "checkmark")
+                        } else {
+                            Text(effort.displayName)
+                        }
+                    }
+                }
+            } label: {
+                panelRow(
+                    title: "Effort",
+                    value: selectedReasoningEffort.displayName.capitalized
+                )
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+        } else {
+            Button {
+                isShowingModelPanel = false
+                session.sendCommand("/model", focusesTerminal: true)
+            } label: {
+                panelRow(
+                    title: "Effort",
+                    value: selectedReasoningEffort.displayName.capitalized
+                )
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private var panelSpeedControl: some View {
+        Button {
+            if session.kind == .codex {
+                withAnimation(.easeOut(duration: 0.14)) {
+                    isSelectingSpeed = true
+                }
+            } else {
+                pasteNotice = "Speed control is available for Codex sessions."
+            }
+        } label: {
+            panelRow(
+                title: "Speed",
+                value: codexFastModeEnabled ? "Fast" : "Standard"
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func panelRow(title: String, value: String) -> some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .foregroundStyle(.primary)
+            Spacer()
             (
-                Text(modelDisplayName)
-                    .foregroundColor(.primary)
-                + Text(" \(selectedReasoningEffort.displayName.capitalized)  ")
+                Text(value)
                     .foregroundColor(.secondary)
-                + Text(Image(systemName: "chevron.down"))
+                + Text("  ")
+                + Text(Image(systemName: "chevron.right"))
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(.secondary)
             )
-            .font(.system(size: 15))
-            .lineLimit(1)
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .disabled(session.status != .running)
-        .help("Change \(session.kind.displayName) model or reasoning effort")
+        .font(.system(size: 15))
+        .frame(height: 48)
+        .contentShape(Rectangle())
+    }
+
+    private func setCodexFastMode(_ isEnabled: Bool) {
+        codexFastModeEnabled = isEnabled
+        sendCommand(isEnabled ? "/fast on" : "/fast off")
+        withAnimation(.easeOut(duration: 0.14)) {
+            isSelectingSpeed = false
+        }
+    }
+
+    private func speedChoice(
+        title: String,
+        isSelected: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack {
+                Text(title)
+                Spacer()
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+            }
+            .font(.system(size: 15))
+            .frame(height: 48)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     private var microphoneButton: some View {
@@ -429,6 +635,8 @@ private struct PromptEditor: NSViewRepresentable {
 
     let onSubmit: () -> Void
     let onPasteImages: ([ClipboardImage]) -> Void
+    let onEscape: () -> Void
+    let onFocusChange: (Bool) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(text: $text)
@@ -442,7 +650,7 @@ private struct PromptEditor: NSViewRepresentable {
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticTextReplacementEnabled = false
-        textView.font = .systemFont(ofSize: 14)
+        textView.font = .systemFont(ofSize: 16)
         textView.textContainerInset = NSSize(width: 5, height: 7)
         textView.minSize = NSSize(width: 0, height: 36)
         textView.maxSize = NSSize(
@@ -460,6 +668,8 @@ private struct PromptEditor: NSViewRepresentable {
         textView.string = text
         textView.onSubmit = onSubmit
         textView.onPasteImages = onPasteImages
+        textView.onEscape = onEscape
+        textView.onFocusChange = onFocusChange
 
         let scrollView = NSScrollView()
         scrollView.drawsBackground = false
@@ -477,6 +687,8 @@ private struct PromptEditor: NSViewRepresentable {
         }
         textView.onSubmit = onSubmit
         textView.onPasteImages = onPasteImages
+        textView.onEscape = onEscape
+        textView.onFocusChange = onFocusChange
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
@@ -496,14 +708,37 @@ private struct PromptEditor: NSViewRepresentable {
 private final class ComposerTextView: NSTextView {
     var onSubmit: (() -> Void)?
     var onPasteImages: (([ClipboardImage]) -> Void)?
+    var onEscape: (() -> Void)?
+    var onFocusChange: ((Bool) -> Void)?
 
     override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 {
+            onEscape?()
+            return
+        }
+
         let usesReturn = event.keyCode == 36 || event.keyCode == 76
         if usesReturn, !event.modifierFlags.contains(.shift) {
             onSubmit?()
             return
         }
         super.keyDown(with: event)
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        let didBecomeFirstResponder = super.becomeFirstResponder()
+        if didBecomeFirstResponder {
+            onFocusChange?(true)
+        }
+        return didBecomeFirstResponder
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let didResignFirstResponder = super.resignFirstResponder()
+        if didResignFirstResponder {
+            onFocusChange?(false)
+        }
+        return didResignFirstResponder
     }
 
     override func paste(_ sender: Any?) {
