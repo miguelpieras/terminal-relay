@@ -48,61 +48,76 @@ private enum SidebarDragItem: Equatable {
     }
 }
 
+private enum SidebarDropPosition: Equatable {
+    case before
+    case after
+}
+
 @MainActor
 private final class SidebarDragCoordinator: ObservableObject {
     private struct DropTarget {
         let frame: CGRect
         let accepts: (SidebarDragItem) -> Bool
+        let position: (SidebarDragItem, CGPoint) -> SidebarDropPosition
         let onDrop: ([String], CGPoint) -> Bool
-        let setTargeted: (Bool) -> Void
+        let setDropPosition: (SidebarDropPosition?) -> Void
     }
 
     private var targets: [UUID: DropTarget] = [:]
     private var targetedID: UUID?
+    private var targetedPosition: SidebarDropPosition?
 
     func register(
         id: UUID,
         frame: CGRect,
         accepts: @escaping (SidebarDragItem) -> Bool,
+        position: @escaping (SidebarDragItem, CGPoint) -> SidebarDropPosition,
         onDrop: @escaping ([String], CGPoint) -> Bool,
-        setTargeted: @escaping (Bool) -> Void
+        setDropPosition: @escaping (SidebarDropPosition?) -> Void
     ) {
         targets[id] = DropTarget(
             frame: frame,
             accepts: accepts,
+            position: position,
             onDrop: onDrop,
-            setTargeted: setTargeted
+            setDropPosition: setDropPosition
         )
     }
 
     func unregister(id: UUID) {
-        targets[id]?.setTargeted(false)
+        targets[id]?.setDropPosition(nil)
         targets[id] = nil
         if targetedID == id {
             targetedID = nil
+            targetedPosition = nil
         }
     }
 
     func update(item: SidebarDragItem, at location: CGPoint) {
-        setTargetedID(target(at: location, accepting: item)?.key)
+        guard let (id, target) = target(at: location, accepting: item) else {
+            setTarget(nil)
+            return
+        }
+        let localLocation = CGPoint(
+            x: location.x - target.frame.minX,
+            y: location.y - target.frame.minY
+        )
+        setTarget(id, position: target.position(item, localLocation))
     }
 
     func finish(item: SidebarDragItem, at location: CGPoint) {
-        if let (id, target) = target(at: location, accepting: item) {
+        if let (_, target) = target(at: location, accepting: item) {
             let localLocation = CGPoint(
                 x: location.x - target.frame.minX,
                 y: location.y - target.frame.minY
             )
             _ = target.onDrop([item.value], localLocation)
-            if targetedID == id {
-                target.setTargeted(false)
-            }
         }
-        setTargetedID(nil)
+        setTarget(nil)
     }
 
     func cancel() {
-        setTargetedID(nil)
+        setTarget(nil)
     }
 
     private func target(
@@ -120,22 +135,27 @@ private final class SidebarDragCoordinator: ObservableObject {
             }
     }
 
-    private func setTargetedID(_ id: UUID?) {
-        guard targetedID != id else { return }
+    private func setTarget(
+        _ id: UUID?,
+        position: SidebarDropPosition? = nil
+    ) {
+        guard targetedID != id || targetedPosition != position else { return }
         if let targetedID {
-            targets[targetedID]?.setTargeted(false)
+            targets[targetedID]?.setDropPosition(nil)
         }
         targetedID = id
-        if let id {
-            targets[id]?.setTargeted(true)
+        targetedPosition = position
+        if let id, let position {
+            targets[id]?.setDropPosition(position)
         }
     }
 }
 
 private struct SidebarDropModifier: ViewModifier {
     @EnvironmentObject private var dragCoordinator: SidebarDragCoordinator
-    @Binding var isTargeted: Bool
+    @Binding var dropPosition: SidebarDropPosition?
     let accepts: (SidebarDragItem) -> Bool
+    let position: (SidebarDragItem, CGPoint) -> SidebarDropPosition
     let onDrop: ([String], CGPoint) -> Bool
 
     @State private var targetID = UUID()
@@ -160,13 +180,14 @@ private struct SidebarDropModifier: ViewModifier {
     }
 
     private func register(frame: CGRect) {
-        let targeted = $isTargeted
+        let displayedPosition = $dropPosition
         dragCoordinator.register(
             id: targetID,
             frame: frame,
             accepts: accepts,
+            position: position,
             onDrop: onDrop,
-            setTargeted: { targeted.wrappedValue = $0 }
+            setDropPosition: { displayedPosition.wrappedValue = $0 }
         )
     }
 }
@@ -205,17 +226,38 @@ private extension View {
     }
 
     func sidebarDropDestination(
-        isTargeted: Binding<Bool>,
+        dropPosition: Binding<SidebarDropPosition?>,
         accepts: @escaping (SidebarDragItem) -> Bool,
+        position: @escaping (SidebarDragItem, CGPoint) -> SidebarDropPosition,
         onDrop: @escaping ([String], CGPoint) -> Bool
     ) -> some View {
         modifier(
             SidebarDropModifier(
-                isTargeted: isTargeted,
+                dropPosition: dropPosition,
                 accepts: accepts,
+                position: position,
                 onDrop: onDrop
             )
         )
+    }
+
+    func sidebarDropIndicator(_ position: SidebarDropPosition?) -> some View {
+        overlay {
+            if let position {
+                VStack(spacing: 0) {
+                    if position == .after {
+                        Spacer(minLength: 0)
+                    }
+                    Rectangle()
+                        .fill(Color.accentColor)
+                        .frame(height: 2)
+                    if position == .before {
+                        Spacer(minLength: 0)
+                    }
+                }
+                .allowsHitTesting(false)
+            }
+        }
     }
 }
 
@@ -1370,7 +1412,7 @@ private struct SidebarFolderRow: View {
     let onDrop: ([String], CGPoint) -> Bool
 
     @State private var isHovering = false
-    @State private var isDropTargeted = false
+    @State private var dropPosition: SidebarDropPosition?
 
     var body: some View {
         HStack(spacing: 7) {
@@ -1394,17 +1436,10 @@ private struct SidebarFolderRow: View {
         .padding(.horizontal, SidebarRowGeometry.contentLeadingPadding)
         .frame(height: 30)
         .background(
-            isDropTargeted
-                ? Color.accentColor.opacity(0.16)
-                : (isHovering ? SidebarPalette.hover : Color.clear),
+            isHovering && dropPosition == nil ? SidebarPalette.hover : Color.clear,
             in: RoundedRectangle(cornerRadius: SidebarRowGeometry.cornerRadius)
         )
-        .overlay {
-            if isDropTargeted {
-                RoundedRectangle(cornerRadius: SidebarRowGeometry.cornerRadius)
-                    .stroke(Color.accentColor.opacity(0.75), lineWidth: 1)
-            }
-        }
+        .sidebarDropIndicator(dropPosition)
         .contentShape(Rectangle())
         .padding(.horizontal, SidebarRowGeometry.horizontalMargin)
         .onHover { isHovering = $0 }
@@ -1413,8 +1448,17 @@ private struct SidebarFolderRow: View {
         .accessibilityAddTraits(.isButton)
         .accessibilityAction { onToggle() }
         .sidebarDropDestination(
-            isTargeted: $isDropTargeted,
+            dropPosition: $dropPosition,
             accepts: acceptsDrop,
+            position: { item, location in
+                if isRoot {
+                    return .after
+                }
+                if case .project = item {
+                    return .after
+                }
+                return location.y > 15 ? .after : .before
+            },
             onDrop: onDrop
         )
         .help(
@@ -1446,7 +1490,7 @@ private struct ProjectSidebarSection: View {
 
     @State private var isExpanded = false
     @State private var isProjectHovering = false
-    @State private var isProjectDropTargeted = false
+    @State private var projectDropPosition: SidebarDropPosition?
 
     private var allSessions: [TerminalSession] {
         sessionManager.sidebarSessions(forProjectID: project.id)
@@ -1507,24 +1551,22 @@ private struct ProjectSidebarSection: View {
             .padding(.trailing, SidebarRowGeometry.contentTrailingPadding)
             .frame(height: SidebarRowGeometry.height)
             .background(
-                isProjectDropTargeted
-                    ? Color.accentColor.opacity(0.12)
-                    : (isProjectHovering ? SidebarPalette.hover : Color.clear),
+                isProjectHovering && projectDropPosition == nil
+                    ? SidebarPalette.hover
+                    : Color.clear,
                 in: RoundedRectangle(cornerRadius: SidebarRowGeometry.cornerRadius)
             )
-            .overlay {
-                if isProjectDropTargeted {
-                    RoundedRectangle(cornerRadius: SidebarRowGeometry.cornerRadius)
-                        .stroke(Color.accentColor.opacity(0.7), lineWidth: 1)
-                }
-            }
+            .sidebarDropIndicator(projectDropPosition)
             .contentShape(Rectangle())
             .padding(.horizontal, SidebarRowGeometry.horizontalMargin)
             .onHover { isProjectHovering = $0 }
             .sidebarDragSource(.project(project.id))
             .sidebarDropDestination(
-                isTargeted: $isProjectDropTargeted,
+                dropPosition: $projectDropPosition,
                 accepts: acceptsProjectDrop,
+                position: { _, location in
+                    location.y > SidebarRowGeometry.height / 2 ? .after : .before
+                },
                 onDrop: onDropProject
             )
             .contextMenu {
@@ -1667,7 +1709,7 @@ private struct ProjectSessionRow: View {
     let onDrop: ([String], CGPoint) -> Bool
 
     @State private var isHovering = false
-    @State private var isDropTargeted = false
+    @State private var dropPosition: SidebarDropPosition?
 
     var body: some View {
         HStack(spacing: 7) {
@@ -1724,28 +1766,26 @@ private struct ProjectSessionRow: View {
         .padding(.trailing, 8)
         .frame(height: 35)
         .background(
-            isDropTargeted
-                ? Color.accentColor.opacity(0.16)
+            isSelected
+                ? SidebarPalette.selected
                 : (
-                    isSelected
-                        ? SidebarPalette.selected
-                        : (isHovering ? SidebarPalette.hover : Color.clear)
+                    isHovering && dropPosition == nil
+                        ? SidebarPalette.hover
+                        : Color.clear
                 ),
             in: RoundedRectangle(cornerRadius: 6)
         )
-        .overlay {
-            if isDropTargeted {
-                RoundedRectangle(cornerRadius: 6)
-                    .stroke(Color.accentColor.opacity(0.75), lineWidth: 1)
-            }
-        }
+        .sidebarDropIndicator(dropPosition)
         .padding(.horizontal, 10)
         .contentShape(Rectangle())
         .onHover { isHovering = $0 }
         .sidebarDragSource(.session(session.id))
         .sidebarDropDestination(
-            isTargeted: $isDropTargeted,
+            dropPosition: $dropPosition,
             accepts: acceptsDrop,
+            position: { _, location in
+                location.y > SidebarRowGeometry.height / 2 ? .after : .before
+            },
             onDrop: onDrop
         )
         .accessibilityLabel("\(session.displayTitle), \(sessionStateLabel.lowercased())")
