@@ -84,10 +84,10 @@ After that, provisioning Worker 3 is one command:
 The command creates the exact Hetzner server, uses a temporary provider
 firewall that admits SSH only from the Mac's current public IPv4, creates a
 single-use tagged Tailscale enrollment, switches to the shared locked-down
-provider firewall, installs the pinned host and application baseline, adds the
-private runtime/root SSH aliases, performs any required Codex and Claude login,
-and registers the stable worker profile in Terminal Relay. The monitoring host
-discovers tagged numeric workers automatically.
+provider firewall, installs the managed host and current application runtime,
+adds the private runtime/root SSH aliases, performs any required Codex and
+Claude login, and registers the stable worker profile in Terminal Relay. The
+monitoring host discovers tagged numeric workers automatically.
 
 Reconcile or verify the complete configured fleet with:
 

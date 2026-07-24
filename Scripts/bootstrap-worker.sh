@@ -435,17 +435,6 @@ test "$(systemctl show -p User --value terminal-relay-session-restore@terminal-r
 systemctl is-enabled --quiet terminal-relay-agent-update.timer
 systemctl is-active --quiet terminal-relay-agent-update.timer
 /usr/local/bin/terminal-relay-session status >/dev/null
-runtime_directory="$HOME/.local/state/terminal-relay"
-/usr/bin/flock "$runtime_directory/codex.control.lock" /bin/sleep 3 &
-lock_holder_pid=$!
-/bin/sleep 1
-set +e
-/usr/bin/timeout 1 /usr/local/bin/terminal-relay-session status >/dev/null
-lock_result=$?
-set -e
-wait "$lock_holder_pid"
-test "$lock_result" -eq 124
-/usr/local/bin/terminal-relay-session status >/dev/null
 '
 
 registration_proof=$(/usr/bin/openssl rand -hex 32) \

@@ -732,7 +732,7 @@ bootstrap_application() {
     local worker_name
 
     worker_name="$(worker_name_for_number "$number")"
-    log "Applying the pinned application runtime to Worker $number."
+    log "Applying the managed application runtime to Worker $number."
     "$BOOTSTRAP_SCRIPT" \
         --identity "$OPERATOR_PRIVATE_KEY" \
         --worker-number "$number" \
