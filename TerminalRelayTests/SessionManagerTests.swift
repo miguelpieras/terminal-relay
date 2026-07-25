@@ -525,6 +525,63 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertFalse(session.isWorking)
     }
 
+    func testTaskCompletionNotificationsFollowPreferenceAndIgnoreAgentStops() {
+        let suiteName = "TerminalRelayTests.TaskCompletionNotifications.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let instanceToken = "01234567-89ab-" + "4def-8abc-0123456789ab"
+        var notifications: [String] = []
+        let manager = SessionManager(defaults: defaults) { session in
+            notifications.append(
+                "\(session.kind.displayName)|\(session.projectName)|\(session.displayTitle)"
+            )
+        }
+
+        func reconcile(reportedWorking: Bool) {
+            manager.reconcile(
+                worker: server,
+                projects: [project],
+                response: WorkerSessionResponse(
+                    projects: [project.displayName],
+                    sessions: [
+                        WorkerSessionSnapshot(
+                            kind: .codex,
+                            repositoryName: project.displayName,
+                            attachedClientCount: 0,
+                            instanceToken: instanceToken,
+                            title: "Review notification behavior",
+                            reportedWorking: reportedWorking
+                        )
+                    ]
+                ),
+                launchDefaults: .standard
+            )
+        }
+
+        reconcile(reportedWorking: true)
+        reconcile(reportedWorking: false)
+        XCTAssertTrue(notifications.isEmpty)
+
+        defaults.set(
+            true,
+            forKey: ApplicationSettings.StorageKey.showTaskCompletionNotifications
+        )
+        reconcile(reportedWorking: true)
+        reconcile(reportedWorking: false)
+
+        XCTAssertEqual(
+            notifications,
+            ["Codex|terminal-relay|Review notification behavior"]
+        )
+
+        reconcile(reportedWorking: true)
+        manager.session(projectID: project.id, kind: .codex)?.beginRemoteStop()
+        XCTAssertEqual(notifications.count, 1)
+    }
+
     func testReconcileSameRepositoryReplacementEndsOldInstanceAndCreatesNewSession() {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let project = makeProject(name: "Terminal Relay", server: server)

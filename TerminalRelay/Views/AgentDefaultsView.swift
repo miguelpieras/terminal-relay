@@ -5,6 +5,10 @@ struct AgentDefaultsView: View {
     private var keepRunningAfterLastWindowClosed =
         ApplicationSettings.defaultKeepRunningAfterLastWindowClosed
 
+    @AppStorage(ApplicationSettings.StorageKey.showTaskCompletionNotifications)
+    private var showTaskCompletionNotifications =
+        ApplicationSettings.defaultShowTaskCompletionNotifications
+
     @AppStorage(AgentLaunchDefaults.StorageKey.codexModel)
     private var codexModel = AgentLaunchDefaults.standard.codexModel
 
@@ -51,6 +55,17 @@ struct AgentDefaultsView: View {
                             )
                             .font(.caption)
                             .foregroundStyle(.secondary)
+
+                            Divider()
+                                .padding(.vertical, 4)
+
+                            Toggle(
+                                "Notify when a task finishes",
+                                isOn: $showTaskCompletionNotifications
+                            )
+                            Text("Shows a desktop notification when an agent finishes a task.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.top, 4)
@@ -98,6 +113,11 @@ struct AgentDefaultsView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .windowBackgroundColor))
         .navigationTitle("Settings")
+        .onChange(of: showTaskCompletionNotifications) { _, isEnabled in
+            if isEnabled {
+                TaskCompletionNotificationService.requestAuthorization()
+            }
+        }
     }
 
     private func agentSettings(
@@ -139,6 +159,8 @@ struct AgentDefaultsView: View {
     private func restoreDefaults() {
         keepRunningAfterLastWindowClosed =
             ApplicationSettings.defaultKeepRunningAfterLastWindowClosed
+        showTaskCompletionNotifications =
+            ApplicationSettings.defaultShowTaskCompletionNotifications
         codexModel = AgentLaunchDefaults.standard.codexModel
         codexReasoningEffort = AgentLaunchDefaults.standard.codexReasoningEffort
         claudeModel = AgentLaunchDefaults.standard.claudeModel

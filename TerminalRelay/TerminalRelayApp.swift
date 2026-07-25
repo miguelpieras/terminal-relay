@@ -1,13 +1,17 @@
 import AppKit
 import SwiftUI
+import UserNotifications
 
 enum ApplicationSettings {
     enum StorageKey {
         static let keepRunningAfterLastWindowClosed =
             "applicationSettings.keepRunningAfterLastWindowClosed"
+        static let showTaskCompletionNotifications =
+            "applicationSettings.showTaskCompletionNotifications"
     }
 
     static let defaultKeepRunningAfterLastWindowClosed = true
+    static let defaultShowTaskCompletionNotifications = false
 
     static func keepRunningAfterLastWindowClosed(in defaults: UserDefaults = .standard) -> Bool {
         guard defaults.object(forKey: StorageKey.keepRunningAfterLastWindowClosed) != nil else {
@@ -15,10 +19,19 @@ enum ApplicationSettings {
         }
         return defaults.bool(forKey: StorageKey.keepRunningAfterLastWindowClosed)
     }
+
+    static func showTaskCompletionNotifications(in defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.object(forKey: StorageKey.showTaskCompletionNotifications) != nil else {
+            return defaultShowTaskCompletionNotifications
+        }
+        return defaults.bool(forKey: StorageKey.showTaskCompletionNotifications)
+    }
 }
 
 @MainActor
-final class TerminalRelayApplicationDelegate: NSObject, NSApplicationDelegate {
+final class TerminalRelayApplicationDelegate: NSObject, NSApplicationDelegate,
+    UNUserNotificationCenterDelegate
+{
     weak var sessionManager: SessionManager?
     private(set) var registrationError: String?
 
@@ -47,6 +60,13 @@ final class TerminalRelayApplicationDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         !ApplicationSettings.keepRunningAfterLastWindowClosed(in: defaults)
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        UNUserNotificationCenter.current().delegate = self
+        if ApplicationSettings.showTaskCompletionNotifications(in: defaults) {
+            TaskCompletionNotificationService.requestAuthorization()
+        }
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
@@ -83,6 +103,13 @@ final class TerminalRelayApplicationDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         sessionManager?.disconnectAll()
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        [.banner, .sound]
     }
 
     private func processRegistrationURL(_ url: URL) {

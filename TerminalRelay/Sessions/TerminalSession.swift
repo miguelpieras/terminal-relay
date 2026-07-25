@@ -143,6 +143,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
     @Published private(set) var terminalTitle: String?
     @Published private(set) var threadID: String?
     @Published private(set) var isWorking = false
+    @Published private(set) var taskCompletionCount = 0
     @Published private(set) var remoteAttachedClientCount: Int?
 
     private let configuration: SSHLaunchConfiguration
@@ -605,6 +606,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
     }
 
     private func updateWorkingState() {
+        let wasWorking = isWorking
         switch status {
         case .connecting, .running:
             isWorking = titleIndicatesWorking
@@ -614,6 +616,14 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
             isWorking = remoteIndicatesWorking
         case .stopping, .exited:
             isWorking = false
+        }
+
+        if wasWorking,
+           !isWorking,
+           !explicitDisconnectRequested,
+           !remoteStopRequested,
+           status == .running || status == .remoteRunning {
+            taskCompletionCount += 1
         }
     }
 }

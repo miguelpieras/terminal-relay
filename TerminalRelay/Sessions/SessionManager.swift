@@ -53,14 +53,21 @@ final class SessionManager: ObservableObject {
     @Published private var remoteSessions: [RemoteSessionKey: WorkerSessionSnapshot] = [:]
 
     private let defaults: UserDefaults
+    private let taskCompletionHandler: @MainActor (TerminalSession) -> Void
     private let sidebarSessionOrderStorageKey = "sidebarSessionOrder.v1"
     private var sidebarSessionInstanceTokensByProject: [String: [String]] = [:]
     private var lastSequenceNumberByProjectAndKind: [ProjectAgentKey: Int] = [:]
     private var sessionObservers: [UUID: AnyCancellable] = [:]
+    private var taskCompletionObservers: [UUID: AnyCancellable] = [:]
     private var backgroundAttachmentAttemptedSessionIDs = Set<UUID>()
 
-    init(defaults: UserDefaults = .standard) {
+    init(
+        defaults: UserDefaults = .standard,
+        taskCompletionHandler: @escaping @MainActor (TerminalSession) -> Void =
+            TaskCompletionNotificationService.notifyTaskCompletion(for:)
+    ) {
         self.defaults = defaults
+        self.taskCompletionHandler = taskCompletionHandler
         if let data = defaults.data(forKey: sidebarSessionOrderStorageKey),
            let savedOrder = try? JSONDecoder().decode([String: [String]].self, from: data) {
             sidebarSessionInstanceTokensByProject = savedOrder
@@ -321,8 +328,10 @@ final class SessionManager: ObservableObject {
             remoteAttachedClientCount: confirmedSnapshot.attachedClientCount
         )
         sessionObservers[existing.id] = nil
+        taskCompletionObservers[existing.id] = nil
         sessions[index] = replacement
         observe(replacement)
+        replacement.applyRemoteSnapshot(confirmedSnapshot)
         selectedSessionID = replacement.id
         return replacement
     }
@@ -447,6 +456,7 @@ final class SessionManager: ObservableObject {
                     remoteAttachedClientCount: snapshot.attachedClientCount
                 )
                 append(session)
+                session.applyRemoteSnapshot(snapshot)
             }
         }
     }
@@ -536,6 +546,16 @@ final class SessionManager: ObservableObject {
         sessionObservers[session.id] = session.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
+        taskCompletionObservers[session.id] = session.$taskCompletionCount
+            .dropFirst()
+            .sink { [weak self, weak session] _ in
+                guard let self,
+                      let session,
+                      ApplicationSettings.showTaskCompletionNotifications(in: self.defaults) else {
+                    return
+                }
+                self.taskCompletionHandler(session)
+            }
     }
 
     private func removeSession(id: UUID) {
@@ -544,6 +564,7 @@ final class SessionManager: ObservableObject {
         let removedInstanceToken = sessions[index].instanceToken
         sessions.remove(at: index)
         sessionObservers[id] = nil
+        taskCompletionObservers[id] = nil
         backgroundAttachmentAttemptedSessionIDs.remove(id)
         sidebarSessionInstanceTokensByProject[removedProjectID.uuidString]?.removeAll {
             $0 == removedInstanceToken
