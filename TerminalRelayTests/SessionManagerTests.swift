@@ -874,6 +874,61 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(manager.selectedSessionID, original.id)
     }
 
+    func testReconnectCompletionDoesNotOverrideANewerSelection() async {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let manager = SessionManager()
+        let reconnecting = manager.open(
+            project: project,
+            on: server,
+            kind: .codex,
+            launchDefaults: .standard
+        ).localSession!
+        reconnecting.processTerminated(source: reconnecting.terminalView, exitCode: nil)
+        await Task.yield()
+
+        let otherInstanceID = UUID().uuidString.lowercased()
+        let other = manager.open(
+            project: project,
+            on: server,
+            kind: .claude,
+            launchDefaults: .standard,
+            instanceToken: otherInstanceID
+        ).localSession!
+        manager.selectedSessionID = reconnecting.id
+
+        let recorder = BlockingWorkerSessionCommandRecorder()
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+        let reconnect = Task {
+            await manager.reconnectAfterRefresh(
+                sessionID: reconnecting.id,
+                project: project,
+                on: server,
+                projects: [project],
+                launchDefaults: .standard,
+                using: service
+            )
+        }
+        while recorder.callCount == 0 {
+            await Task.yield()
+        }
+
+        manager.selectedSessionID = other.id
+        let reconnectingID = reconnecting.instanceToken
+        recorder.finish(
+            with: Self.statusResult(
+                kind: .codex,
+                repositoryName: project.displayName,
+                instanceToken: reconnectingID
+            )
+        )
+        _ = await reconnect.value
+
+        XCTAssertEqual(manager.selectedSessionID, other.id)
+    }
+
     func testReconnectRejectsSameRepositoryReplacementInstance() async {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let project = makeProject(name: "Terminal Relay", server: server)

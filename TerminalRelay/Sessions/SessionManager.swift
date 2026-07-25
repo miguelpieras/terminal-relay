@@ -239,7 +239,8 @@ final class SessionManager: ObservableObject {
                    sessionID: existing.id,
                    project: project,
                    on: server,
-                   confirmedSnapshot: snapshot
+                   confirmedSnapshot: snapshot,
+                   selectReplacement: true
                ) {
                 return .selectedExisting(replacement)
             }
@@ -291,7 +292,8 @@ final class SessionManager: ObservableObject {
             sessionID: sessionID,
             project: project,
             on: server,
-            confirmedSnapshot: snapshot
+            confirmedSnapshot: snapshot,
+            selectReplacement: selectedSessionID == sessionID
         )
     }
 
@@ -299,7 +301,8 @@ final class SessionManager: ObservableObject {
         sessionID: UUID,
         project: ProjectProfile,
         on server: ServerProfile,
-        confirmedSnapshot: WorkerSessionSnapshot
+        confirmedSnapshot: WorkerSessionSnapshot,
+        selectReplacement: Bool
     ) -> TerminalSession? {
         guard let index = sessions.firstIndex(where: { $0.id == sessionID }) else { return nil }
         let existing = sessions[index]
@@ -332,7 +335,9 @@ final class SessionManager: ObservableObject {
         sessions[index] = replacement
         observe(replacement)
         replacement.applyRemoteSnapshot(confirmedSnapshot)
-        selectedSessionID = replacement.id
+        if selectReplacement {
+            selectedSessionID = replacement.id
+        }
         return replacement
     }
 

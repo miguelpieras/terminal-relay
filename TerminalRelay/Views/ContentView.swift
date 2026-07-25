@@ -985,12 +985,12 @@ struct ContentView: View {
             return
         }
         selectedSessionIDs = [sessionID]
+        navigate(to: .session(projectID: project.id, sessionID: sessionID))
 
         guard let session = sessionManager.sessions(forProjectID: project.id)
             .first(where: { $0.id == sessionID }),
               session.status.canReconnect,
               let worker = serverStore.server(id: project.serverID) else {
-            navigate(to: .session(projectID: project.id, sessionID: sessionID))
             return
         }
 
@@ -1003,7 +1003,6 @@ struct ContentView: View {
                 launchDefaults: launchDefaults,
                 using: workerSessionService
             )
-            navigate(to: .session(projectID: project.id, sessionID: sessionID))
         }
     }
 
@@ -1800,37 +1799,36 @@ private struct ProjectSessionRow: View {
 
     var body: some View {
         HStack(spacing: 7) {
-            HStack(spacing: 7) {
-                AgentBrandIcon(kind: session.kind, size: 17)
-                    .frame(width: 18, height: 18)
-                    .opacity(session.status.occupiesSlot ? 1 : 0.55)
+            Button(action: onSelect) {
+                HStack(spacing: 7) {
+                    AgentBrandIcon(kind: session.kind, size: 17)
+                        .frame(width: 18, height: 18)
+                        .opacity(session.status.occupiesSlot ? 1 : 0.55)
 
-                Text(session.displayTitle)
-                    .font(.system(size: 14))
-                    .foregroundStyle(
-                        session.status.occupiesSlot
-                            ? SidebarPalette.primary
-                            : SidebarPalette.secondary
-                    )
-                    .lineLimit(1)
+                    Text(session.displayTitle)
+                        .font(.system(size: 14))
+                        .foregroundStyle(
+                            session.status.occupiesSlot
+                                ? SidebarPalette.primary
+                                : SidebarPalette.secondary
+                        )
+                        .lineLimit(1)
 
-                Spacer(minLength: 5)
+                    Spacer(minLength: 5)
 
-                if session.isWorking {
-                    ProgressView()
-                        .controlSize(.mini)
-                        .tint(SidebarPalette.secondary)
-                        .frame(width: 12, height: 12)
-                        .help("Working")
-                        .accessibilityLabel("\(session.kind.displayName), working")
+                    if session.isWorking {
+                        ProgressView()
+                            .controlSize(.mini)
+                            .tint(SidebarPalette.secondary)
+                            .frame(width: 12, height: 12)
+                            .help("Working")
+                            .accessibilityLabel("\(session.kind.displayName), working")
+                    }
                 }
+                .contentShape(Rectangle())
             }
             .frame(maxWidth: .infinity)
-            .contentShape(Rectangle())
-            .onTapGesture(perform: onSelect)
-            .accessibilityElement(children: .combine)
-            .accessibilityAddTraits(.isButton)
-            .accessibilityAction { onSelect() }
+            .buttonStyle(.plain)
 
             if isHovering {
                 Button(action: onArchive) {
