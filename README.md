@@ -22,6 +22,23 @@ Terminal Relay starts with no configured workers or GitHub owner. It reads the
 currently authenticated GitHub CLI user on macOS and stores every connection
 profile locally.
 
+## Install on macOS
+
+There is no prebuilt release yet. Install the current version from source:
+
+```bash
+git clone https://github.com/miguelpieras/terminal-relay.git
+cd terminal-relay
+brew install xcodegen
+xcodebuild -downloadComponent MetalToolchain
+./Scripts/build-and-install.sh
+```
+
+The install script regenerates the Xcode project, runs the test suite, builds
+the Release app, installs it at `/Applications/Terminal Relay.app`, and opens
+it. In the app, choose **Workers → Add Worker** to bootstrap a fresh Ubuntu
+host or register an existing Terminal Relay worker.
+
 ## Architecture
 
 The macOS app starts the system SSH client inside a pseudo-terminal. The iPhone
@@ -52,28 +69,13 @@ iPhone app ┘                         └ repositories in /workspace
 - Codex CLI and/or Claude Code accounts for the worker
 - Tailscale on the iPhone and worker when using a private Tailscale route
 
-Install the local build tools:
-
-```bash
-brew install xcodegen
-xcodebuild -downloadComponent MetalToolchain
-```
-
-## Build the apps
+## Development builds
 
 Generate the Xcode project:
 
 ```bash
 xcodegen generate
 open TerminalRelay.xcodeproj
-```
-
-The maintainer installation command regenerates the project, runs the complete
-local test set, builds the Release macOS app, installs it at
-`/Applications/Terminal Relay.app`, and relaunches it:
-
-```bash
-./Scripts/build-and-install.sh
 ```
 
 The macOS app intentionally does not enable App Sandbox because its embedded
@@ -207,3 +209,7 @@ tests, and public-repository hygiene.
 Terminal Relay is licensed under the [Apache License 2.0](LICENSE). Bundled
 dependency licenses and attributions are listed in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## Credits
+
+Created and maintained by [Miguel Pieras (@mpieras)](https://x.com/mpieras).
