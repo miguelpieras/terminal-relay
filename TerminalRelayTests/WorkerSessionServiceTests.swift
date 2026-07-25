@@ -102,6 +102,78 @@ final class WorkerSessionServiceTests: XCTestCase {
         )
     }
 
+    func testStopActiveSessionRefreshesAndStopsTheMatchingAgent() async {
+        let worker = makeWorker()
+        let instanceToken = "01234567-89ab-" + "4def-8abc-0123456789ab"
+        let recorder = WorkerSessionCommandRecorder(
+            results: [
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data(
+                        """
+                        __TERMINAL_RELAY_SESSION_V1__
+                        session|claude|terminal-relay|0|\(instanceToken)
+                        """.utf8
+                    ),
+                    standardError: Data()
+                ),
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data(),
+                    standardError: Data()
+                )
+            ]
+        )
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+
+        let stopped = await service.stopActiveSession(kind: .claude, on: worker)
+
+        XCTAssertTrue(stopped)
+        XCTAssertEqual(
+            recorder.configurations,
+            [
+                SSHCommandBuilder.workerSessionStatusConfiguration(for: worker),
+                SSHCommandBuilder.workerSessionStopConfiguration(
+                    for: worker,
+                    kind: .claude,
+                    repositoryName: "terminal-relay",
+                    instanceToken: instanceToken
+                )
+            ]
+        )
+        XCTAssertEqual(service.response(for: worker.id)?.sessions, [])
+    }
+
+    func testStopActiveSessionSucceedsWhenTheAgentAlreadyExited() async {
+        let worker = makeWorker()
+        let recorder = WorkerSessionCommandRecorder(
+            results: [
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data(
+                        """
+                        __TERMINAL_RELAY_SESSION_V1__
+                        """.utf8
+                    ),
+                    standardError: Data()
+                )
+            ]
+        )
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+
+        let stopped = await service.stopActiveSession(kind: .claude, on: worker)
+
+        XCTAssertTrue(stopped)
+        XCTAssertEqual(
+            recorder.configurations,
+            [SSHCommandBuilder.workerSessionStatusConfiguration(for: worker)]
+        )
+    }
+
     func testStartReturnsAndStoresTheExactSessionSnapshot() async {
         let worker = makeWorker()
         let instanceToken = "01234567-89ab-" + "4def-8abc-0123456789ab"

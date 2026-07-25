@@ -487,10 +487,8 @@ struct ProjectWorkspaceView: View {
                                 || workerSessionService.isStarting(worker: worker, kind: kind)
                                 || workerSessionService.isStopping(worker: worker, kind: kind)
                                 || (requiresNewSessionSignIn && !hasActiveAgent),
-                            isAccountActionDisabled: (
-                                hasActiveAgent && !requiresNewSessionSignIn
-                            )
-                                || workerSessionService.isStarting(worker: worker, kind: kind)
+                            isAccountActionDisabled:
+                                workerSessionService.isStarting(worker: worker, kind: kind)
                                 || workerSessionService.isStopping(worker: worker, kind: kind),
                             onViewResets: kind == .codex ? { isShowingCodexResets = true } : nil,
                             action: { open(kind) }
@@ -728,8 +726,6 @@ struct ProjectWorkspaceView: View {
 }
 
 private struct AccountUsageCard: View {
-    @EnvironmentObject private var accountAuthenticationService: AccountAuthenticationService
-
     let worker: ServerProfile
     let kind: AgentKind
     let accountFallback: String
@@ -781,27 +777,16 @@ private struct AccountUsageCard: View {
 
                 Spacer(minLength: 8)
 
-                Button {
-                    accountAuthenticationService.begin(
-                        worker: worker,
-                        kind: kind,
-                        currentAccount: snapshot?.account
-                    )
-                } label: {
-                    Label(
-                        snapshot == nil ? "Sign In" : "Change",
-                        systemImage: snapshot == nil
-                            ? "person.crop.circle.badge.plus"
-                            : "arrow.triangle.2.circlepath"
-                    )
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(
-                    isAccountActionDisabled
-                        || accountAuthenticationService.isRunning
+                AccountChangeButton(
+                    worker: worker,
+                    kind: kind,
+                    currentAccount: snapshot?.account,
+                    hasActiveAgent: hasActiveAgent,
+                    requiresNewSessionSignIn: requiresNewSessionSignIn,
+                    isSessionOperationInProgress: isAccountActionDisabled,
+                    controlSize: .small,
+                    showsIcon: true
                 )
-                .help(accountActionHelp)
             }
 
             Divider()
@@ -929,21 +914,6 @@ private struct AccountUsageCard: View {
             return "Unavailable"
         }
         return count == 1 ? "1 available" : "\(count) available"
-    }
-
-    private var accountActionHelp: String {
-        if requiresNewSessionSignIn, hasActiveAgent {
-            return "Sign in once, then restart this active \(productName) terminal to finish its account migration."
-        }
-        if hasActiveAgent {
-            return "Stop the active \(productName) agent before changing its account."
-        }
-        if isAccountActionDisabled {
-            return "Wait for the \(productName) session operation to finish."
-        }
-        return snapshot == nil
-            ? "Sign in to \(productName) on \(worker.displayName)"
-            : "Change the \(productName) account on \(worker.displayName)"
     }
 
     private var accountStateLabel: String {

@@ -257,6 +257,25 @@ final class WorkerSessionService: ObservableObject {
         }
     }
 
+    @discardableResult
+    func stopActiveSession(
+        kind: AgentKind,
+        on worker: ServerProfile
+    ) async -> Bool {
+        guard let response = await refresh(worker: worker) else {
+            return false
+        }
+        guard let snapshot = response.sessions.first(where: { $0.kind == kind }) else {
+            return true
+        }
+        return await stop(
+            kind: kind,
+            repositoryName: snapshot.repositoryName,
+            instanceToken: snapshot.instanceToken,
+            on: worker
+        )
+    }
+
     private static func logDetail(_ data: Data) -> String {
         let detail = String(decoding: data, as: UTF8.self)
             .split(whereSeparator: \.isWhitespace)

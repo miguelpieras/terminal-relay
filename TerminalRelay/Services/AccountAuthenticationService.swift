@@ -41,6 +41,15 @@ struct AccountAuthenticationOutput: Equatable {
     let deviceCode: String?
 }
 
+enum AccountChangePolicy {
+    static func requiresStoppingActiveAgent(
+        kind: AgentKind,
+        hasActiveAgent: Bool
+    ) -> Bool {
+        kind == .claude && hasActiveAgent
+    }
+}
+
 enum AccountAuthenticationOutputParser {
     static func parse(_ output: String, for kind: AgentKind) -> AccountAuthenticationOutput {
         let authorizationURL = urls(in: output).first { url in

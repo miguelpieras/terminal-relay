@@ -522,7 +522,7 @@ private struct WorkerMetricStatus: View {
 
 private struct WorkerAccountStatus: View {
     @EnvironmentObject private var sessionManager: SessionManager
-    @EnvironmentObject private var accountAuthenticationService: AccountAuthenticationService
+    @EnvironmentObject private var workerSessionService: WorkerSessionService
 
     let worker: ServerProfile
     let kind: AgentKind
@@ -559,7 +559,8 @@ private struct WorkerAccountStatus: View {
     }
 
     private var isAccountActionDisabled: Bool {
-        hasActiveAgent && !requiresNewSessionSignIn
+        workerSessionService.isStarting(worker: worker, kind: kind)
+            || workerSessionService.isStopping(worker: worker, kind: kind)
     }
 
     var body: some View {
@@ -596,17 +597,16 @@ private struct WorkerAccountStatus: View {
                     .lineLimit(1)
             }
 
-            Button(snapshot == nil ? "Sign In" : "Change") {
-                accountAuthenticationService.begin(
-                    worker: worker,
-                    kind: kind,
-                    currentAccount: snapshot?.account
-                )
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.mini)
-            .disabled(isAccountActionDisabled || accountAuthenticationService.isRunning)
-            .help(accountActionHelp)
+            AccountChangeButton(
+                worker: worker,
+                kind: kind,
+                currentAccount: snapshot?.account,
+                hasActiveAgent: hasActiveAgent,
+                requiresNewSessionSignIn: requiresNewSessionSignIn,
+                isSessionOperationInProgress: isAccountActionDisabled,
+                controlSize: .mini,
+                showsIcon: false
+            )
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -637,17 +637,6 @@ private struct WorkerAccountStatus: View {
         return lines.joined(separator: "\n")
     }
 
-    private var accountActionHelp: String {
-        if requiresNewSessionSignIn, hasActiveAgent {
-            return "Sign in once, then restart the active \(productName) terminal to finish its account migration."
-        }
-        if isAccountActionDisabled {
-            return "Stop the active \(productName) agent before changing its account."
-        }
-        return snapshot == nil
-            ? "Sign in to \(productName) on \(worker.displayName)"
-            : "Change the \(productName) account on \(worker.displayName)"
-    }
 }
 
 private struct LinkedAppRow: View {

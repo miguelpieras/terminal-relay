@@ -2,6 +2,27 @@ import XCTest
 @testable import TerminalRelay
 
 final class AccountAuthenticationServiceTests: XCTestCase {
+    func testOnlyClaudeRequiresStoppingAnActiveAgentBeforeAccountChange() {
+        XCTAssertFalse(
+            AccountChangePolicy.requiresStoppingActiveAgent(
+                kind: .codex,
+                hasActiveAgent: true
+            )
+        )
+        XCTAssertTrue(
+            AccountChangePolicy.requiresStoppingActiveAgent(
+                kind: .claude,
+                hasActiveAgent: true
+            )
+        )
+        XCTAssertFalse(
+            AccountChangePolicy.requiresStoppingActiveAgent(
+                kind: .claude,
+                hasActiveAgent: false
+            )
+        )
+    }
+
     func testParsesCodexDeviceAuthorizationFromStyledOutput() throws {
         let output = """
         Follow these steps to sign in:
