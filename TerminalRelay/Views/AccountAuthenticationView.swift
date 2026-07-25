@@ -424,7 +424,7 @@ struct AccountChangeButton: View {
     private func stopClaudeAndBeginAccountChange() {
         isStoppingClaudeForAccountChange = true
         Task {
-            let stopped = await workerSessionService.stopActiveSession(
+            let stopped = await workerSessionService.stopActiveSessions(
                 kind: .claude,
                 on: worker
             )

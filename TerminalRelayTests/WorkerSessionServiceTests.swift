@@ -102,9 +102,11 @@ final class WorkerSessionServiceTests: XCTestCase {
         )
     }
 
-    func testStopActiveSessionRefreshesAndStopsTheMatchingAgent() async {
+    func testStopActiveSessionsRefreshesAndStopsEveryMatchingAgent() async {
         let worker = makeWorker()
-        let instanceToken = "01234567-89ab-" + "4def-8abc-0123456789ab"
+        let firstClaudeToken = "01234567-89ab-" + "4def-8abc-0123456789ab"
+        let secondClaudeToken = "11111111-2222-" + "4333-8444-555555555555"
+        let codexToken = "aaaaaaaa-bbbb-" + "4ccc-8ddd-eeeeeeeeeeee"
         let recorder = WorkerSessionCommandRecorder(
             results: [
                 WorkerSessionCommandResult(
@@ -112,9 +114,16 @@ final class WorkerSessionServiceTests: XCTestCase {
                     standardOutput: Data(
                         """
                         __TERMINAL_RELAY_SESSION_V1__
-                        session|claude|terminal-relay|0|\(instanceToken)
+                        session|claude|terminal-relay|0|\(firstClaudeToken)
+                        session|codex|terminal-relay|0|\(codexToken)
+                        session|claude|website-api|0|\(secondClaudeToken)
                         """.utf8
                     ),
+                    standardError: Data()
+                ),
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data(),
                     standardError: Data()
                 ),
                 WorkerSessionCommandResult(
@@ -128,7 +137,7 @@ final class WorkerSessionServiceTests: XCTestCase {
             await recorder.run(configuration)
         }
 
-        let stopped = await service.stopActiveSession(kind: .claude, on: worker)
+        let stopped = await service.stopActiveSessions(kind: .claude, on: worker)
 
         XCTAssertTrue(stopped)
         XCTAssertEqual(
@@ -139,14 +148,30 @@ final class WorkerSessionServiceTests: XCTestCase {
                     for: worker,
                     kind: .claude,
                     repositoryName: "terminal-relay",
-                    instanceToken: instanceToken
+                    instanceToken: firstClaudeToken
+                ),
+                SSHCommandBuilder.workerSessionStopConfiguration(
+                    for: worker,
+                    kind: .claude,
+                    repositoryName: "website-api",
+                    instanceToken: secondClaudeToken
                 )
             ]
         )
-        XCTAssertEqual(service.response(for: worker.id)?.sessions, [])
+        XCTAssertEqual(
+            service.response(for: worker.id)?.sessions,
+            [
+                WorkerSessionSnapshot(
+                    kind: .codex,
+                    repositoryName: "terminal-relay",
+                    attachedClientCount: 0,
+                    instanceToken: codexToken
+                )
+            ]
+        )
     }
 
-    func testStopActiveSessionSucceedsWhenTheAgentAlreadyExited() async {
+    func testStopActiveSessionsSucceedsWhenTheAgentAlreadyExited() async {
         let worker = makeWorker()
         let recorder = WorkerSessionCommandRecorder(
             results: [
@@ -165,12 +190,76 @@ final class WorkerSessionServiceTests: XCTestCase {
             await recorder.run(configuration)
         }
 
-        let stopped = await service.stopActiveSession(kind: .claude, on: worker)
+        let stopped = await service.stopActiveSessions(kind: .claude, on: worker)
 
         XCTAssertTrue(stopped)
         XCTAssertEqual(
             recorder.configurations,
             [SSHCommandBuilder.workerSessionStatusConfiguration(for: worker)]
+        )
+    }
+
+    func testStopActiveSessionsWaitsForAnInFlightRefresh() async {
+        let worker = makeWorker()
+        let instanceToken = "01234567-89ab-" + "4def-8abc-0123456789ab"
+        let recorder = BlockingFirstWorkerSessionCommandRecorder(
+            subsequentResults: [
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data(),
+                    standardError: Data()
+                )
+            ]
+        )
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+        let refreshTask = Task {
+            await service.refresh(worker: worker)
+        }
+        while recorder.configurations.isEmpty {
+            await Task.yield()
+        }
+
+        let stopTask = Task {
+            await service.stopActiveSessions(kind: .claude, on: worker)
+        }
+        await Task.yield()
+
+        XCTAssertEqual(
+            recorder.configurations,
+            [SSHCommandBuilder.workerSessionStatusConfiguration(for: worker)]
+        )
+
+        recorder.finishFirst(
+            with: WorkerSessionCommandResult(
+                exitCode: 0,
+                standardOutput: Data(
+                    """
+                    __TERMINAL_RELAY_SESSION_V1__
+                    session|claude|terminal-relay|0|\(instanceToken)
+                    """.utf8
+                ),
+                standardError: Data()
+            )
+        )
+
+        let stopped = await stopTask.value
+        let refreshed = await refreshTask.value
+
+        XCTAssertTrue(stopped)
+        XCTAssertNotNil(refreshed)
+        XCTAssertEqual(
+            recorder.configurations,
+            [
+                SSHCommandBuilder.workerSessionStatusConfiguration(for: worker),
+                SSHCommandBuilder.workerSessionStopConfiguration(
+                    for: worker,
+                    kind: .claude,
+                    repositoryName: "terminal-relay",
+                    instanceToken: instanceToken
+                )
+            ]
         )
     }
 
@@ -281,5 +370,31 @@ private final class WorkerSessionCommandRecorder {
     func run(_ configuration: SSHLaunchConfiguration) async -> WorkerSessionCommandResult {
         configurations.append(configuration)
         return results.removeFirst()
+    }
+}
+
+@MainActor
+private final class BlockingFirstWorkerSessionCommandRecorder {
+    private(set) var configurations: [SSHLaunchConfiguration] = []
+    private var firstContinuation: CheckedContinuation<WorkerSessionCommandResult, Never>?
+    private var subsequentResults: [WorkerSessionCommandResult]
+
+    init(subsequentResults: [WorkerSessionCommandResult]) {
+        self.subsequentResults = subsequentResults
+    }
+
+    func run(_ configuration: SSHLaunchConfiguration) async -> WorkerSessionCommandResult {
+        configurations.append(configuration)
+        if configurations.count == 1 {
+            return await withCheckedContinuation { continuation in
+                firstContinuation = continuation
+            }
+        }
+        return subsequentResults.removeFirst()
+    }
+
+    func finishFirst(with result: WorkerSessionCommandResult) {
+        firstContinuation?.resume(returning: result)
+        firstContinuation = nil
     }
 }

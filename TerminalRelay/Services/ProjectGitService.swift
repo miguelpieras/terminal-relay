@@ -123,6 +123,7 @@ final class ProjectGitService: ObservableObject {
     @Published private(set) var deploymentStates: [UUID: ProjectDeploymentState] = [:]
 
     private var deploymentTasks: [UUID: Task<Void, Never>] = [:]
+    private var deploymentRequestIDs: [UUID: UUID] = [:]
 
     func snapshot(for projectID: UUID) -> ProjectGitSnapshot? {
         snapshots[projectID]
@@ -611,12 +612,15 @@ final class ProjectGitService: ObservableObject {
         waitsForNewRun: Bool
     ) {
         deploymentTasks[project.id]?.cancel()
+        let requestID = UUID()
+        deploymentRequestIDs[project.id] = requestID
         deploymentStates[project.id] = .checking(commitOID: commitOID)
         deploymentTasks[project.id] = Task { [weak self] in
             await self?.pollDeployment(
                 project: project,
                 commitOID: commitOID,
-                waitsForNewRun: waitsForNewRun
+                waitsForNewRun: waitsForNewRun,
+                requestID: requestID
             )
         }
     }
@@ -624,12 +628,21 @@ final class ProjectGitService: ObservableObject {
     private func pollDeployment(
         project: ProjectProfile,
         commitOID: String,
-        waitsForNewRun: Bool
+        waitsForNewRun: Bool,
+        requestID: UUID
     ) async {
-        defer { deploymentTasks[project.id] = nil }
+        defer {
+            if deploymentRequestIDs[project.id] == requestID {
+                deploymentTasks[project.id] = nil
+                deploymentRequestIDs[project.id] = nil
+            }
+        }
 
         for attempt in 0..<75 {
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled,
+                  deploymentRequestIDs[project.id] == requestID else {
+                return
+            }
 
             do {
                 let data = try await GitHubProjectService.runGitHubCLI(
@@ -638,6 +651,10 @@ final class ProjectGitService: ObservableObject {
                         commitOID: commitOID
                     )
                 )
+                guard !Task.isCancelled,
+                      deploymentRequestIDs[project.id] == requestID else {
+                    return
+                }
                 if let run = try Self.parseWorkflowRuns(data).first {
                     deploymentStates[project.id] = .run(run)
                     if run.isCompleted { return }
@@ -646,6 +663,10 @@ final class ProjectGitService: ObservableObject {
                     return
                 }
             } catch {
+                guard !Task.isCancelled,
+                      deploymentRequestIDs[project.id] == requestID else {
+                    return
+                }
                 deploymentStates[project.id] = .unavailable(Self.message(for: error))
                 return
             }

@@ -41,6 +41,7 @@ final class WorkerSessionService: ObservableObject {
     @Published private(set) var stoppingSlots: Set<SessionSlot> = []
 
     private let runCommand: CommandRunner
+    private var refreshTasks: [UUID: Task<WorkerSessionResponse?, Never>] = [:]
 
     convenience init() {
         self.init { configuration in
@@ -82,7 +83,29 @@ final class WorkerSessionService: ObservableObject {
 
     @discardableResult
     func refresh(worker: ServerProfile) async -> WorkerSessionResponse? {
-        guard !loadingWorkerIDs.contains(worker.id) else { return nil }
+        guard refreshTasks[worker.id] == nil else { return nil }
+        return await startRefresh(worker: worker)
+    }
+
+    private func refreshCoalescing(worker: ServerProfile) async -> WorkerSessionResponse? {
+        if let task = refreshTasks[worker.id] {
+            return await task.value
+        }
+        return await startRefresh(worker: worker)
+    }
+
+    private func startRefresh(worker: ServerProfile) async -> WorkerSessionResponse? {
+        let task: Task<WorkerSessionResponse?, Never> = Task { [weak self] in
+            guard let self else { return nil }
+            return await self.performRefresh(worker: worker)
+        }
+        refreshTasks[worker.id] = task
+        let response = await task.value
+        refreshTasks[worker.id] = nil
+        return response
+    }
+
+    private func performRefresh(worker: ServerProfile) async -> WorkerSessionResponse? {
         loadingWorkerIDs.insert(worker.id)
         defer { loadingWorkerIDs.remove(worker.id) }
         workerSessionLogger.info(
@@ -258,22 +281,25 @@ final class WorkerSessionService: ObservableObject {
     }
 
     @discardableResult
-    func stopActiveSession(
+    func stopActiveSessions(
         kind: AgentKind,
         on worker: ServerProfile
     ) async -> Bool {
-        guard let response = await refresh(worker: worker) else {
+        guard let response = await refreshCoalescing(worker: worker) else {
             return false
         }
-        guard let snapshot = response.sessions.first(where: { $0.kind == kind }) else {
-            return true
+
+        for snapshot in response.sessions where snapshot.kind == kind {
+            guard await stop(
+                kind: kind,
+                repositoryName: snapshot.repositoryName,
+                instanceToken: snapshot.instanceToken,
+                on: worker
+            ) else {
+                return false
+            }
         }
-        return await stop(
-            kind: kind,
-            repositoryName: snapshot.repositoryName,
-            instanceToken: snapshot.instanceToken,
-            on: worker
-        )
+        return true
     }
 
     private static func logDetail(_ data: Data) -> String {
