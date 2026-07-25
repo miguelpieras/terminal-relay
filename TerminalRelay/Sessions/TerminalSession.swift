@@ -141,6 +141,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
 
     @Published private(set) var status: TerminalSessionStatus
     @Published private(set) var terminalTitle: String?
+    @Published private(set) var threadID: String?
     @Published private(set) var isWorking = false
     @Published private(set) var remoteAttachedClientCount: Int?
 
@@ -166,6 +167,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         startedAt: Date = Date(),
         initialStatus: TerminalSessionStatus = .connecting,
         terminalTitle: String? = nil,
+        threadID: String? = nil,
         remoteAttachedClientCount: Int? = nil
     ) {
         self.id = id
@@ -181,6 +183,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         self.instanceToken = instanceToken
         self.status = initialStatus
         self.terminalTitle = nil
+        self.threadID = threadID ?? (kind == .claude ? instanceToken : nil)
         self.remoteAttachedClientCount = remoteAttachedClientCount
         self.configuration = SSHCommandBuilder.configuration(
             for: server,
@@ -475,6 +478,9 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
             return
         }
         remoteAttachedClientCount = snapshot.attachedClientCount
+        if let threadID = snapshot.threadID {
+            self.threadID = threadID
+        }
         if let title = snapshot.title {
             applyResolvedTerminalTitle(title)
         } else if kind == .codex, snapshot.reportedWorking != nil {
@@ -563,6 +569,9 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
 
     private func applyTerminalTitle(_ title: String) {
         if kind == .codex {
+            if let parsedThreadID = Self.threadID(in: title) {
+                threadID = parsedThreadID
+            }
             let parsedTitle = CodexTerminalTitle(title)
             if let parsedTitle = parsedTitle.title {
                 terminalTitle = parsedTitle
@@ -572,6 +581,17 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
             terminalTitle = displayableTitle
         }
         updateWorkingState()
+    }
+
+    private static func threadID(in title: String) -> String? {
+        guard let range = title.range(
+            of: #"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"#,
+            options: .regularExpression
+        ),
+        let id = UUID(uuidString: String(title[range])) else {
+            return nil
+        }
+        return id.uuidString.lowercased()
     }
 
     private func applyResolvedTerminalTitle(_ title: String) {

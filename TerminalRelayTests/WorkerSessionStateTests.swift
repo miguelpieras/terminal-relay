@@ -57,6 +57,24 @@ final class WorkerSessionStateTests: XCTestCase {
         XCTAssertEqual(response.sessions.first?.isWorking(now: Date(timeIntervalSince1970: 121)), false)
     }
 
+    func testParsesThreadIDsAndCanonicalizesThem() throws {
+        let response = try WorkerSessionProtocol.parse(
+            """
+            __TERMINAL_RELAY_SESSION_V1__
+            session|codex|terminal-relay|1|01234567-89ab-4def-8abc-0123456789ab|123|466978206c6f67696e|0|AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA
+            session|claude|website-api|0|11111111-2222-4333-8444-555555555555|120||0|11111111-2222-4333-8444-555555555555
+            """
+        )
+
+        XCTAssertEqual(
+            response.sessions.map(\.threadID),
+            [
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "11111111-2222-4333-8444-555555555555",
+            ]
+        )
+    }
+
     func testRejectsDuplicateInstancesAndUnsafeProjectNames() {
         let duplicateInstance = """
         __TERMINAL_RELAY_SESSION_V1__

@@ -247,6 +247,7 @@ final class SessionManager: ObservableObject {
             sequenceNumber: nextSequenceNumber(projectID: project.id, kind: snapshot.kind),
             instanceToken: snapshot.instanceToken,
             terminalTitle: snapshot.title,
+            threadID: snapshot.threadID,
             remoteAttachedClientCount: snapshot.attachedClientCount
         )
         append(session)
@@ -316,6 +317,7 @@ final class SessionManager: ObservableObject {
             startedAt: existing.startedAt,
             initialStatus: .connecting,
             terminalTitle: existing.terminalTitle,
+            threadID: confirmedSnapshot.threadID ?? existing.threadID,
             remoteAttachedClientCount: confirmedSnapshot.attachedClientCount
         )
         sessionObservers[existing.id] = nil
@@ -441,6 +443,7 @@ final class SessionManager: ObservableObject {
                     instanceToken: snapshot.instanceToken,
                     initialStatus: .remoteRunning,
                     terminalTitle: snapshot.title,
+                    threadID: snapshot.threadID,
                     remoteAttachedClientCount: snapshot.attachedClientCount
                 )
                 append(session)

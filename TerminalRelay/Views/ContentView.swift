@@ -308,7 +308,6 @@ struct ContentView: View {
     @State private var selectedProjectID: UUID?
     @State private var projectPendingDeletion: ProjectProfile?
     @State private var pageDestination: SidebarDestination?
-    @State private var isSearching = false
     @State private var searchQuery = ""
     @State private var navigationHistory: [SidebarDestination] = []
     @State private var navigationIndex = -1
@@ -317,7 +316,6 @@ struct ContentView: View {
     @State private var isNamingSidebarFolder = false
     @State private var newSidebarFolderName = ""
     @State private var expandedSidebarFolderIDs: Set<UUID> = []
-    @State private var isRootProjectsExpanded = true
 
     private var launchDefaults: AgentLaunchDefaults {
         AgentLaunchDefaults(
@@ -333,11 +331,8 @@ struct ContentView: View {
         let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return projectStore.sidebarProjects }
 
-        return projectStore.projects.filter { project in
+        return projectStore.sidebarProjects.filter { project in
             project.displayName.localizedCaseInsensitiveContains(query)
-                || sessionManager.sessions(forProjectID: project.id).contains {
-                    $0.displayTitle.localizedCaseInsensitiveContains(query)
-                }
         }
     }
 
@@ -483,6 +478,7 @@ struct ContentView: View {
         VStack(spacing: 0) {
             sidebarHeader
             sidebarCreationButtons
+            sidebarProjectFilter
 
             Rectangle()
                 .fill(SidebarPalette.separator)
@@ -493,7 +489,7 @@ struct ContentView: View {
                     sidebarProjectList
 
                     if !searchQuery.isEmpty && visibleProjects.isEmpty {
-                        Text("No matching projects or sessions")
+                        Text("No matching projects")
                             .font(.system(size: 13.5))
                             .foregroundStyle(SidebarPalette.tertiary)
                             .padding(.horizontal, 15)
@@ -519,34 +515,14 @@ struct ContentView: View {
                 projectSidebarSection(project, folderID: nil)
             }
         } else {
-            if !projectStore.sidebarFolders.isEmpty {
-                SidebarFolderRow(
-                    title: "Projects",
-                    isExpanded: isRootProjectsExpanded,
-                    isRoot: true,
-                    onToggle: { isRootProjectsExpanded.toggle() },
-                    acceptsDrop: { item in
-                        guard case .project = item else { return false }
-                        return true
-                    },
-                    onDrop: handleRootFolderDrop
-                )
-                .contextMenu {
-                    sidebarCreationMenu
-                }
-            }
-
-            if isRootProjectsExpanded || projectStore.sidebarFolders.isEmpty {
-                ForEach(projectStore.rootProjects) { project in
-                    projectSidebarSection(project, folderID: nil)
-                }
+            ForEach(projectStore.rootProjects) { project in
+                projectSidebarSection(project, folderID: nil)
             }
 
             ForEach(projectStore.sidebarFolders) { folder in
                 SidebarFolderRow(
                     title: folder.name,
                     isExpanded: expandedSidebarFolderIDs.contains(folder.id),
-                    isRoot: false,
                     onToggle: {
                         toggleSidebarFolder(folder.id)
                     },
@@ -619,7 +595,7 @@ struct ContentView: View {
                       movingProjectID != project.id else {
                     return false
                 }
-                return projectStore.sidebarFolderID(containing: movingProjectID) == folderID
+                return true
             },
             onDropProject: { values, location in
                 handleProjectDrop(
@@ -634,64 +610,28 @@ struct ContentView: View {
 
     @ViewBuilder
     private var sidebarHeader: some View {
-        if isSearching {
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(SidebarPalette.secondary)
-
-                TextField("Search", text: $searchQuery)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 14))
-                    .foregroundStyle(SidebarPalette.primary)
-
-                Button {
-                    searchQuery = ""
-                    isSearching = false
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 11, weight: .semibold))
+        HStack(spacing: 0) {
+            Menu {
+                Button("Manage Workers", systemImage: "server.rack") {
+                    navigate(to: .workers)
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(SidebarPalette.secondary)
+                Button("Settings…", systemImage: "gearshape") {
+                    navigate(to: .settings)
+                }
+            } label: {
+                Text("Terminal Relay")
+                    .font(.system(size: 16, weight: .bold))
+                .foregroundStyle(SidebarPalette.primary)
+                .contentShape(Rectangle())
             }
-            .padding(.horizontal, 10)
-            .frame(height: 42)
-        } else {
-            HStack(spacing: 0) {
-                Menu {
-                    Button("Manage Workers", systemImage: "server.rack") {
-                        navigate(to: .workers)
-                    }
-                    Button("Settings…", systemImage: "gearshape") {
-                        navigate(to: .settings)
-                    }
-                } label: {
-                    Text("Terminal Relay")
-                        .font(.system(size: 16, weight: .bold))
-                    .foregroundStyle(SidebarPalette.primary)
-                    .contentShape(Rectangle())
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
+            .menuStyle(.borderlessButton)
+            .fixedSize()
 
-                Spacer()
-
-                Button {
-                    isSearching = true
-                } label: {
-                    Image(systemName: "magnifyingglass")
-                        .font(.system(size: 14, weight: .medium))
-                        .frame(width: 26, height: 28)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(SidebarPalette.secondary)
-                .help("Search projects and sessions")
-            }
-            .padding(.leading, 10)
-            .padding(.trailing, 8)
-            .frame(height: 42)
+            Spacer()
         }
+        .padding(.leading, 10)
+        .padding(.trailing, 8)
+        .frame(height: 42)
     }
 
     private var sidebarCreationButtons: some View {
@@ -717,6 +657,36 @@ struct ContentView: View {
             .help("New parent folder")
             .accessibilityLabel("New Parent Folder")
         }
+    }
+
+    private var sidebarProjectFilter: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(SidebarPalette.tertiary)
+
+            TextField("Filter projects", text: $searchQuery)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12.5))
+                .foregroundStyle(SidebarPalette.primary)
+
+            if !searchQuery.isEmpty {
+                Button {
+                    searchQuery = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 11))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(SidebarPalette.tertiary)
+                .help("Clear project filter")
+            }
+        }
+        .padding(.horizontal, 9)
+        .frame(height: 27)
+        .background(SidebarPalette.hover, in: RoundedRectangle(cornerRadius: 6))
+        .padding(.horizontal, 10)
+        .padding(.bottom, 7)
     }
 
     @ViewBuilder
@@ -1122,7 +1092,6 @@ struct ContentView: View {
             return false
         }
         projectStore.moveProject(id: projectID, intoSidebarFolder: nil)
-        isRootProjectsExpanded = true
         return true
     }
 
@@ -1404,7 +1373,6 @@ private struct SidebarActionButton: View {
 private struct SidebarFolderRow: View {
     let title: String
     let isExpanded: Bool
-    let isRoot: Bool
     let onToggle: () -> Void
     let acceptsDrop: (SidebarDragItem) -> Bool
     let onDrop: ([String], CGPoint) -> Bool
@@ -1414,7 +1382,7 @@ private struct SidebarFolderRow: View {
 
     var body: some View {
         HStack(spacing: SidebarRowGeometry.iconSpacing) {
-            Image(systemName: isRoot ? "tray.full" : "folder.fill")
+            Image(systemName: "folder.fill")
                 .font(.system(size: 12))
                 .foregroundStyle(SidebarPalette.secondary)
                 .frame(width: SidebarRowGeometry.iconFrameWidth)
@@ -1449,9 +1417,6 @@ private struct SidebarFolderRow: View {
             dropPosition: $dropPosition,
             accepts: acceptsDrop,
             position: { item, location in
-                if isRoot {
-                    return .after
-                }
                 if case .project = item {
                     return .after
                 }
@@ -1459,11 +1424,7 @@ private struct SidebarFolderRow: View {
             },
             onDrop: onDrop
         )
-        .help(
-            isRoot
-                ? "Drop a project folder here to move it out of a parent folder"
-                : "Drop a project folder here to move it into this parent folder"
-        )
+        .help("Drop a project folder here to move it into this parent folder")
     }
 }
 
@@ -1491,6 +1452,31 @@ private struct ProjectSidebarSection: View {
 
     private var allSessions: [TerminalSession] {
         sessionManager.sidebarSessions(forProjectID: project.id)
+    }
+
+    private var sessionsWithThreadIDs: [TerminalSession] {
+        allSessions.filter { $0.threadID != nil }
+    }
+
+    private var localProjectURL: URL? {
+        let fileManager = FileManager.default
+        let homeDirectory = fileManager.homeDirectoryForCurrentUser
+        let candidates = [
+            URL(fileURLWithPath: project.workingDirectory, isDirectory: true),
+            homeDirectory.appendingPathComponent("dev/\(project.displayName)", isDirectory: true),
+            homeDirectory.appendingPathComponent("Developer/\(project.displayName)", isDirectory: true),
+            homeDirectory.appendingPathComponent("Projects/\(project.displayName)", isDirectory: true),
+        ]
+
+        return candidates.first { candidate in
+            var isDirectory: ObjCBool = false
+            return fileManager.fileExists(atPath: candidate.path, isDirectory: &isDirectory)
+                && isDirectory.boolValue
+        }
+    }
+
+    private var projectReferencePath: String {
+        localProjectURL?.path ?? project.workingDirectory
     }
 
     private var matchingSessions: [TerminalSession] {
@@ -1573,6 +1559,8 @@ private struct ProjectSidebarSection: View {
                 Button("Open Codex") { onOpenTerminal(.codex) }
                 Button("Open Claude Code") { onOpenTerminal(.claude) }
                 Divider()
+                projectReferenceMenu
+                Divider()
                 Button("Edit Project", action: onEdit)
                 Divider()
                 Button("Remove Project", role: .destructive, action: onRemove)
@@ -1646,6 +1634,20 @@ private struct ProjectSidebarSection: View {
                         }
                         .disabled(session.status == .stopping)
                         Divider()
+                        Button("Copy Thread ID", systemImage: "number") {
+                            if let threadID = session.threadID {
+                                copyToPasteboard(threadID)
+                            }
+                        }
+                        .disabled(session.threadID == nil)
+                        Button("Copy Path", systemImage: "document.on.document") {
+                            copyToPasteboard(projectReferencePath)
+                        }
+                        Button("Open in Finder", systemImage: "folder") {
+                            openProjectInFinder()
+                        }
+                        .disabled(localProjectURL == nil)
+                        Divider()
                         Button("Archive Terminal", role: .destructive) {
                             onArchiveSession(session.id)
                         }
@@ -1665,6 +1667,50 @@ private struct ProjectSidebarSection: View {
             }
         }
         .padding(.bottom, 8)
+    }
+
+    @ViewBuilder
+    private var projectReferenceMenu: some View {
+        if sessionsWithThreadIDs.count == 1,
+           let threadID = sessionsWithThreadIDs.first?.threadID {
+            Button("Copy Thread ID", systemImage: "number") {
+                copyToPasteboard(threadID)
+            }
+        } else if sessionsWithThreadIDs.count > 1 {
+            Menu {
+                ForEach(sessionsWithThreadIDs) { session in
+                    Button(session.displayTitle) {
+                        if let threadID = session.threadID {
+                            copyToPasteboard(threadID)
+                        }
+                    }
+                }
+            } label: {
+                Label("Copy Thread ID", systemImage: "number")
+            }
+        } else {
+            Button("Copy Thread ID", systemImage: "number") {}
+                .disabled(true)
+        }
+
+        Button("Copy Path", systemImage: "document.on.document") {
+            copyToPasteboard(projectReferencePath)
+        }
+
+        Button("Open in Finder", systemImage: "folder") {
+            openProjectInFinder()
+        }
+        .disabled(localProjectURL == nil)
+    }
+
+    private func copyToPasteboard(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+    }
+
+    private func openProjectInFinder() {
+        guard let localProjectURL else { return }
+        NSWorkspace.shared.open(localProjectURL)
     }
 
     private func handleSessionDrop(

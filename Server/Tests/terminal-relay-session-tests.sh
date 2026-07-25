@@ -96,6 +96,10 @@ title_hex_from_line() {
     printf '%s\n' "$1" | /usr/bin/awk -F'|' '$1 == "session" { print $7; exit }'
 }
 
+thread_id_from_line() {
+    printf '%s\n' "$1" | /usr/bin/awk -F'|' '$1 == "session" { print $9; exit }'
+}
+
 encode_title() {
     "$python_path" -c 'import sys; print(sys.argv[1].encode("utf-8").hex())' "$1"
 }
@@ -112,13 +116,14 @@ wait_for_session() {
     local actual_clients
     local instance
     local working
+    local thread_id
     local extra
 
     while [[ $attempt -lt 160 ]]; do
         attempt=$((attempt + 1))
         line="$(session_line "$tool" "$repository" 2>/dev/null || true)"
         IFS='|' read -r record_type actual_tool actual_repository actual_clients instance \
-            activity title working extra <<< "$line"
+            activity title working thread_id extra <<< "$line"
         if [[ "$record_type" == "session" \
             && "$actual_tool" == "$tool" \
             && "$actual_repository" == "$repository" \
@@ -127,6 +132,7 @@ wait_for_session() {
             && "$activity" =~ ^[0-9]+$ \
             && "$title" =~ ^([a-f0-9]{2})*$ \
             && "$working" =~ ^[01]?$ \
+            && "$thread_id" =~ ^([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})?$ \
             && -z "${extra:-}" ]]; then
             printf '%s\n' "$line"
             return 0
@@ -456,6 +462,10 @@ assert_equal \
     "0" \
     "$(printf '%s\n' "$codex_title_status" | /usr/bin/awk -F'|' '$1 == "session" { print $8; exit }')" \
     "Codex ready state"
+assert_equal \
+    "$codex_thread_id" \
+    "$(thread_id_from_line "$codex_title_status")" \
+    "Codex thread id"
 "$tmux_path" -f /dev/null -L "$tmux_socket" \
     select-pane -t "terminal-relay-codex-$first_instance" \
     -T "Renamed live thread | Working"
@@ -662,6 +672,10 @@ assert_equal \
     "$(encode_title "Generated Claude title")" \
     "$(title_hex_from_line "$claude_generated_title_status")" \
     "Claude generated title"
+assert_equal \
+    "$claude_reboot_instance" \
+    "$(thread_id_from_line "$claude_generated_title_status")" \
+    "Claude thread id"
 printf '%s\n' \
     '{"type":"custom-title","customTitle":"Renamed Claude title"}' \
     >> "$claude_history_file"

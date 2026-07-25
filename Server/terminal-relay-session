@@ -1476,6 +1476,7 @@ session_display_fields() {
     session_activity=0
     session_title_hex=""
     session_working=""
+    session_thread_id=""
     session_name="$(session_name_for "$tool" "$instance")"
     display="$(tmux_command display-message -p -t "$session_name" \
         '#{window_activity}|#{pane_title}' 2>/dev/null)" || return 1
@@ -1483,12 +1484,18 @@ session_display_fields() {
     pane_title="${display#*|}"
     [[ "$session_activity" =~ ^[0-9]+$ ]] || session_activity=0
     if [[ "$tool" == "codex" ]]; then
+        if [[ "$pane_title" =~ ([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}) ]]; then
+            session_thread_id="$(printf '%s' "${BASH_REMATCH[1]}" \
+                | /usr/bin/tr '[:upper:]' '[:lower:]')"
+        fi
         case "$pane_title" in
             *" | Ready") session_working=0 ;;
             *" | Working"|*" | Thinking"|*" | Waiting"|*" | Starting")
                 session_working=1
                 ;;
         esac
+    else
+        session_thread_id="$instance"
     fi
     session_title_hex="$(encode_argument_hex "$(resolve_session_title "$tool" "$instance" "$pane_title")")"
 }
@@ -1563,8 +1570,9 @@ status_sessions() {
             session_activity=0
             session_title_hex=""
             session_working=""
+            session_thread_id=""
         fi
-        records+=("session|$tool|$repository|$attached_client_count|$instance|$session_activity|$session_title_hex|$session_working")
+        records+=("session|$tool|$repository|$attached_client_count|$instance|$session_activity|$session_title_hex|$session_working|$session_thread_id")
     done
     shopt -u nullglob
 
@@ -2389,11 +2397,12 @@ start_instance_session() {
         session_activity=0
         session_title_hex=""
         session_working=""
+        session_thread_id=""
     fi
     printf '%s\n' "$protocol_marker"
-    printf 'session|%s|%s|%s|%s|%s|%s|%s\n' \
+    printf 'session|%s|%s|%s|%s|%s|%s|%s|%s\n' \
         "$tool" "$repository" "$attached_client_count" "$instance" \
-        "$session_activity" "$session_title_hex" "$session_working"
+        "$session_activity" "$session_title_hex" "$session_working" "$session_thread_id"
 }
 
 reattach_instance_session() {

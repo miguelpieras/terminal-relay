@@ -8,6 +8,7 @@ struct WorkerSessionSnapshot: Equatable, Identifiable {
     let title: String?
     let lastActivityAt: Int?
     let reportedWorking: Bool?
+    let threadID: String?
 
     var id: String { instanceToken }
 
@@ -18,7 +19,8 @@ struct WorkerSessionSnapshot: Equatable, Identifiable {
         instanceToken: String,
         title: String? = nil,
         lastActivityAt: Int? = nil,
-        reportedWorking: Bool? = nil
+        reportedWorking: Bool? = nil,
+        threadID: String? = nil
     ) {
         self.kind = kind
         self.repositoryName = repositoryName
@@ -27,6 +29,7 @@ struct WorkerSessionSnapshot: Equatable, Identifiable {
         self.title = title
         self.lastActivityAt = lastActivityAt
         self.reportedWorking = reportedWorking
+        self.threadID = threadID
     }
 
     func isWorking(now: Date = Date()) -> Bool {
@@ -91,7 +94,8 @@ enum WorkerSessionProtocol {
                 }
                 projects.append(fields[1])
             case "session":
-                guard fields.count == 5 || fields.count == 7 || fields.count == 8,
+                guard fields.count == 5 || fields.count == 7
+                        || fields.count == 8 || fields.count == 9,
                       let kind = AgentKind(rawValue: fields[1]),
                       isValidRepositoryName(fields[2]),
                       let attachedClientCount = Int(fields[3]),
@@ -106,6 +110,7 @@ enum WorkerSessionProtocol {
                 let lastActivityAt: Int?
                 let title: String?
                 let reportedWorking: Bool?
+                let threadID: String?
                 if fields.count >= 7 {
                     guard let activity = Int(fields[5]), activity >= 0,
                           let decodedTitle = decodeHexUTF8(fields[6]),
@@ -122,10 +127,23 @@ enum WorkerSessionProtocol {
                     } else {
                         reportedWorking = nil
                     }
+                    if fields.count == 9 {
+                        if fields[8].isEmpty {
+                            threadID = nil
+                        } else {
+                            guard let parsedThreadID = UUID(uuidString: fields[8]) else {
+                                throw WorkerSessionProtocolError.invalidRecord
+                            }
+                            threadID = parsedThreadID.uuidString.lowercased()
+                        }
+                    } else {
+                        threadID = nil
+                    }
                 } else {
                     lastActivityAt = nil
                     title = nil
                     reportedWorking = nil
+                    threadID = nil
                 }
                 sessions.append(
                     WorkerSessionSnapshot(
@@ -135,7 +153,8 @@ enum WorkerSessionProtocol {
                         instanceToken: canonicalInstanceID,
                         title: title,
                         lastActivityAt: lastActivityAt,
-                        reportedWorking: reportedWorking
+                        reportedWorking: reportedWorking,
+                        threadID: threadID
                     )
                 )
             default:

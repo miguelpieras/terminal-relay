@@ -262,6 +262,7 @@ final class SessionManagerTests: XCTestCase {
 
         XCTAssertNil(session.terminalTitle)
         XCTAssertEqual(session.displayTitle, "Codex 1")
+        XCTAssertEqual(session.threadID, "019f89a7-f067-7e41-a7ec-76d0ed91e684")
         XCTAssertFalse(session.isWorking)
 
         session.setTerminalTitle(
@@ -415,7 +416,8 @@ final class SessionManagerTests: XCTestCase {
                         repositoryName: project.displayName,
                         attachedClientCount: 0,
                         instanceToken: instanceToken,
-                        title: "Improve terminal titles"
+                        title: "Improve terminal titles",
+                        threadID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
                     )
                 ]
             ),
@@ -424,6 +426,7 @@ final class SessionManagerTests: XCTestCase {
 
         let session = manager.session(projectID: project.id, kind: .codex)
         XCTAssertEqual(session?.displayTitle, "Improve terminal titles")
+        XCTAssertEqual(session?.threadID, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 
         manager.reconcile(
             worker: server,
@@ -436,7 +439,8 @@ final class SessionManagerTests: XCTestCase {
                         repositoryName: project.displayName,
                         attachedClientCount: 1,
                         instanceToken: instanceToken,
-                        title: "Polish terminal titles"
+                        title: "Polish terminal titles",
+                        threadID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
                     )
                 ]
             ),
@@ -445,6 +449,7 @@ final class SessionManagerTests: XCTestCase {
 
         XCTAssertTrue(manager.session(projectID: project.id, kind: .codex) === session)
         XCTAssertEqual(session?.displayTitle, "Polish terminal titles")
+        XCTAssertEqual(session?.threadID, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 
         manager.reconcile(
             worker: server,
