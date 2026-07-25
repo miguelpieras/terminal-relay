@@ -179,6 +179,38 @@ final class WorkerRegistrationURLTests: XCTestCase {
         XCTAssertNotNil(surfacedError)
     }
 
+    @MainActor
+    func testApplicationDelegateUsesLastWindowClosePreference() {
+        let suiteName = "TerminalRelayTests.ApplicationSettings.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let delegate = TerminalRelayApplicationDelegate(
+            registrationAuthorization: { _ in },
+            defaults: defaults
+        )
+
+        XCTAssertFalse(
+            delegate.applicationShouldTerminateAfterLastWindowClosed(NSApplication.shared)
+        )
+
+        defaults.set(
+            false,
+            forKey: ApplicationSettings.StorageKey.keepRunningAfterLastWindowClosed
+        )
+        XCTAssertTrue(
+            delegate.applicationShouldTerminateAfterLastWindowClosed(NSApplication.shared)
+        )
+
+        defaults.set(
+            true,
+            forKey: ApplicationSettings.StorageKey.keepRunningAfterLastWindowClosed
+        )
+        XCTAssertFalse(
+            delegate.applicationShouldTerminateAfterLastWindowClosed(NSApplication.shared)
+        )
+    }
+
     func testTokenAuthorizerConsumesAValidFileOnlyOnce() throws {
         let directory = try makeTemporaryRegistrationDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }

@@ -1,6 +1,22 @@
 import AppKit
 import SwiftUI
 
+enum ApplicationSettings {
+    enum StorageKey {
+        static let keepRunningAfterLastWindowClosed =
+            "applicationSettings.keepRunningAfterLastWindowClosed"
+    }
+
+    static let defaultKeepRunningAfterLastWindowClosed = true
+
+    static func keepRunningAfterLastWindowClosed(in defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.object(forKey: StorageKey.keepRunningAfterLastWindowClosed) != nil else {
+            return defaultKeepRunningAfterLastWindowClosed
+        }
+        return defaults.bool(forKey: StorageKey.keepRunningAfterLastWindowClosed)
+    }
+}
+
 @MainActor
 final class TerminalRelayApplicationDelegate: NSObject, NSApplicationDelegate {
     weak var sessionManager: SessionManager?
@@ -11,16 +27,26 @@ final class TerminalRelayApplicationDelegate: NSObject, NSApplicationDelegate {
     private var pendingRegistrationURLs: [URL] = []
     private var registrationErrorHandler: ((String?) -> Void)?
     private let registrationAuthorization: (WorkerRegistration) throws -> Void
+    private let defaults: UserDefaults
 
     override init() {
         let authorizer = WorkerRegistrationTokenAuthorizer()
         registrationAuthorization = authorizer.authorize
+        defaults = .standard
         super.init()
     }
 
-    init(registrationAuthorization: @escaping (WorkerRegistration) throws -> Void) {
+    init(
+        registrationAuthorization: @escaping (WorkerRegistration) throws -> Void,
+        defaults: UserDefaults = .standard
+    ) {
         self.registrationAuthorization = registrationAuthorization
+        self.defaults = defaults
         super.init()
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        !ApplicationSettings.keepRunningAfterLastWindowClosed(in: defaults)
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {

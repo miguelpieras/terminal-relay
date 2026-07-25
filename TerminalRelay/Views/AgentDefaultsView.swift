@@ -1,6 +1,10 @@
 import SwiftUI
 
 struct AgentDefaultsView: View {
+    @AppStorage(ApplicationSettings.StorageKey.keepRunningAfterLastWindowClosed)
+    private var keepRunningAfterLastWindowClosed =
+        ApplicationSettings.defaultKeepRunningAfterLastWindowClosed
+
     @AppStorage(AgentLaunchDefaults.StorageKey.codexModel)
     private var codexModel = AgentLaunchDefaults.standard.codexModel
 
@@ -22,7 +26,7 @@ struct AgentDefaultsView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Settings")
                         .font(.title2.weight(.semibold))
-                    Text("Defaults applied to every newly started terminal on every worker.")
+                    Text("Manage app behavior and defaults for newly started terminals.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
@@ -36,6 +40,24 @@ struct AgentDefaultsView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
+                    GroupBox {
+                        VStack(alignment: .leading, spacing: 7) {
+                            Toggle(
+                                "Keep running after closing the last window",
+                                isOn: $keepRunningAfterLastWindowClosed
+                            )
+                            Text(
+                                "Keeps Terminal Relay and its terminal sessions open. Quit the app to disconnect."
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, 4)
+                    } label: {
+                        Label("Application", systemImage: "macwindow")
+                    }
+
                     agentSettings(
                         kind: .codex,
                         title: "Codex",
@@ -115,6 +137,8 @@ struct AgentDefaultsView: View {
     }
 
     private func restoreDefaults() {
+        keepRunningAfterLastWindowClosed =
+            ApplicationSettings.defaultKeepRunningAfterLastWindowClosed
         codexModel = AgentLaunchDefaults.standard.codexModel
         codexReasoningEffort = AgentLaunchDefaults.standard.codexReasoningEffort
         claudeModel = AgentLaunchDefaults.standard.claudeModel

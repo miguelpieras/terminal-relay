@@ -1446,6 +1446,7 @@ private struct ProjectSidebarSection: View {
     let acceptsProjectDrop: (SidebarDragItem) -> Bool
     let onDropProject: ([String], CGPoint) -> Bool
 
+    @State private var isCollapsed = false
     @State private var isExpanded = false
     @State private var isProjectHovering = false
     @State private var projectDropPosition: SidebarDropPosition?
@@ -1529,6 +1530,21 @@ private struct ProjectSidebarSection: View {
                         .accessibilityLabel("Open \(kind.displayName) terminal")
                     }
                 }
+
+                Button {
+                    isCollapsed.toggle()
+                } label: {
+                    Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(SidebarPalette.secondary)
+                        .frame(width: 18, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(isCollapsed ? "Show project terminals" : "Hide project terminals")
+                .accessibilityLabel(
+                    isCollapsed ? "Expand \(project.displayName)" : "Collapse \(project.displayName)"
+                )
             }
             .padding(.leading, SidebarRowGeometry.contentLeadingPadding)
             .padding(.trailing, SidebarRowGeometry.contentTrailingPadding)
@@ -1566,107 +1582,118 @@ private struct ProjectSidebarSection: View {
                 Button("Remove Project", role: .destructive, action: onRemove)
             }
 
-            if matchingSessions.isEmpty {
-                Text("No sessions")
-                    .font(.system(size: 14))
-                    .foregroundStyle(SidebarPalette.tertiary)
-                    .padding(.leading, 40)
-                    .padding(.trailing, 12)
-                    .frame(height: 35, alignment: .leading)
-            } else {
-                ForEach(visibleSessions) { session in
-                    ProjectSessionRow(
-                        session: session,
-                        isSelected: selectedSessionID == session.id
-                            || selectedSessionIDs.contains(session.id),
-                        archiveCount: selectedSessionIDs.contains(session.id)
-                            ? max(1, selectedSessionIDs.count)
-                            : 1,
-                        onSelect: {
-                            onSelectSession(
-                                session.id,
-                                NSEvent.modifierFlags.contains(.command)
-                            )
-                        },
-                        onArchive: {
-                            onArchiveSession(session.id)
-                        },
-                        acceptsDrop: { item in
-                            guard case .session(let movingSessionID) = item,
-                                  movingSessionID != session.id,
-                                  let movingSession = sessionManager.sessions.first(where: {
-                                      $0.id == movingSessionID
-                                  }) else {
-                                return false
+            if !isCollapsed {
+                if matchingSessions.isEmpty {
+                    Text("No sessions")
+                        .font(.system(size: 14))
+                        .foregroundStyle(SidebarPalette.tertiary)
+                        .padding(.leading, 40)
+                        .padding(.trailing, 12)
+                        .frame(height: 35, alignment: .leading)
+                } else {
+                    ForEach(visibleSessions) { session in
+                        ProjectSessionRow(
+                            session: session,
+                            isSelected: selectedSessionID == session.id
+                                || selectedSessionIDs.contains(session.id),
+                            archiveCount: selectedSessionIDs.contains(session.id)
+                                ? max(1, selectedSessionIDs.count)
+                                : 1,
+                            onSelect: {
+                                onSelectSession(
+                                    session.id,
+                                    NSEvent.modifierFlags.contains(.command)
+                                )
+                            },
+                            onArchive: {
+                                onArchiveSession(session.id)
+                            },
+                            acceptsDrop: { item in
+                                guard case .session(let movingSessionID) = item,
+                                      movingSessionID != session.id,
+                                      let movingSession = sessionManager.sessions.first(where: {
+                                          $0.id == movingSessionID
+                                      }) else {
+                                    return false
+                                }
+                                return movingSession.projectID == project.id
+                            },
+                            onDrop: { values, location in
+                                handleSessionDrop(
+                                    values,
+                                    at: location,
+                                    before: session.id
+                                )
                             }
-                            return movingSession.projectID == project.id
-                        },
-                        onDrop: { values, location in
-                            handleSessionDrop(
-                                values,
-                                at: location,
-                                before: session.id
-                            )
-                        }
-                    )
-                    .contextMenu {
-                        Button("New Project", systemImage: "square.and.pencil", action: onNewProject)
-                        Button(
-                            "New Parent Folder",
-                            systemImage: "folder.badge.plus",
-                            action: onNewParentFolder
                         )
-                        Divider()
-                        Group {
-                            if session.status.isLocallyAttached {
-                                Button("Disconnect") {
-                                    sessionManager.disconnect(sessionID: session.id)
-                                }
-                            } else if session.status.canReconnect {
-                                Button("Reconnect") {
-                                    onSelectSession(session.id, false)
-                                }
-                            } else {
-                                Button("Close Session") {
-                                    sessionManager.close(sessionID: session.id)
+                        .contextMenu {
+                            Button(
+                                "New Project",
+                                systemImage: "square.and.pencil",
+                                action: onNewProject
+                            )
+                            Button(
+                                "New Parent Folder",
+                                systemImage: "folder.badge.plus",
+                                action: onNewParentFolder
+                            )
+                            Divider()
+                            Group {
+                                if session.status.isLocallyAttached {
+                                    Button("Disconnect") {
+                                        sessionManager.disconnect(sessionID: session.id)
+                                    }
+                                } else if session.status.canReconnect {
+                                    Button("Reconnect") {
+                                        onSelectSession(session.id, false)
+                                    }
+                                } else {
+                                    Button("Close Session") {
+                                        sessionManager.close(sessionID: session.id)
+                                    }
                                 }
                             }
-                        }
-                        .disabled(session.status == .stopping)
-                        Divider()
-                        Button("Copy Thread ID", systemImage: "number") {
-                            if let threadID = session.threadID {
-                                copyToPasteboard(threadID)
+                            .disabled(session.status == .stopping)
+                            Divider()
+                            Button("Copy Thread ID", systemImage: "number") {
+                                if let threadID = session.threadID {
+                                    copyToPasteboard(threadID)
+                                }
                             }
-                        }
-                        .disabled(session.threadID == nil)
-                        Button("Copy Path", systemImage: "document.on.document") {
-                            copyToPasteboard(projectReferencePath)
-                        }
-                        Button("Open in Finder", systemImage: "folder") {
-                            openProjectInFinder()
-                        }
-                        .disabled(localProjectURL == nil)
-                        Divider()
-                        Button("Archive Terminal", role: .destructive) {
-                            onArchiveSession(session.id)
+                            .disabled(session.threadID == nil)
+                            Button("Copy Path", systemImage: "document.on.document") {
+                                copyToPasteboard(projectReferencePath)
+                            }
+                            Button("Open in Finder", systemImage: "folder") {
+                                openProjectInFinder()
+                            }
+                            .disabled(localProjectURL == nil)
+                            Divider()
+                            Button("Archive Terminal", role: .destructive) {
+                                onArchiveSession(session.id)
+                            }
                         }
                     }
-                }
 
-                if searchQuery.isEmpty && matchingSessions.count > 5 {
-                    Button(isExpanded ? "Show less" : "Show more") {
-                        isExpanded.toggle()
+                    if searchQuery.isEmpty && matchingSessions.count > 5 {
+                        Button(isExpanded ? "Show less" : "Show more") {
+                            isExpanded.toggle()
+                        }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 14))
+                        .foregroundStyle(SidebarPalette.secondary)
+                        .padding(.leading, 40)
+                        .frame(height: 35)
                     }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 14))
-                    .foregroundStyle(SidebarPalette.secondary)
-                    .padding(.leading, 40)
-                    .frame(height: 35)
                 }
             }
         }
         .padding(.bottom, 8)
+        .onChange(of: searchQuery) { _, query in
+            if !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                isCollapsed = false
+            }
+        }
     }
 
     @ViewBuilder
