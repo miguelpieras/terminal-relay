@@ -316,6 +316,7 @@ struct ContentView: View {
     @State private var isNamingSidebarFolder = false
     @State private var newSidebarFolderName = ""
     @State private var expandedSidebarFolderIDs: Set<UUID> = []
+    @FocusState private var isProjectFilterFocused: Bool
 
     private var launchDefaults: AgentLaunchDefaults {
         AgentLaunchDefaults(
@@ -409,7 +410,10 @@ struct ContentView: View {
 
     private var lifecycleContent: some View {
         navigationContent
-            .onAppear(perform: selectFirstProjectIfNeeded)
+            .onAppear {
+                selectFirstProjectIfNeeded()
+                clearInitialFilterFocus()
+            }
             .onChange(of: projectStore.projects) { _, _ in selectFirstProjectIfNeeded() }
             .onChange(of: sessionManager.sessions.map(\.id)) { _, sessionIDs in
                 selectedSessionIDs.formIntersection(sessionIDs)
@@ -669,6 +673,7 @@ struct ContentView: View {
                 .textFieldStyle(.plain)
                 .font(.system(size: 12.5))
                 .foregroundStyle(SidebarPalette.primary)
+                .focused($isProjectFilterFocused)
 
             if !searchQuery.isEmpty {
                 Button {
@@ -1076,6 +1081,13 @@ struct ContentView: View {
     private func beginCreatingSidebarFolder() {
         newSidebarFolderName = ""
         isNamingSidebarFolder = true
+    }
+
+    private func clearInitialFilterFocus() {
+        isProjectFilterFocused = false
+        DispatchQueue.main.async {
+            isProjectFilterFocused = false
+        }
     }
 
     private func toggleSidebarFolder(_ folderID: UUID) {
@@ -1511,10 +1523,16 @@ private struct ProjectSidebarSection: View {
                     Spacer(minLength: 6)
                 }
                 .contentShape(Rectangle())
-                .onTapGesture(perform: onSelectProject)
+                .onTapGesture {
+                    onSelectProject()
+                    isCollapsed.toggle()
+                }
                 .accessibilityElement(children: .combine)
                 .accessibilityAddTraits(.isButton)
-                .accessibilityAction { onSelectProject() }
+                .accessibilityAction {
+                    onSelectProject()
+                    isCollapsed.toggle()
+                }
 
                 if isProjectHovering {
                     ForEach(AgentKind.allCases) { kind in

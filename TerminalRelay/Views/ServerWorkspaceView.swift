@@ -454,14 +454,7 @@ struct ProjectWorkspaceView: View {
 
     private var readyState: some View {
         ScrollView {
-            VStack(spacing: 22) {
-                VStack(spacing: 6) {
-                    Text("Ready to work on \(project.displayName)")
-                        .font(.title3.weight(.semibold))
-                    Text("Choose the account with the most capacity on \(worker.displayName).")
-                        .foregroundStyle(.secondary)
-                }
-
+            VStack(spacing: 16) {
                 HStack(alignment: .top, spacing: 14) {
                     ForEach(AgentKind.allCases) { kind in
                         let hasActiveAgent = sessionManager.occupant(
@@ -502,26 +495,6 @@ struct ProjectWorkspaceView: View {
                         isShowingCodexResets = false
                     }
                     .frame(maxWidth: 820)
-                }
-
-                HStack(spacing: 8) {
-                    Text(project.workingDirectory)
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-
-                    Button {
-                        Task {
-                            await accountUsageService.refresh(worker: worker, force: true)
-                        }
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-                    .disabled(AgentKind.allCases.contains {
-                        accountUsageService.isLoading(workerID: worker.id, kind: $0)
-                    })
-                    .help("Refresh account usage")
                 }
             }
             .frame(maxWidth: .infinity)
