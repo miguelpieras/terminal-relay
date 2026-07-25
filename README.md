@@ -85,6 +85,12 @@ and run on a simulator or connected device.
 
 ## Configure a worker
 
+The macOS app's **Workers → Add Worker** screen provides a copyable bootstrap
+command for a fresh host. It can also store connection details for a host that
+already has the Terminal Relay runtime installed; manual registration does not
+create or configure that host. Successful bootstrap or managed provisioning
+registers the worker in the app automatically.
+
 ### Managed Hetzner and Tailscale lifecycle
 
 Copy the public template into the ignored machine-specific configuration:

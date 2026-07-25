@@ -50,10 +50,10 @@ struct WorkersView: View {
                 ContentUnavailableView {
                     Label("No Workers", systemImage: "server.rack")
                 } description: {
-                    Text("Add a remote worker before creating a project.")
+                    Text("Set up a worker, or register one that is already prepared.")
                 } actions: {
                     Button("Add Worker") {
-                        editorProfile = ServerProfile()
+                        editorProfile = newWorkerProfile()
                     }
                     .buttonStyle(.borderedProminent)
                 }
@@ -104,7 +104,7 @@ struct WorkersView: View {
 
                 Button {
                     workerPendingDeletion = nil
-                    editorProfile = ServerProfile()
+                    editorProfile = newWorkerProfile()
                 } label: {
                     Label("Add Worker", systemImage: "plus")
                 }
@@ -121,6 +121,15 @@ struct WorkersView: View {
         let name = editorProfile.displayName
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return name.isEmpty ? "Add Worker" : "Edit \(name)"
+    }
+
+    private func newWorkerProfile() -> ServerProfile {
+        ServerProfile(
+            username: "terminal-relay",
+            workingDirectory: WorkerRegistrationURL.workingDirectory,
+            codexCommand: WorkerRegistrationURL.codexCommand,
+            claudeCommand: WorkerRegistrationURL.claudeCommand
+        )
     }
 
     private var workerList: some View {

@@ -1,10 +1,13 @@
+import AppKit
 import SwiftUI
 
 struct WorkerEditorView: View {
     @State private var draft: ServerProfile
+    @State private var copiedBootstrapCommand = false
 
     let onSave: (ServerProfile) -> Void
     let onCancel: () -> Void
+    private let isRegistering: Bool
 
     init(
         profile: ServerProfile,
@@ -14,34 +17,53 @@ struct WorkerEditorView: View {
         _draft = State(initialValue: profile)
         self.onSave = onSave
         self.onCancel = onCancel
+        isRegistering = profile.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && profile.host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     var body: some View {
         VStack(spacing: 0) {
             Form {
-                Section("Connection") {
+                if isRegistering {
+                    Section("Set up a new worker") {
+                        Text(
+                            "For a fresh Ubuntu host you can already reach as root, run this from a configured Terminal Relay repository checkout. Setup installs the runtime and registers the worker here automatically."
+                        )
+                        .foregroundStyle(.secondary)
+
+                        HStack(alignment: .firstTextBaseline, spacing: 12) {
+                            Text(bootstrapCommand)
+                                .font(.system(.callout, design: .monospaced))
+                                .textSelection(.enabled)
+
+                            Spacer(minLength: 8)
+
+                            Button(copiedBootstrapCommand ? "Copied" : "Copy") {
+                                copyBootstrapCommand()
+                            }
+                            .controlSize(.small)
+                        }
+                    }
+                }
+
+                Section(isRegistering ? "Or register an existing worker" : "Connection") {
                     TextField("Worker name", text: $draft.name, prompt: Text("My Worker"))
                     TextField("Host or SSH alias", text: $draft.host, prompt: Text("worker.example.com"))
-                    TextField("Username (optional)", text: $draft.username, prompt: Text("ubuntu"))
+                    TextField("Username", text: $draft.username, prompt: Text("terminal-relay"))
                     TextField("Port", value: $draft.port, format: .number)
                     TextField("Identity file (optional)", text: $draft.identityFile, prompt: Text("~/.ssh/id_ed25519"))
                 }
 
-                Section("Codex") {
-                    TextField("Account label", text: $draft.codexAccountLabel, prompt: Text("Work Codex"))
-                    TextField("Launch command", text: $draft.codexCommand, prompt: Text("codex"))
-                        .font(.system(.body, design: .monospaced))
-                }
-
-                Section("Claude") {
-                    TextField("Account label", text: $draft.claudeAccountLabel, prompt: Text("Work Claude"))
-                    TextField("Launch command", text: $draft.claudeCommand, prompt: Text("claude"))
-                        .font(.system(.body, design: .monospaced))
+                Section("Account labels (optional)") {
+                    TextField("Codex", text: $draft.codexAccountLabel, prompt: Text("Work Codex"))
+                    TextField("Claude", text: $draft.claudeAccountLabel, prompt: Text("Work Claude"))
                 }
 
                 Section {
                     Label(
-                        "Passwords and API keys are not stored. SSH authentication and agent accounts stay on the worker.",
+                        isRegistering
+                            ? "Manual registration saves connection details only. The host must already have the Terminal Relay runtime installed."
+                            : "Passwords and API keys are not stored. SSH authentication and agent accounts stay on the worker.",
                         systemImage: "lock.shield"
                     )
                     .font(.callout)
@@ -58,7 +80,7 @@ struct WorkerEditorView: View {
                 Spacer()
                 Button("Cancel", action: onCancel)
                     .keyboardShortcut(.cancelAction)
-                Button("Save") {
+                Button(isRegistering ? "Register Worker" : "Save") {
                     onSave(trimmed(draft))
                 }
                 .buttonStyle(.borderedProminent)
@@ -68,6 +90,34 @@ struct WorkerEditorView: View {
             .padding(16)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onChange(of: bootstrapCommand) { _, _ in
+            copiedBootstrapCommand = false
+        }
+    }
+
+    private var bootstrapCommand: String {
+        let host = draft.host.trimmingCharacters(in: .whitespacesAndNewlines)
+        let identityFile = draft.identityFile.trimmingCharacters(in: .whitespacesAndNewlines)
+        var arguments = ["./Scripts/bootstrap-worker.sh"]
+        if !identityFile.isEmpty {
+            arguments += [
+                "--identity",
+                SSHCommandBuilder.shellQuote((identityFile as NSString).expandingTildeInPath)
+            ]
+        }
+        if draft.port != 22 {
+            arguments += ["--port", String(draft.port)]
+        }
+        arguments.append(
+            SSHCommandBuilder.shellQuote("root@\(host.isEmpty ? "worker.example.com" : host)")
+        )
+        return arguments.joined(separator: " ")
+    }
+
+    private func copyBootstrapCommand() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(bootstrapCommand, forType: .string)
+        copiedBootstrapCommand = true
     }
 
     private func trimmed(_ profile: ServerProfile) -> ServerProfile {
