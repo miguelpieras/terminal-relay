@@ -127,7 +127,13 @@ struct WorkersView: View {
                         }
                     }
                 }
-                .frame(width: contentWidth)
+                .frame(
+                    minWidth: contentWidth,
+                    idealWidth: contentWidth,
+                    maxWidth: contentWidth,
+                    minHeight: max(proxy.size.height - 54, 0),
+                    alignment: .topLeading
+                )
                 .padding(.horizontal, horizontalPadding)
                 .padding(.top, 22)
                 .padding(.bottom, 32)
@@ -485,6 +491,7 @@ private struct WorkersSummaryBar: View {
                 )
                 .frame(maxWidth: .infinity)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
         }
         .frame(height: 112)
         .background(
