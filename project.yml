@@ -13,10 +13,13 @@ packages:
     exactVersion: 1.15.0
   NIOSSH:
     url: https://github.com/apple/swift-nio-ssh.git
-    exactVersion: 0.12.0
+    exactVersion: 0.14.1
   SwiftNIO:
     url: https://github.com/apple/swift-nio.git
-    exactVersion: 2.92.2
+    exactVersion: 2.101.3
+  SwiftCrypto:
+    url: https://github.com/apple/swift-crypto.git
+    exactVersion: 4.5.1
 
 targets:
   TerminalRelay:
@@ -103,7 +106,7 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         MARKETING_VERSION: 1.0
-        CURRENT_PROJECT_VERSION: 1
+        CURRENT_PROJECT_VERSION: 2
         SWIFT_VERSION: 5.0
         TARGETED_DEVICE_FAMILY: "1"
         CODE_SIGN_STYLE: Automatic
