@@ -1,7 +1,7 @@
 import Foundation
 
 struct ProjectProfile: Codable, Hashable, Identifiable {
-    static let defaultRepositoryOwner = "miguelpieras"
+    static let defaultRepositoryOwner = ""
 
     var id: UUID
     var serverID: UUID

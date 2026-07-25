@@ -13,7 +13,11 @@ final class ProjectStoreTests: XCTestCase {
             host: "worker",
             workingDirectory: "/workspace"
         )
-        let legacyWorkspace = ProjectProfile(serverID: server.id, repositoryName: "Workspace")
+        let legacyWorkspace = ProjectProfile(
+            serverID: server.id,
+            repositoryOwner: "example-user",
+            repositoryName: "Workspace"
+        )
         defaults.set(try JSONEncoder().encode([legacyWorkspace]), forKey: "projectProfiles.v1")
 
         let store = ProjectStore(defaults: defaults, servers: [server])
@@ -32,6 +36,7 @@ final class ProjectStoreTests: XCTestCase {
         let original = ProjectProfile(
             id: projectID,
             serverID: server.id,
+            repositoryOwner: "example-user",
             repositoryName: "original"
         )
         let firstStore = ProjectStore(defaults: defaults, servers: [server], initialProjects: [])
@@ -61,6 +66,7 @@ final class ProjectStoreTests: XCTestCase {
         let server = ServerProfile(name: "Worker", host: "worker")
         let project = ProjectProfile(
             serverID: server.id,
+            repositoryOwner: "example-user",
             repositoryName: "terminal-relay"
         )
         let store = ProjectStore(defaults: defaults, servers: [server], initialProjects: [])
@@ -76,18 +82,24 @@ final class ProjectStoreTests: XCTestCase {
 
         let missingProject = ProjectProfile(
             serverID: UUID(),
+            repositoryOwner: "example-user",
             repositoryName: "missing"
         )
         XCTAssertFalse(store.save(missingProject))
         XCTAssertEqual(store.projects, [project])
         XCTAssertNotNil(store.validationError)
 
-        let invalidProject = ProjectProfile(serverID: server.id, repositoryName: "../invalid")
+        let invalidProject = ProjectProfile(
+            serverID: server.id,
+            repositoryOwner: "example-user",
+            repositoryName: "../invalid"
+        )
         XCTAssertFalse(store.save(invalidProject))
         XCTAssertEqual(store.projects, [project])
 
         let duplicate = ProjectProfile(
             serverID: server.id,
+            repositoryOwner: "example-user",
             repositoryName: "TERMINAL-RELAY"
         )
         XCTAssertFalse(store.save(duplicate))
@@ -115,9 +127,21 @@ final class ProjectStoreTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         let server = ServerProfile(name: "Worker", host: "worker")
-        let first = ProjectProfile(serverID: server.id, repositoryName: "first")
-        let second = ProjectProfile(serverID: server.id, repositoryName: "second")
-        let third = ProjectProfile(serverID: server.id, repositoryName: "third")
+        let first = ProjectProfile(
+            serverID: server.id,
+            repositoryOwner: "example-user",
+            repositoryName: "first"
+        )
+        let second = ProjectProfile(
+            serverID: server.id,
+            repositoryOwner: "example-user",
+            repositoryName: "second"
+        )
+        let third = ProjectProfile(
+            serverID: server.id,
+            repositoryOwner: "example-user",
+            repositoryName: "third"
+        )
         let store = ProjectStore(defaults: defaults, servers: [server], initialProjects: [])
 
         XCTAssertTrue(store.save(first))

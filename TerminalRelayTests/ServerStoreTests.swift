@@ -99,14 +99,13 @@ final class ServerStoreTests: XCTestCase {
         XCTAssertEqual(ServerStore(defaults: defaults).servers, [existing])
     }
 
-    func testRegisterWorkerPreservesBundledWorkerOne() throws {
-        let suiteName = "TerminalRelayTests.ServerStore.BundledRegistration.\(UUID().uuidString)"
+    func testFreshInstallStartsWithoutAUserSpecificWorker() throws {
+        let suiteName = "TerminalRelayTests.ServerStore.EmptyRegistration.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         let store = ServerStore(defaults: defaults)
-        XCTAssertEqual(store.servers.count, 1)
-        XCTAssertEqual(store.servers.first?.name, "Terminal Relay Worker 1")
+        XCTAssertTrue(store.servers.isEmpty)
 
         let importedID = UUID()
         let imported = try WorkerRegistrationURL.registration(
@@ -114,8 +113,7 @@ final class ServerStoreTests: XCTestCase {
         ).profile
         store.save(imported)
 
-        XCTAssertEqual(store.servers.count, 2)
-        XCTAssertEqual(store.servers.first?.name, "Terminal Relay Worker 1")
+        XCTAssertEqual(store.servers, [imported])
         XCTAssertNotNil(store.server(id: importedID))
     }
 
@@ -137,7 +135,7 @@ final class ServerStoreTests: XCTestCase {
                 id: serverID,
                 name: "Terminal Relay Worker 1",
                 host: "terminal-relay-worker-1",
-                identity: "/Users/miguel/.ssh/hetzner_key"
+                identity: "/Users/developer/.ssh/terminal-relay-operator"
             )
         ).profile
 
@@ -148,7 +146,7 @@ final class ServerStoreTests: XCTestCase {
         XCTAssertEqual(store.servers[0].host, "terminal-relay-worker-1")
         XCTAssertEqual(
             store.servers[0].identityFile,
-            "/Users/miguel/.ssh/hetzner_key"
+            "/Users/developer/.ssh/terminal-relay-operator"
         )
     }
 

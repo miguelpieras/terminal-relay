@@ -6,7 +6,7 @@ final class ProjectProfileTests: XCTestCase {
         let original = ProjectProfile(
             id: UUID(uuidString: "70C5B403-C7D6-48BA-8A2F-61AE88B0C705")!,
             serverID: UUID(uuidString: "50A309A8-FF38-4350-A80F-33653992B039")!,
-            repositoryOwner: "miguelpieras",
+            repositoryOwner: "example-user",
             repositoryName: "terminal-relay"
         )
 
@@ -19,17 +19,22 @@ final class ProjectProfileTests: XCTestCase {
     func testRepositoryIdentityAndWorkingDirectoryAreDerivedFromRepositoryName() {
         let project = ProjectProfile(
             serverID: UUID(),
+            repositoryOwner: "example-user",
             repositoryName: "  terminal-relay  "
         )
 
         XCTAssertEqual(project.displayName, "terminal-relay")
-        XCTAssertEqual(project.githubRepository, "miguelpieras/terminal-relay")
+        XCTAssertEqual(project.githubRepository, "example-user/terminal-relay")
         XCTAssertEqual(project.workingDirectory, "/workspace/terminal-relay")
     }
 
     func testValidationRequiresSafeOwnerAndRepositoryName() {
         let serverID = UUID()
-        var project = ProjectProfile(serverID: serverID, repositoryName: "terminal-relay")
+        var project = ProjectProfile(
+            serverID: serverID,
+            repositoryOwner: "example-user",
+            repositoryName: "terminal-relay"
+        )
 
         XCTAssertTrue(project.isValid)
 
@@ -46,10 +51,10 @@ final class ProjectProfileTests: XCTestCase {
         project.repositoryOwner = ""
         XCTAssertFalse(project.isValid)
 
-        project.repositoryOwner = "miguelpieras/team"
+        project.repositoryOwner = "example-user/team"
         XCTAssertFalse(project.isValid)
 
-        project.repositoryOwner = "miguelpieras"
+        project.repositoryOwner = "example-user"
         project.repositoryName = "terminal relay"
         XCTAssertFalse(project.isValid)
     }
@@ -65,6 +70,7 @@ final class ProjectProfileTests: XCTestCase {
         let server = ServerProfile(name: "Worker", host: "worker")
         let project = ProjectProfile(
             serverID: server.id,
+            repositoryOwner: "example-user",
             repositoryName: "terminal-relay"
         )
 

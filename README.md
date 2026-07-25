@@ -1,269 +1,203 @@
 # Terminal Relay
 
-Terminal Relay is a native macOS workspace for Codex CLI and Claude Code sessions that run on remote servers. The app only starts the system SSH client locally; the coding agents, repositories, and account credentials stay on each server.
+[![CI](https://github.com/miguelpieras/terminal-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/miguelpieras/terminal-relay/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-## What it does
+Terminal Relay is a native macOS and iPhone client for Codex CLI and Claude Code
+sessions running on workers you control. Repositories, agent credentials, and
+terminal processes remain on the worker; the apps connect over SSH.
 
-- Keeps a project-first list of remote workspaces, each assigned to a reusable worker profile.
-- Lists repositories from the authenticated GitHub account on the Mac and can create private repositories under `miguelpieras`.
-- Uses the same remote path for every worker: `/workspace/<repository-name>`.
-- Opens embedded, full interactive SSH terminals for Codex CLI and Claude Code.
-- Starts those sessions without project or worker MCP servers.
-- Allows one Codex session and one Claude session per worker at the same time, even when that worker hosts several projects.
-- Uses the existing OpenSSH config, agent, known-hosts checks, and optional identity files on the Mac.
-- Persists connection details and account labels, but never passwords, API keys,
-  terminal output, or a local copy of running-session state. Live sessions are
-  discovered from the worker.
+## Features
 
-The first launch includes the dedicated **Terminal Relay Worker 1** profile. Its `terminal-relay-worker-1` SSH alias uses that worker's private Tailscale route. The project list starts empty; Terminal Relay never creates or opens a generic Workspace project.
+- Project-first macOS workspace with embedded interactive terminals.
+- Shared, persistent Codex and Claude sessions backed by worker-side `tmux`.
+- Mac-to-iPhone handoff without stopping the remote agent.
+- GitHub repository creation, deploy-key setup, and worker checkout from macOS.
+- Multiple reusable workers and pinned SSH identities.
+- Tailscale-friendly iPhone client with a device-specific Keychain identity.
+- Optional Hetzner and Tailscale worker lifecycle automation.
+- No advertising, analytics, tracking, or Terminal Relay cloud service.
 
-The current worker-to-host mapping, access commands, trusted fingerprints, and
-recovery details are documented in [`docs/workers.md`](docs/workers.md).
+Terminal Relay starts with no configured workers or GitHub owner. It reads the
+currently authenticated GitHub CLI user on macOS and stores every connection
+profile locally.
 
-Each project expands into thin session rows in the sidebar. An animated spinner means the agent is working, a static colored dot means it is open and ready, and a gray outlined dot means it has exited. Exited sessions remain as history until closed, so one project can accumulate many Codex and Claude rows without implying that more than one of either tool is active on a worker.
+## Architecture
 
-That worker also has the small root-owned `terminal-relay-session` launcher from
-`Server/`. It keeps Codex and Claude inside stable worker-side `tmux` sessions
-and retains the host-local lock per tool, so the server itself allows one Codex
-and one Claude process at a time across Mac and iPhone clients. A worker-side
-systemd service restores active sessions after a reboot; neither client nor the
-Mac needs to be online.
+The macOS app starts the system SSH client inside a pseudo-terminal. The iPhone
+app uses SwiftNIO SSH and SwiftTerm. Both clients talk to the
+`terminal-relay-session` helper installed on each worker.
 
-The concurrency limit applies to sessions started by Terminal Relay. It cannot detect an agent started independently in another SSH client.
+The helper keeps one Codex and one Claude process per worker user, permits
+multiple client attachments, and preserves restart intent across worker
+reboots. Disconnecting a client leaves the remote agent running; **Stop Agent**
+ends the exact shared session.
+
+Terminal Relay does not operate a central backend:
+
+```text
+macOS app ─┐
+           ├─ SSH over your network ─ worker ─ Codex / Claude
+iPhone app ┘                         └ repositories in /workspace
+```
 
 ## Requirements
 
 - macOS 14 or later
 - Xcode 26 or later
-- `xcodegen` (`brew install xcodegen`)
-- Working SSH access to each configured server
-- GitHub CLI authenticated as `miguelpieras` on the Mac (`gh auth login`)
-- `hcloud`, `tailscale`, and `jq` for the standardized worker lifecycle
-- `codex` and/or `claude` available to the remote account's login shell;
-  bootstrap installs both on a fresh worker
-- Apple's Metal toolchain component, used to compile SwiftTerm's optional renderer (`xcodebuild -downloadComponent MetalToolchain`)
+- [XcodeGen](https://github.com/yonaskolb/XcodeGen)
+- Apple's Metal toolchain component
+- Working SSH access to an Ubuntu 24.04 amd64 worker with at least 4 GB RAM
+- GitHub CLI authenticated on the Mac for repository management
+- Codex CLI and/or Claude Code accounts for the worker
+- Tailscale on the iPhone and worker when using a private Tailscale route
 
-## Build and install
+Install the local build tools:
 
-```sh
-cd ~/dev/terminal-relay
+```bash
+brew install xcodegen
+xcodebuild -downloadComponent MetalToolchain
+```
+
+## Build the apps
+
+Generate the Xcode project:
+
+```bash
+xcodegen generate
+open TerminalRelay.xcodeproj
+```
+
+The maintainer installation command regenerates the project, runs the complete
+local test set, builds the Release macOS app, installs it at
+`/Applications/Terminal Relay.app`, and relaunches it:
+
+```bash
 ./Scripts/build-and-install.sh
 ```
 
-This required post-change command regenerates the Xcode project, runs all tests, creates a Release build, ad-hoc signs it, installs it at `/Applications/Terminal Relay.app`, and relaunches it. The Dock item continues to point at that stable path as builds are replaced.
+The macOS app intentionally does not enable App Sandbox because its embedded
+terminal launches `/usr/bin/ssh`.
 
-To work in Xcode, run `open TerminalRelay.xcodeproj`.
+For an iPhone development build, select the `TerminalRelayIOS` scheme, choose
+your Apple development team and bundle identifier if you are building a fork,
+and run on a simulator or connected device.
 
-The app target intentionally does not enable App Sandbox because its embedded terminal needs to launch `/usr/bin/ssh` inside a pseudo-terminal.
+## Configure a worker
 
-## Standard worker lifecycle
+### Managed Hetzner and Tailscale lifecycle
 
-`Server/worker-baseline.env` is the single source of truth for every
-standardizable worker setting: Hetzner project and server shape, Ubuntu release,
-provider firewall, shared operator public key, Tailscale version and tag,
-host firewall, Docker stack, monitoring exporter, Codex, Claude, runtime user,
-workspace permissions, session helper, and restore service.
+Copy the public template into the ignored machine-specific configuration:
 
-Configure the project-scoped Hetzner and Tailscale lifecycle credentials once:
+```bash
+cp Server/worker-baseline.example.env Server/worker-baseline.local.env
+```
+
+Replace every `REPLACE_ME` value with identifiers and public-key material for
+your own infrastructure. Never put provider credentials, OAuth secrets, private
+keys, live addresses, or fleet inventories in tracked files.
+
+Configure the local provider clients once, then provision a numbered worker:
 
 ```bash
 ./Scripts/manage-worker.sh configure
+./Scripts/manage-worker.sh provision 1
 ```
 
-The Tailscale OAuth client needs Auth Keys Write and Devices Core Write,
-restricted to `tag:terminal-relay-worker`. Its secret is stored in macOS
-Keychain; the Hetzner token stays in the project-scoped `terminal-relay`
-`hcloud` context. Neither credential enters the repository.
+The Tailscale OAuth credential is stored in macOS Keychain. The Hetzner token
+remains in a local `hcloud` context. Provisioning creates the worker, enrolls
+Tailscale, applies the declared host baseline, installs the application runtime,
+completes agent authentication, and registers the worker in the macOS app.
 
-After that, provisioning Worker 3 is one command:
-
-```bash
-./Scripts/manage-worker.sh provision 3
-```
-
-The command creates the exact Hetzner server, uses a temporary provider
-firewall that admits SSH only from the Mac's current public IPv4, creates a
-single-use tagged Tailscale enrollment, switches to the shared locked-down
-provider firewall, installs the managed host and current application runtime,
-adds the private runtime/root SSH aliases, performs any required Codex and
-Claude login, and registers the stable worker profile in Terminal Relay. The
-monitoring host discovers tagged numeric workers automatically.
-
-Reconcile or verify the complete configured fleet with:
+Reconcile, verify, or retire your configured workers with:
 
 ```bash
 ./Scripts/manage-worker.sh reconcile all
 ./Scripts/manage-worker.sh verify all
+./Scripts/manage-worker.sh retire 1
 ```
 
-Retirement is also standardized:
+Retirement refuses active sessions, dirty worktrees, missing upstreams, and
+unpushed commits before asking for an exact destructive confirmation.
+
+### Application-only bootstrap
+
+If you manage networking and host security separately, bootstrap an existing
+Ubuntu host:
 
 ```bash
-./Scripts/manage-worker.sh retire 3
+./Scripts/bootstrap-worker.sh [--identity PATH] [--port N] root@worker.example.com
 ```
 
-It refuses active Terminal Relay sessions, dirty checkouts, repositories
-without upstreams, and unpushed commits, then requires the exact provider name
-before deleting the VM and its Tailscale identity.
+The command verifies the exact target, keeps normal OpenSSH host-key checking,
+installs the unprivileged `terminal-relay` runtime, authenticates the selected
+agent CLIs interactively, and registers the worker only after readiness checks
+pass. Re-run the same command to update or recover the managed runtime.
 
-The operator public key is deliberately identical on every worker. Host SSH
-keys, Tailscale node identities and enrollment keys, worker UUIDs, agent
-credentials, and per-worker/per-project GitHub deploy keys are deliberately
-unique. Project checkouts under `/workspace` are workload state and are not
-part of the common host baseline.
+See [Server/README.md](Server/README.md) for the worker contract, installed
+paths, session protocol, recovery behavior, and helper-only update flow.
 
-### Lower-level application bootstrap
+## Configure the iPhone client
 
-For an already-created Ubuntu 24.04 amd64 host with at least 4 GB RAM and
-key-based root access, the application-only bootstrap remains available:
+1. Install and connect Tailscale on the iPhone when the worker is private.
+2. Open Terminal Relay and copy its generated Ed25519 public key.
+3. Add that public key to the worker user's `~/.ssh/authorized_keys`.
+4. Obtain the worker's ED25519 host-key fingerprint through an already trusted
+   administrative connection.
+5. Add the worker's name, hostname, SSH port, username, and fingerprint.
+
+The private device key stays in Keychain. The app rejects a worker whose host
+key does not match the pinned fingerprint. Worker connection details and read
+state remain on the device.
+
+## Distribution
+
+Source availability and binary distribution are independent:
+
+- Developers can clone the repository and sign a fork with their own Apple
+  team and bundle identifiers.
+- The maintained iPhone binary can be distributed through App Store Connect
+  under the configured Terminal Relay application identifier.
+- Every user still connects to their own private workers and accounts.
+
+Create a signed App Store archive and exported package:
 
 ```bash
-./Scripts/bootstrap-worker.sh [--identity PATH] [--port N] root@host
+./Scripts/release-ios.sh export
 ```
 
-The script keeps normal OpenSSH known-hosts verification. Before changing the
-server, it shows the resolved SSH destination, trusted host-key fingerprint,
-current remote hostname, OS, and architecture in one exact-target confirmation.
-It then creates an unprivileged, password-locked `terminal-relay` account, gives
-it the bootstrap account's authorized keys, and assigns a stable generated UUID,
-hostname, and display name. A preassigned hostname such as
-`terminal-relay-worker-2` is retained as the friendly app name **Terminal Relay
-Worker 2**; otherwise the display name uses the UUID's short form. Root SSH
-access and `sshd` configuration are left unchanged.
-
-Codex and Claude are installed from their official distributions at
-`/usr/bin/codex` and `/usr/bin/claude`; bootstrap does not install either tool
-through npm. After installation, the script reconnects as `terminal-relay`. It
-skips account setup when a CLI is already authenticated and otherwise runs
-`codex login --device-auth` and `claude auth login` interactively. Registration
-in Terminal Relay happens only after both account checks pass, then the script
-opens the app through its `com.mpieras.TerminalRelay` bundle identifier. The app
-receives connection details and the generated worker identity through a
-mode-`0600`, one-time local registration handoff, never CLI credentials.
-
-Re-running the same command is the supported update and recovery path. It reuses
-the UUID in `/etc/terminal-relay/worker-id`, hostname, and display name, updates
-the existing app profile instead of adding a duplicate, preserves valid
-authentication, and makes no change to already-correct managed files. Differing
-installer-owned configuration receives timestamped sibling backups, and a failed
-install restores the managed files changed during that run. The UUID and
-installer marker intentionally remain after a partial failure so the next run
-can recover the same worker. If preflight reports an unexpected existing
-account, managed path, or non-empty `/workspace`, inspect that conflict instead
-of deleting it and retry after resolving it; the unchanged root SSH route
-remains available for recovery.
-
-Application bootstrap manages `/etc/terminal-relay` (including `worker-id`, `display-name`,
-and the `installer-version` marker), `/home/terminal-relay`, `/workspace`, the
-agent executables, `/usr/local/bin/terminal-relay-session`, its systemd restore
-unit, the root-owned automatic agent updater and timer, the worker-wide guidance
-under the worker's home directory, and the consumed local registration handoff.
-`manage-worker.sh` owns the surrounding provider, Tailscale, firewall, Docker,
-monitoring, SSH-hardening, verification, and retirement lifecycle.
-
-Both dedicated workers use this bootstrap and recovery flow. For a helper-only
-repair or manual guidance synchronization, see `Server/README.md`.
-
-When a project is added, Terminal Relay uses the Mac's authenticated `gh` CLI to create or inspect the repository. It generates a dedicated deploy key on the selected worker, grants that key access only to the selected repository, and clones into `/workspace/<repository-name>`. The private key never leaves the worker, the GitHub credential never leaves the Mac, and no credential is stored in the project record or Git remote URL.
-
-## Persistent terminal lifecycle
-
-Each worker can run one Codex and one Claude agent. Opening a terminal starts the
-tool in its stable `tmux` session or attaches to the existing session for that
-repository. A second Mac or iPhone may attach at the same time. If that tool is
-already running for another repository, the worker reports the occupied
-repository instead of launching a second process.
-
-**Disconnect**, closing a terminal, losing SSH, backgrounding the iPhone app,
-and quitting the Mac app close only that client's attachment. The agent keeps
-running on the worker. Terminal Relay polls worker status at launch, when it
-returns to the foreground, and while it remains open, then offers **Reconnect**
-for detached sessions. **Stop Agent** is the separately confirmed operation that
-ends the shared remote agent for every client.
-
-If the worker reboots while an agent is active, its systemd restore service
-recreates the `tmux` session with the same Terminal Relay UUID and resumes the
-provider conversation from the worker's local CLI transcript. Claude resumes
-the exact UUID-bound session. Codex runs `resume --last` from the recorded
-repository, so a newer out-of-band Codex session in that same repository can
-change which conversation Codex selects. A normal CLI exit or **Stop Agent**
-deletes the restart intent, preventing resurrection.
-
-Recovery requires the worker disk and the provider's local session data (for
-example `~/.codex/sessions` and `~/.claude/projects`) to survive. It does not
-restore a conversation from OpenAI or Anthropic after disk or host loss; those
-directories need a separate encrypted off-worker backup for that case.
-
-For a helper-only worker repair, test and install the current helper with:
+After the App Store Connect record, metadata, review access, privacy answers,
+and export-compliance answers are complete, upload with:
 
 ```bash
-./Server/Tests/terminal-relay-session-tests.sh
-./Scripts/install-worker-session-helper.sh \
-  terminal-relay-worker-1 \
-  root@terminal-relay-worker-1
+./Scripts/release-ios.sh upload
 ```
 
-The installer verifies that both SSH targets reach the same machine and that
-systemd, `/usr/bin/tmux`, `/usr/bin/flock`, and `/usr/bin/python3` with Linux
-pidfd signaling are available. It atomically installs the helper and restore
-unit, retains differing files as timestamped backups, enables the per-user
-service, and prints one guarded rollback command. Re-run the same installer to
-update or recover both managed files. First read the live status record, then
-use its repository and instance UUID for an emergency stop:
+The upload command requires the maintainer's Apple account in Xcode or an App
+Store Connect authentication key supplied directly to Xcode. Signing keys and
+authentication keys must never enter this repository.
+
+See [Distribution/AppStore/metadata.md](Distribution/AppStore/metadata.md) for
+the prepared listing copy and the remaining submission-only fields.
+
+## Security and privacy
+
+Read [SECURITY.md](SECURITY.md) before reporting a vulnerability and
+[PRIVACY.md](PRIVACY.md) for the data-handling policy. Debugging guidance in
+[docs/debugging.md](docs/debugging.md) identifies safe checks and information
+that must not be copied into issues.
+
+Run the public-repository guard before every release:
 
 ```bash
-ssh terminal-relay-worker-1 /usr/local/bin/terminal-relay-session status
-# session|codex|REPOSITORY|ATTACHED_CLIENTS|INSTANCE_UUID
-ssh terminal-relay-worker-1 \
-  '/usr/local/bin/terminal-relay-session stop codex REPOSITORY INSTANCE_UUID'
-
-# Inspect or retry boot recovery (use the worker's application username).
-ssh root@terminal-relay-worker-1 \
-  'systemctl status terminal-relay-session-restore@terminal-relay.service'
-ssh root@terminal-relay-worker-1 \
-  'journalctl -b -u terminal-relay-session-restore@terminal-relay.service'
-ssh root@terminal-relay-worker-1 \
-  'systemctl restart terminal-relay-session-restore@terminal-relay.service'
+./Scripts/check-public-repo.sh
 ```
 
-Use `claude` in place of `codex` for that slot. The UUID check deliberately
-refuses a stale stop instead of ending a replacement launch.
+## Contributing
 
-Pane titles cross the `tmux` relay, including Codex's title-based working state.
-Claude's standalone OSC 9;4 progress signal is stripped by `tmux`, so its
-progress-only sidebar animation is unavailable while relayed; the session and
-ordinary terminal output are unaffected.
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup,
+tests, and public-repository hygiene.
 
-## iPhone client
-
-The iOS 17 app keeps a local worker list and manages each worker's `/workspace`
-projects and shared Codex and Claude sessions. Repository creation, Git
-operations, deployment, account usage, and worker administration remain
-Mac-only. Build and run the **TerminalRelayIOS** scheme from
-`TerminalRelay.xcodeproj` on an iPhone with Tailscale installed and connected.
-
-On first launch, the app creates a dedicated Ed25519 key and keeps its private
-material in the device Keychain. Copy the displayed public key into the worker
-user's `~/.ssh/authorized_keys`. Retrieve the trusted server fingerprint over an
-already verified Mac SSH connection, rather than from the iPhone's first network
-connection:
-
-```bash
-ssh terminal-relay-worker-1 \
-  '/usr/bin/ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256'
-```
-
-Add each worker with its display name, Tailscale hostname or IP, SSH port,
-username, and reported `SHA256:...` fingerprint. Every connection pins the
-selected worker's fingerprint and rejects a different host key. Swipe a worker
-row to edit or remove it. Worker connection fields are stored locally; one
-device-specific public key can be authorized on every worker, while its private
-key never leaves Keychain.
-
-A normal handoff is: start or attach on the Mac, disconnect or quit the Mac app,
-attach to the same project and tool on iPhone, disconnect the iPhone, then choose
-**Reconnect** on the Mac. If iOS loses its Keychain identity, authorize its newly
-displayed public key. If the worker host key changes, verify the replacement
-through a trusted administrative route before updating the pin. If discovery
-fails because the helper is missing or outdated, re-run the helper installer and
-retain its printed rollback command.
+Terminal Relay is licensed under the [Apache License 2.0](LICENSE). Bundled
+dependency licenses and attributions are listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

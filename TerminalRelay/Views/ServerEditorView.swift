@@ -20,8 +20,8 @@ struct WorkerEditorView: View {
         VStack(spacing: 0) {
             Form {
                 Section("Connection") {
-                    TextField("Worker name", text: $draft.name, prompt: Text("Terminal Relay Worker 1"))
-                    TextField("Host or SSH alias", text: $draft.host, prompt: Text("terminal-relay-worker-1"))
+                    TextField("Worker name", text: $draft.name, prompt: Text("My Worker"))
+                    TextField("Host or SSH alias", text: $draft.host, prompt: Text("worker.example.com"))
                     TextField("Username (optional)", text: $draft.username, prompt: Text("ubuntu"))
                     TextField("Port", value: $draft.port, format: .number)
                     TextField("Identity file (optional)", text: $draft.identityFile, prompt: Text("~/.ssh/id_ed25519"))

@@ -12,9 +12,10 @@ for source_name in AGENTS.md CLAUDE.md install.sh; do
     fi
 done
 
-if [[ "$#" -eq 0 ]]; then
-    set -- terminal-relay-worker-1
-fi
+[[ "$#" -gt 0 ]] || {
+    echo "Usage: ./Scripts/sync-worker-guidance.sh SSH_TARGET [...]" >&2
+    exit 64
+}
 
 for target in "$@"; do
     if [[ -z "$target" || "$target" == -* || "$target" == *$'\n'* ]]; then

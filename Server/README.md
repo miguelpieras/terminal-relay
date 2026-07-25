@@ -2,9 +2,9 @@
 
 `terminal-relay-session` is the root-owned `/usr/local/bin/terminal-relay-session`
 entry point used by Terminal Relay clients. The worker needs Bash, `flock`,
-`/usr/bin/python3` with Linux pidfd support, and tmux (Worker 1 currently uses
-tmux 3.4), plus Codex and Claude at their standard `/usr/bin` paths. Projects are
-immediate directories below `/workspace`.
+`/usr/bin/python3` with Linux pidfd support, and tmux, plus Codex and Claude at
+their standard `/usr/bin` paths. Projects are immediate directories below
+`/workspace`.
 
 ## Standardized fleet lifecycle
 
@@ -18,12 +18,14 @@ From the repository root, the supported top-level interface is:
 ./Scripts/manage-worker.sh retire 3
 ```
 
-`worker-baseline.env` pins the standardizable provider, host, network, runtime,
-and CLI state. `install-worker-host.sh` applies that host state idempotently;
+`worker-baseline.example.env` documents the standardizable provider, host,
+network, runtime, and CLI state. Copy it to the ignored
+`worker-baseline.local.env` before using lifecycle commands.
+`install-worker-host.sh` applies that host state idempotently;
 `install-worker.sh` applies the application state. Tagged numeric Tailscale
-workers are discovered automatically by Prometheus. Worker-specific IPs,
-host keys, Tailscale identities, UUIDs, provider credentials, project
-checkouts, and repository deploy keys remain unique.
+workers are discovered automatically by Prometheus. Worker-specific addresses,
+host keys, Tailscale identities, UUIDs, provider credentials, project checkouts,
+and repository deploy keys remain local and unique.
 
 The shared operator **public** key and its fingerprint are intentionally the
 same on every worker. Private machine and project identities must never be
@@ -125,12 +127,11 @@ application SSH target and an optional privileged SSH target:
 
 ```bash
 ./Scripts/install-worker-session-helper.sh \
-  terminal-relay-worker-1 \
-  root@terminal-relay-worker-1
+  terminal-relay-worker-N \
+  root@terminal-relay-worker-N
 ```
 
-Those are also the defaults, so `./Scripts/install-worker-session-helper.sh` is
-equivalent. The installer verifies the application account, systemd, exact
+The installer verifies the application account, systemd, exact
 `/usr/bin/tmux`, `/usr/bin/flock`, and `/usr/bin/python3` pidfd support; verifies
 that the admin connection reaches the same hostname and machine ID; and rechecks
 both identity values inside the actual install SSH connection before any managed
@@ -283,7 +284,7 @@ paths and socket label.
 
 `worker-config/` is the source of truth for worker-wide Codex and Claude
 guidance. From the repository root, run
-`./Scripts/sync-worker-guidance.sh [ssh-target ...]`; it defaults to
-`terminal-relay-worker-1`. The worker installer updates `~/AGENTS.md`,
+`./Scripts/sync-worker-guidance.sh ssh-target [...]`. The worker installer
+updates `~/AGENTS.md`,
 `~/CLAUDE.md`, `~/.codex/AGENTS.md`, and `~/.claude/CLAUDE.md`, preserving each
 differing file as a timestamped adjacent backup.

@@ -4,6 +4,12 @@ set -euo pipefail
 readonly APP_PATH="/Applications/Terminal Relay.app"
 readonly APP_BUNDLE_ID="com.mpieras.TerminalRelay"
 readonly RUNTIME_USER="terminal-relay"
+SCRIPT_DIRECTORY="$(cd "$(dirname "$0")" && pwd -P)"
+readonly SCRIPT_DIRECTORY
+REPOSITORY_ROOT="$(cd "$SCRIPT_DIRECTORY/.." && pwd -P)"
+readonly REPOSITORY_ROOT
+readonly SERVER_DIRECTORY="$REPOSITORY_ROOT/Server"
+readonly BASELINE_FILE="${TERMINAL_RELAY_BASELINE_FILE:-$SERVER_DIRECTORY/worker-baseline.local.env}"
 
 usage() {
     cat <<'EOF'
@@ -196,11 +202,13 @@ if [[ -n "$identity_path" ]]; then
         || die "the SSH identity fingerprint is invalid"
 fi
 
-script_directory="$(cd "$(dirname "$0")" && pwd -P)"
-repository_root="$(cd "$script_directory/.." && pwd -P)"
-server_directory="$repository_root/Server"
-for payload_path in worker-baseline.env install-worker.sh terminal-relay-session terminal-relay-session-restore@.service terminal-relay-agent-update terminal-relay-agent-update.service terminal-relay-agent-update.timer worker-config/install.sh worker-config/AGENTS.md worker-config/CLAUDE.md; do
-    [[ -f "$server_directory/$payload_path" ]] || die "missing bootstrap payload: Server/$payload_path"
+[[ -f "$BASELINE_FILE" && ! -L "$BASELINE_FILE" ]] \
+    || die "missing local baseline: copy Server/worker-baseline.example.env to Server/worker-baseline.local.env"
+if /usr/bin/grep -Eq '="REPLACE_ME"$' "$BASELINE_FILE"; then
+    die "local worker baseline still contains REPLACE_ME values"
+fi
+for payload_path in install-worker.sh terminal-relay-session terminal-relay-session-restore@.service terminal-relay-agent-update terminal-relay-agent-update.service terminal-relay-agent-update.timer worker-config/install.sh worker-config/AGENTS.md worker-config/CLAUDE.md; do
+    [[ -f "$SERVER_DIRECTORY/$payload_path" ]] || die "missing bootstrap payload: Server/$payload_path"
 done
 
 ssh_options=(-o ControlMaster=no -o ControlPath=none)
@@ -228,6 +236,8 @@ temporary_root="${TMPDIR:-/tmp}"
 [[ "$temporary_root" == /* && -d "$temporary_root" ]] || die "invalid temporary directory root: $temporary_root"
 temporary_root="$(cd "$temporary_root" && pwd -P)"
 temporary_directory=$(/usr/bin/mktemp -d "$temporary_root/terminal-relay-bootstrap.XXXXXX")
+/bin/cp "$BASELINE_FILE" "$temporary_directory/worker-baseline.env"
+/bin/chmod 0600 "$temporary_directory/worker-baseline.env"
 registration_token_file=""
 registration_handoff_dispatched=false
 cleanup() {
@@ -357,7 +367,9 @@ if [[ "$assume_yes" != true ]]; then
 fi
 
 result_file="$temporary_directory/install-result"
-/usr/bin/tar --no-xattrs -C "$server_directory" -cf - worker-baseline.env install-worker.sh terminal-relay-session terminal-relay-session-restore@.service terminal-relay-agent-update terminal-relay-agent-update.service terminal-relay-agent-update.timer worker-config | \
+/usr/bin/tar --no-xattrs -cf - \
+    -C "$temporary_directory" worker-baseline.env \
+    -C "$SERVER_DIRECTORY" install-worker.sh terminal-relay-session terminal-relay-session-restore@.service terminal-relay-agent-update terminal-relay-agent-update.service terminal-relay-agent-update.timer worker-config | \
     /usr/bin/ssh "${ssh_options[@]}" "$target" '
 set -eu
 worker_number='"$worker_number"'

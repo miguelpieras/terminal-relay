@@ -65,8 +65,7 @@ enum GitHubProjectError: LocalizedError, Equatable {
 
 @MainActor
 final class GitHubProjectService: ObservableObject {
-    static let repositoryOwner = ProjectProfile.defaultRepositoryOwner
-
+    @Published private(set) var authenticatedUser = ""
     @Published private(set) var organizations: [String] = []
     @Published private(set) var repositories: [GitHubRepository] = []
     @Published private(set) var isLoadingRepositories = false
@@ -87,6 +86,9 @@ final class GitHubProjectService: ObservableObject {
         defer { isLoadingOrganizations = false }
 
         do {
+            authenticatedUser = try Self.parseAuthenticatedUser(
+                await runGH(arguments: Self.authenticatedUserArguments())
+            )
             organizations = try Self.parseOrganizationPages(
                 await runGH(arguments: Self.listOrganizationArguments())
             )
@@ -232,9 +234,17 @@ final class GitHubProjectService: ObservableObject {
         ]
     }
 
-    static func listRepositoryArguments(owner: String? = nil) -> [String] {
+    static func authenticatedUserArguments() -> [String] {
+        ["api", "user", "--jq", ".login"]
+    }
+
+    static func listRepositoryArguments(
+        owner: String? = nil,
+        authenticatedUser: String? = nil
+    ) -> [String] {
         if let owner {
-            if owner.caseInsensitiveCompare(repositoryOwner) == .orderedSame {
+            if let authenticatedUser,
+               owner.caseInsensitiveCompare(authenticatedUser) == .orderedSame {
                 return [
                     "api", "user/repos",
                     "--method", "GET",
@@ -316,6 +326,15 @@ final class GitHubProjectService: ObservableObject {
         } catch {
             throw GitHubProjectError.invalidGitHubResponse
         }
+    }
+
+    static func parseAuthenticatedUser(_ data: Data) throws -> String {
+        let user = String(decoding: data, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isSafeRepositoryOwner(user) else {
+            throw GitHubProjectError.invalidGitHubResponse
+        }
+        return user
     }
 
     static func parseRepository(_ data: Data) throws -> GitHubRepository {
@@ -495,7 +514,10 @@ final class GitHubProjectService: ObservableObject {
             throw GitHubProjectError.invalidRepositoryName
         }
 
-        let data = try await runGH(arguments: Self.listRepositoryArguments(owner: owner))
+        let data = try await runGH(arguments: Self.listRepositoryArguments(
+            owner: owner,
+            authenticatedUser: authenticatedUser
+        ))
         return try Self.parseRepositoryPages(data)
             .filter { !$0.isArchived }
             .sorted {

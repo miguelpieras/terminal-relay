@@ -3,7 +3,8 @@ set -euo pipefail
 
 script_directory="$(cd "$(dirname "$0")" && pwd -P)"
 repository_root="$(cd "$script_directory/../.." && pwd -P)"
-baseline="$repository_root/Server/worker-baseline.env"
+baseline="$repository_root/Server/worker-baseline.example.env"
+local_baseline="$repository_root/Server/worker-baseline.local.env"
 host_installer="$repository_root/Server/install-worker-host.sh"
 lifecycle="$repository_root/Scripts/manage-worker.sh"
 bootstrap="$repository_root/Scripts/bootstrap-worker.sh"
@@ -44,18 +45,22 @@ done
 # shellcheck disable=SC1090
 . "$baseline"
 [[ "$TERMINAL_RELAY_BASELINE_VERSION" == terminal-relay-host-v1 ]]
-[[ "$TERMINAL_RELAY_PROVIDER_PROJECT_ID" == 1234567 ]]
-[[ "$TERMINAL_RELAY_PROVIDER_FIREWALL_ID" == 7654321 ]]
+[[ "$TERMINAL_RELAY_PROVIDER_PROJECT_ID" == REPLACE_ME ]]
+[[ "$TERMINAL_RELAY_PROVIDER_FIREWALL_ID" == REPLACE_ME ]]
 [[ "$TERMINAL_RELAY_SERVER_TYPE" == cpx22 ]]
 [[ "$TERMINAL_RELAY_SERVER_LOCATION" == fsn1 ]]
 [[ "$TERMINAL_RELAY_SERVER_IMAGE" == ubuntu-24.04 ]]
 [[ "$TERMINAL_RELAY_TAILSCALE_TAG" == tag:terminal-relay-worker ]]
-printf '%s\n' "$TERMINAL_RELAY_OPERATOR_AUTHORIZED_KEY" \
-    > "$temporary_directory/operator.pub"
-actual_fingerprint="$(ssh-keygen -lf "$temporary_directory/operator.pub" -E sha256 \
-    | awk 'NR == 1 { print $2 }')"
-[[ "$actual_fingerprint" == "$TERMINAL_RELAY_OPERATOR_KEY_FINGERPRINT" ]] \
-    || fail "baseline operator public key and fingerprint disagree"
+[[ "$TERMINAL_RELAY_OPERATOR_AUTHORIZED_KEY" == REPLACE_ME ]]
+[[ "$TERMINAL_RELAY_OPERATOR_KEY_FINGERPRINT" == REPLACE_ME ]]
+grep -Fxq 'Server/worker-baseline.local.env' "$repository_root/.gitignore" \
+    || fail "local worker baseline is not ignored"
+if [[ -f "$local_baseline" ]]; then
+    git -C "$repository_root" ls-files --error-unmatch \
+        Server/worker-baseline.local.env >/dev/null 2>&1 \
+        && fail "local worker baseline is tracked"
+    bash -n "$local_baseline"
+fi
 
 bash -n "$host_installer" "$lifecycle" "$bootstrap" \
     "$repository_root/Server/install-worker.sh" \
@@ -70,6 +75,10 @@ fi
     || fail "lifecycle help is missing the one-command provisioning contract"
 grep -Fq 'worker-baseline.env' "$bootstrap" \
     || fail "bootstrap does not include the shared baseline"
+grep -Fq 'worker-baseline.local.env' "$bootstrap" \
+    || fail "bootstrap does not load the ignored local baseline"
+grep -Fq 'worker-baseline.local.env' "$lifecycle" \
+    || fail "lifecycle does not load the ignored local baseline"
 grep -Fq 'worker-baseline.env' "$repository_root/Server/install-worker.sh" \
     || fail "application installer does not consume the shared baseline"
 grep -Fq 'node-exporter.service.template' "$lifecycle" \

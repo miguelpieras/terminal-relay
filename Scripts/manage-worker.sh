@@ -6,12 +6,10 @@ readonly SCRIPT_DIRECTORY
 REPOSITORY_ROOT="$(cd "$SCRIPT_DIRECTORY/.." && pwd -P)"
 readonly REPOSITORY_ROOT
 readonly SERVER_DIRECTORY="$REPOSITORY_ROOT/Server"
-readonly BASELINE_FILE="$SERVER_DIRECTORY/worker-baseline.env"
+readonly BASELINE_FILE="${TERMINAL_RELAY_BASELINE_FILE:-$SERVER_DIRECTORY/worker-baseline.local.env}"
 readonly HOST_INSTALLER="$SERVER_DIRECTORY/install-worker-host.sh"
 readonly NODE_EXPORTER_TEMPLATE="$SERVER_DIRECTORY/node-exporter.service.template"
 readonly BOOTSTRAP_SCRIPT="$SCRIPT_DIRECTORY/bootstrap-worker.sh"
-readonly OPERATOR_PRIVATE_KEY="${HOME:?HOME must be set}/.ssh/hetzner_key"
-readonly OPERATOR_PUBLIC_KEY="$OPERATOR_PRIVATE_KEY.pub"
 readonly SSH_CONFIG="$HOME/.ssh/config"
 readonly TAILSCALE_KEYCHAIN_SERVICE="com.mpieras.TerminalRelay.worker-lifecycle.tailscale-oauth"
 readonly TAILSCALE_CLIENT_ID_ACCOUNT="client-id"
@@ -57,10 +55,30 @@ without replacing its UUID or project data, then applies the same baseline.
 EOF
 }
 
-[[ -f "$BASELINE_FILE" && ! -L "$BASELINE_FILE" ]] \
-    || die "missing or unsafe baseline: $BASELINE_FILE"
-# shellcheck disable=SC1090
-. "$BASELINE_FILE"
+load_baseline() {
+    local variable
+
+    [[ -f "$BASELINE_FILE" && ! -L "$BASELINE_FILE" ]] \
+        || die "missing local baseline: copy Server/worker-baseline.example.env to Server/worker-baseline.local.env"
+    # shellcheck disable=SC1090
+    . "$BASELINE_FILE"
+
+    for variable in \
+        TERMINAL_RELAY_PROVIDER_PROJECT_ID \
+        TERMINAL_RELAY_PROVIDER_FIREWALL_ID \
+        TERMINAL_RELAY_MONITOR_IPV4 \
+        TERMINAL_RELAY_MONITOR_IPV6 \
+        TERMINAL_RELAY_DESKTOP_IPV4 \
+        TERMINAL_RELAY_DESKTOP_IPV6 \
+        TERMINAL_RELAY_OPERATOR_KEY_FINGERPRINT \
+        TERMINAL_RELAY_OPERATOR_AUTHORIZED_KEY; do
+        [[ -n "${!variable:-}" && "${!variable}" != REPLACE_ME ]] \
+            || die "local baseline value is not configured: $variable"
+    done
+
+    readonly OPERATOR_PRIVATE_KEY="${TERMINAL_RELAY_OPERATOR_PRIVATE_KEY:-${HOME:?HOME must be set}/.ssh/terminal-relay-operator}"
+    readonly OPERATOR_PUBLIC_KEY="$OPERATOR_PRIVATE_KEY.pub"
+}
 
 temporary_directory=""
 temporary_root_resolved=""
@@ -544,7 +562,8 @@ host_bundle() {
 
     /bin/rm -rf -- "$payload_directory"
     /bin/mkdir -m 0700 "$payload_directory"
-    /bin/cp "$BASELINE_FILE" "$HOST_INSTALLER" "$NODE_EXPORTER_TEMPLATE" "$payload_directory/"
+    /bin/cp "$BASELINE_FILE" "$payload_directory/worker-baseline.env"
+    /bin/cp "$HOST_INSTALLER" "$NODE_EXPORTER_TEMPLATE" "$payload_directory/"
     /bin/chmod 0700 "$payload_directory/install-worker-host.sh"
     if [[ -n "$auth_key_file" ]]; then
         /bin/cp "$auth_key_file" "$payload_directory/tailscale-auth-key"
@@ -1126,6 +1145,12 @@ main() {
     local target
     local assume_yes=false
 
+    if [[ "$command" == -h || "$command" == --help ]]; then
+        usage
+        return
+    fi
+
+    load_baseline
     validate_local_prerequisites
     make_temporary_directory
     case "$command" in
@@ -1164,9 +1189,6 @@ main() {
         retire)
             [[ "$#" -eq 2 ]] || { usage >&2; exit 2; }
             retire_worker "$2"
-            ;;
-        -h|--help)
-            usage
             ;;
         *)
             usage >&2

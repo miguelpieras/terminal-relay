@@ -5,27 +5,23 @@ script_directory="$(cd "$(dirname "$0")" && pwd -P)"
 repository_root="$(cd "$script_directory/.." && pwd -P)"
 source_helper="$repository_root/Server/terminal-relay-session"
 source_restore_unit="$repository_root/Server/terminal-relay-session-restore@.service"
-default_application_target="terminal-relay-worker-1"
-default_admin_target="root@terminal-relay-worker-1"
 remote_lock_path="/run/lock/terminal-relay-session-helper.lock"
 
 usage() {
     cat >&2 <<'EOF'
-usage: install-worker-session-helper.sh [application-ssh-target [admin-ssh-target]]
+usage: install-worker-session-helper.sh application-ssh-target [admin-ssh-target]
 
 The application target verifies the worker account, systemd, and /usr/bin/tmux.
 The admin target must reach the same machine as root or as an account with
-non-interactive sudo. Defaults: terminal-relay-worker-1 and
-root@terminal-relay-worker-1.
+non-interactive sudo. The application target is required. If the admin target
+is omitted, root@ is combined with the application target's host.
 EOF
 }
 
-[[ $# -le 2 ]] || { usage; exit 64; }
-application_target="${1:-$default_application_target}"
+[[ $# -ge 1 && $# -le 2 ]] || { usage; exit 64; }
+application_target="$1"
 if [[ $# -eq 2 ]]; then
     admin_target="$2"
-elif [[ "$application_target" == "$default_application_target" ]]; then
-    admin_target="$default_admin_target"
 else
     admin_target="root@${application_target#*@}"
 fi

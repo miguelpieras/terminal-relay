@@ -33,7 +33,7 @@ final class SSHCommandBuilderTests: XCTestCase {
                 "-o", "ServerAliveCountMax=3",
                 "-p", "2222",
                 "-i", ("~/Keys/agent key" as NSString).expandingTildeInPath,
-                "miguel@example.com",
+                "developer@example.com",
                 remoteCommand
             ]
         )
@@ -52,7 +52,7 @@ final class SSHCommandBuilderTests: XCTestCase {
 
         XCTAssertFalse(configuration.arguments.contains("-i"))
         XCTAssertEqual(configuration.arguments.suffix(2), [
-            "miguel@example.com",
+            "developer@example.com",
             SSHCommandBuilder.remoteCommand(
                 for: server,
                 project: project,
@@ -131,7 +131,7 @@ final class SSHCommandBuilderTests: XCTestCase {
                 "-p", "2222",
                 "-i", ("~/Keys/agent key" as NSString).expandingTildeInPath,
                 "--",
-                "miguel@example.com",
+                "developer@example.com",
                 "'/usr/local/bin/terminal-relay-session' 'status'"
             ]
         )
@@ -222,7 +222,7 @@ final class SSHCommandBuilderTests: XCTestCase {
             configuration.arguments.suffix(3),
             [
                 "--",
-                "miguel@example.com",
+                "developer@example.com",
                 "'/usr/local/bin/terminal-relay-session' 'stop' 'claude' 'terminal-relay' '\(instanceToken)'"
             ]
         )
@@ -384,7 +384,7 @@ final class SSHCommandBuilderTests: XCTestCase {
             name: "Production",
             host: "example.com",
             port: port,
-            username: "miguel",
+            username: "developer",
             identityFile: identityFile,
             workingDirectory: "/legacy/server/workspace",
             codexCommand: codexCommand,

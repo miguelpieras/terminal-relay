@@ -9,17 +9,7 @@ final class ServerStore: ObservableObject {
     private let defaults: UserDefaults
     private let storageKey = "serverProfiles.v3"
 
-    private static let bundledServers = [
-        ServerProfile(
-            name: "Terminal Relay Worker 1",
-            host: "terminal-relay-worker-1",
-            workingDirectory: "/workspace",
-            codexAccountLabel: "Worker Codex",
-            claudeAccountLabel: "Worker Claude",
-            codexCommand: "/usr/local/bin/terminal-relay-session codex",
-            claudeCommand: "/usr/local/bin/terminal-relay-session claude"
-        )
-    ]
+    private static let bundledServers: [ServerProfile] = []
 
     init(
         defaults: UserDefaults = .standard,

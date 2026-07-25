@@ -12,6 +12,14 @@ launch_services="/System/Library/Frameworks/CoreServices.framework/Frameworks/La
 
 cd "$repository_root"
 
+echo "Checking public repository hygiene"
+"$repository_root/Scripts/check-public-repo.sh"
+
+echo "Running worker tests"
+"$repository_root/Server/Tests/terminal-relay-session-tests.sh"
+"$repository_root/Server/Tests/install-worker-session-helper-generation-tests.sh"
+"$repository_root/Server/Tests/worker-lifecycle-tests.sh"
+
 echo "Regenerating Terminal Relay.xcodeproj"
 xcodegen generate
 
@@ -20,6 +28,31 @@ xcodebuild \
     -project TerminalRelay.xcodeproj \
     -scheme TerminalRelay \
     -destination 'platform=macOS,arch=arm64' \
+    -derivedDataPath "$derived_data" \
+    CODE_SIGNING_ALLOWED=NO \
+    CURRENT_PROJECT_VERSION="$build_number" \
+    test
+
+echo "Running Terminal Relay iOS tests"
+ios_simulator_id=$(/usr/bin/python3 - <<'PYTHON'
+import json
+import subprocess
+
+devices = json.loads(
+    subprocess.check_output(["xcrun", "simctl", "list", "devices", "available", "-j"])
+)["devices"]
+for runtime in sorted(devices, reverse=True):
+    for device in devices[runtime]:
+        if device["name"].startswith("iPhone"):
+            print(device["udid"])
+            raise SystemExit(0)
+raise SystemExit("No available iPhone simulator")
+PYTHON
+)
+xcodebuild \
+    -project TerminalRelay.xcodeproj \
+    -scheme TerminalRelayIOS \
+    -destination "platform=iOS Simulator,id=$ios_simulator_id" \
     -derivedDataPath "$derived_data" \
     CODE_SIGNING_ALLOWED=NO \
     CURRENT_PROJECT_VERSION="$build_number" \
@@ -87,7 +120,7 @@ while IFS= read -r duplicate_app; do
         "$launch_services" -u "$duplicate_app" >/dev/null 2>&1 || true
         unregistered_duplicate=true
     fi
-done < <(/usr/bin/mdfind 'kMDItemCFBundleIdentifier == "com.mpieras.TerminalRelay"c || kMDItemCFBundleIdentifier == "com.miguelpieras.TerminalRelay"c')
+done < <(/usr/bin/mdfind 'kMDItemCFBundleIdentifier == "com.mpieras.TerminalRelay"c')
 
 "$launch_services" -f "$installed_app"
 

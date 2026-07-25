@@ -253,12 +253,12 @@ final class ProjectGitServiceTests: XCTestCase {
     func testBuildsAndParsesWorkflowRunLookupForPushedCommit() throws {
         XCTAssertEqual(
             ProjectGitService.workflowRunArguments(
-                repository: "worklific/worklific-app",
+                repository: "example-org/example-app",
                 commitOID: "0123456789abcdef"
             ),
             [
                 "run", "list",
-                "--repo", "worklific/worklific-app",
+                "--repo", "example-org/example-app",
                 "--commit", "0123456789abcdef",
                 "--limit", "1",
                 "--json", "databaseId,displayTitle,workflowName,status,conclusion,url"
@@ -273,7 +273,7 @@ final class ProjectGitServiceTests: XCTestCase {
               "workflowName": "Deploy",
               "status": "completed",
               "conclusion": "success",
-              "url": "https://github.com/worklific/worklific-app/actions/runs/42"
+              "url": "https://github.com/example-org/example-app/actions/runs/42"
             }]
             """.utf8
         ))

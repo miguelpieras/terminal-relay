@@ -19,3 +19,7 @@ id_dsa
 id_ecdsa
 id_ed25519
 id_rsa
+
+# Machine-specific Terminal Relay configuration and private planning
+Server/worker-baseline.local.env
+.private/

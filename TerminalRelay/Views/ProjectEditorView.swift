@@ -99,7 +99,10 @@ struct ProjectEditorView: View {
     }
 
     private var repositoryOwners: [String] {
-        var owners = [ProjectProfile.defaultRepositoryOwner]
+        var owners: [String] = []
+        if !githubService.authenticatedUser.isEmpty {
+            owners.append(githubService.authenticatedUser)
+        }
         owners.append(contentsOf: githubService.organizations)
         if !selectedRepositoryOwner.isEmpty {
             owners.append(selectedRepositoryOwner)
@@ -183,10 +186,10 @@ struct ProjectEditorView: View {
         .navigationTitle(isCreatingProject ? "New Project" : draft.displayName)
         .task {
             guard isCreatingProject else { return }
-            if selectedRepositoryOwner.isEmpty {
-                selectedRepositoryOwner = ProjectProfile.defaultRepositoryOwner
-            }
             await githubService.loadOrganizationsIfNeeded()
+            if selectedRepositoryOwner.isEmpty {
+                selectedRepositoryOwner = githubService.authenticatedUser
+            }
         }
         .task(id: repositoryLoadID) {
             guard isCreatingProject, source == .existing else { return }
@@ -194,7 +197,7 @@ struct ProjectEditorView: View {
         }
         .onChange(of: source) { _, newSource in
             if newSource == .new && selectedRepositoryOwner.isEmpty {
-                selectedRepositoryOwner = ProjectProfile.defaultRepositoryOwner
+                selectedRepositoryOwner = githubService.authenticatedUser
             }
         }
         .onChange(of: selectedRepositoryOwner) { _, _ in

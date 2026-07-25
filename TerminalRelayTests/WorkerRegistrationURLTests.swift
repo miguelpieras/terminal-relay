@@ -10,7 +10,7 @@ final class WorkerRegistrationURLTests: XCTestCase {
             name: "Terminal Relay Worker 8d5a22c7",
             host: "worker.example.com",
             port: "2222",
-            identity: "/Users/miguel/.ssh/hetzner"
+            identity: "/Users/developer/.ssh/terminal-relay-operator"
         )
 
         let registration = try WorkerRegistrationURL.registration(from: url)
@@ -22,7 +22,7 @@ final class WorkerRegistrationURLTests: XCTestCase {
         XCTAssertEqual(profile.host, "worker.example.com")
         XCTAssertEqual(profile.port, 2_222)
         XCTAssertEqual(profile.username, "terminal-relay")
-        XCTAssertEqual(profile.identityFile, "/Users/miguel/.ssh/hetzner")
+        XCTAssertEqual(profile.identityFile, "/Users/developer/.ssh/terminal-relay-operator")
         XCTAssertEqual(profile.workingDirectory, "/workspace")
         XCTAssertEqual(profile.codexAccountLabel, "Terminal Relay Worker 8d5a22c7 Codex")
         XCTAssertEqual(profile.claudeAccountLabel, "Terminal Relay Worker 8d5a22c7 Claude")
@@ -148,7 +148,11 @@ final class WorkerRegistrationURLTests: XCTestCase {
         XCTAssertNotNil(serverStore.server(id: warmID))
         XCTAssertEqual(serverStore.servers.count, 2)
 
-        let project = ProjectProfile(serverID: warmID, repositoryName: "terminal-relay")
+        let project = ProjectProfile(
+            serverID: warmID,
+            repositoryOwner: "example-user",
+            repositoryName: "terminal-relay"
+        )
         XCTAssertTrue(projectStore.save(project))
         XCTAssertTrue(errors.isEmpty)
     }

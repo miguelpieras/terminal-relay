@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-26
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: brew install xcodegen tmux shellcheck
+
+      - name: Install Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      - name: Check public repository
+        run: ./Scripts/check-public-repo.sh
+
+      - name: Test worker scripts
+        run: |
+          ./Server/Tests/terminal-relay-session-tests.sh
+          ./Server/Tests/install-worker-session-helper-generation-tests.sh
+          ./Server/Tests/worker-lifecycle-tests.sh
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Test macOS app
+        run: |
+          xcodebuild \
+            -project TerminalRelay.xcodeproj \
+            -scheme TerminalRelay \
+            -destination 'platform=macOS,arch=arm64' \
+            CODE_SIGNING_ALLOWED=NO \
+            test
+
+      - name: Select iOS simulator
+        id: simulator
+        run: |
+          simulator_id=$(/usr/bin/python3 - <<'PYTHON'
+          import json
+          import subprocess
+
+          devices = json.loads(
+              subprocess.check_output(["xcrun", "simctl", "list", "devices", "available", "-j"])
+          )["devices"]
+          for runtime in sorted(devices, reverse=True):
+              for device in devices[runtime]:
+                  if device["name"].startswith("iPhone"):
+                      print(device["udid"])
+                      raise SystemExit(0)
+          raise SystemExit("No available iPhone simulator")
+          PYTHON
+          )
+          echo "id=$simulator_id" >> "$GITHUB_OUTPUT"
+
+      - name: Test iOS app
+        run: |
+          xcodebuild \
+            -project TerminalRelay.xcodeproj \
+            -scheme TerminalRelayIOS \
+            -destination 'platform=iOS Simulator,id=${{ steps.simulator.outputs.id }}' \
+            CODE_SIGNING_ALLOWED=NO \
+            test
