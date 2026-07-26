@@ -1039,13 +1039,13 @@ struct ContentView: View {
     private func selectFirstProjectIfNeeded() {
         if selectedProjectID == nil || projectStore.project(id: selectedProjectID) == nil {
             selectedProjectID = projectStore.sidebarProjects.first?.id
-            sessionManager.selectedSessionID = nil
+            sessionManager.selectSession(nil)
         }
     }
 
     private func updateSelectedSession(for projectID: UUID?) {
         guard let projectID else {
-            sessionManager.selectedSessionID = nil
+            sessionManager.selectSession(nil)
             return
         }
 
@@ -1053,7 +1053,7 @@ struct ContentView: View {
             .sessions(forProjectID: projectID)
             .contains { $0.id == sessionManager.selectedSessionID }
         if !selectedSessionBelongsToProject {
-            sessionManager.selectedSessionID = nil
+            sessionManager.selectSession(nil)
         }
     }
 
@@ -1264,14 +1264,17 @@ struct ContentView: View {
         case .project(let projectID):
             pageDestination = nil
             selectedProjectID = projectID
-            sessionManager.selectedSessionID = nil
+            sessionManager.selectSession(nil)
         case .session(let projectID, let sessionID):
             pageDestination = nil
             selectedProjectID = projectID
-            sessionManager.selectedSessionID = sessionManager
-                .sessions(forProjectID: projectID)
-                .contains(where: { $0.id == sessionID }) ? sessionID : nil
+            sessionManager.selectSession(
+                sessionManager
+                    .sessions(forProjectID: projectID)
+                    .contains(where: { $0.id == sessionID }) ? sessionID : nil
+            )
         case .workers, .settings, .newProject, .editProject:
+            sessionManager.invalidatePendingOpenSelection()
             pageDestination = destination
         }
     }
@@ -1296,7 +1299,7 @@ struct ContentView: View {
         sessionManager.closeSessions(forProjectID: project.id)
         projectStore.delete(id: project.id)
         projectPendingDeletion = nil
-        sessionManager.selectedSessionID = nil
+        sessionManager.selectSession(nil)
 
         navigationHistory.removeAll { destination in
             switch destination {
@@ -1805,7 +1808,7 @@ private struct ProjectSessionRow: View {
     @State private var dropPosition: SidebarDropPosition?
 
     var body: some View {
-        HStack(spacing: 7) {
+        ZStack(alignment: .trailing) {
             Button(action: onSelect) {
                 HStack(spacing: 7) {
                     AgentBrandIcon(kind: session.kind, size: 17)
@@ -1832,12 +1835,23 @@ private struct ProjectSessionRow: View {
                             .accessibilityLabel("\(session.kind.displayName), working")
                     }
                 }
+                .padding(.trailing, 45)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .contentShape(Rectangle())
             }
-            .frame(maxWidth: .infinity)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .buttonStyle(.plain)
 
-            if isHovering {
+            HStack(spacing: 1) {
+                Image(systemName: "line.3.horizontal")
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(SidebarPalette.secondary)
+                    .frame(width: 19, height: 25)
+                    .contentShape(Rectangle())
+                    .sidebarDragSource(.session(session.id))
+                    .help("Drag to reorder terminal")
+                    .accessibilityHidden(true)
+
                 Button(action: onArchive) {
                     Image(systemName: "archivebox")
                         .font(.system(size: 11.5, weight: .medium))
@@ -1846,16 +1860,19 @@ private struct ProjectSessionRow: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .disabled(session.status == .stopping)
+                .disabled(!isHovering || session.status == .stopping)
                 .help(
                     archiveCount == 1
                         ? "Archive terminal"
                         : "Archive \(archiveCount) selected terminals"
                 )
             }
+            .padding(.trailing, 8)
+            .opacity(isHovering ? 1 : 0)
+            .allowsHitTesting(isHovering)
+            .accessibilityHidden(!isHovering)
         }
         .padding(.leading, 18)
-        .padding(.trailing, 8)
         .frame(height: 35)
         .background(
             isSelected
@@ -1871,7 +1888,6 @@ private struct ProjectSessionRow: View {
         .padding(.horizontal, 10)
         .contentShape(Rectangle())
         .onHover { isHovering = $0 }
-        .sidebarDragSource(.session(session.id))
         .sidebarDropDestination(
             dropPosition: $dropPosition,
             accepts: acceptsDrop,

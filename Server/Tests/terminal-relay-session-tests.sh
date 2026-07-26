@@ -18,12 +18,17 @@ runtime_root="$test_root/runtime"
 test_home="$test_root/home"
 agent_log="$test_root/agent.log"
 signal_log="$test_root/signal.log"
+codex_app_server_log="$test_root/codex-app-server.log"
+codex_app_server_control="$test_root/codex-app-server.control"
 boot_id_file="$test_root/boot-id"
 stub_agent="$test_root/stub-agent"
+stub_codex="$test_root/stub-codex"
+stub_codex_app_server="$test_root/stub-codex-app-server"
 flock_adapter="$test_root/flock"
 signal_adapter="$test_root/signal"
 tmux_socket="terminal-relay-test-$(/usr/bin/id -u)-$$-$RANDOM"
 harness_socket="$tmux_socket-harness"
+rotation_codex_socket="/tmp/terminal-relay-codex-rotation-$$.sock"
 
 cleanup() {
     local cleanup_exit_code=$?
@@ -33,6 +38,7 @@ cleanup() {
 
     "$tmux_path" -f /dev/null -L "$harness_socket" kill-server 2>/dev/null || true
     "$tmux_path" -f /dev/null -L "$tmux_socket" kill-server 2>/dev/null || true
+    /bin/rm -f -- "$rotation_codex_socket"
 
     if [[ -f "$agent_log" ]]; then
         while IFS= read -r pid; do
@@ -373,7 +379,172 @@ trap 'exit 0' HUP INT TERM
 while :; do sleep 1; done
 STUB_AGENT
 
-/bin/chmod 700 "$flock_adapter" "$signal_adapter" "$stub_agent"
+{
+    printf '#!%s\n' "$python_path"
+    cat <<'PYTHON_CODEX_APP_SERVER'
+import base64
+import hashlib
+import json
+import os
+import signal
+import socket
+import struct
+import sys
+import traceback
+
+
+root = os.path.dirname(os.path.realpath(__file__))
+log_path = os.path.join(root, "codex-app-server.log")
+control_path = os.path.join(root, "codex-app-server.control")
+
+
+def report_uncaught(exception_type, exception, exception_traceback):
+    with open(log_path, "a", encoding="utf-8") as log_file:
+        traceback.print_exception(
+            exception_type,
+            exception,
+            exception_traceback,
+            file=log_file,
+        )
+
+
+sys.excepthook = report_uncaught
+
+
+def stop_server(_signal_number, _frame):
+    raise SystemExit(0)
+
+
+def read_exact(connection, length):
+    result = b""
+    while len(result) < length:
+        chunk = connection.recv(length - len(result))
+        if not chunk:
+            raise EOFError
+        result += chunk
+    return result
+
+
+def read_frame(connection):
+    first, second = read_exact(connection, 2)
+    opcode = first & 0x0F
+    length = second & 0x7F
+    if length == 126:
+        length = struct.unpack("!H", read_exact(connection, 2))[0]
+    elif length == 127:
+        length = struct.unpack("!Q", read_exact(connection, 8))[0]
+    mask = read_exact(connection, 4) if second & 0x80 else None
+    payload = read_exact(connection, length)
+    if mask is not None:
+        payload = bytes(
+            value ^ mask[index % 4] for index, value in enumerate(payload)
+        )
+    return opcode, payload
+
+
+def send_json(connection, value):
+    payload = json.dumps(value, separators=(",", ":")).encode("utf-8")
+    if len(payload) < 126:
+        header = bytes([0x81, len(payload)])
+    else:
+        header = bytes([0x81, 126]) + struct.pack("!H", len(payload))
+    connection.sendall(header + payload)
+
+
+def serve_connection(connection):
+    request = b""
+    while b"\r\n\r\n" not in request:
+        request += connection.recv(4096)
+    headers = {}
+    for line in request.split(b"\r\n")[1:]:
+        name, separator, value = line.partition(b":")
+        if separator:
+            headers[name.strip().lower()] = value.strip()
+    key = headers[b"sec-websocket-key"]
+    accept = base64.b64encode(
+        hashlib.sha1(
+            key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+        ).digest()
+    )
+    connection.sendall(
+        b"HTTP/1.1 101 Switching Protocols\r\n"
+        b"Upgrade: websocket\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+    )
+    while True:
+        opcode, payload = read_frame(connection)
+        if opcode == 8:
+            return
+        if opcode != 1:
+            continue
+        request_value = json.loads(payload)
+        request_id = request_value.get("id")
+        if request_id is None:
+            continue
+        method = request_value.get("method")
+        if method == "account/read":
+            result = {"account": {"type": "chatgpt"}}
+        else:
+            result = {}
+        send_json(connection, {"id": request_id, "result": result})
+
+
+if sys.argv[1:3] != ["app-server", "--listen"] or len(sys.argv) != 4:
+    raise SystemExit(64)
+socket_url = sys.argv[3]
+if not socket_url.startswith("unix://"):
+    raise SystemExit(64)
+socket_path = socket_url.removeprefix("unix://")
+with open(log_path, "a", encoding="utf-8") as log_file:
+    log_file.write(f"launch|pid={os.getpid()}|path={os.environ.get('PATH', '')}\n")
+if os.path.exists(control_path):
+    with open(control_path, encoding="utf-8") as control_file:
+        if control_file.read().strip() == "fail":
+            raise SystemExit(70)
+
+signal.signal(signal.SIGHUP, stop_server)
+signal.signal(signal.SIGINT, stop_server)
+signal.signal(signal.SIGTERM, stop_server)
+os.umask(0o077)
+try:
+    os.unlink(socket_path)
+except FileNotFoundError:
+    pass
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    server.bind(socket_path)
+    server.listen()
+    while True:
+        connection, _ = server.accept()
+        with connection:
+            try:
+                serve_connection(connection)
+            except (BrokenPipeError, ConnectionError, EOFError, json.JSONDecodeError):
+                pass
+finally:
+    server.close()
+    try:
+        os.unlink(socket_path)
+    except FileNotFoundError:
+        pass
+PYTHON_CODEX_APP_SERVER
+} > "$stub_codex_app_server"
+
+{
+    printf '#!/bin/bash\n'
+    printf "if [[ \"\${1:-}\" == app-server ]]; then\n"
+    printf '    exec %q "$@"\n' "$stub_codex_app_server"
+    printf 'fi\n'
+    printf 'exec %q "$@"\n' "$stub_agent"
+} > "$stub_codex"
+
+/bin/chmod 700 \
+    "$flock_adapter" \
+    "$signal_adapter" \
+    "$stub_agent" \
+    "$stub_codex" \
+    "$stub_codex_app_server"
 
 echo "1/18 test overrides require explicit non-installed test mode; projects are sorted"
 set +e
@@ -761,5 +932,188 @@ assert_contains "$shared_codex_log" \
 if [[ "$shared_codex_log" == *"mcp_servers.test_server"* ]]; then
     fail "shared Codex launch forwarded client-side MCP overrides"
 fi
+
+echo "Codex app-server restart waits for live terminals and clears only after readiness"
+wait_for_no_session codex
+: > "$codex_app_server_log"
+printf '%s\n' ready > "$codex_app_server_control"
+export TERMINAL_RELAY_TEST_CODEX_PATH="$stub_codex"
+export TERMINAL_RELAY_TEST_CODEX_APP_SERVER_SOCKET="$rotation_codex_socket"
+codex_restart_marker="$runtime_root/codex-app-server-restart-required"
+codex_account_session="terminal-relay-account-server"
+codex_rotation_guard="terminal-relay-codex-rotation-guard"
+claude_rotation_guard="terminal-relay-claude-rotation-guard"
+
+if ! /bin/bash "$helper" codex-account >/dev/null; then
+    /bin/cat "$codex_app_server_log" >&2
+    fail "initial Codex app-server launch did not become ready"
+fi
+assert_equal \
+    "1" \
+    "$(/usr/bin/awk -F'|' '$1 == "launch" { count++ } END { print count + 0 }' "$codex_app_server_log")" \
+    "initial Codex app-server launch count"
+initial_account_pid="$("$tmux_path" -f /dev/null -L "$tmux_socket" \
+    display-message -p -t "$codex_account_session" '#{pane_pid}')"
+[[ "$initial_account_pid" =~ ^[1-9][0-9]*$ ]] \
+    || fail "initial Codex account server has an invalid pid"
+assert_contains \
+    "$(/bin/cat "$codex_app_server_log")" \
+    "path=/usr/local/bin:/usr/bin:/bin" \
+    "Codex app-server safe PATH"
+
+"$tmux_path" -f /dev/null -L "$tmux_socket" \
+    new-session -d -s "$codex_rotation_guard" "/bin/sleep 30"
+"$tmux_path" -f /dev/null -L "$tmux_socket" \
+    new-session -d -s "$claude_rotation_guard" "/bin/sleep 30"
+/bin/bash "$helper" __schedule-codex-app-server-restart
+assert_equal "600" "$(path_mode "$codex_restart_marker")" "Codex restart marker mode"
+/bin/bash "$helper" codex-account >/dev/null
+[[ -f "$codex_restart_marker" ]] \
+    || fail "Codex restart marker cleared while a Codex terminal was active"
+assert_equal \
+    "1" \
+    "$(/usr/bin/awk -F'|' '$1 == "launch" { count++ } END { print count + 0 }' "$codex_app_server_log")" \
+    "deferred Codex app-server launch count"
+assert_equal \
+    "$initial_account_pid" \
+    "$("$tmux_path" -f /dev/null -L "$tmux_socket" \
+        display-message -p -t "$codex_account_session" '#{pane_pid}')" \
+    "deferred Codex account-server pid"
+
+"$tmux_path" -f /dev/null -L "$tmux_socket" \
+    kill-session -t "$codex_rotation_guard"
+/bin/bash "$helper" codex-account >/dev/null
+[[ ! -e "$codex_restart_marker" ]] \
+    || fail "Codex restart marker remained after successful deferred rotation"
+assert_equal \
+    "2" \
+    "$(/usr/bin/awk -F'|' '$1 == "launch" { count++ } END { print count + 0 }' "$codex_app_server_log")" \
+    "deferred Codex app-server rotation count"
+rotated_account_pid="$("$tmux_path" -f /dev/null -L "$tmux_socket" \
+    display-message -p -t "$codex_account_session" '#{pane_pid}')"
+[[ "$rotated_account_pid" =~ ^[1-9][0-9]*$ \
+    && "$rotated_account_pid" != "$initial_account_pid" ]] \
+    || fail "Codex account server did not rotate after the last Codex terminal exited"
+"$tmux_path" -f /dev/null -L "$tmux_socket" \
+    has-session -t "$claude_rotation_guard" \
+    || fail "Codex rotation disturbed an unrelated tmux session"
+
+printf '%s\n' fail > "$codex_app_server_control"
+/bin/bash "$helper" __schedule-codex-app-server-restart
+set +e
+failed_rotation_output="$(/bin/bash "$helper" codex-account 2>&1)"
+failed_rotation_status=$?
+set -e
+assert_equal "70" "$failed_rotation_status" "failed Codex app-server rotation status"
+assert_contains \
+    "$failed_rotation_output" \
+    "did not become ready" \
+    "failed Codex app-server rotation diagnostic"
+[[ -f "$codex_restart_marker" ]] \
+    || fail "Codex restart marker cleared before replacement readiness"
+assert_equal \
+    "3" \
+    "$(/usr/bin/awk -F'|' '$1 == "launch" { count++ } END { print count + 0 }' "$codex_app_server_log")" \
+    "failed Codex app-server rotation count"
+"$tmux_path" -f /dev/null -L "$tmux_socket" \
+    has-session -t "$claude_rotation_guard" \
+    || fail "failed Codex rotation disturbed an unrelated tmux session"
+
+printf '%s\n' ready > "$codex_app_server_control"
+/bin/bash "$helper" codex-account >/dev/null
+[[ ! -e "$codex_restart_marker" ]] \
+    || fail "Codex restart marker remained after replacement readiness"
+assert_equal \
+    "4" \
+    "$(/usr/bin/awk -F'|' '$1 == "launch" { count++ } END { print count + 0 }' "$codex_app_server_log")" \
+    "successful Codex app-server retry count"
+ready_account_pid="$("$tmux_path" -f /dev/null -L "$tmux_socket" \
+    display-message -p -t "$codex_account_session" '#{pane_pid}')"
+
+echo "Codex start reservation closes the readiness-to-tmux race"
+reservation_pause="$test_root/pause-after-codex-reservation"
+reservation_start_output="$test_root/reservation-start.out"
+reservation_schedule_started="$test_root/reservation-schedule.started"
+reservation_schedule_done="$test_root/reservation-schedule.done"
+reservation_account_started="$test_root/reservation-account.started"
+reservation_account_done="$test_root/reservation-account.done"
+: > "$reservation_pause"
+export TERMINAL_RELAY_TEST_CODEX_SHARED_ACCOUNT=1
+export TERMINAL_RELAY_TEST_PAUSE_AFTER_CODEX_RESERVATION="$reservation_pause"
+/bin/bash "$helper" start codex alpha --reservation-race \
+    > "$reservation_start_output" 2>&1 &
+reservation_start_pid=$!
+attempt=0
+while [[ ! -f "$reservation_pause.ready" && $attempt -lt 100 ]]; do
+    attempt=$((attempt + 1))
+    sleep 0.05
+done
+[[ -f "$reservation_pause.ready" ]] \
+    || fail "Codex start did not reach the reserved account-server boundary"
+exec 5>"$runtime_root/codex-app-server.lock"
+if "$flock_adapter" --nonblock 5; then
+    exec 5>&-
+    fail "Codex start released the account-server lock before tmux registration"
+fi
+exec 5>&-
+
+(
+    : > "$reservation_schedule_started"
+    /bin/bash "$helper" __schedule-codex-app-server-restart
+    : > "$reservation_schedule_done"
+) &
+reservation_schedule_pid=$!
+(
+    : > "$reservation_account_started"
+    /bin/bash "$helper" codex-account >/dev/null
+    : > "$reservation_account_done"
+) &
+reservation_account_pid=$!
+attempt=0
+while { [[ ! -f "$reservation_schedule_started" \
+    || ! -f "$reservation_account_started" ]]; } && [[ $attempt -lt 100 ]]; do
+    attempt=$((attempt + 1))
+    sleep 0.05
+done
+[[ -f "$reservation_schedule_started" && -f "$reservation_account_started" ]] \
+    || fail "concurrent Codex restart requests did not start"
+[[ ! -e "$reservation_schedule_done" && ! -e "$reservation_account_done" ]] \
+    || fail "a Codex restart request crossed the held start reservation"
+
+/bin/rm -f -- "$reservation_pause"
+unset TERMINAL_RELAY_TEST_PAUSE_AFTER_CODEX_RESERVATION
+wait "$reservation_start_pid"
+wait "$reservation_schedule_pid"
+wait "$reservation_account_pid"
+reservation_start_line="$(/usr/bin/awk -F'|' '$1 == "session" { print; exit }' \
+    "$reservation_start_output")"
+reservation_instance="$(instance_from_line "$reservation_start_line")"
+[[ "$reservation_instance" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] \
+    || fail "reserved Codex start returned an invalid instance"
+wait_for_session codex alpha 0 >/dev/null
+[[ -f "$codex_restart_marker" ]] \
+    || fail "Codex restart marker was lost across the start reservation"
+assert_equal \
+    "4" \
+    "$(/usr/bin/awk -F'|' '$1 == "launch" { count++ } END { print count + 0 }' "$codex_app_server_log")" \
+    "Codex app-server count across the start reservation"
+assert_equal \
+    "$ready_account_pid" \
+    "$("$tmux_path" -f /dev/null -L "$tmux_socket" \
+        display-message -p -t "$codex_account_session" '#{pane_pid}')" \
+    "Codex account-server pid across the start reservation"
+
+/bin/bash "$helper" stop codex alpha "$reservation_instance"
+wait_for_no_session codex
+/bin/bash "$helper" codex-account >/dev/null
+[[ ! -e "$codex_restart_marker" ]] \
+    || fail "Codex restart marker remained after the reserved terminal stopped"
+assert_equal \
+    "5" \
+    "$(/usr/bin/awk -F'|' '$1 == "launch" { count++ } END { print count + 0 }' "$codex_app_server_log")" \
+    "Codex app-server rotation count after reserved terminal stop"
+unset TERMINAL_RELAY_TEST_CODEX_SHARED_ACCOUNT
+"$tmux_path" -f /dev/null -L "$tmux_socket" \
+    kill-session -t "$claude_rotation_guard"
 
 echo "PASS: terminal-relay-session integration tests"

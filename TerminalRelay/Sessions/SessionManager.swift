@@ -49,12 +49,13 @@ enum SessionOpenResult {
 @MainActor
 final class SessionManager: ObservableObject {
     @Published private(set) var sessions: [TerminalSession] = []
-    @Published var selectedSessionID: UUID?
+    @Published private(set) var selectedSessionID: UUID?
     @Published private var remoteSessions: [RemoteSessionKey: WorkerSessionSnapshot] = [:]
 
     private let defaults: UserDefaults
     private let taskCompletionHandler: @MainActor (TerminalSession) -> Void
     private let sidebarSessionOrderStorageKey = "sidebarSessionOrder.v1"
+    private var selectionRevision = 0
     private var sidebarSessionInstanceTokensByProject: [String: [String]] = [:]
     private var lastSequenceNumberByProjectAndKind: [ProjectAgentKey: Int] = [:]
     private var sessionObservers: [UUID: AnyCancellable] = [:]
@@ -169,6 +170,7 @@ final class SessionManager: ObservableObject {
         launchDefaults: AgentLaunchDefaults,
         using service: WorkerSessionService
     ) async -> SessionOpenResult? {
+        let openSelectionRevision = claimOpenSelectionIntent()
         guard project.serverID == server.id else { return nil }
 
         guard await refresh(
@@ -191,18 +193,31 @@ final class SessionManager: ObservableObject {
             return nil
         }
 
-        return openConfirmedRemote(
+        let shouldSelectResult = selectionRevision == openSelectionRevision
+        let result = openConfirmedRemote(
             project: project,
             on: server,
-            snapshot: snapshot
+            snapshot: snapshot,
+            selectResult: shouldSelectResult
         )
+        return shouldSelectResult ? result : nil
+    }
+
+    func invalidatePendingOpenSelection() {
+        selectionRevision &+= 1
+    }
+
+    func selectSession(_ sessionID: UUID?) {
+        invalidatePendingOpenSelection()
+        selectedSessionID = sessionID
     }
 
     @discardableResult
     func openConfirmedRemote(
         project: ProjectProfile,
         on server: ServerProfile,
-        snapshot: WorkerSessionSnapshot
+        snapshot: WorkerSessionSnapshot,
+        selectResult: Bool = true
     ) -> SessionOpenResult? {
         guard project.serverID == server.id,
               snapshot.repositoryName == project.displayName,
@@ -240,11 +255,13 @@ final class SessionManager: ObservableObject {
                    project: project,
                    on: server,
                    confirmedSnapshot: snapshot,
-                   selectReplacement: true
+                   selectReplacement: selectResult
                ) {
                 return .selectedExisting(replacement)
             }
-            selectedSessionID = existing.id
+            if selectResult {
+                selectedSessionID = existing.id
+            }
             return .selectedExisting(existing)
         }
 
@@ -259,7 +276,9 @@ final class SessionManager: ObservableObject {
             remoteAttachedClientCount: snapshot.attachedClientCount
         )
         append(session)
-        selectedSessionID = session.id
+        if selectResult {
+            selectedSessionID = session.id
+        }
         return .opened(session)
     }
 
@@ -578,7 +597,6 @@ final class SessionManager: ObservableObject {
 
         if selectedSessionID == id {
             selectedSessionID = sessions.last(where: { $0.projectID == removedProjectID })?.id
-                ?? sessions.last?.id
         }
     }
 
@@ -594,6 +612,11 @@ final class SessionManager: ObservableObject {
             return
         }
         defaults.set(data, forKey: sidebarSessionOrderStorageKey)
+    }
+
+    private func claimOpenSelectionIntent() -> Int {
+        invalidatePendingOpenSelection()
+        return selectionRevision
     }
 
     private func confirmedRemoteSnapshot(

@@ -367,6 +367,40 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertTrue(manager.sessions.first === otherResult.localSession)
     }
 
+    func testClosingTheLastSelectedProjectSessionDoesNotSelectAnotherProject() async {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let firstProject = makeProject(name: "Terminal Relay", server: server)
+        let secondProject = makeProject(name: "Website API", server: server)
+        let manager = SessionManager()
+        let firstSession = manager.open(
+            project: firstProject,
+            on: server,
+            kind: .codex,
+            launchDefaults: .standard
+        ).localSession!
+        let secondSession = manager.open(
+            project: secondProject,
+            on: server,
+            kind: .claude,
+            launchDefaults: .standard,
+            instanceToken: "11111111-2222-" + "4333-8444-555555555555"
+        ).localSession!
+        firstSession.processTerminated(source: firstSession.terminalView, exitCode: 0)
+        await Task.yield()
+        manager.reconcile(
+            worker: server,
+            projects: [firstProject, secondProject],
+            response: WorkerSessionResponse(projects: [], sessions: []),
+            launchDefaults: .standard
+        )
+        manager.selectSession(firstSession.id)
+
+        manager.close(sessionID: firstSession.id)
+
+        XCTAssertNil(manager.selectedSessionID)
+        XCTAssertTrue(manager.sessions.contains { $0.id == secondSession.id })
+    }
+
     func testReconcileRestoresDetachedRemoteSessionUnderMatchingProject() {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let project = makeProject(name: "Terminal Relay", server: server)
@@ -895,7 +929,7 @@ final class SessionManagerTests: XCTestCase {
             launchDefaults: .standard,
             instanceToken: otherInstanceID
         ).localSession!
-        manager.selectedSessionID = reconnecting.id
+        manager.selectSession(reconnecting.id)
 
         let recorder = BlockingWorkerSessionCommandRecorder()
         let service = WorkerSessionService { configuration in
@@ -915,7 +949,7 @@ final class SessionManagerTests: XCTestCase {
             await Task.yield()
         }
 
-        manager.selectedSessionID = other.id
+        manager.selectSession(other.id)
         let reconnectingID = reconnecting.instanceToken
         recorder.finish(
             with: Self.statusResult(
@@ -927,6 +961,268 @@ final class SessionManagerTests: XCTestCase {
         _ = await reconnect.value
 
         XCTAssertEqual(manager.selectedSessionID, other.id)
+    }
+
+    func testStartCompletionDoesNotOverrideANewerSelection() async {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let firstProject = makeProject(name: "Terminal Relay", server: server)
+        let secondProject = makeProject(name: "Website API", server: server)
+        let thirdProject = makeProject(name: "Landing Page", server: server)
+        let manager = SessionManager()
+        let first = manager.open(
+            project: firstProject,
+            on: server,
+            kind: .codex,
+            launchDefaults: .standard
+        ).localSession!
+        let second = manager.open(
+            project: secondProject,
+            on: server,
+            kind: .claude,
+            launchDefaults: .standard,
+            instanceToken: "11111111-2222-" + "4333-8444-555555555555"
+        ).localSession!
+        manager.selectSession(first.id)
+
+        let recorder = BlockingWorkerSessionCommandRecorder()
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+        let start = Task {
+            await manager.openAfterRefresh(
+                project: thirdProject,
+                on: server,
+                kind: .codex,
+                projects: [firstProject, secondProject, thirdProject],
+                launchDefaults: .standard,
+                using: service
+            )
+        }
+        while recorder.callCount == 0 {
+            await Task.yield()
+        }
+        recorder.finish(with: Self.emptyStatusResult())
+        while recorder.callCount < 2 {
+            await Task.yield()
+        }
+
+        manager.selectSession(second.id)
+        let startedInstance = "22222222-3333-" + "4444-8555-666666666666"
+        recorder.finish(
+            with: Self.statusResult(
+                kind: .codex,
+                repositoryName: thirdProject.displayName,
+                instanceToken: startedInstance
+            )
+        )
+        let result = await start.value
+
+        XCTAssertNil(result)
+        XCTAssertEqual(manager.selectedSessionID, second.id)
+        XCTAssertEqual(
+            manager.sessions.first(where: { $0.instanceToken == startedInstance })?.projectID,
+            thirdProject.id
+        )
+    }
+
+    func testStartCompletionDoesNotOverrideARepeatedSelection() async {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let selectedProject = makeProject(name: "Terminal Relay", server: server)
+        let startingProject = makeProject(name: "Landing Page", server: server)
+        let manager = SessionManager()
+        let selected = manager.open(
+            project: selectedProject,
+            on: server,
+            kind: .claude,
+            launchDefaults: .standard
+        ).localSession!
+        manager.selectSession(selected.id)
+
+        let recorder = BlockingWorkerSessionCommandRecorder()
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+        let start = Task {
+            await manager.openAfterRefresh(
+                project: startingProject,
+                on: server,
+                kind: .codex,
+                projects: [selectedProject, startingProject],
+                launchDefaults: .standard,
+                using: service
+            )
+        }
+        while recorder.callCount == 0 {
+            await Task.yield()
+        }
+        recorder.finish(with: Self.emptyStatusResult())
+        while recorder.callCount < 2 {
+            await Task.yield()
+        }
+
+        manager.selectSession(selected.id)
+        let startedInstance = "22222222-3333-" + "4444-8555-666666666666"
+        recorder.finish(
+            with: Self.statusResult(
+                kind: .codex,
+                repositoryName: startingProject.displayName,
+                instanceToken: startedInstance
+            )
+        )
+        let result = await start.value
+
+        XCTAssertNil(result)
+        XCTAssertEqual(manager.selectedSessionID, selected.id)
+        XCTAssertEqual(
+            manager.sessions.first(where: { $0.instanceToken == startedInstance })?.projectID,
+            startingProject.id
+        )
+    }
+
+    func testLatestOverlappingStartControlsSelection() async {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let selectedProject = makeProject(name: "Terminal Relay", server: server)
+        let olderProject = makeProject(name: "Website API", server: server)
+        let newerProject = makeProject(name: "Landing Page", server: server)
+        let manager = SessionManager()
+        let selected = manager.open(
+            project: selectedProject,
+            on: server,
+            kind: .codex,
+            launchDefaults: .standard
+        ).localSession!
+        manager.selectSession(selected.id)
+
+        let olderRecorder = BlockingWorkerSessionCommandRecorder()
+        let olderService = WorkerSessionService { configuration in
+            await olderRecorder.run(configuration)
+        }
+        let olderStart = Task {
+            await manager.openAfterRefresh(
+                project: olderProject,
+                on: server,
+                kind: .claude,
+                projects: [selectedProject, olderProject, newerProject],
+                launchDefaults: .standard,
+                using: olderService
+            )
+        }
+        while olderRecorder.callCount == 0 {
+            await Task.yield()
+        }
+        olderRecorder.finish(with: Self.emptyStatusResult())
+        while olderRecorder.callCount < 2 {
+            await Task.yield()
+        }
+
+        let newerRecorder = BlockingWorkerSessionCommandRecorder()
+        let newerService = WorkerSessionService { configuration in
+            await newerRecorder.run(configuration)
+        }
+        let newerStart = Task {
+            await manager.openAfterRefresh(
+                project: newerProject,
+                on: server,
+                kind: .codex,
+                projects: [selectedProject, olderProject, newerProject],
+                launchDefaults: .standard,
+                using: newerService
+            )
+        }
+        while newerRecorder.callCount == 0 {
+            await Task.yield()
+        }
+        newerRecorder.finish(with: Self.emptyStatusResult())
+        while newerRecorder.callCount < 2 {
+            await Task.yield()
+        }
+
+        let olderInstance = "22222222-3333-" + "4444-8555-666666666666"
+        olderRecorder.finish(
+            with: Self.statusResult(
+                kind: .claude,
+                repositoryName: olderProject.displayName,
+                instanceToken: olderInstance
+            )
+        )
+        let olderResult = await olderStart.value
+
+        XCTAssertNil(olderResult)
+        XCTAssertEqual(manager.selectedSessionID, selected.id)
+        XCTAssertEqual(
+            manager.sessions.first(where: { $0.instanceToken == olderInstance })?.projectID,
+            olderProject.id
+        )
+
+        let newerInstance = "33333333-4444-" + "4555-8666-777777777777"
+        newerRecorder.finish(
+            with: Self.statusResult(
+                kind: .codex,
+                repositoryName: newerProject.displayName,
+                instanceToken: newerInstance
+            )
+        )
+        let newerResult = await newerStart.value
+
+        guard case .opened(let newerSession) = newerResult else {
+            return XCTFail("Expected the latest start to control selection")
+        }
+        XCTAssertEqual(newerSession.instanceToken, newerInstance)
+        XCTAssertEqual(manager.selectedSessionID, newerSession.id)
+    }
+
+    func testInvalidatingPendingOpenSelectionPreventsLateStartSelection() async {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let selectedProject = makeProject(name: "Terminal Relay", server: server)
+        let startingProject = makeProject(name: "Landing Page", server: server)
+        let manager = SessionManager()
+        let selected = manager.open(
+            project: selectedProject,
+            on: server,
+            kind: .claude,
+            launchDefaults: .standard
+        ).localSession!
+        manager.selectSession(selected.id)
+
+        let recorder = BlockingWorkerSessionCommandRecorder()
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+        let start = Task {
+            await manager.openAfterRefresh(
+                project: startingProject,
+                on: server,
+                kind: .codex,
+                projects: [selectedProject, startingProject],
+                launchDefaults: .standard,
+                using: service
+            )
+        }
+        while recorder.callCount == 0 {
+            await Task.yield()
+        }
+        recorder.finish(with: Self.emptyStatusResult())
+        while recorder.callCount < 2 {
+            await Task.yield()
+        }
+
+        manager.invalidatePendingOpenSelection()
+        let startedInstance = "22222222-3333-" + "4444-8555-666666666666"
+        recorder.finish(
+            with: Self.statusResult(
+                kind: .codex,
+                repositoryName: startingProject.displayName,
+                instanceToken: startedInstance
+            )
+        )
+        let result = await start.value
+
+        XCTAssertNil(result)
+        XCTAssertEqual(manager.selectedSessionID, selected.id)
+        XCTAssertEqual(
+            manager.sessions.first(where: { $0.instanceToken == startedInstance })?.projectID,
+            startingProject.id
+        )
     }
 
     func testReconnectRejectsSameRepositoryReplacementInstance() async {

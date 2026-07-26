@@ -659,7 +659,7 @@ struct ProjectWorkspaceView: View {
             if let projectID = occupant.projectID, let session = occupant.localSession {
                 Button("Show \(occupant.repositoryName)") {
                     onSelectProject(projectID)
-                    sessionManager.selectedSessionID = session.id
+                    sessionManager.selectSession(session.id)
                     conflictingOccupant = nil
                 }
                 .buttonStyle(.borderless)

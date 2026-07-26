@@ -4,9 +4,40 @@ set -uo pipefail
 readonly lock_path="/run/lock/terminal-relay-agent-update.lock"
 readonly codex_home="/opt/terminal-relay/codex"
 readonly codex_install_directory="/usr/bin"
+readonly runtime_user="terminal-relay"
+readonly runtime_group="terminal-relay"
+readonly runtime_home="/home/terminal-relay"
+readonly runtime_state_directory="$runtime_home/.local/state/terminal-relay"
+readonly codex_app_server_restart_marker="$runtime_state_directory/codex-app-server-restart-required"
+readonly launcher_path="/usr/local/bin/terminal-relay-session"
+readonly safe_path="/usr/local/bin:/usr/bin:/bin"
 
 log() {
     printf '[terminal-relay-agent-update] %s\n' "$*"
+}
+
+run_as_worker() {
+    /usr/sbin/runuser -u "$runtime_user" -- \
+        /usr/bin/env \
+            HOME="$runtime_home" \
+            USER="$runtime_user" \
+            LOGNAME="$runtime_user" \
+            SHELL=/bin/bash \
+            PATH="$safe_path" \
+            "$@"
+}
+
+schedule_codex_app_server_restart() {
+    run_as_worker "$launcher_path" __schedule-codex-app-server-restart \
+        || return 1
+    [[ "$(/usr/bin/stat -c '%U:%G:%a' "$codex_app_server_restart_marker")" \
+        == "$runtime_user:$runtime_group:600" ]]
+}
+
+codex_fingerprint() {
+    [[ -x "$codex_install_directory/codex" ]] || return 1
+    /usr/bin/sha256sum "$codex_install_directory/codex" \
+        | /usr/bin/awk '{ print $1; exit }'
 }
 
 exec 9>"$lock_path"
@@ -16,6 +47,7 @@ if ! /usr/bin/flock -n 9; then
 fi
 
 status=0
+codex_fingerprint_before="$(codex_fingerprint 2>/dev/null || true)"
 
 log "Updating Claude Code from its signed apt channel."
 /usr/bin/apt-mark unhold claude-code >/dev/null 2>&1 || true
@@ -33,11 +65,24 @@ fi
 
 log "Updating Codex through its standalone self-updater."
 if /usr/bin/env \
+    PATH="$safe_path" \
     CODEX_HOME="$codex_home" \
     CODEX_INSTALL_DIR="$codex_install_directory" \
     CODEX_NON_INTERACTIVE=1 \
     /usr/bin/codex update; then
-    log "Codex is $(/usr/bin/codex --version | /usr/bin/awk '{ print $NF; exit }')."
+    codex_fingerprint_after="$(codex_fingerprint 2>/dev/null || true)"
+    if [[ -z "$codex_fingerprint_after" ]]; then
+        log "Codex update completed without a usable Codex executable."
+        status=1
+    elif [[ "$codex_fingerprint_after" == "$codex_fingerprint_before" ]]; then
+        log "Codex is already $(/usr/bin/codex --version | /usr/bin/awk '{ print $NF; exit }')."
+    elif schedule_codex_app_server_restart; then
+        log "Codex is $(/usr/bin/codex --version | /usr/bin/awk '{ print $NF; exit }')."
+        log "Scheduled the shared Codex account service to restart after active Codex terminals exit."
+    else
+        log "Codex updated, but scheduling the shared account service restart failed."
+        status=1
+    fi
 else
     log "Codex update failed."
     status=1

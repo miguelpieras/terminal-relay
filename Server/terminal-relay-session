@@ -12,6 +12,7 @@ readonly default_flock_path="/usr/bin/flock"
 readonly default_python_path="/usr/bin/python3"
 readonly default_getent_path="/usr/bin/getent"
 readonly default_boot_id_path="/proc/sys/kernel/random/boot_id"
+readonly default_safe_path="/usr/local/bin:/usr/bin:/bin"
 
 resolve_helper_path() {
     local path="$0"
@@ -161,6 +162,7 @@ done
 while [[ "$runtime_directory" == */ ]]; do
     runtime_directory="${runtime_directory%/}"
 done
+readonly codex_app_server_restart_marker="$runtime_directory/codex-app-server-restart-required"
 
 umask 077
 if [[ -L "$runtime_directory" ]] \
@@ -512,10 +514,46 @@ codex_app_server_ready() {
         && run_codex_rpc ready >/dev/null 2>&1
 }
 
-ensure_codex_app_server() {
+lock_codex_app_server() {
+    require_flock
+    exec 3>"$runtime_directory/codex-app-server.lock"
+    "$flock_path" 3
+}
+
+unlock_codex_app_server() {
+    exec 3>&-
+}
+
+schedule_codex_app_server_restart() {
+    lock_codex_app_server || return $?
+
+    if [[ -e "$codex_app_server_restart_marker" \
+        || -L "$codex_app_server_restart_marker" ]]; then
+        if [[ ! -f "$codex_app_server_restart_marker" \
+            || -L "$codex_app_server_restart_marker" ]]; then
+            unlock_codex_app_server
+            echo "Codex app-server restart marker is not a safe file." >&2
+            return 78
+        fi
+    elif ! /usr/bin/touch "$codex_app_server_restart_marker"; then
+        unlock_codex_app_server
+        echo "Unable to schedule the shared Codex account service restart." >&2
+        return 70
+    fi
+
+    if ! /bin/chmod 600 "$codex_app_server_restart_marker"; then
+        unlock_codex_app_server
+        echo "Unable to secure the Codex app-server restart marker." >&2
+        return 70
+    fi
+    unlock_codex_app_server
+}
+
+ensure_codex_app_server_locked() {
     local launch_file
     local launch_command
     local attempt
+    local restart_required=0
 
     [[ -x "$codex_path" ]] || {
         echo "Required Codex executable is unavailable: $codex_path" >&2
@@ -525,12 +563,26 @@ ensure_codex_app_server() {
         echo "Required tmux executable is unavailable: $tmux_path" >&2
         return 69
     }
-    require_flock
-    exec 3>"$runtime_directory/codex-app-server.lock"
-    "$flock_path" 3
 
-    if codex_app_server_ready; then
-        exec 3>&-
+    if [[ -e "$codex_app_server_restart_marker" \
+        || -L "$codex_app_server_restart_marker" ]]; then
+        if [[ ! -f "$codex_app_server_restart_marker" \
+            || -L "$codex_app_server_restart_marker" ]]; then
+            echo "Codex app-server restart marker is not a safe file." >&2
+            return 78
+        fi
+        restart_required=1
+    fi
+
+    if [[ $restart_required -eq 1 ]] && any_tool_session_exists codex; then
+        if codex_app_server_ready; then
+            return 0
+        fi
+        echo "The shared Codex account service cannot be restarted while Codex terminals are active." >&2
+        return 70
+    fi
+
+    if [[ $restart_required -eq 0 ]] && codex_app_server_ready; then
         return 0
     fi
 
@@ -545,6 +597,7 @@ ensure_codex_app_server() {
     {
         printf '#!/bin/bash\n'
         printf '/bin/rm -f -- %q\n' "$launch_file"
+        printf 'export PATH=%q\n' "$default_safe_path"
         printf 'exec %q app-server --listen %q\n' \
             "$codex_path" "unix://$codex_app_server_socket"
     } > "$launch_file"
@@ -553,7 +606,6 @@ ensure_codex_app_server() {
     if ! tmux_command new-session -d -s "$codex_app_server_session" \
         -c "${runtime_home:-${HOME:-/}}" "$launch_command"; then
         /bin/rm -f -- "$launch_file"
-        exec 3>&-
         echo "Unable to start the shared Codex account service." >&2
         return 70
     fi
@@ -571,17 +623,59 @@ ensure_codex_app_server() {
     if ! codex_app_server_ready; then
         tmux_command kill-session -t "$codex_app_server_session" 2>/dev/null || true
         /bin/rm -f -- "$codex_app_server_socket"
-        exec 3>&-
         echo "The shared Codex account service did not become ready." >&2
         return 70
     fi
 
-    exec 3>&-
+    if [[ $restart_required -eq 1 ]] \
+        && ! /bin/rm -f -- "$codex_app_server_restart_marker"; then
+        echo "The shared Codex account service restarted, but its restart marker could not be cleared." >&2
+        return 70
+    fi
 }
 
-require_codex_account() {
-    ensure_codex_app_server || return $?
-    run_codex_rpc require-account
+reserve_codex_account_server() {
+    local status=0
+
+    lock_codex_app_server || return $?
+    ensure_codex_app_server_locked || {
+        status=$?
+        unlock_codex_app_server
+        return "$status"
+    }
+    run_codex_rpc require-account || {
+        status=$?
+        unlock_codex_app_server
+        return "$status"
+    }
+}
+
+run_codex_rpc_with_app_server_lock() {
+    local mode="$1"
+    shift
+    local status=0
+
+    lock_codex_app_server || return $?
+    ensure_codex_app_server_locked || {
+        status=$?
+        unlock_codex_app_server
+        return "$status"
+    }
+    run_codex_rpc "$mode" "$@" || status=$?
+    unlock_codex_app_server
+    return "$status"
+}
+
+pause_after_codex_reservation_for_test() {
+    local pause_file
+
+    [[ $test_mode -eq 1 \
+        && -n "${TERMINAL_RELAY_TEST_PAUSE_AFTER_CODEX_RESERVATION:-}" ]] \
+        || return 0
+    pause_file="$TERMINAL_RELAY_TEST_PAUSE_AFTER_CODEX_RESERVATION"
+    [[ "$pause_file" == /* && "$pause_file" != *$'\n'* ]] || return 78
+    printf 'ready\n' > "$pause_file.ready"
+    while [[ -e "$pause_file" ]]; do sleep 0.05; done
 }
 
 validate_tool() {
@@ -1341,6 +1435,7 @@ write_launch_script() {
     {
         printf '#!/bin/bash\n'
         printf '/bin/rm -f -- %q\n' "$launch_file"
+        printf 'export PATH=%q\n' "$default_safe_path"
         if [[ $test_mode -eq 1 ]]; then
             printf 'export TERMINAL_RELAY_TEST_MODE=1\n'
             printf 'export TERMINAL_RELAY_TEST_WORKSPACE_ROOT=%q\n' "$workspace_root"
@@ -1701,6 +1796,7 @@ restore_sessions() {
     local launch_command
     local session_name
     local overall_status=0
+    local codex_app_server_reserved=0
 
     [[ -x "$tmux_path" ]] || {
         echo "Required tmux executable is unavailable: $tmux_path" >&2
@@ -1734,6 +1830,7 @@ restore_sessions() {
     done
 
     for intent_file in "$runtime_directory"/*.intent; do
+        codex_app_server_reserved=0
         instance="${intent_file##*/}"
         instance="${instance%.intent}"
         is_valid_instance "$instance" || continue
@@ -1779,11 +1876,18 @@ restore_sessions() {
                 continue
             fi
         elif [[ "$codex_shared_account_enabled" == "1" ]]; then
-            set +e
-            require_codex_account
-            load_status=$?
-            set -e
+            load_status=0
+            reserve_codex_account_server || load_status=$?
             if [[ $load_status -ne 0 ]]; then
+                unlock_tool_metadata
+                unlock_tool_control
+                overall_status="$load_status"
+                continue
+            fi
+            codex_app_server_reserved=1
+            pause_after_codex_reservation_for_test || load_status=$?
+            if [[ $load_status -ne 0 ]]; then
+                unlock_codex_app_server
                 unlock_tool_metadata
                 unlock_tool_control
                 overall_status="$load_status"
@@ -1794,6 +1898,9 @@ restore_sessions() {
             load_metadata_unlocked "$tool" "$instance" \
                 && metadata_launch_is_running "$instance";
         }; then
+            if [[ $codex_app_server_reserved -eq 1 ]]; then
+                unlock_codex_app_server
+            fi
             unlock_tool_metadata
             unlock_tool_control
             continue
@@ -1805,6 +1912,9 @@ restore_sessions() {
             "$tool" "$repository" "$instance" "$boot_id" "${intent_arguments[@]}"; then
             remove_metadata_unlocked "$instance"
             unlock_tool_metadata
+            if [[ $codex_app_server_reserved -eq 1 ]]; then
+                unlock_codex_app_server
+            fi
             unlock_tool_control
             echo "Unable to advance the saved $tool restart intent." >&2
             overall_status=70
@@ -1823,10 +1933,16 @@ restore_sessions() {
             remove_metadata_unlocked "$instance"
             remove_intent_if_matches_unlocked "$tool" "$repository" "$instance"
             unlock_tool_metadata
+            if [[ $codex_app_server_reserved -eq 1 ]]; then
+                unlock_codex_app_server
+            fi
             unlock_tool_control
             echo "Unable to recreate the $tool tmux session during recovery." >&2
             overall_status=70
             continue
+        fi
+        if [[ $codex_app_server_reserved -eq 1 ]]; then
+            unlock_codex_app_server
         fi
         if ! configure_tmux || ! session_exists "$tool" "$instance"; then
             terminate_launch "$tool" "$repository" "$instance" || true
@@ -2325,6 +2441,8 @@ start_instance_session() {
     local launch_command
     local attached_client_count
     local boot_id
+    local account_status=0
+    local codex_app_server_reserved=0
 
     validate_tool "$tool"
     validate_launch_arguments "$tool" "$@" || exit $?
@@ -2341,8 +2459,6 @@ start_instance_session() {
     require_lifetime_signal_support || exit $?
     if [[ "$tool" == "claude" ]]; then
         prepare_claude_onboarding || exit $?
-    elif [[ "$codex_shared_account_enabled" == "1" ]]; then
-        require_codex_account || exit $?
     fi
     instance="$(generate_instance)" || {
         echo "Unable to generate a launch instance token." >&2
@@ -2351,11 +2467,28 @@ start_instance_session() {
     session_name="$(session_name_for "$tool" "$instance")"
 
     lock_tool_control "$instance"
+    if [[ "$tool" == "codex" && "$codex_shared_account_enabled" == "1" ]]; then
+        reserve_codex_account_server || account_status=$?
+        if [[ $account_status -ne 0 ]]; then
+            unlock_tool_control
+            exit "$account_status"
+        fi
+        codex_app_server_reserved=1
+        pause_after_codex_reservation_for_test || {
+            account_status=$?
+            unlock_codex_app_server
+            unlock_tool_control
+            exit "$account_status"
+        }
+    fi
     lock_tool_metadata "$instance"
     write_metadata_unlocked "$tool" "$repository" "$instance" 0 pending
     if ! write_intent_unlocked "$tool" "$repository" "$instance" "$boot_id" "$@"; then
         remove_metadata_unlocked "$instance"
         unlock_tool_metadata
+        if [[ $codex_app_server_reserved -eq 1 ]]; then
+            unlock_codex_app_server
+        fi
         unlock_tool_control
         echo "Unable to persist the $tool restart intent." >&2
         exit 70
@@ -2371,9 +2504,15 @@ start_instance_session() {
         remove_metadata_unlocked "$instance"
         remove_intent_if_matches_unlocked "$tool" "$repository" "$instance"
         unlock_tool_metadata
+        if [[ $codex_app_server_reserved -eq 1 ]]; then
+            unlock_codex_app_server
+        fi
         unlock_tool_control
         echo "Unable to start the $tool tmux session." >&2
         exit 70
+    fi
+    if [[ $codex_app_server_reserved -eq 1 ]]; then
+        unlock_codex_app_server
     fi
     if ! configure_tmux; then
         terminate_launch "$tool" "$repository" "$instance" || true
@@ -3007,21 +3146,18 @@ case "$command_name" in
         ;;
     codex-account)
         [[ $# -eq 0 ]] || fail_usage "codex-account does not accept arguments."
-        ensure_codex_app_server
-        run_codex_rpc account
+        run_codex_rpc_with_app_server_lock account
         ;;
     codex-login)
         [[ $# -eq 0 ]] || fail_usage "codex-login does not accept arguments."
-        ensure_codex_app_server
-        run_codex_rpc login
+        run_codex_rpc_with_app_server_lock login
         ;;
     codex-reset)
         [[ $# -ge 1 && $# -le 2 ]] \
             || fail_usage "codex-reset requires an idempotency key and optional credit id."
         [[ "$1" =~ ^[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$ ]] \
             || fail_usage "codex-reset requires a UUID idempotency key."
-        ensure_codex_app_server
-        run_codex_rpc reset "$@"
+        run_codex_rpc_with_app_server_lock reset "$@"
         ;;
     codex|claude)
         legacy_tool="$command_name"
@@ -3031,6 +3167,10 @@ case "$command_name" in
     __run-agent)
         [[ $# -ge 4 ]] || fail_usage "Invalid internal launch request."
         run_agent_instance "$@"
+        ;;
+    __schedule-codex-app-server-restart)
+        [[ $# -eq 0 ]] || fail_usage "Invalid internal Codex restart request."
+        schedule_codex_app_server_restart
         ;;
     *) fail_usage "Unknown command: $command_name" ;;
 esac

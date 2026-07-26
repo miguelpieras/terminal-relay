@@ -14,6 +14,8 @@ readonly installer_version="terminal-relay-worker-v1"
 readonly runtime_user="terminal-relay"
 readonly runtime_group="terminal-relay"
 readonly runtime_home="/home/terminal-relay"
+readonly runtime_state_directory="$runtime_home/.local/state/terminal-relay"
+readonly codex_app_server_restart_marker="$runtime_state_directory/codex-app-server-restart-required"
 readonly state_directory="/etc/terminal-relay"
 readonly version_file="$state_directory/installer-version"
 readonly worker_id_file="$state_directory/worker-id"
@@ -661,6 +663,15 @@ run_as_worker() {
             "$@"
 }
 
+schedule_codex_app_server_restart() {
+    run_as_worker "$launcher_destination" __schedule-codex-app-server-restart \
+        || fail "Unable to schedule the shared Codex account service restart."
+    [[ "$(/usr/bin/stat -c '%U:%G:%a' "$codex_app_server_restart_marker")" \
+        == "$runtime_user:$runtime_group:600" ]] \
+        || fail "Unexpected ownership or mode on the Codex app-server restart marker."
+    log "Scheduled the shared Codex account service to restart after active Codex terminals exit."
+}
+
 install_dependencies() {
     log "Installing Ubuntu runtime dependencies."
     export DEBIAN_FRONTEND=noninteractive
@@ -977,6 +988,7 @@ main() {
     install_codex
     install_claude
     install_runtime_files
+    schedule_codex_app_server_restart
     configure_restore_service
     configure_agent_update_timer
     set_worker_hostname
