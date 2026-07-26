@@ -674,6 +674,9 @@ struct ContentView: View {
                 .font(.system(size: 12.5))
                 .foregroundStyle(SidebarPalette.primary)
                 .focused($isProjectFilterFocused)
+                .onSubmit {
+                    isProjectFilterFocused = false
+                }
 
             if !searchQuery.isEmpty {
                 Button {
@@ -1224,6 +1227,7 @@ struct ContentView: View {
 
     private func navigate(to destination: SidebarDestination) {
         projectPendingDeletion = nil
+        isProjectFilterFocused = false
 
         if currentDestination != destination {
             if navigationHistory.isEmpty, let currentDestination {
