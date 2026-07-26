@@ -418,6 +418,9 @@ struct ContentView: View {
             .onChange(of: sessionManager.sessions.map(\.id)) { _, sessionIDs in
                 selectedSessionIDs.formIntersection(sessionIDs)
             }
+            .onChange(of: sessionManager.selectedSessionID) { _, sessionID in
+                selectedSessionIDs = sessionID.map { [$0] } ?? []
+            }
             .onChange(of: serverStore.servers) { _, workers in
                 projectStore.updateServers(workers)
             }
