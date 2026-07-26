@@ -108,7 +108,10 @@ The root-owned updater:
 - runs `codex update` against the root-owned standalone installation with
   `CODEX_NON_INTERACTIVE=1`;
 - serializes itself with the application installer and reports failures through
-  the service exit status and journal.
+  the service exit status and journal;
+- atomically publishes a root-owned mode-`0644` last-run record containing only
+  the UTC timestamp, overall success or failure, and sanitized installed Codex
+  and Claude version strings.
 
 An already-running Claude or Codex process continues with the version it
 started. The next agent launch uses the updated executable. Inspect the schedule
@@ -118,7 +121,14 @@ and the last run as root with:
 systemctl list-timers terminal-relay-agent-update.timer
 systemctl status terminal-relay-agent-update.service
 journalctl -u terminal-relay-agent-update.service
+/usr/local/bin/terminal-relay-session update-status
 ```
+
+`update-status` is safe for the unprivileged application account. A failed
+update does not disable either agent: macOS and iOS show a dismissible warning
+with the installed versions the next time they refresh the worker, and the timer
+retries automatically. The response contains no package-manager output,
+repository details, credentials, host data, or terminal contents.
 
 ## Install or update the session runtime
 
@@ -171,6 +181,7 @@ The commands are:
 ```text
 terminal-relay-session list-projects
 terminal-relay-session status
+terminal-relay-session update-status
 terminal-relay-session restore
 terminal-relay-session start <codex|claude> <repository> [agent arguments...]
 terminal-relay-session attach <codex|claude> <repository> [agent arguments...]
@@ -187,6 +198,19 @@ directories (not symlinks) below `/workspace`.
 ```text
 session|<codex|claude>|<repository>|<attached-client-count>|<instance-uuid>
 ```
+
+`update-status` begins with a separate versioned marker and emits at most one
+record:
+
+```text
+__TERMINAL_RELAY_AGENT_UPDATE_V1__
+update|<UTC-epoch-seconds>|<success|failure>|<codex-version>|<claude-version>
+```
+
+A marker with no record means that no update status is available yet. The
+helper accepts only the fixed root-owned status path, rejects symlinks,
+unexpected ownership or permissions, malformed timestamps, and non-version
+fields, and exits `70` for malformed state.
 
 The instance is a canonical lowercase UUID and changes on every new agent
 launch. `start` is the non-PTY, create-or-identify operation used by apps. Under

@@ -30,18 +30,26 @@ enum WorkerSessionServiceError: LocalizedError, Equatable {
     }
 }
 
+private enum WorkerUpdateStatusFetchResult {
+    case loaded(WorkerUpdateStatus?)
+    case unavailable
+}
+
 @MainActor
 final class WorkerSessionService: ObservableObject {
     typealias CommandRunner = (SSHLaunchConfiguration) async throws -> WorkerSessionCommandResult
 
     @Published private(set) var responses: [UUID: WorkerSessionResponse] = [:]
     @Published private(set) var errors: [UUID: String] = [:]
+    @Published private(set) var updateStatuses: [UUID: WorkerUpdateStatus] = [:]
+    @Published private(set) var updateWarnings: [UUID: String] = [:]
     @Published private(set) var loadingWorkerIDs: Set<UUID> = []
     @Published private(set) var startingSlots: Set<SessionSlot> = []
     @Published private(set) var stoppingSlots: Set<SessionSlot> = []
 
     private let runCommand: CommandRunner
     private var refreshTasks: [UUID: Task<WorkerSessionResponse?, Never>] = [:]
+    private var dismissedUpdateTimestamps: [UUID: Int] = [:]
 
     convenience init() {
         self.init { configuration in
@@ -71,6 +79,17 @@ final class WorkerSessionService: ObservableObject {
 
     func dismissError(for workerID: UUID) {
         errors[workerID] = nil
+    }
+
+    func updateWarning(for workerID: UUID) -> String? {
+        updateWarnings[workerID]
+    }
+
+    func dismissUpdateWarning(for workerID: UUID) {
+        if let status = updateStatuses[workerID] {
+            dismissedUpdateTimestamps[workerID] = status.timestamp
+        }
+        updateWarnings[workerID] = nil
     }
 
     func isStopping(worker: ServerProfile, kind: AgentKind) -> Bool {
@@ -124,6 +143,7 @@ final class WorkerSessionService: ObservableObject {
             }
 
             let response = try WorkerSessionProtocol.parse(result.standardOutput)
+            apply(await fetchUpdateStatus(worker: worker), to: worker.id)
             responses[worker.id] = response
             errors[worker.id] = nil
             workerSessionLogger.info(
@@ -131,12 +151,45 @@ final class WorkerSessionService: ObservableObject {
             )
             return response
         } catch {
+            apply(await fetchUpdateStatus(worker: worker), to: worker.id)
             let message = message(for: error, fallback: .statusFailed)
             workerSessionLogger.error(
                 "Session refresh failed on \(worker.destination, privacy: .public): \(message, privacy: .public)"
             )
             errors[worker.id] = message
             return nil
+        }
+    }
+
+    private func fetchUpdateStatus(worker: ServerProfile) async -> WorkerUpdateStatusFetchResult {
+        do {
+            let result = try await runCommand(
+                SSHCommandBuilder.workerUpdateStatusConfiguration(for: worker)
+            )
+            guard result.exitCode == 0 else { return .unavailable }
+            return .loaded(try WorkerUpdateStatusProtocol.parse(result.standardOutput))
+        } catch {
+            return .unavailable
+        }
+    }
+
+    private func apply(_ result: WorkerUpdateStatusFetchResult, to workerID: UUID) {
+        guard case .loaded(let status) = result else { return }
+        guard let status else {
+            updateStatuses[workerID] = nil
+            updateWarnings[workerID] = nil
+            dismissedUpdateTimestamps[workerID] = nil
+            return
+        }
+
+        updateStatuses[workerID] = status
+        guard let warning = status.warningMessage else {
+            updateWarnings[workerID] = nil
+            dismissedUpdateTimestamps[workerID] = nil
+            return
+        }
+        if dismissedUpdateTimestamps[workerID] != status.timestamp {
+            updateWarnings[workerID] = warning
         }
     }
 

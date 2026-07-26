@@ -48,6 +48,20 @@ ssh root@terminal-relay-worker-N \
   'journalctl -b -u terminal-relay-session-restore@terminal-relay.service --no-pager'
 ```
 
+Inspect the sanitized automatic-agent update status through the same
+unprivileged helper:
+
+```bash
+ssh terminal-relay-worker-N \
+  '/usr/local/bin/terminal-relay-session update-status'
+```
+
+The response should contain only its marker and, after the first timer run, one
+timestamp/result/version record. Use the root-only systemd status and journal
+commands in `Server/README.md` for the underlying failure. Do not copy package
+manager output into a public issue until it has been checked for hostnames,
+repository details, account data, or credentials.
+
 Compare the installed helper with the repository source:
 
 ```bash

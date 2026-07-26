@@ -8,6 +8,9 @@ options:
   createIntermediateGroups: true
 
 packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    exactVersion: 2.9.2
   SwiftTerm:
     url: https://github.com/migueldeicaza/SwiftTerm.git
     exactVersion: 1.15.0
@@ -43,7 +46,18 @@ targets:
               - terminal-relay
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSApplicationCategoryType: public.app-category.developer-tools
+        SUAllowsAutomaticUpdates: true
+        SUAutomaticallyUpdate: false
+        SUEnableAutomaticChecks: true
+        SUEnableSystemProfiling: false
+        SUFeedURL: https://miguelpieras.github.io/terminal-relay/appcast.xml
+        SUPublicEDKey: v0p1N1q4J2BUKlqOx8GpDSwJTJYWZrFvkAyMXdLSesQ=
+        SURequireSignedFeed: true
+        SUScheduledCheckInterval: 86400
+        SUSignedFeedFailureExpirationInterval: 0
+        SUVerifyUpdateBeforeExtraction: true
     dependencies:
+      - package: Sparkle
       - package: SwiftTerm
     settings:
       base:
@@ -84,6 +98,7 @@ targets:
       - path: TerminalRelay/Models/AgentKind.swift
       - path: TerminalRelay/Models/AgentLaunchDefaults.swift
       - path: TerminalRelay/Models/WorkerSessionState.swift
+      - path: TerminalRelay/Models/WorkerUpdateStatus.swift
       - path: LICENSE
         buildPhase: resources
       - path: THIRD_PARTY_NOTICES.md

@@ -69,6 +69,15 @@ enum SSHCommandBuilder {
         )
     }
 
+    static func workerUpdateStatusConfiguration(
+        for server: ServerProfile
+    ) -> SSHLaunchConfiguration {
+        workerSessionConfiguration(
+            for: server,
+            arguments: ["update-status"]
+        )
+    }
+
     static func workerSessionStartConfiguration(
         for server: ServerProfile,
         kind: AgentKind,

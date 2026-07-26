@@ -138,6 +138,30 @@ final class SSHCommandBuilderTests: XCTestCase {
         XCTAssertFalse(configuration.arguments.contains("-tt"))
     }
 
+    func testWorkerUpdateStatusUsesNoninteractiveSSHAndFixedHelper() {
+        let server = makeServer(port: 2_222, identityFile: "~/Keys/agent key")
+
+        let configuration = SSHCommandBuilder.workerUpdateStatusConfiguration(for: server)
+
+        XCTAssertEqual(configuration.executable, "/usr/bin/ssh")
+        XCTAssertEqual(
+            configuration.arguments,
+            [
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=5",
+                "-o", "ServerAliveInterval=30",
+                "-o", "ServerAliveCountMax=3",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-p", "2222",
+                "-i", ("~/Keys/agent key" as NSString).expandingTildeInPath,
+                "--",
+                "developer@example.com",
+                "'/usr/local/bin/terminal-relay-session' 'update-status'"
+            ]
+        )
+        XCTAssertFalse(configuration.arguments.contains("-tt"))
+    }
+
     func testWorkerSessionStartPassesCodexDefaultsToFixedHelper() {
         let server = makeServer(codexCommand: "printf should-not-run")
         let defaults = AgentLaunchDefaults(

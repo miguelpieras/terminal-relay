@@ -23,3 +23,4 @@ id_rsa
 # Machine-specific Terminal Relay configuration and private planning
 Server/worker-baseline.local.env
 .private/
+dev-tasklists/

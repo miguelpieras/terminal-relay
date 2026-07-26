@@ -1761,6 +1761,13 @@ private final class WorkerSessionCommandRecorder {
     }
 
     func run(_ configuration: SSHLaunchConfiguration) async -> WorkerSessionCommandResult {
+        if configuration.arguments.last?.contains("'update-status'") == true {
+            return WorkerSessionCommandResult(
+                exitCode: 64,
+                standardOutput: Data(),
+                standardError: Data()
+            )
+        }
         configurations.append(configuration)
         return results.removeFirst()
     }
@@ -1772,6 +1779,13 @@ private final class BlockingWorkerSessionCommandRecorder {
     private var continuation: CheckedContinuation<WorkerSessionCommandResult, Never>?
 
     func run(_ configuration: SSHLaunchConfiguration) async -> WorkerSessionCommandResult {
+        if configuration.arguments.last?.contains("'update-status'") == true {
+            return WorkerSessionCommandResult(
+                exitCode: 64,
+                standardOutput: Data(),
+                standardError: Data()
+            )
+        }
         callCount += 1
         return await withCheckedContinuation { continuation in
             self.continuation = continuation

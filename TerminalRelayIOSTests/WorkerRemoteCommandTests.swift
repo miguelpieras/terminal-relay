@@ -38,9 +38,29 @@ final class WorkerRemoteCommandTests: XCTestCase {
             WorkerRemoteCommand.status,
             "/usr/local/bin/terminal-relay-session status"
         )
+        XCTAssertEqual(
+            WorkerRemoteCommand.updateStatus,
+            "/usr/local/bin/terminal-relay-session update-status"
+        )
         XCTAssertTrue(WorkerRemoteCommand.resources.contains("__TERMINAL_RELAY_METRICS_V1__"))
         XCTAssertTrue(WorkerRemoteCommand.codexAccount.contains("account/rateLimits/read"))
         XCTAssertTrue(WorkerRemoteCommand.claudeAccount.contains("__TERMINAL_RELAY_CLAUDE_USAGE__"))
+    }
+
+    func testWorkerUpdateStatusUsesTheSharedSanitizedProtocol() throws {
+        let status = try WorkerUpdateStatusProtocol.parse(
+            """
+            login banner
+            \(WorkerUpdateStatusProtocol.marker)
+            update|1700000000|failure|1.2.3|4.5.6
+            """
+        )
+
+        XCTAssertEqual(status?.timestamp, 1_700_000_000)
+        XCTAssertEqual(status?.result, .failure)
+        XCTAssertEqual(status?.codexVersion, "1.2.3")
+        XCTAssertEqual(status?.claudeVersion, "4.5.6")
+        XCTAssertNotNil(status?.warningMessage)
     }
 
     func testStopIsRepositoryAndInstanceScoped() throws {

@@ -1,4 +1,5 @@
 import AppKit
+import Sparkle
 import SwiftUI
 import UserNotifications
 
@@ -141,6 +142,7 @@ private struct WorkerRegistrationAlert: Identifiable {
 @MainActor
 struct TerminalRelayApp: App {
     @NSApplicationDelegateAdaptor(TerminalRelayApplicationDelegate.self) private var appDelegate
+    private let updaterController: SPUStandardUpdaterController
     @StateObject private var serverStore: ServerStore
     @StateObject private var projectStore: ProjectStore
     @StateObject private var sessionManager = SessionManager()
@@ -152,6 +154,11 @@ struct TerminalRelayApp: App {
     @State private var workerRegistrationAlert: WorkerRegistrationAlert?
 
     init() {
+        updaterController = SPUStandardUpdaterController(
+            startingUpdater: ApplicationUpdateConfiguration.shouldStartUpdater(),
+            updaterDelegate: nil,
+            userDriverDelegate: nil
+        )
         let serverStore = ServerStore()
         _serverStore = StateObject(wrappedValue: serverStore)
         _projectStore = StateObject(
@@ -170,6 +177,7 @@ struct TerminalRelayApp: App {
                 .environmentObject(accountUsageService)
                 .environmentObject(workerMetricsService)
                 .environmentObject(projectGitService)
+                .environment(\.applicationUpdater, updaterController.updater)
                 .preferredColorScheme(.dark)
                 .frame(minWidth: 980, minHeight: 640)
                 .onAppear {
@@ -194,5 +202,10 @@ struct TerminalRelayApp: App {
         .defaultSize(width: 1_260, height: 820)
         .windowStyle(.titleBar)
         .windowToolbarStyle(.unifiedCompact)
+        .commands {
+            CommandGroup(after: .appInfo) {
+                CheckForUpdatesView(updater: updaterController.updater)
+            }
+        }
     }
 }

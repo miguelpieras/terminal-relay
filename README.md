@@ -16,6 +16,7 @@ terminal processes remain on the worker; the apps connect over SSH.
 - Multiple reusable workers and pinned SSH identities.
 - Tailscale-friendly iPhone client with a device-specific Keychain identity.
 - Optional Hetzner and Tailscale worker lifecycle automation.
+- Signed, in-app macOS updates with daily checks and user-controlled installation.
 - No advertising, analytics, tracking, or Terminal Relay cloud service.
 
 Terminal Relay starts with no configured workers or GitHub owner. It reads the
@@ -38,6 +39,12 @@ The install script regenerates the Xcode project, runs the test suite, builds
 the Release app, installs it at `/Applications/Terminal Relay.app`, and opens
 it. In the app, choose **Workers → Add Worker** to bootstrap a fresh Ubuntu
 host or register an existing Terminal Relay worker.
+
+Maintainer-signed macOS releases use Sparkle. The app checks the public signed
+feed once per day without sending system-profile data. Use **Terminal Relay →
+Check for Updates…** at any time; automatic checks, downloads, and installation
+remain configurable in **Settings → Agent Defaults**. iPhone updates continue
+to be installed through the App Store.
 
 ## Architecture
 
@@ -166,7 +173,16 @@ Source availability and binary distribution are independent:
   team and bundle identifiers.
 - The maintained iPhone binary can be distributed through App Store Connect
   under the configured Terminal Relay application identifier.
+- Maintainer-signed macOS binaries are Developer ID signed, notarized, and
+  delivered from GitHub Releases through a signed Sparkle feed on GitHub Pages.
 - Every user still connects to their own private workers and accounts.
+
+A macOS release is cut by pushing a version tag that matches
+`MARKETING_VERSION` on the current `main`. The `macos-release`
+environment runs `Scripts/release-macos.sh`, publishes the notarized ZIP and
+release notes, and deploys the signed appcast. See
+[Distribution/macOS.md](Distribution/macOS.md) for the credential names,
+verification checks, and recovery constraint.
 
 Create a signed App Store archive and exported package:
 

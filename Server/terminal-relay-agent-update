@@ -2,6 +2,8 @@
 set -uo pipefail
 
 readonly lock_path="/run/lock/terminal-relay-agent-update.lock"
+readonly update_status_directory="/var/lib/terminal-relay"
+readonly update_status_path="$update_status_directory/agent-update-status"
 readonly codex_home="/opt/terminal-relay/codex"
 readonly codex_install_directory="/usr/bin"
 readonly runtime_user="terminal-relay"
@@ -38,6 +40,45 @@ codex_fingerprint() {
     [[ -x "$codex_install_directory/codex" ]] || return 1
     /usr/bin/sha256sum "$codex_install_directory/codex" \
         | /usr/bin/awk '{ print $1; exit }'
+}
+
+safe_version() {
+    local value="$1"
+    if [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$ ]]; then
+        printf '%s\n' "$value"
+    else
+        printf 'unknown\n'
+    fi
+}
+
+write_update_status() {
+    local result="$1"
+    local codex_version
+    local claude_version
+    local temporary_file
+    local timestamp
+
+    timestamp="$(/bin/date -u +%s)" || return 1
+    [[ "$timestamp" =~ ^[1-9][0-9]*$ ]] || return 1
+    codex_version="$(safe_version "$(/usr/bin/codex --version 2>/dev/null \
+        | /usr/bin/awk '{ print $NF; exit }')")"
+    claude_version="$(safe_version "$(/usr/bin/claude --version 2>/dev/null \
+        | /usr/bin/awk '{ print $1; exit }')")"
+
+    /usr/bin/install -d -o root -g root -m 0755 "$update_status_directory" \
+        || return 1
+    temporary_file="$(/usr/bin/mktemp "$update_status_directory/.agent-update-status.XXXXXX")" \
+        || return 1
+    if ! printf '%s\nupdate|%s|%s|%s|%s\n' \
+        '__TERMINAL_RELAY_AGENT_UPDATE_V1__' \
+        "$timestamp" "$result" "$codex_version" "$claude_version" \
+        > "$temporary_file" \
+        || ! /bin/chown root:root "$temporary_file" \
+        || ! /bin/chmod 0644 "$temporary_file" \
+        || ! /bin/mv -f -- "$temporary_file" "$update_status_path"; then
+        /bin/rm -f -- "$temporary_file"
+        return 1
+    fi
 }
 
 exec 9>"$lock_path"
@@ -85,6 +126,13 @@ if /usr/bin/env \
     fi
 else
     log "Codex update failed."
+    status=1
+fi
+
+update_result=success
+[[ "$status" -eq 0 ]] || update_result=failure
+if ! write_update_status "$update_result"; then
+    log "Writing the agent update status failed."
     status=1
 fi
 

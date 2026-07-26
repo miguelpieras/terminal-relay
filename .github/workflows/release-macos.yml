@@ -1,0 +1,151 @@
+name: Release macOS
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: macos-26
+    timeout-minutes: 60
+    environment: macos-release
+    permissions:
+      contents: write
+      pages: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Validate release tag and main commit
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+(\.[0-9]+){1,2}$ ]]
+          git fetch --quiet origin main
+          [[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]]
+          configured_version=$(
+            awk '/MARKETING_VERSION:/ { gsub(/"/, "", $2); print $2; exit }' project.yml
+          )
+          [[ "${RELEASE_TAG#v}" == "$configured_version" ]]
+
+      - name: Install build tools
+        run: brew install xcodegen tmux shellcheck
+
+      - name: Install Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      - name: Import Developer ID identity
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          certificate_path="$RUNNER_TEMP/developer-id.p12"
+          keychain_path="$RUNNER_TEMP/release-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          printf '%s' "$CERTIFICATE_BASE64" | /usr/bin/base64 -D > "$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "$CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+          security find-identity -v -p codesigning "$keychain_path" \
+            | grep -q 'Developer ID Application'
+
+      - name: Prepare notarization key
+        id: apple-key
+        env:
+          APPLE_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+        run: |
+          key_path="$RUNNER_TEMP/AuthKey_${APPLE_KEY_ID}.p8"
+          printf '%s' "$APPLE_KEY_BASE64" | /usr/bin/base64 -D > "$key_path"
+          chmod 600 "$key_path"
+          echo "path=$key_path" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes
+        id: notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          notes_path="$RUNNER_TEMP/release-notes.md"
+          gh api \
+            --method POST \
+            "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="$RELEASE_TAG" \
+            -f target_commitish="$GITHUB_SHA" \
+            --jq .body > "$notes_path"
+          echo "path=$notes_path" >> "$GITHUB_OUTPUT"
+
+      - name: Detect first macOS release
+        id: history
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$(gh release list --limit 1 --json tagName --jq length)" == 0 ]]; then
+            echo "first=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "first=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build, sign, notarize, and generate appcast
+        env:
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_KEY_PATH: ${{ steps.apple-key.outputs.path }}
+          FIRST_MACOS_RELEASE: ${{ steps.history.outputs.first }}
+          RELEASE_NOTES_FILE: ${{ steps.notes.outputs.path }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: ./Scripts/release-macos.sh "${GITHUB_REF_NAME#v}"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_NOTES_FILE: ${{ steps.notes.outputs.path }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          gh release create "$RELEASE_TAG" \
+            "build/macos-release/Terminal-Relay-${version}.zip" \
+            "build/macos-release/Terminal-Relay-${version}.md" \
+            "build/macos-release/appcast.xml" \
+            --verify-tag \
+            --title "Terminal Relay ${version}" \
+            --notes-file "$RELEASE_NOTES_FILE"
+
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+
+      - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+        with:
+          path: build/macos-release/pages
+
+  deploy-pages:
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+
+    steps:
+      - name: Deploy signed appcast
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

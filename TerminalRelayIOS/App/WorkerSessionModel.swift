@@ -44,6 +44,7 @@ final class WorkerSessionModel: ObservableObject {
     @Published private(set) var workerOverviews: [UUID: WorkerOverviewSnapshot] = [:]
     @Published private(set) var workerLoadingIDs: Set<UUID> = []
     @Published private(set) var projectLoadingIDs: Set<UUID> = []
+    @Published private var dismissedUpdateTimestamps: [UUID: Int] = [:]
     @Published private(set) var publicKey = ""
     @Published private(set) var isLoading = false
     @Published var errorMessage: String?
@@ -122,6 +123,7 @@ final class WorkerSessionModel: ObservableObject {
         workerOverviews[id] = nil
         workerLoadingIDs.remove(id)
         projectLoadingIDs.remove(id)
+        dismissedUpdateTimestamps[id] = nil
         profile = profileStore.selectedProfileID()
             .flatMap { selectedID in profiles.first { $0.id == selectedID } }
             ?? profiles.first
@@ -133,6 +135,21 @@ final class WorkerSessionModel: ObservableObject {
         isLoading = false
         projects = []
         sessions = []
+    }
+
+    func updateWarning(for profileID: UUID) -> String? {
+        guard let status = workerOverviews[profileID]?.updateStatus,
+              dismissedUpdateTimestamps[profileID] != status.timestamp else {
+            return nil
+        }
+        return status.warningMessage
+    }
+
+    func dismissUpdateWarning(for profileID: UUID) {
+        guard let timestamp = workerOverviews[profileID]?.updateStatus?.timestamp else {
+            return
+        }
+        dismissedUpdateTimestamps[profileID] = timestamp
     }
 
     func refresh() async {
@@ -149,7 +166,13 @@ final class WorkerSessionModel: ObservableObject {
         do {
             async let projectData = workerClient.execute(WorkerRemoteCommand.listProjects, on: profile)
             async let statusData = workerClient.execute(WorkerRemoteCommand.status, on: profile)
+            async let updateResult = Self.commandResult(
+                WorkerRemoteCommand.updateStatus,
+                profile: profile,
+                workerClient: workerClient
+            )
             let (projectsOutput, statusOutput) = try await (projectData, statusData)
+            let updateStatus = Self.parseUpdateStatus(await updateResult)
             let projectResponse = try WorkerSessionProtocol.parse(projectsOutput)
             let statusResponse = try WorkerSessionProtocol.parse(statusOutput)
 
@@ -163,16 +186,16 @@ final class WorkerSessionModel: ObservableObject {
             let visibleSessions = statusResponse.sessions.filter {
                 visibleProjects.contains($0.repositoryName)
             }
-            if let currentOverview = workerOverviews[profile.id] {
-                workerOverviews[profile.id] = WorkerOverviewSnapshot(
-                    projects: projects,
-                    sessions: visibleSessions,
-                    resources: currentOverview.resources,
-                    accounts: currentOverview.accounts,
-                    accountErrors: currentOverview.accountErrors,
-                    connectionError: nil
-                )
-            }
+            let currentOverview = workerOverviews[profile.id]
+            workerOverviews[profile.id] = WorkerOverviewSnapshot(
+                projects: projects,
+                sessions: visibleSessions,
+                resources: currentOverview?.resources,
+                accounts: currentOverview?.accounts ?? [:],
+                accountErrors: currentOverview?.accountErrors ?? [],
+                connectionError: nil,
+                updateStatus: updateStatus ?? currentOverview?.updateStatus
+            )
             errorMessage = nil
         } catch {
             guard refreshToken == token else { return }
@@ -349,7 +372,8 @@ final class WorkerSessionModel: ObservableObject {
                     resources: currentOverview.resources,
                     accounts: currentOverview.accounts,
                     accountErrors: currentOverview.accountErrors,
-                    connectionError: nil
+                    connectionError: nil,
+                    updateStatus: currentOverview.updateStatus
                 )
                 if profile?.id == profileID, !isLoading {
                     sessions = refreshedSessions
@@ -373,14 +397,25 @@ final class WorkerSessionModel: ObservableObject {
             profile: profile,
             workerClient: workerClient
         )
+        async let updateResult = commandResult(
+            WorkerRemoteCommand.updateStatus,
+            profile: profile,
+            workerClient: workerClient
+        )
 
         do {
-            let (projectData, sessionData) = try await (
-                projectsResult.get(),
-                sessionsResult.get()
+            let (projectData, sessionData, updateStatusResult) = await (
+                projectsResult,
+                sessionsResult,
+                updateResult
             )
-            let projectResponse = try WorkerSessionProtocol.parse(projectData)
-            let sessionResponse = try WorkerSessionProtocol.parse(sessionData)
+            let (projectOutput, sessionOutput) = try (
+                projectData.get(),
+                sessionData.get()
+            )
+            let updateStatus = parseUpdateStatus(updateStatusResult)
+            let projectResponse = try WorkerSessionProtocol.parse(projectOutput)
+            let sessionResponse = try WorkerSessionProtocol.parse(sessionOutput)
             let projects = WorkerProjectCatalog.visibleProjectNames(
                 discoveredProjects: projectResponse.projects,
                 sessions: sessionResponse.sessions
@@ -394,7 +429,8 @@ final class WorkerSessionModel: ObservableObject {
                 resources: currentOverview?.resources,
                 accounts: currentOverview?.accounts ?? [:],
                 accountErrors: currentOverview?.accountErrors ?? [],
-                connectionError: nil
+                connectionError: nil,
+                updateStatus: updateStatus ?? currentOverview?.updateStatus
             )
         } catch {
             return WorkerOverviewSnapshot(
@@ -403,7 +439,8 @@ final class WorkerSessionModel: ObservableObject {
                 resources: currentOverview?.resources,
                 accounts: currentOverview?.accounts ?? [:],
                 accountErrors: currentOverview?.accountErrors ?? [],
-                connectionError: error.localizedDescription
+                connectionError: error.localizedDescription,
+                updateStatus: currentOverview?.updateStatus
             )
         }
     }
@@ -437,13 +474,19 @@ final class WorkerSessionModel: ObservableObject {
             profile: profile,
             workerClient: workerClient
         )
+        async let updateResult = commandResult(
+            WorkerRemoteCommand.updateStatus,
+            profile: profile,
+            workerClient: workerClient
+        )
 
         let results = await (
             projectsResult,
             sessionsResult,
             resourcesResult,
             codexResult,
-            claudeResult
+            claudeResult,
+            updateResult
         )
 
         let projectResponse: WorkerSessionResponse
@@ -458,7 +501,8 @@ final class WorkerSessionModel: ObservableObject {
                 resources: nil,
                 accounts: [:],
                 accountErrors: Set(AgentKind.allCases),
-                connectionError: error.localizedDescription
+                connectionError: error.localizedDescription,
+                updateStatus: parseUpdateStatus(results.5)
             )
         }
 
@@ -471,6 +515,7 @@ final class WorkerSessionModel: ObservableObject {
             visibleProjects.contains($0.repositoryName)
         }
         let resources = try? WorkerOverviewParser.resources(results.2.get())
+        let updateStatus = parseUpdateStatus(results.5)
 
         var accounts: [AgentKind: WorkerAccountSnapshot] = [:]
         var accountErrors: Set<AgentKind> = []
@@ -495,8 +540,16 @@ final class WorkerSessionModel: ObservableObject {
             resources: resources,
             accounts: accounts,
             accountErrors: accountErrors,
-            connectionError: nil
+            connectionError: nil,
+            updateStatus: updateStatus
         )
+    }
+
+    private static func parseUpdateStatus(
+        _ result: Result<Data, Error>
+    ) -> WorkerUpdateStatus? {
+        guard case .success(let data) = result else { return nil }
+        return try? WorkerUpdateStatusProtocol.parse(data)
     }
 
     private static func loadCodexAccount(

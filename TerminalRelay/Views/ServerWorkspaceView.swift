@@ -63,6 +63,11 @@ struct ProjectWorkspaceView: View {
     var body: some View {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
+                if let warning = workerSessionService.updateWarning(for: worker.id) {
+                    workerUpdateWarningBanner(warning)
+                    Divider()
+                }
+
                 if let error = workerSessionService.error(for: worker.id) {
                     workerSessionErrorBanner(error)
                     Divider()
@@ -685,6 +690,27 @@ struct ProjectWorkspaceView: View {
             Spacer(minLength: 12)
             Button {
                 workerSessionService.dismissError(for: worker.id)
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss")
+        }
+        .padding(.horizontal, 14)
+        .frame(minHeight: 34)
+        .background(Color.orange.opacity(0.08))
+    }
+
+    private func workerUpdateWarningBanner(_ message: String) -> some View {
+        HStack(spacing: 9) {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .foregroundStyle(.orange)
+            Text(message)
+                .font(.caption)
+                .lineLimit(2)
+            Spacer(minLength: 12)
+            Button {
+                workerSessionService.dismissUpdateWarning(for: worker.id)
             } label: {
                 Image(systemName: "xmark")
             }

@@ -28,6 +28,7 @@ struct WorkerOverviewSnapshot: Equatable {
     let accounts: [AgentKind: WorkerAccountSnapshot]
     let accountErrors: Set<AgentKind>
     let connectionError: String?
+    let updateStatus: WorkerUpdateStatus?
 
     var isOnline: Bool {
         connectionError == nil

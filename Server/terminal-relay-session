@@ -2,7 +2,9 @@
 set -euo pipefail
 
 readonly protocol_marker="__TERMINAL_RELAY_SESSION_V1__"
+readonly agent_update_protocol_marker="__TERMINAL_RELAY_AGENT_UPDATE_V1__"
 readonly installed_helper_path="/usr/local/bin/terminal-relay-session"
+readonly default_agent_update_status_path="/var/lib/terminal-relay/agent-update-status"
 readonly default_tmux_path="/usr/bin/tmux"
 readonly default_tmux_socket="terminal-relay"
 readonly default_workspace_root="/workspace"
@@ -73,6 +75,7 @@ if [[ $test_mode -eq 1 ]]; then
     boot_id_path="${TERMINAL_RELAY_TEST_BOOT_ID_PATH:-$default_boot_id_path}"
     codex_shared_account_enabled="${TERMINAL_RELAY_TEST_CODEX_SHARED_ACCOUNT:-0}"
     codex_app_server_socket="${TERMINAL_RELAY_TEST_CODEX_APP_SERVER_SOCKET:-$runtime_directory/codex.sock}"
+    agent_update_status_path="${TERMINAL_RELAY_TEST_AGENT_UPDATE_STATUS_PATH:-$default_agent_update_status_path}"
 else
     if [[ ! -x "$default_getent_path" ]]; then
         echo "Required account database command is unavailable: $default_getent_path" >&2
@@ -98,6 +101,7 @@ else
     boot_id_path="$default_boot_id_path"
     codex_shared_account_enabled=1
     codex_app_server_socket="$runtime_directory/codex.sock"
+    agent_update_status_path="$default_agent_update_status_path"
 fi
 readonly codex_app_server_session="terminal-relay-account-server"
 
@@ -106,6 +110,7 @@ usage() {
 usage:
   terminal-relay-session list-projects
   terminal-relay-session status
+  terminal-relay-session update-status
   terminal-relay-session restore
   terminal-relay-session start <codex|claude> <repository> [agent arguments...]
   terminal-relay-session attach <codex|claude> <repository> [agent arguments...]
@@ -142,6 +147,7 @@ validate_absolute_path "Claude executable" "$claude_path"
 validate_absolute_path "flock executable" "$flock_path"
 validate_absolute_path "boot id" "$boot_id_path"
 validate_absolute_path "Codex app-server socket" "$codex_app_server_socket"
+validate_absolute_path "agent update status" "$agent_update_status_path"
 
 if [[ "$codex_shared_account_enabled" == "1" ]]; then
     codex_socket_bytes="$(printf '%s' "$codex_app_server_socket" | /usr/bin/wc -c | /usr/bin/tr -d '[:space:]')"
@@ -1477,6 +1483,55 @@ list_projects() {
     if [[ ${#repositories[@]} -gt 0 ]]; then
         printf 'project|%s\n' "${repositories[@]}" | LC_ALL=C /usr/bin/sort
     fi
+}
+
+agent_update_status() {
+    local expected_owner=0
+    local file_identity
+    local -a lines=()
+    local record_type
+    local timestamp
+    local result
+    local codex_version
+    local claude_version
+    local extra
+    local line
+
+    printf '%s\n' "$agent_update_protocol_marker"
+    [[ -e "$agent_update_status_path" || -L "$agent_update_status_path" ]] || return 0
+    [[ -f "$agent_update_status_path" && ! -L "$agent_update_status_path" ]] || {
+        echo "The agent update status is not a regular file." >&2
+        return 70
+    }
+    [[ $test_mode -eq 0 ]] || expected_owner="$user_id"
+    file_identity="$(path_uid_mode "$agent_update_status_path")" || {
+        echo "The agent update status cannot be inspected." >&2
+        return 70
+    }
+    [[ "$file_identity" == "$expected_owner:644" ]] || {
+        echo "The agent update status has unsafe ownership or permissions." >&2
+        return 70
+    }
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lines+=("$line")
+    done < "$agent_update_status_path"
+    [[ ${#lines[@]} -eq 2 && "${lines[0]}" == "$agent_update_protocol_marker" ]] || {
+        echo "The agent update status is malformed." >&2
+        return 70
+    }
+    IFS='|' read -r record_type timestamp result codex_version claude_version extra \
+        <<< "${lines[1]}"
+    [[ "$record_type" == "update" \
+        && "$timestamp" =~ ^[1-9][0-9]*$ \
+        && "$result" =~ ^(success|failure)$ \
+        && "$codex_version" =~ ^(unknown|[A-Za-z0-9][A-Za-z0-9._+-]{0,63})$ \
+        && "$claude_version" =~ ^(unknown|[A-Za-z0-9][A-Za-z0-9._+-]{0,63})$ \
+        && -z "${extra:-}" ]] || {
+        echo "The agent update status is malformed." >&2
+        return 70
+    }
+    printf '%s\n' "${lines[1]}"
 }
 
 resolve_session_title() {
@@ -3123,6 +3178,10 @@ case "$command_name" in
     status)
         [[ $# -eq 0 ]] || fail_usage "status does not accept arguments."
         status_sessions
+        ;;
+    update-status)
+        [[ $# -eq 0 ]] || fail_usage "update-status does not accept arguments."
+        agent_update_status
         ;;
     restore)
         [[ $# -eq 0 ]] || fail_usage "restore does not accept arguments."

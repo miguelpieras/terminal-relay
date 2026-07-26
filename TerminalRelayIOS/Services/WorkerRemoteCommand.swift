@@ -17,6 +17,7 @@ enum WorkerRemoteCommandError: LocalizedError, Equatable {
 enum WorkerRemoteCommand {
     static let listProjects = "\(WorkerSessionProtocol.helperPath) list-projects"
     static let status = "\(WorkerSessionProtocol.helperPath) status"
+    static let updateStatus = "\(WorkerSessionProtocol.helperPath) update-status"
     static let resources = """
         set -eu
 

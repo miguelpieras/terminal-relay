@@ -1,6 +1,8 @@
 import SwiftUI
 
 struct AgentDefaultsView: View {
+    @Environment(\.applicationUpdater) private var applicationUpdater
+
     @AppStorage(ApplicationSettings.StorageKey.keepRunningAfterLastWindowClosed)
     private var keepRunningAfterLastWindowClosed =
         ApplicationSettings.defaultKeepRunningAfterLastWindowClosed
@@ -71,6 +73,10 @@ struct AgentDefaultsView: View {
                         .padding(.top, 4)
                     } label: {
                         Label("Application", systemImage: "macwindow")
+                    }
+
+                    if let applicationUpdater {
+                        ApplicationUpdateSettingsView(updater: applicationUpdater)
                     }
 
                     agentSettings(

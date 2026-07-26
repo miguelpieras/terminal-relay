@@ -21,6 +21,7 @@ signal_log="$test_root/signal.log"
 codex_app_server_log="$test_root/codex-app-server.log"
 codex_app_server_control="$test_root/codex-app-server.control"
 boot_id_file="$test_root/boot-id"
+agent_update_status_file="$test_root/agent-update-status"
 stub_agent="$test_root/stub-agent"
 stub_codex="$test_root/stub-codex"
 stub_codex_app_server="$test_root/stub-codex-app-server"
@@ -567,6 +568,7 @@ export TERMINAL_RELAY_TEST_SIGNAL_PATH="$signal_adapter"
 export TERMINAL_RELAY_TEST_SIGNAL_LOG="$signal_log"
 export TERMINAL_RELAY_TEST_SIGNAL_TARGET_PATH="$stub_agent"
 export TERMINAL_RELAY_TEST_BOOT_ID_PATH="$boot_id_file"
+export TERMINAL_RELAY_TEST_AGENT_UPDATE_STATUS_PATH="$agent_update_status_file"
 export HOME="$test_home"
 
 list_output="$(/bin/bash "$helper" list-projects)"
@@ -575,6 +577,38 @@ assert_equal \
     "$list_output" \
     "list-projects response"
 assert_equal "700" "$(path_mode "$runtime_root")" "persistent state-root mode"
+assert_equal \
+    "__TERMINAL_RELAY_AGENT_UPDATE_V1__" \
+    "$(/bin/bash "$helper" update-status)" \
+    "missing agent update status"
+printf '%s\n' \
+    '__TERMINAL_RELAY_AGENT_UPDATE_V1__' \
+    'update|1785055200|success|0.85.0|2.1.0' \
+    > "$agent_update_status_file"
+/bin/chmod 644 "$agent_update_status_file"
+assert_equal \
+    $'__TERMINAL_RELAY_AGENT_UPDATE_V1__\nupdate|1785055200|success|0.85.0|2.1.0' \
+    "$(/bin/bash "$helper" update-status)" \
+    "successful agent update status"
+printf '%s\n' \
+    '__TERMINAL_RELAY_AGENT_UPDATE_V1__' \
+    'update|1785055300|failure|0.85.0|2.1.0' \
+    > "$agent_update_status_file"
+assert_equal \
+    $'__TERMINAL_RELAY_AGENT_UPDATE_V1__\nupdate|1785055300|failure|0.85.0|2.1.0' \
+    "$(/bin/bash "$helper" update-status)" \
+    "partially failed agent update status"
+printf '%s\n' \
+    '__TERMINAL_RELAY_AGENT_UPDATE_V1__' \
+    'update|not-a-time|failure|unsafe value|2.1.0' \
+    > "$agent_update_status_file"
+set +e
+malformed_update_output="$(/bin/bash "$helper" update-status 2>&1)"
+malformed_update_status=$?
+set -e
+assert_equal "70" "$malformed_update_status" "malformed agent update status"
+assert_contains "$malformed_update_output" "malformed" "malformed agent update diagnostic"
+/bin/rm -f -- "$agent_update_status_file"
 
 echo "2/18 concurrent starts create independent terminals with distinct tokens"
 start_one_output="$test_root/start-one.out"

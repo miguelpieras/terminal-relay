@@ -20,6 +20,13 @@ final class WorkerSessionServiceTests: XCTestCase {
                 ),
                 WorkerSessionCommandResult(
                     exitCode: 0,
+                    standardOutput: Data(
+                        "\(WorkerUpdateStatusProtocol.marker)\n".utf8
+                    ),
+                    standardError: Data()
+                ),
+                WorkerSessionCommandResult(
+                    exitCode: 0,
                     standardOutput: Data(),
                     standardError: Data()
                 )
@@ -53,6 +60,7 @@ final class WorkerSessionServiceTests: XCTestCase {
             recorder.configurations,
             [
                 SSHCommandBuilder.workerSessionStatusConfiguration(for: worker),
+                SSHCommandBuilder.workerUpdateStatusConfiguration(for: worker),
                 SSHCommandBuilder.workerSessionStopConfiguration(
                     for: worker,
                     kind: .codex,
@@ -80,9 +88,21 @@ final class WorkerSessionServiceTests: XCTestCase {
                     standardError: Data()
                 ),
                 WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data(
+                        "\(WorkerUpdateStatusProtocol.marker)\n".utf8
+                    ),
+                    standardError: Data()
+                ),
+                WorkerSessionCommandResult(
                     exitCode: 127,
                     standardOutput: Data(),
                     standardError: Data("helper missing".utf8)
+                ),
+                WorkerSessionCommandResult(
+                    exitCode: 64,
+                    standardOutput: Data(),
+                    standardError: Data("unsupported command".utf8)
                 )
             ]
         )
@@ -123,6 +143,13 @@ final class WorkerSessionServiceTests: XCTestCase {
                 ),
                 WorkerSessionCommandResult(
                     exitCode: 0,
+                    standardOutput: Data(
+                        "\(WorkerUpdateStatusProtocol.marker)\n".utf8
+                    ),
+                    standardError: Data()
+                ),
+                WorkerSessionCommandResult(
+                    exitCode: 0,
                     standardOutput: Data(),
                     standardError: Data()
                 ),
@@ -144,6 +171,7 @@ final class WorkerSessionServiceTests: XCTestCase {
             recorder.configurations,
             [
                 SSHCommandBuilder.workerSessionStatusConfiguration(for: worker),
+                SSHCommandBuilder.workerUpdateStatusConfiguration(for: worker),
                 SSHCommandBuilder.workerSessionStopConfiguration(
                     for: worker,
                     kind: .claude,
@@ -183,6 +211,13 @@ final class WorkerSessionServiceTests: XCTestCase {
                         """.utf8
                     ),
                     standardError: Data()
+                ),
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data(
+                        "\(WorkerUpdateStatusProtocol.marker)\n".utf8
+                    ),
+                    standardError: Data()
                 )
             ]
         )
@@ -195,7 +230,10 @@ final class WorkerSessionServiceTests: XCTestCase {
         XCTAssertTrue(stopped)
         XCTAssertEqual(
             recorder.configurations,
-            [SSHCommandBuilder.workerSessionStatusConfiguration(for: worker)]
+            [
+                SSHCommandBuilder.workerSessionStatusConfiguration(for: worker),
+                SSHCommandBuilder.workerUpdateStatusConfiguration(for: worker)
+            ]
         )
     }
 
@@ -204,6 +242,13 @@ final class WorkerSessionServiceTests: XCTestCase {
         let instanceToken = "01234567-89ab-" + "4def-8abc-0123456789ab"
         let recorder = BlockingFirstWorkerSessionCommandRecorder(
             subsequentResults: [
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data(
+                        "\(WorkerUpdateStatusProtocol.marker)\n".utf8
+                    ),
+                    standardError: Data()
+                ),
                 WorkerSessionCommandResult(
                     exitCode: 0,
                     standardOutput: Data(),
@@ -253,6 +298,7 @@ final class WorkerSessionServiceTests: XCTestCase {
             recorder.configurations,
             [
                 SSHCommandBuilder.workerSessionStatusConfiguration(for: worker),
+                SSHCommandBuilder.workerUpdateStatusConfiguration(for: worker),
                 SSHCommandBuilder.workerSessionStopConfiguration(
                     for: worker,
                     kind: .claude,
@@ -261,6 +307,57 @@ final class WorkerSessionServiceTests: XCTestCase {
                 )
             ]
         )
+    }
+
+    func testUpdateFailureWarningCanBeDismissedUntilANewFailureArrives() async {
+        let worker = makeWorker()
+        let sessionStatus = WorkerSessionCommandResult(
+            exitCode: 0,
+            standardOutput: Data("__TERMINAL_RELAY_SESSION_V1__\n".utf8),
+            standardError: Data()
+        )
+        func updateStatus(_ timestamp: Int, _ result: String) -> WorkerSessionCommandResult {
+            WorkerSessionCommandResult(
+                exitCode: 0,
+                standardOutput: Data(
+                    """
+                    \(WorkerUpdateStatusProtocol.marker)
+                    update|\(timestamp)|\(result)|1.2.3|4.5.6
+
+                    """.utf8
+                ),
+                standardError: Data()
+            )
+        }
+        let recorder = WorkerSessionCommandRecorder(
+            results: [
+                sessionStatus, updateStatus(1_700_000_000, "failure"),
+                sessionStatus, updateStatus(1_700_000_000, "failure"),
+                sessionStatus, updateStatus(1_700_000_001, "failure"),
+                sessionStatus, updateStatus(1_700_000_002, "success"),
+            ]
+        )
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+
+        _ = await service.refresh(worker: worker)
+        XCTAssertEqual(
+            service.updateWarning(for: worker.id),
+            "Automatic agent update failed. Codex 1.2.3 and Claude Code 4.5.6 remain available; the worker will retry automatically."
+        )
+
+        service.dismissUpdateWarning(for: worker.id)
+        XCTAssertNil(service.updateWarning(for: worker.id))
+
+        _ = await service.refresh(worker: worker)
+        XCTAssertNil(service.updateWarning(for: worker.id))
+
+        _ = await service.refresh(worker: worker)
+        XCTAssertNotNil(service.updateWarning(for: worker.id))
+
+        _ = await service.refresh(worker: worker)
+        XCTAssertNil(service.updateWarning(for: worker.id))
     }
 
     func testStartReturnsAndStoresTheExactSessionSnapshot() async {

@@ -35,6 +35,15 @@ struct RootView: View {
             .joined(separator: "|")
     }
 
+    private var workerUpdateWarning: (profile: WorkerProfile, message: String)? {
+        for profile in model.profiles {
+            if let message = model.updateWarning(for: profile.id) {
+                return (profile, message)
+            }
+        }
+        return nil
+    }
+
     var body: some View {
         TabView(selection: $selectedTab) {
             NavigationStack {
@@ -57,6 +66,16 @@ struct RootView: View {
                 Label("Workers", systemImage: "server.rack")
             }
             .tag(RootTab.workers)
+        }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if let warning = workerUpdateWarning {
+                WorkerUpdateWarningBanner(
+                    workerName: warning.profile.displayName,
+                    message: warning.message
+                ) {
+                    model.dismissUpdateWarning(for: warning.profile.id)
+                }
+            }
         }
         .sheet(item: $editorRoute) { route in
             NavigationStack {
@@ -208,6 +227,39 @@ struct RootView: View {
                     Label("Add Worker", systemImage: "plus")
                 }
             }
+        }
+    }
+}
+
+private struct WorkerUpdateWarningBanner: View {
+    let workerName: String
+    let message: String
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(workerName) update needs attention")
+                    .font(.caption.weight(.semibold))
+                Text(message)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 4)
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+                    .font(.caption.weight(.bold))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss update warning")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(.regularMaterial)
+        .overlay(alignment: .bottom) {
+            Divider()
         }
     }
 }

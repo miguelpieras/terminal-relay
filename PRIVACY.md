@@ -17,6 +17,18 @@ Tailscale, GitHub, Codex, or Claude. Those services process data under their own
 terms and privacy policies. The Terminal Relay project and its maintainers do
 not receive this traffic.
 
+Maintainer-signed macOS builds check a public GitHub Pages appcast once per day
+and download accepted updates from GitHub Releases. Sparkle system profiling is
+disabled, and Terminal Relay does not attach worker, account, project, or device
+details to update requests. You can disable automatic checks, downloads, or
+installation in the app and can always initiate a manual check. iPhone
+application updates are managed by the App Store.
+
+When a client connects to one of your workers, it may read a root-owned
+last-update record over the existing SSH connection. That response is limited
+to a timestamp, success or failure, and sanitized installed Codex and Claude
+version strings. It is not sent to the maintainer.
+
 ## Diagnostics
 
 The apps do not transmit diagnostics to the maintainer. If you choose to file a
