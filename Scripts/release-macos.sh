@@ -14,6 +14,8 @@ derived_data="$repository_root/DerivedData"
 release_root="$repository_root/build/macos-release"
 archive_path="$release_root/TerminalRelay.xcarchive"
 archived_app="$archive_path/Products/Applications/Terminal Relay.app"
+export_path="$release_root/export"
+exported_app="$export_path/Terminal Relay.app"
 staged_app="$release_root/Terminal Relay.app"
 update_archive="$release_root/Terminal-Relay-${version}.zip"
 release_notes_asset="$release_root/Terminal-Relay-${version}.md"
@@ -154,7 +156,64 @@ xcodebuild -quiet \
     exit 1
 }
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$archived_app"
-/usr/bin/ditto "$archived_app" "$staged_app"
+
+export_options="$temporary_directory/ExportOptions.plist"
+/usr/bin/plutil -create xml1 "$export_options"
+/usr/bin/plutil -insert method -string developer-id "$export_options"
+/usr/bin/plutil -insert destination -string export "$export_options"
+/usr/bin/plutil -insert signingStyle -string manual "$export_options"
+/usr/bin/plutil -insert signingCertificate -string "$signing_identity" "$export_options"
+/usr/bin/plutil -insert teamID -string "$development_team" "$export_options"
+/usr/bin/plutil -insert manageAppVersionAndBuildNumber -bool NO "$export_options"
+/usr/bin/plutil -insert stripSwiftSymbols -bool YES "$export_options"
+
+xcodebuild -quiet \
+    -exportArchive \
+    -archivePath "$archive_path" \
+    -exportPath "$export_path" \
+    -exportOptionsPlist "$export_options"
+
+[[ -d "$exported_app" && ! -L "$exported_app" ]] || {
+    echo "release-macos: Developer ID export did not contain Terminal Relay.app" >&2
+    exit 1
+}
+/usr/bin/codesign --verify --deep --strict --verbose=2 "$exported_app"
+/usr/bin/ditto "$exported_app" "$staged_app"
+
+unexpected_payload_file="$(
+    /usr/bin/find "$staged_app" -type f \
+        \( \
+            -name '*.p8' -o \
+            -name '*.p12' -o \
+            -name '*.pem' -o \
+            -name '*.key' -o \
+            -name '.env' -o \
+            -name 'known_hosts' -o \
+            -name '*.log' -o \
+            -name '*.xctest' \
+        \) \
+        -print \
+        -quit
+)"
+[[ -z "$unexpected_payload_file" ]] || {
+    echo "release-macos: exported app contains a forbidden private-data file" >&2
+    exit 1
+}
+
+unexpected_payload_content="$(
+    /usr/bin/find "$staged_app" -type f \
+        -exec /usr/bin/grep -a -E -l \
+            -- \
+            '-----BEGIN (OPENSSH |RSA |EC )?PRIVATE KEY-----|github_pat_|gh[opsu]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-|sk-[A-Za-z0-9]{20,}|[/]Users/[^/[:space:]]+/|terminal-relay-worker-[0-9]|10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}' \
+            {} + \
+        2>/dev/null \
+        | /usr/bin/head -n 1 \
+        || true
+)"
+[[ -z "$unexpected_payload_content" ]] || {
+    echo "release-macos: exported app contains private-data content" >&2
+    exit 1
+}
 
 notary_archive="$temporary_directory/Terminal-Relay-notarization.zip"
 /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$staged_app" "$notary_archive"
