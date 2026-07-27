@@ -80,9 +80,9 @@ struct ProjectListView: View {
                 ContentUnavailableView {
                     Label("No Projects", systemImage: "folder")
                 } description: {
-                    Text("Add a worker to load its projects and shared agent sessions.")
+                    Text("Pair with the Terminal Relay app on your Mac to load projects and shared agent sessions.")
                 } actions: {
-                    Button("Add Worker", action: onAddWorker)
+                    Button("Scan Mac Pairing Code", action: onAddWorker)
                         .buttonStyle(.borderedProminent)
                 }
             } else {
@@ -213,7 +213,7 @@ struct ProjectListView: View {
             Divider()
 
             Button(action: onAddWorker) {
-                Label("Add Worker", systemImage: "plus")
+                Label("Pair Another Worker", systemImage: "qrcode.viewfinder")
             }
         } label: {
             Image(systemName: workerFilterID == nil

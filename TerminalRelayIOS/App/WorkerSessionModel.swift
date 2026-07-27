@@ -47,12 +47,14 @@ final class WorkerSessionModel: ObservableObject {
     @Published private var dismissedUpdateTimestamps: [UUID: Int] = [:]
     @Published private(set) var publicKey = ""
     @Published private(set) var isLoading = false
+    @Published private(set) var isPairing = false
     @Published var errorMessage: String?
     @Published var terminalRoute: TerminalRoute?
 
     private let profileStore: WorkerProfileStore
     private let identityStore: SSHIdentityStore
     private let workerClient: SSHWorkerClient
+    private let pairingClient: MobilePairingClient
     private let readStateDefaults: UserDefaults
     private var readActivityBySession: [String: Int]
     private var lastOpenedTerminalRoute: TerminalRoute?
@@ -67,6 +69,7 @@ final class WorkerSessionModel: ObservableObject {
         self.profileStore = profileStore
         self.identityStore = identityStore
         self.workerClient = SSHWorkerClient(identityStore: identityStore)
+        self.pairingClient = MobilePairingClient(identityStore: identityStore)
         self.readStateDefaults = readStateDefaults
         self.readActivityBySession = Self.loadReadState(from: readStateDefaults)
         let profiles = profileStore.load()
@@ -79,6 +82,37 @@ final class WorkerSessionModel: ObservableObject {
             self.publicKey = try identityStore.publicKeyForAuthorizedKeys()
         } catch {
             self.errorMessage = error.localizedDescription
+        }
+    }
+
+    @discardableResult
+    func pair(with code: String) async -> Bool {
+        guard !isPairing else { return false }
+        isPairing = true
+        errorMessage = nil
+        defer { isPairing = false }
+
+        do {
+            let payload = try MobilePairingPayloadCodec.decode(code)
+            let existingProfileID = profiles.first {
+                $0.host.caseInsensitiveCompare(payload.host) == .orderedSame
+                    && $0.port == payload.port
+                    && $0.username == payload.username
+            }?.id
+            let pairedProfile = try await pairingClient.pair(
+                payload: payload,
+                existingProfileID: existingProfileID
+            )
+            try profileStore.save(pairedProfile)
+            profiles = profileStore.load()
+            profileStore.setSelectedProfileID(pairedProfile.id)
+            profile = pairedProfile
+            resetWorkerState()
+            await refreshProjectCatalogs()
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
         }
     }
 

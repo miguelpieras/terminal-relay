@@ -10,6 +10,11 @@ preferences, and account labels locally. The universal iPhone and iPad app
 creates an SSH private key in the device Keychain. Terminal Relay does not
 upload that private key.
 
+The iPhone and iPad app uses the camera only to scan a pairing code displayed
+by the Mac app. Camera frames are processed on the device and are not stored or
+transmitted. The short-lived pairing credential is sent directly to the worker
+you selected and is removed from the worker after it authorizes the device key.
+
 ## Data sent to services you choose
 
 Terminal sessions, repository operations, and account requests are sent

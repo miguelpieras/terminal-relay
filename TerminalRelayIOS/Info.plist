@@ -22,6 +22,8 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.developer-tools</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Scan a private pairing code shown by Terminal Relay on your Mac.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Terminal Relay connects to your worker over Tailscale.</string>
 	<key>UILaunchScreen</key>

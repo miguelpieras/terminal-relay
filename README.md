@@ -17,6 +17,7 @@ over SSH.
 - Multiple reusable workers and pinned SSH identities.
 - Tailscale-friendly iPhone and iPad client with a device-specific Keychain
   identity.
+- Private Mac-to-mobile pairing with a short-lived, single-use QR code.
 - Optional Hetzner and Tailscale worker lifecycle automation.
 - Signed, in-app macOS updates with daily checks and user-controlled installation.
 - No advertising, analytics, tracking, or Terminal Relay cloud service.
@@ -159,15 +160,17 @@ paths, session protocol, recovery behavior, and helper-only update flow.
 
 1. Install and connect Tailscale on the iPhone or iPad when the worker is
    private.
-2. Open Terminal Relay and copy its generated Ed25519 public key.
-3. Add that public key to the worker user's `~/.ssh/authorized_keys`.
-4. Obtain the worker's ED25519 host-key fingerprint through an already trusted
-   administrative connection.
-5. Add the worker's name, hostname, SSH port, username, and fingerprint.
+2. On the Mac, open **Workers**, use the worker's action menu, and choose
+   **Pair iPhone or iPad**.
+3. On the iPhone or iPad, open Terminal Relay, tap **Scan Mac Pairing Code**,
+   and scan the code.
 
-The private device key stays in Keychain. The app rejects a worker whose host
-key does not match the pinned fingerprint. Worker connection details and read
-state remain on the device.
+The Mac creates a restricted SSH invitation that expires after 10 minutes and
+can authorize one device key but cannot open a shell. The mobile app verifies
+the worker's ED25519 host key before enrollment, replaces the invitation with
+its permanent public key, and saves the connection locally. No pairing service
+or Terminal Relay account is involved. The private device key stays in
+Keychain. Manual worker entry remains available as a fallback.
 
 ## Distribution
 

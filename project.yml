@@ -97,6 +97,7 @@ targets:
       - path: TerminalRelayIOS
       - path: TerminalRelay/Models/AgentKind.swift
       - path: TerminalRelay/Models/AgentLaunchDefaults.swift
+      - path: TerminalRelay/Models/MobilePairingPayload.swift
       - path: TerminalRelay/Models/WorkerSessionState.swift
       - path: TerminalRelay/Models/WorkerUpdateStatus.swift
       - path: LICENSE
@@ -117,6 +118,7 @@ targets:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSApplicationCategoryType: public.app-category.developer-tools
+        NSCameraUsageDescription: Scan a private pairing code shown by Terminal Relay on your Mac.
         NSLocalNetworkUsageDescription: Terminal Relay connects to your worker over Tailscale.
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:

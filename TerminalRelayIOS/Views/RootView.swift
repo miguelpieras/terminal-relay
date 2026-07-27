@@ -16,6 +16,7 @@ struct RootView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var selectedTab = RootTab.projects
     @State private var editorRoute: WorkerEditorRoute?
+    @State private var showsPairingScanner = false
     @State private var workerPendingDeletion: WorkerProfile?
     @State private var workerSearchText = ""
 
@@ -48,10 +49,7 @@ struct RootView: View {
         TabView(selection: $selectedTab) {
             NavigationStack {
                 ProjectListView(model: model) {
-                    editorRoute = WorkerEditorRoute(
-                        profile: nil,
-                        showsProjectsAfterSave: true
-                    )
+                    showsPairingScanner = true
                 }
             }
             .tabItem {
@@ -89,6 +87,16 @@ struct RootView: View {
                         selectedTab = .projects
                     }
                     Task { await model.refresh() }
+                }
+            }
+        }
+        .sheet(isPresented: $showsPairingScanner) {
+            PairingScannerView { code in
+                showsPairingScanner = false
+                Task {
+                    if await model.pair(with: code) {
+                        selectedTab = .projects
+                    }
                 }
             }
         }
@@ -142,6 +150,17 @@ struct RootView: View {
         } message: {
             Text(model.errorMessage ?? "Unknown error")
         }
+        .overlay {
+            if model.isPairing {
+                ZStack {
+                    Color.black.opacity(0.28)
+                        .ignoresSafeArea()
+                    ProgressView("Pairing securely…")
+                        .padding(20)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                }
+            }
+        }
     }
 
     @ViewBuilder
@@ -151,15 +170,19 @@ struct RootView: View {
                 ContentUnavailableView {
                     Label("No Workers", systemImage: "server.rack")
                 } description: {
-                    Text("Add a worker to load its projects and shared agent sessions.")
+                    Text("Scan the private pairing code shown by Terminal Relay on your Mac.")
                 } actions: {
-                    Button("Add Worker") {
+                    Button("Scan Mac Pairing Code") {
+                        showsPairingScanner = true
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Button("Add Manually") {
                         editorRoute = WorkerEditorRoute(
                             profile: nil,
                             showsProjectsAfterSave: true
                         )
                     }
-                    .buttonStyle(.borderedProminent)
                 }
             } else {
                 List {
@@ -218,11 +241,21 @@ struct RootView: View {
         }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    editorRoute = WorkerEditorRoute(
-                        profile: nil,
-                        showsProjectsAfterSave: true
-                    )
+                Menu {
+                    Button {
+                        showsPairingScanner = true
+                    } label: {
+                        Label("Scan Mac Pairing Code", systemImage: "qrcode.viewfinder")
+                    }
+
+                    Button {
+                        editorRoute = WorkerEditorRoute(
+                            profile: nil,
+                            showsProjectsAfterSave: true
+                        )
+                    } label: {
+                        Label("Add Manually", systemImage: "keyboard")
+                    }
                 } label: {
                     Label("Add Worker", systemImage: "plus")
                 }

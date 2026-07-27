@@ -28,6 +28,7 @@ Use it to:
 - Start or reconnect to Codex and Claude terminal sessions.
 - Move between Mac, iPhone, and iPad without stopping the remote agent.
 - Monitor worker availability and resource usage.
+- Pair securely with the Mac app by scanning a short-lived QR code.
 - Keep a dedicated SSH identity in the device Keychain.
 - Pin every worker's SSH host key.
 
@@ -44,8 +45,10 @@ terminal,ssh,coding,developer,codex,claude,remote,tailscale
 ## Review notes
 
 Terminal Relay is a client for user-owned SSH workers. The app generates a
-device-specific Ed25519 key and requires the matching public key to be
-authorized on a worker.
+device-specific Ed25519 key. The normal onboarding flow scans a QR code created
+by the Mac app; the code contains a short-lived SSH key restricted to
+authorizing that device key and cannot open a shell. Camera frames are
+processed only on the device.
 
 Before submitting, replace this paragraph with exact instructions for an
 Apple-accessible review worker or an in-app demonstration path. Do not expose a

@@ -50,6 +50,7 @@ struct WorkersView: View {
     let onSelectProject: (UUID) -> Void
 
     @State private var editorProfile: ServerProfile?
+    @State private var pairingWorker: ServerProfile?
     @State private var workerPendingDeletion: ServerProfile?
     @State private var expandedWorkerIDs: Set<UUID> = []
     @State private var isRefreshingAll = false
@@ -75,6 +76,9 @@ struct WorkersView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .navigationTitle("")
+        .sheet(item: $pairingWorker) { worker in
+            MobilePairingView(worker: worker)
+        }
         .task(id: refreshTaskID) {
             await refreshAll()
             await pollMetrics()
@@ -109,6 +113,10 @@ struct WorkersView: View {
                                     isConfirmingDeletion: workerPendingDeletion?.id == worker.id,
                                     onToggleApps: { toggleApps(for: worker.id) },
                                     onOpenProject: onSelectProject,
+                                    onPairMobile: {
+                                        workerPendingDeletion = nil
+                                        pairingWorker = worker
+                                    },
                                     onEdit: {
                                         workerPendingDeletion = nil
                                         editorProfile = worker
@@ -579,6 +587,7 @@ private struct WorkerOverviewCard: View {
     let isConfirmingDeletion: Bool
     let onToggleApps: () -> Void
     let onOpenProject: (UUID) -> Void
+    let onPairMobile: () -> Void
     let onEdit: () -> Void
     let onRequestDelete: () -> Void
     let onCancelDelete: () -> Void
@@ -661,6 +670,7 @@ private struct WorkerOverviewCard: View {
                         projects: projects,
                         isExpanded: isExpanded,
                         onToggle: onToggleApps,
+                        onPairMobile: onPairMobile,
                         onEdit: onEdit,
                         onRequestDelete: onRequestDelete
                     )
@@ -1091,6 +1101,7 @@ private struct WorkerLinkedAppsColumn: View {
     let projects: [ProjectProfile]
     let isExpanded: Bool
     let onToggle: () -> Void
+    let onPairMobile: () -> Void
     let onEdit: () -> Void
     let onRequestDelete: () -> Void
 
@@ -1122,6 +1133,12 @@ private struct WorkerLinkedAppsColumn: View {
                     .allowsHitTesting(false)
 
                 Menu {
+                    Button(
+                        "Pair iPhone or iPad",
+                        systemImage: "qrcode",
+                        action: onPairMobile
+                    )
+                    Divider()
                     Button("Edit", systemImage: "pencil", action: onEdit)
                     Button(
                         "Delete",

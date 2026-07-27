@@ -373,6 +373,14 @@ final class SSHWorkerClient {
 
     func execute(_ command: String, on profile: WorkerProfile) async throws -> Data {
         let privateKey = try identityStore.loadOrCreatePrivateKey()
+        return try await execute(command, on: profile, privateKey: privateKey)
+    }
+
+    func execute(
+        _ command: String,
+        on profile: WorkerProfile,
+        privateKey: NIOSSHPrivateKey
+    ) async throws -> Data {
         return try await withCheckedThrowingContinuation { continuation in
             let operation = SSHExecOperation(profile: profile, privateKey: privateKey, command: command)
             operation.start { [operation] result in
