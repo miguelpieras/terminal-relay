@@ -3,18 +3,20 @@
 [![CI](https://github.com/miguelpieras/terminal-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/miguelpieras/terminal-relay/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-Terminal Relay is a native macOS and iPhone client for Codex CLI and Claude Code
-sessions running on workers you control. Repositories, agent credentials, and
-terminal processes remain on the worker; the apps connect over SSH.
+Terminal Relay provides native macOS, iPhone, and iPad clients for Codex CLI
+and Claude Code sessions running on workers you control. Repositories, agent
+credentials, and terminal processes remain on the worker; the apps connect
+over SSH.
 
 ## Features
 
 - Project-first macOS workspace with embedded interactive terminals.
 - Shared, persistent Codex and Claude sessions backed by worker-side `tmux`.
-- Mac-to-iPhone handoff without stopping the remote agent.
+- Handoff between Mac, iPhone, and iPad without stopping the remote agent.
 - GitHub repository creation, deploy-key setup, and worker checkout from macOS.
 - Multiple reusable workers and pinned SSH identities.
-- Tailscale-friendly iPhone client with a device-specific Keychain identity.
+- Tailscale-friendly iPhone and iPad client with a device-specific Keychain
+  identity.
 - Optional Hetzner and Tailscale worker lifecycle automation.
 - Signed, in-app macOS updates with daily checks and user-controlled installation.
 - No advertising, analytics, tracking, or Terminal Relay cloud service.
@@ -43,14 +45,14 @@ host or register an existing Terminal Relay worker.
 Maintainer-signed macOS releases use Sparkle. The app checks the public signed
 feed once per day without sending system-profile data. Use **Terminal Relay →
 Check for Updates…** at any time; automatic checks, downloads, and installation
-remain configurable in **Settings → Agent Defaults**. iPhone updates continue
-to be installed through the App Store.
+remain configurable in **Settings → Agent Defaults**. iPhone and iPad updates
+continue to be installed through the App Store.
 
 ## Architecture
 
-The macOS app starts the system SSH client inside a pseudo-terminal. The iPhone
-app uses SwiftNIO SSH and SwiftTerm. Both clients talk to the
-`terminal-relay-session` helper installed on each worker.
+The macOS app starts the system SSH client inside a pseudo-terminal. The
+universal iPhone and iPad app uses SwiftNIO SSH and SwiftTerm. Both clients talk
+to the `terminal-relay-session` helper installed on each worker.
 
 The helper keeps one Codex and one Claude process per worker user, permits
 multiple client attachments, and preserves restart intent across worker
@@ -60,9 +62,9 @@ ends the exact shared session.
 Terminal Relay does not operate a central backend:
 
 ```text
-macOS app ─┐
-           ├─ SSH over your network ─ worker ─ Codex / Claude
-iPhone app ┘                         └ repositories in /workspace
+macOS app ───────┐
+                 ├─ SSH over your network ─ worker ─ Codex / Claude
+iPhone/iPad app ┘                         └ repositories in /workspace
 ```
 
 ## Requirements
@@ -74,7 +76,8 @@ iPhone app ┘                         └ repositories in /workspace
 - Working SSH access to an Ubuntu 24.04 amd64 worker with at least 4 GB RAM
 - GitHub CLI authenticated on the Mac for repository management
 - Codex CLI and/or Claude Code accounts for the worker
-- Tailscale on the iPhone and worker when using a private Tailscale route
+- Tailscale on the iPhone or iPad and worker when using a private Tailscale
+  route
 
 ## Development builds
 
@@ -88,9 +91,9 @@ open TerminalRelay.xcodeproj
 The macOS app intentionally does not enable App Sandbox because its embedded
 terminal launches `/usr/bin/ssh`.
 
-For an iPhone development build, select the `TerminalRelayIOS` scheme, choose
-your Apple development team and bundle identifier if you are building a fork,
-and run on a simulator or connected device.
+For an iPhone or iPad development build, select the `TerminalRelayIOS` scheme,
+choose your Apple development team and bundle identifier if you are building a
+fork, and run on a simulator or connected device.
 
 ## Configure a worker
 
@@ -152,9 +155,10 @@ pass. Re-run the same command to update or recover the managed runtime.
 See [Server/README.md](Server/README.md) for the worker contract, installed
 paths, session protocol, recovery behavior, and helper-only update flow.
 
-## Configure the iPhone client
+## Configure the iPhone or iPad client
 
-1. Install and connect Tailscale on the iPhone when the worker is private.
+1. Install and connect Tailscale on the iPhone or iPad when the worker is
+   private.
 2. Open Terminal Relay and copy its generated Ed25519 public key.
 3. Add that public key to the worker user's `~/.ssh/authorized_keys`.
 4. Obtain the worker's ED25519 host-key fingerprint through an already trusted
@@ -171,8 +175,8 @@ Source availability and binary distribution are independent:
 
 - Developers can clone the repository and sign a fork with their own Apple
   team and bundle identifiers.
-- The maintained iPhone binary can be distributed through App Store Connect
-  under the configured Terminal Relay application identifier.
+- The maintained universal iPhone and iPad binary can be distributed through
+  App Store Connect under the configured Terminal Relay application identifier.
 - Maintainer-signed macOS binaries are Developer ID signed, notarized, and
   delivered from GitHub Releases through a signed Sparkle feed on GitHub Pages.
 - Every user still connects to their own private workers and accounts.

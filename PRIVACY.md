@@ -6,8 +6,9 @@ developer-operated data service.
 ## Data stored on your devices
 
 The apps store worker connection settings, project references, display
-preferences, and account labels locally. The iPhone app creates an SSH private
-key in the device Keychain. Terminal Relay does not upload that private key.
+preferences, and account labels locally. The universal iPhone and iPad app
+creates an SSH private key in the device Keychain. Terminal Relay does not
+upload that private key.
 
 ## Data sent to services you choose
 
@@ -21,7 +22,7 @@ Maintainer-signed macOS builds check a public GitHub Pages appcast once per day
 and download accepted updates from GitHub Releases. Sparkle system profiling is
 disabled, and Terminal Relay does not attach worker, account, project, or device
 details to update requests. You can disable automatic checks, downloads, or
-installation in the app and can always initiate a manual check. iPhone
+installation in the app and can always initiate a manual check. iPhone and iPad
 application updates are managed by the App Store.
 
 When a client connects to one of your workers, it may read a root-owned

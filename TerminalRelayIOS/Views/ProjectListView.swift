@@ -284,7 +284,7 @@ private struct ProjectDetailView: View {
                 ContentUnavailableView {
                     Label("No Terminals", systemImage: "terminal")
                 } description: {
-                    Text("Start a terminal for this project to work from your iPhone.")
+                    Text("Start a terminal for this project to work from this device.")
                 }
                 .listRowBackground(Color.clear)
             } else {

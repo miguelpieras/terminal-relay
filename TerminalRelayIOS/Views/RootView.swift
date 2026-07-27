@@ -129,7 +129,7 @@ struct RootView: View {
                 workerPendingDeletion = nil
             }
         } message: {
-            Text("This removes the worker connection from this iPhone. It does not change or stop the remote worker.")
+            Text("This removes the worker connection from this device. It does not change or stop the remote worker.")
         }
         .alert(
             "Terminal Relay",

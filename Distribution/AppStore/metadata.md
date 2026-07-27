@@ -15,20 +15,20 @@
 
 ## Promotional text
 
-Continue your remote Codex and Claude coding sessions from your iPhone.
+Continue your remote Codex and Claude coding sessions from your iPhone or iPad.
 
 ## Description
 
-Terminal Relay connects your iPhone to coding-agent sessions running on
-workers you control.
+Terminal Relay connects your iPhone or iPad to coding-agent sessions running
+on workers you control.
 
 Use it to:
 
 - Browse projects stored under `/workspace` on your workers.
 - Start or reconnect to Codex and Claude terminal sessions.
-- Move between Mac and iPhone without stopping the remote agent.
+- Move between Mac, iPhone, and iPad without stopping the remote agent.
 - Monitor worker availability and resource usage.
-- Keep a dedicated SSH identity in the iPhone Keychain.
+- Keep a dedicated SSH identity in the device Keychain.
 - Pin every worker's SSH host key.
 
 Terminal Relay does not provide hosted workers or agent accounts. You bring
@@ -58,6 +58,7 @@ SSH and Swift Crypto implementation. Do not add
 ## Required assets outside the repository
 
 - At least one current iPhone screenshot.
+- At least one current iPad screenshot.
 - App Review contact information.
 - Age rating, territories, price, and release method.
 - Export-compliance answers and any requested documentation.
