@@ -7,8 +7,14 @@ struct TerminalScreen: View {
     @State private var confirmsStop = false
     @State private var stopError: String?
     @State private var isStopping = false
+    private let onClose: (() -> Void)?
 
-    init(profile: WorkerProfile, route: TerminalRoute) {
+    init(
+        profile: WorkerProfile,
+        route: TerminalRoute,
+        onClose: (() -> Void)? = nil
+    ) {
+        self.onClose = onClose
         _controller = StateObject(
             wrappedValue: TerminalSessionController(
                 profile: profile,
@@ -38,7 +44,7 @@ struct TerminalScreen: View {
                         } else {
                             Button("Back to Projects") {
                                 controller.disconnect(manually: true)
-                                dismiss()
+                                close()
                             }
                             .buttonStyle(.borderedProminent)
                         }
@@ -61,8 +67,9 @@ struct TerminalScreen: View {
                         .disabled(isStopping)
                     Button("Disconnect") {
                         controller.disconnect(manually: true)
-                        dismiss()
+                        close()
                     }
+                    .keyboardShortcut("w", modifiers: .command)
                 }
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -141,11 +148,19 @@ struct TerminalScreen: View {
         Task {
             do {
                 try await controller.stopAgent()
-                dismiss()
+                close()
             } catch {
                 stopError = error.localizedDescription
                 isStopping = false
             }
+        }
+    }
+
+    private func close() {
+        if let onClose {
+            onClose()
+        } else {
+            dismiss()
         }
     }
 }

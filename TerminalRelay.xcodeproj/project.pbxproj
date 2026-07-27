@@ -18,6 +18,7 @@
 		0B69126CE70C815298882288 /* SSHCommandBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2B8C4489491EF49B7822E03A /* SSHCommandBuilder.swift */; };
 		0EDA139B2EF7A6E5517F8B93 /* SwiftTerm in Frameworks */ = {isa = PBXBuildFile; productRef = 946BC5F61BD8D63948D993CD /* SwiftTerm */; };
 		11CC230FC23C4396DE674214 /* WorkerProfileTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35F10890C7A7B20CEA93E345 /* WorkerProfileTests.swift */; };
+		13B0D6FA272FAB7205663CDD /* AdaptiveNavigationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE0898BDEEEA8374EFD2D80A /* AdaptiveNavigationTests.swift */; };
 		13D5D2117CCAAB899A0E301B /* MobilePairingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5BBF47FBF6B34F0D16E93884 /* MobilePairingTests.swift */; };
 		149A0AA1438A64937313424E /* WorkerProfileStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBB07D879D1A8101A648ACE6 /* WorkerProfileStoreTests.swift */; };
 		14ADAB4E0A22C6C72C412851 /* ServerProfileTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB03758D1CB3A90E9F6492F2 /* ServerProfileTests.swift */; };
@@ -204,6 +205,7 @@
 		D0C0296EE9E83451DA6E5434 /* ProjectEditorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectEditorView.swift; sourceTree = "<group>"; };
 		D11B01481FFDEF95AD72D764 /* WorkerRegistrationTokenAuthorizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerRegistrationTokenAuthorizer.swift; sourceTree = "<group>"; };
 		DBCA9937CC101C673C39E7CF /* AccountUsageServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountUsageServiceTests.swift; sourceTree = "<group>"; };
+		DE0898BDEEEA8374EFD2D80A /* AdaptiveNavigationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AdaptiveNavigationTests.swift; sourceTree = "<group>"; };
 		E1107CD200FBE55F0833D63D /* ServerStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerStoreTests.swift; sourceTree = "<group>"; };
 		E162AC5ABBC627C51BD1D70A /* ProjectGitService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectGitService.swift; sourceTree = "<group>"; };
 		E1A7640C32046044EFC9BE2E /* WorkerRemoteCommand.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerRemoteCommand.swift; sourceTree = "<group>"; };
@@ -375,6 +377,7 @@
 		ACA96F67DC5FB8F90277471D /* TerminalRelayIOSTests */ = {
 			isa = PBXGroup;
 			children = (
+				DE0898BDEEEA8374EFD2D80A /* AdaptiveNavigationTests.swift */,
 				01B842C4635C4D69477F1116 /* MobilePairingTests.swift */,
 				ABB05FB3387FD2E18DF120E9 /* WorkerOverviewTests.swift */,
 				BBB07D879D1A8101A648ACE6 /* WorkerProfileStoreTests.swift */,
@@ -710,6 +713,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				13B0D6FA272FAB7205663CDD /* AdaptiveNavigationTests.swift in Sources */,
 				F4E7437749538A19C29AF037 /* MobilePairingTests.swift in Sources */,
 				CC23D02CEAA3A3EF87935FE0 /* WorkerOverviewTests.swift in Sources */,
 				149A0AA1438A64937313424E /* WorkerProfileStoreTests.swift in Sources */,

@@ -17,11 +17,26 @@ private struct WorkerProject: Identifiable {
     var id: String {
         "\(workerID.uuidString):\(repositoryName)"
     }
+
+    var selection: ProjectSelection {
+        ProjectSelection(workerID: workerID, repositoryName: repositoryName)
+    }
+}
+
+struct ProjectSelection: Hashable, Identifiable {
+    let workerID: UUID
+    let repositoryName: String
+
+    var id: String {
+        "\(workerID.uuidString):\(repositoryName)"
+    }
 }
 
 struct ProjectListView: View {
     @ObservedObject var model: WorkerSessionModel
     let onAddWorker: () -> Void
+    @Binding private var selection: ProjectSelection?
+    private let usesSplitSelection: Bool
     @State private var searchText = ""
     @State private var showsSearch = false
     @State private var workerFilterID: UUID?
@@ -74,6 +89,27 @@ struct ProjectListView: View {
             .joined(separator: "|")
     }
 
+    init(
+        model: WorkerSessionModel,
+        onAddWorker: @escaping () -> Void
+    ) {
+        self.model = model
+        self.onAddWorker = onAddWorker
+        _selection = .constant(nil)
+        usesSplitSelection = false
+    }
+
+    init(
+        model: WorkerSessionModel,
+        selection: Binding<ProjectSelection?>,
+        onAddWorker: @escaping () -> Void
+    ) {
+        self.model = model
+        self.onAddWorker = onAddWorker
+        _selection = selection
+        usesSplitSelection = true
+    }
+
     var body: some View {
         Group {
             if model.profiles.isEmpty {
@@ -97,6 +133,7 @@ struct ProjectListView: View {
                 self.workerFilterID = nil
             }
             await model.refreshProjectCatalogs()
+            reconcileSelection()
             while !Task.isCancelled {
                 do {
                     try await Task.sleep(for: .seconds(4))
@@ -107,6 +144,9 @@ struct ProjectListView: View {
                     await model.refreshProjectActivity()
                 }
             }
+        }
+        .onChange(of: projects.map(\.selection)) { _, _ in
+            reconcileSelection()
         }
     }
 
@@ -138,29 +178,62 @@ struct ProjectListView: View {
         }
     }
 
+    @ViewBuilder
     private var projectListContent: some View {
-        List {
-            if projects.isEmpty {
-                if !model.projectLoadingIDs.isEmpty {
-                    HStack {
-                        Spacer()
-                        ProgressView("Loading projects…")
-                        Spacer()
-                    }
-                    .listRowBackground(Color.clear)
-                } else {
-                    ContentUnavailableView(
-                        "No Projects",
-                        systemImage: "folder",
-                        description: Text(emptyProjectsDescription)
-                    )
-                    .listRowBackground(Color.clear)
+        if usesSplitSelection {
+            List(selection: $selection) {
+                projectRows
+            }
+            .refreshable { await model.refreshProjectCatalogs() }
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    workerFilter
                 }
-            } else if filteredProjects.isEmpty {
-                ContentUnavailableView.search(text: searchText)
-                    .listRowBackground(Color.clear)
+            }
+        } else {
+            List {
+                projectRows
+            }
+            .refreshable { await model.refreshProjectCatalogs() }
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    workerFilter
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var projectRows: some View {
+        if projects.isEmpty {
+            if !model.projectLoadingIDs.isEmpty {
+                HStack {
+                    Spacer()
+                    ProgressView("Loading projects…")
+                    Spacer()
+                }
+                .listRowBackground(Color.clear)
             } else {
-                ForEach(filteredProjects) { project in
+                ContentUnavailableView(
+                    "No Projects",
+                    systemImage: "folder",
+                    description: Text(emptyProjectsDescription)
+                )
+                .listRowBackground(Color.clear)
+            }
+        } else if filteredProjects.isEmpty {
+            ContentUnavailableView.search(text: searchText)
+                .listRowBackground(Color.clear)
+        } else {
+            ForEach(filteredProjects) { project in
+                if usesSplitSelection {
+                    ProjectListRow(
+                        repositoryName: project.repositoryName,
+                        workerName: model.profiles.count > 1 ? project.workerName : nil,
+                        sessions: project.sessions
+                    )
+                    .tag(project.selection)
+                } else {
                     NavigationLink {
                         ProjectDetailView(
                             workerID: project.workerID,
@@ -170,16 +243,11 @@ struct ProjectListView: View {
                     } label: {
                         ProjectListRow(
                             repositoryName: project.repositoryName,
+                            workerName: model.profiles.count > 1 ? project.workerName : nil,
                             sessions: project.sessions
                         )
                     }
                 }
-            }
-        }
-        .refreshable { await model.refreshProjectCatalogs() }
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                workerFilter
             }
         }
     }
@@ -231,10 +299,19 @@ struct ProjectListView: View {
         }
         return "No repositories were found on \(workerFilterName)."
     }
+
+    private func reconcileSelection() {
+        guard usesSplitSelection else { return }
+        selection = AdaptiveSelectionPolicy.project(
+            current: selection,
+            available: projects.map(\.selection)
+        )
+    }
 }
 
 private struct ProjectListRow: View {
     let repositoryName: String
+    let workerName: String?
     let sessions: [WorkerSessionSnapshot]
 
     private var isWorking: Bool {
@@ -243,8 +320,15 @@ private struct ProjectListRow: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Text(repositoryName)
-                .font(.body.weight(.medium))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(repositoryName)
+                    .font(.body.weight(.medium))
+                if let workerName {
+                    Text(workerName)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
 
             Spacer()
 
@@ -258,7 +342,7 @@ private struct ProjectListRow: View {
     }
 }
 
-private struct ProjectDetailView: View {
+struct ProjectDetailView: View {
     let workerID: UUID
     let repositoryName: String
     @ObservedObject var model: WorkerSessionModel
@@ -308,6 +392,7 @@ private struct ProjectDetailView: View {
                 } label: {
                     Label("New Terminal", systemImage: "plus")
                 }
+                .keyboardShortcut("n", modifiers: .command)
             }
         }
         .confirmationDialog(

@@ -9,12 +9,29 @@ private struct WorkerEditorRoute: Identifiable {
 private enum RootTab: Hashable {
     case projects
     case workers
+
+    var label: String {
+        switch self {
+        case .projects: "Projects"
+        case .workers: "Workers"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .projects: "folder"
+        case .workers: "server.rack"
+        }
+    }
 }
 
 struct RootView: View {
     @ObservedObject var model: WorkerSessionModel
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.scenePhase) private var scenePhase
     @State private var selectedTab = RootTab.projects
+    @State private var selectedProject: ProjectSelection?
+    @State private var selectedWorkerID: UUID?
     @State private var editorRoute: WorkerEditorRoute?
     @State private var showsPairingScanner = false
     @State private var workerPendingDeletion: WorkerProfile?
@@ -46,24 +63,12 @@ struct RootView: View {
     }
 
     var body: some View {
-        TabView(selection: $selectedTab) {
-            NavigationStack {
-                ProjectListView(model: model) {
-                    showsPairingScanner = true
-                }
+        Group {
+            if usesSplitWorkspace {
+                splitWorkspace
+            } else {
+                compactWorkspace
             }
-            .tabItem {
-                Label("Projects", systemImage: "folder")
-            }
-            .tag(RootTab.projects)
-
-            NavigationStack {
-                workerList
-            }
-            .tabItem {
-                Label("Workers", systemImage: "server.rack")
-            }
-            .tag(RootTab.workers)
         }
         .safeAreaInset(edge: .top, spacing: 0) {
             if let warning = workerUpdateWarning {
@@ -100,12 +105,7 @@ struct RootView: View {
                 }
             }
         }
-        .fullScreenCover(item: $model.terminalRoute, onDismiss: {
-            Task {
-                await model.refresh()
-                model.markLastOpenedTerminalRead()
-            }
-        }) { route in
+        .fullScreenCover(item: compactTerminalRoute, onDismiss: refreshAfterTerminal) { route in
             if let profile = model.profile {
                 TerminalScreen(profile: profile, route: route)
             }
@@ -120,7 +120,18 @@ struct RootView: View {
         }
         .onChange(of: selectedTab) { _, tab in
             if tab == .workers {
+                reconcileWorkerSelection()
                 Task { await model.refreshWorkerOverviews() }
+            }
+        }
+        .onChange(of: model.profiles.map(\.id)) { _, profileIDs in
+            selectedWorkerID = AdaptiveSelectionPolicy.worker(
+                current: selectedWorkerID,
+                available: profileIDs
+            )
+            if let selectedProject,
+               !profileIDs.contains(selectedProject.workerID) {
+                self.selectedProject = nil
             }
         }
         .alert("Remove worker?", isPresented: Binding(
@@ -133,6 +144,7 @@ struct RootView: View {
             Button("Remove", role: .destructive) {
                 if let workerPendingDeletion {
                     model.deleteProfile(id: workerPendingDeletion.id)
+                    reconcileWorkerSelection()
                 }
                 workerPendingDeletion = nil
             }
@@ -163,8 +175,126 @@ struct RootView: View {
         }
     }
 
+    private var usesSplitWorkspace: Bool {
+        horizontalSizeClass == .regular
+    }
+
+    private var compactWorkspace: some View {
+        TabView(selection: $selectedTab) {
+            NavigationStack {
+                ProjectListView(model: model) {
+                    showsPairingScanner = true
+                }
+            }
+            .tabItem {
+                Label("Projects", systemImage: "folder")
+            }
+            .tag(RootTab.projects)
+
+            NavigationStack {
+                workerList()
+            }
+            .tabItem {
+                Label("Workers", systemImage: "server.rack")
+            }
+            .tag(RootTab.workers)
+        }
+    }
+
+    private var splitWorkspace: some View {
+        NavigationSplitView {
+            List(selection: splitTabSelection) {
+                Label(RootTab.projects.label, systemImage: RootTab.projects.systemImage)
+                    .tag(RootTab.projects)
+                Label(RootTab.workers.label, systemImage: RootTab.workers.systemImage)
+                    .tag(RootTab.workers)
+            }
+            .listStyle(.sidebar)
+            .navigationTitle("Terminal Relay")
+            .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 260)
+        } content: {
+            switch selectedTab {
+            case .projects:
+                ProjectListView(
+                    model: model,
+                    selection: $selectedProject
+                ) {
+                    showsPairingScanner = true
+                }
+            case .workers:
+                workerList(usesSplitSelection: true)
+            }
+        } detail: {
+            splitDetail
+        }
+        .navigationSplitViewStyle(.balanced)
+    }
+
     @ViewBuilder
-    private var workerList: some View {
+    private var splitDetail: some View {
+        if let route = model.terminalRoute,
+           let profile = model.profile {
+            TerminalScreen(
+                profile: profile,
+                route: route,
+                onClose: closeEmbeddedTerminal
+            )
+            .id(route.id)
+        } else {
+            switch selectedTab {
+            case .projects:
+                if let selectedProject {
+                    ProjectDetailView(
+                        workerID: selectedProject.workerID,
+                        repositoryName: selectedProject.repositoryName,
+                        model: model
+                    )
+                    .id(selectedProject.id)
+                } else {
+                    ContentUnavailableView(
+                        "Select a Project",
+                        systemImage: "folder",
+                        description: Text("Choose a project to see its terminals.")
+                    )
+                }
+            case .workers:
+                if let selectedWorkerID,
+                   let profile = model.profiles.first(where: { $0.id == selectedWorkerID }) {
+                    workerDetail(profile)
+                } else {
+                    ContentUnavailableView(
+                        "Select a Worker",
+                        systemImage: "server.rack",
+                        description: Text("Choose a worker to inspect its status and accounts.")
+                    )
+                }
+            }
+        }
+    }
+
+    private var compactTerminalRoute: Binding<TerminalRoute?> {
+        Binding(
+            get: { usesSplitWorkspace ? nil : model.terminalRoute },
+            set: { route in
+                guard !usesSplitWorkspace else { return }
+                model.terminalRoute = route
+            }
+        )
+    }
+
+    private var splitTabSelection: Binding<RootTab?> {
+        Binding(
+            get: { selectedTab },
+            set: { selection in
+                if let selection {
+                    selectedTab = selection
+                }
+            }
+        )
+    }
+
+    @ViewBuilder
+    private func workerList(usesSplitSelection: Bool = false) -> some View {
         Group {
             if model.profiles.isEmpty {
                 ContentUnavailableView {
@@ -185,45 +315,14 @@ struct RootView: View {
                     }
                 }
             } else {
-                List {
-                    if filteredWorkerProfiles.isEmpty {
-                        ContentUnavailableView.search(text: workerSearchText)
-                            .listRowBackground(Color.clear)
+                Group {
+                    if usesSplitSelection {
+                        List(selection: $selectedWorkerID) {
+                            workerRows(usesSplitSelection: true)
+                        }
                     } else {
-                        ForEach(filteredWorkerProfiles) { profile in
-                            WorkerOverviewRow(
-                                profile: profile,
-                                snapshot: model.workerOverviews[profile.id],
-                                isLoading: model.workerLoadingIDs.contains(profile.id)
-                            )
-                            .swipeActions(edge: .trailing) {
-                                Button("Remove", role: .destructive) {
-                                    workerPendingDeletion = profile
-                                }
-                                Button("Edit") {
-                                    editorRoute = WorkerEditorRoute(
-                                        profile: profile,
-                                        showsProjectsAfterSave: false
-                                    )
-                                }
-                                .tint(.blue)
-                            }
-                            .contextMenu {
-                                Button {
-                                    editorRoute = WorkerEditorRoute(
-                                        profile: profile,
-                                        showsProjectsAfterSave: false
-                                    )
-                                } label: {
-                                    Label("Edit Worker", systemImage: "pencil")
-                                }
-
-                                Button(role: .destructive) {
-                                    workerPendingDeletion = profile
-                                } label: {
-                                    Label("Remove Worker", systemImage: "trash")
-                                }
-                            }
+                        List {
+                            workerRows(usesSplitSelection: false)
                         }
                     }
                 }
@@ -236,6 +335,9 @@ struct RootView: View {
         .navigationTitle("Workers")
         .task(id: workerRefreshTaskID) {
             if selectedTab == .workers {
+                if usesSplitSelection {
+                    reconcileWorkerSelection()
+                }
                 await model.refreshWorkerOverviews()
             }
         }
@@ -261,6 +363,204 @@ struct RootView: View {
                 }
             }
         }
+    }
+
+    @ViewBuilder
+    private func workerRows(usesSplitSelection: Bool) -> some View {
+        if filteredWorkerProfiles.isEmpty {
+            ContentUnavailableView.search(text: workerSearchText)
+                .listRowBackground(Color.clear)
+        } else {
+            ForEach(filteredWorkerProfiles) { profile in
+                Group {
+                    if usesSplitSelection {
+                        WorkerCompactRow(
+                            profile: profile,
+                            snapshot: model.workerOverviews[profile.id],
+                            isLoading: model.workerLoadingIDs.contains(profile.id)
+                        )
+                    } else {
+                        WorkerOverviewRow(
+                            profile: profile,
+                            snapshot: model.workerOverviews[profile.id],
+                            isLoading: model.workerLoadingIDs.contains(profile.id)
+                        )
+                    }
+                }
+                .tag(profile.id)
+                .modifier(
+                    WorkerActionsModifier(
+                        onEdit: { edit(profile) },
+                        onRemove: { workerPendingDeletion = profile }
+                    )
+                )
+            }
+        }
+    }
+
+    private func workerDetail(_ profile: WorkerProfile) -> some View {
+        ScrollView {
+            WorkerOverviewRow(
+                profile: profile,
+                snapshot: model.workerOverviews[profile.id],
+                isLoading: model.workerLoadingIDs.contains(profile.id)
+            )
+            .padding(24)
+            .frame(maxWidth: 760)
+        }
+        .frame(maxWidth: .infinity)
+        .navigationTitle(profile.displayName)
+        .refreshable {
+            await model.refreshWorkerOverviews()
+        }
+        .toolbar {
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button {
+                    edit(profile)
+                } label: {
+                    Label("Edit Worker", systemImage: "pencil")
+                }
+
+                Menu {
+                    Button(role: .destructive) {
+                        workerPendingDeletion = profile
+                    } label: {
+                        Label("Remove Worker", systemImage: "trash")
+                    }
+                } label: {
+                    Label("Worker Actions", systemImage: "ellipsis.circle")
+                }
+            }
+        }
+    }
+
+    private func edit(_ profile: WorkerProfile) {
+        editorRoute = WorkerEditorRoute(
+            profile: profile,
+            showsProjectsAfterSave: false
+        )
+    }
+
+    private func reconcileWorkerSelection() {
+        selectedWorkerID = AdaptiveSelectionPolicy.worker(
+            current: selectedWorkerID,
+            available: model.profiles.map(\.id)
+        )
+    }
+
+    private func refreshAfterTerminal() {
+        Task {
+            await model.refresh()
+            model.markLastOpenedTerminalRead()
+        }
+    }
+
+    private func closeEmbeddedTerminal() {
+        model.terminalRoute = nil
+        refreshAfterTerminal()
+    }
+}
+
+enum AdaptiveSelectionPolicy {
+    static func project(
+        current: ProjectSelection?,
+        available: [ProjectSelection]
+    ) -> ProjectSelection? {
+        guard !available.isEmpty else { return nil }
+        if let current, available.contains(current) {
+            return current
+        }
+        return available.first
+    }
+
+    static func worker(current: UUID?, available: [UUID]) -> UUID? {
+        guard !available.isEmpty else { return nil }
+        if let current, available.contains(current) {
+            return current
+        }
+        return available.first
+    }
+}
+
+private struct WorkerActionsModifier: ViewModifier {
+    let onEdit: () -> Void
+    let onRemove: () -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .swipeActions(edge: .trailing) {
+                Button("Remove", role: .destructive, action: onRemove)
+                Button("Edit", action: onEdit)
+                    .tint(.blue)
+            }
+            .contextMenu {
+                Button(action: onEdit) {
+                    Label("Edit Worker", systemImage: "pencil")
+                }
+                Button(role: .destructive, action: onRemove) {
+                    Label("Remove Worker", systemImage: "trash")
+                }
+            }
+    }
+}
+
+private struct WorkerCompactRow: View {
+    let profile: WorkerProfile
+    let snapshot: WorkerOverviewSnapshot?
+    let isLoading: Bool
+
+    private var status: (label: String, color: Color) {
+        if let snapshot {
+            return snapshot.isOnline ? ("Online", .green) : ("Unavailable", .red)
+        }
+        return isLoading ? ("Checking", .orange) : ("Not checked", .secondary)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Image(systemName: "server.rack")
+                    .foregroundStyle(.tint)
+                    .frame(width: 30, height: 30)
+                    .background(
+                        Color.accentColor.opacity(0.12),
+                        in: RoundedRectangle(cornerRadius: 8)
+                    )
+
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(profile.displayName)
+                            .font(.body.weight(.semibold))
+                        Circle()
+                            .fill(status.color)
+                            .frame(width: 7, height: 7)
+                    }
+                    Text(profile.host)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer()
+
+                if isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+
+            if let snapshot {
+                HStack(spacing: 14) {
+                    Label("\(snapshot.projects.count)", systemImage: "folder")
+                    Label("\(snapshot.sessions.count)", systemImage: "terminal")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 5)
+        .accessibilityElement(children: .combine)
+        .accessibilityValue(status.label)
     }
 }
 
