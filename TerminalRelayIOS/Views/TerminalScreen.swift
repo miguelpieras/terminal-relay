@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct TerminalScreen: View {
     @Environment(\.dismiss) private var dismiss
@@ -7,13 +8,16 @@ struct TerminalScreen: View {
     @State private var confirmsStop = false
     @State private var stopError: String?
     @State private var isStopping = false
+    private let isDemo: Bool
     private let onClose: (() -> Void)?
 
     init(
         profile: WorkerProfile,
         route: TerminalRoute,
+        isDemo: Bool = false,
         onClose: (() -> Void)? = nil
     ) {
+        self.isDemo = isDemo
         self.onClose = onClose
         _controller = StateObject(
             wrappedValue: TerminalSessionController(
@@ -29,9 +33,17 @@ struct TerminalScreen: View {
         NavigationStack {
             ZStack {
                 Color.black.ignoresSafeArea()
-                TerminalRepresentable(controller: controller)
+                if isDemo {
+                    DemoTerminalRepresentable(
+                        kind: controller.kind,
+                        repositoryName: controller.repositoryName
+                    )
+                    .padding(.top, hidesEmbeddedDemoNavigation ? 40 : 0)
+                } else {
+                    TerminalRepresentable(controller: controller)
+                }
 
-                if let recovery = recoveryPresentation {
+                if !isDemo, let recovery = recoveryPresentation {
                     VStack(spacing: 12) {
                         Text(recovery.message)
                             .font(.footnote)
@@ -56,27 +68,58 @@ struct TerminalScreen: View {
             }
             .navigationTitle("\(controller.kind.displayName) · \(controller.repositoryName)")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar(
+                hidesEmbeddedDemoNavigation ? .hidden : .automatic,
+                for: .navigationBar
+            )
             .toolbarBackground(.black, for: .navigationBar)
             .toolbarColorScheme(.dark, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    connectionLabel
+                    if isDemo {
+                        Label("Demo", systemImage: "play.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.indigo)
+                    } else {
+                        connectionLabel
+                    }
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
-                    Button("Stop", role: .destructive) { confirmsStop = true }
-                        .disabled(isStopping)
-                    Button("Disconnect") {
-                        controller.disconnect(manually: true)
-                        close()
+                    if isDemo {
+                        Button("Close Demo") {
+                            close()
+                        }
+                    } else {
+                        Button("Stop", role: .destructive) { confirmsStop = true }
+                            .disabled(isStopping)
+                        Button("Disconnect") {
+                            controller.disconnect(manually: true)
+                            close()
+                        }
+                        .keyboardShortcut("w", modifiers: .command)
                     }
-                    .keyboardShortcut("w", modifiers: .command)
                 }
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
-                MobileTerminalKeyBar(controller: controller)
+                if isDemo {
+                    HStack {
+                        Label("Read-only local demo", systemImage: "lock.shield")
+                            .font(.caption.weight(.medium))
+                        Spacer()
+                        Text("No worker connection")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(Color(uiColor: .secondarySystemBackground))
+                } else {
+                    MobileTerminalKeyBar(controller: controller)
+                }
             }
         }
         .onChange(of: scenePhase) { _, phase in
+            guard !isDemo else { return }
             switch phase {
             case .background:
                 controller.suspendForBackground()
@@ -87,7 +130,9 @@ struct TerminalScreen: View {
             }
         }
         .onDisappear {
-            controller.disconnect(manually: true)
+            if !isDemo {
+                controller.disconnect(manually: true)
+            }
         }
         .alert("Stop \(controller.kind.displayName)?", isPresented: $confirmsStop) {
             Button("Stop Agent", role: .destructive) {
@@ -127,6 +172,10 @@ struct TerminalScreen: View {
         }
     }
 
+    private var hidesEmbeddedDemoNavigation: Bool {
+        isDemo && onClose != nil
+    }
+
     private var recoveryPresentation: (message: String, canReconnect: Bool)? {
         switch controller.state {
         case .disconnected:
@@ -162,6 +211,57 @@ struct TerminalScreen: View {
         } else {
             dismiss()
         }
+    }
+}
+
+private struct DemoTerminalRepresentable: UIViewRepresentable {
+    let kind: AgentKind
+    let repositoryName: String
+
+    func makeUIView(context: Context) -> RelayTerminalView {
+        let view = RelayTerminalView(frame: .zero)
+        view.font = .monospacedSystemFont(ofSize: 14, weight: .regular)
+        view.nativeBackgroundColor = .black
+        view.nativeForegroundColor = UIColor(white: 0.88, alpha: 1)
+        view.isUserInteractionEnabled = false
+        DispatchQueue.main.async {
+            view.feed(text: transcript)
+        }
+        return view
+    }
+
+    func updateUIView(_ uiView: RelayTerminalView, context: Context) {}
+
+    private var transcript: String {
+        let accent = "\u{001B}[38;5;75m"
+        let success = "\u{001B}[38;5;114m"
+        let muted = "\u{001B}[38;5;245m"
+        let primary = "\u{001B}[38;5;252m"
+        let reset = "\u{001B}[0m"
+
+        let content = """
+        \(muted)example-user@private-worker:/workspace/\(repositoryName)$\(reset) \(kind.rawValue)
+
+        \(accent)> Make the iPad workspace feel native. Keep projects and terminals in a compact sidebar, then give the active terminal as much room as possible.\(reset)
+
+        \(primary)I will simplify the iPad layout into two columns and keep the phone navigation compact. The worker, pairing, and session logic remains shared across both device experiences.\(reset)
+
+        \(muted)- Inspecting the adaptive workspace
+        - Combining projects and active terminals in the sidebar
+        - Expanding the terminal detail across the remaining display\(reset)
+
+        \(success)Done. The iPad now keeps navigation close at hand while the terminal uses the full detail area. Switching projects or sessions never stops the remote agent.\(reset)
+
+        \(accent)> Review the private pairing path and prepare the App Store release.\(reset)
+
+        \(primary)Pairing uses a short-lived, enrollment-only key. Every user connects to a worker they control; this demo contains example data and makes no network connection.\(reset)
+
+        \(success)Ready for review.\(reset)
+        """
+        return content
+            .components(separatedBy: "\n")
+            .map { $0.isEmpty ? "" : "  \($0)" }
+            .joined(separator: "\r\n")
     }
 }
 

@@ -33,6 +33,7 @@
 		354AC532DA7ABB9688F98244 /* ServerProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1A2A3C58843B9F9BBDF0B62 /* ServerProfile.swift */; };
 		3B09B478BC43F5E998CFD148 /* WorkerUpdateStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = 42B3415016E40E746420EBA8 /* WorkerUpdateStatus.swift */; };
 		3F0C3E4D664E8C88BC474F21 /* WorkerMetricsService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0678D0C9803DB05DEFD31A0 /* WorkerMetricsService.swift */; };
+		3F1C1D34B6D580CB3D1E1295 /* IPadWorkspaceSidebar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CD0B1B74359CE6DEE5FCF3E /* IPadWorkspaceSidebar.swift */; };
 		41518A6B6C29B1CC91B48A43 /* WorkerManagementView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3B1A41DF226105884B36B97 /* WorkerManagementView.swift */; };
 		41AA9BCC2E9D79FD257E3457 /* PairingScannerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C66C2971BF9E5A6F2254989 /* PairingScannerView.swift */; };
 		48382C6268D1E654DDD75B5E /* AgentAttachmentService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51049327A7B10937117459C3 /* AgentAttachmentService.swift */; };
@@ -97,6 +98,7 @@
 		E2ADDC0EA215EBD53200AD46 /* SSHIdentityStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0E0A0111A5E62BD133D1B1D8 /* SSHIdentityStore.swift */; };
 		E3E4645D18A532417C160831 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 86CC14D081ABBDBDC564291F /* Assets.xcassets */; };
 		EA0CEC01562388C25B86A9B1 /* WorkerSessionStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C681D55FCC5367DD2051E01 /* WorkerSessionStateTests.swift */; };
+		EDBF93AE6355FBFBE6FE0A84 /* DemoWorkspaceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB4C279C200B9647864CFC8C /* DemoWorkspaceTests.swift */; };
 		F4A28A72A125021D2239CBA1 /* ProjectGitService.swift in Sources */ = {isa = PBXBuildFile; fileRef = E162AC5ABBC627C51BD1D70A /* ProjectGitService.swift */; };
 		F4E7437749538A19C29AF037 /* MobilePairingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 01B842C4635C4D69477F1116 /* MobilePairingTests.swift */; };
 		F54E906C1BD44DCB15A4F89E /* WorkerOverview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9B82967FBC08D0A3EDD8DB9C /* WorkerOverview.swift */; };
@@ -171,6 +173,7 @@
 		798FCEE76EAC4A8B1B69AC6A /* WorkerSessionState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerSessionState.swift; sourceTree = "<group>"; };
 		7B4D5435F1D7D297F5428E90 /* WorkerOnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerOnboardingView.swift; sourceTree = "<group>"; };
 		7BA492BA581F2C2B0C2AF051 /* WorkerSessionServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerSessionServiceTests.swift; sourceTree = "<group>"; };
+		7CD0B1B74359CE6DEE5FCF3E /* IPadWorkspaceSidebar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IPadWorkspaceSidebar.swift; sourceTree = "<group>"; };
 		7DC204D99814E9F11DA7D053 /* SessionSlotRegistryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionSlotRegistryTests.swift; sourceTree = "<group>"; };
 		865E323F9872A2B96FD0A247 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		86CC14D081ABBDBDC564291F /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -201,6 +204,7 @@
 		C71350FF53C3388E6DC058B6 /* AccountAuthenticationServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountAuthenticationServiceTests.swift; sourceTree = "<group>"; };
 		C873751F82394CA5B3125CE3 /* SessionManagerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionManagerTests.swift; sourceTree = "<group>"; };
 		C960F483C9C9B2DA0E97774D /* WorkerRemoteCommandTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerRemoteCommandTests.swift; sourceTree = "<group>"; };
+		CB4C279C200B9647864CFC8C /* DemoWorkspaceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DemoWorkspaceTests.swift; sourceTree = "<group>"; };
 		CBB3BF44468D527C634FE65A /* TerminalRelay.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TerminalRelay.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		CDED8E0950703DD0CEB6F15B /* ProjectProfileTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectProfileTests.swift; sourceTree = "<group>"; };
 		CE41CB9D4FEF27A7497D439B /* TerminalRelayIOSTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = TerminalRelayIOSTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -383,6 +387,7 @@
 			isa = PBXGroup;
 			children = (
 				DE0898BDEEEA8374EFD2D80A /* AdaptiveNavigationTests.swift */,
+				CB4C279C200B9647864CFC8C /* DemoWorkspaceTests.swift */,
 				01B842C4635C4D69477F1116 /* MobilePairingTests.swift */,
 				ABB05FB3387FD2E18DF120E9 /* WorkerOverviewTests.swift */,
 				BBB07D879D1A8101A648ACE6 /* WorkerProfileStoreTests.swift */,
@@ -395,6 +400,7 @@
 		BD277CC5C3E8708191E8EAC2 /* Views */ = {
 			isa = PBXGroup;
 			children = (
+				7CD0B1B74359CE6DEE5FCF3E /* IPadWorkspaceSidebar.swift */,
 				1C66C2971BF9E5A6F2254989 /* PairingScannerView.swift */,
 				F1BE14175A44909F00948D51 /* ProjectListView.swift */,
 				FF68598718838E8064DF0C45 /* RootView.swift */,
@@ -668,6 +674,7 @@
 			files = (
 				8273E578B2270DE06F2929AD /* AgentKind.swift in Sources */,
 				AAEB19BE832AA82DC18FCAB7 /* AgentLaunchDefaults.swift in Sources */,
+				3F1C1D34B6D580CB3D1E1295 /* IPadWorkspaceSidebar.swift in Sources */,
 				2B8315E7553879CE73F320DD /* MobilePairingClient.swift in Sources */,
 				F65709DF14A6D5CDE965E57C /* MobilePairingPayload.swift in Sources */,
 				41AA9BCC2E9D79FD257E3457 /* PairingScannerView.swift in Sources */,
@@ -722,6 +729,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				13B0D6FA272FAB7205663CDD /* AdaptiveNavigationTests.swift in Sources */,
+				EDBF93AE6355FBFBE6FE0A84 /* DemoWorkspaceTests.swift in Sources */,
 				F4E7437749538A19C29AF037 /* MobilePairingTests.swift in Sources */,
 				CC23D02CEAA3A3EF87935FE0 /* WorkerOverviewTests.swift in Sources */,
 				149A0AA1438A64937313424E /* WorkerProfileStoreTests.swift in Sources */,

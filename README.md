@@ -172,6 +172,10 @@ its permanent public key, and saves the connection locally. No pairing service
 or Terminal Relay account is involved. The private device key stays in
 Keychain. Manual worker entry remains available as a fallback.
 
+To inspect the interface without a worker, tap **Explore Demo** on a fresh
+install. The clearly labeled demo uses bundled example data and never makes a
+network connection.
+
 ## Distribution
 
 Source availability and binary distribution are independent:

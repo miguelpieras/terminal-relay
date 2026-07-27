@@ -36,6 +36,7 @@ struct RootView: View {
     @State private var showsPairingScanner = false
     @State private var workerPendingDeletion: WorkerProfile?
     @State private var workerSearchText = ""
+    @State private var splitColumnVisibility = NavigationSplitViewVisibility.all
 
     private var filteredWorkerProfiles: [WorkerProfile] {
         model.profiles.filter {
@@ -71,12 +72,19 @@ struct RootView: View {
             }
         }
         .safeAreaInset(edge: .top, spacing: 0) {
-            if let warning = workerUpdateWarning {
-                WorkerUpdateWarningBanner(
-                    workerName: warning.profile.displayName,
-                    message: warning.message
-                ) {
-                    model.dismissUpdateWarning(for: warning.profile.id)
+            VStack(spacing: 0) {
+                if model.isDemoMode {
+                    DemoModeBanner {
+                        exitDemo()
+                    }
+                }
+                if let warning = workerUpdateWarning {
+                    WorkerUpdateWarningBanner(
+                        workerName: warning.profile.displayName,
+                        message: warning.message
+                    ) {
+                        model.dismissUpdateWarning(for: warning.profile.id)
+                    }
                 }
             }
         }
@@ -107,7 +115,11 @@ struct RootView: View {
         }
         .fullScreenCover(item: compactTerminalRoute, onDismiss: refreshAfterTerminal) { route in
             if let profile = model.profile {
-                TerminalScreen(profile: profile, route: route)
+                TerminalScreen(
+                    profile: profile,
+                    route: route,
+                    isDemo: model.isDemoMode
+                )
             }
         }
         .onChange(of: scenePhase) { _, phase in
@@ -182,9 +194,11 @@ struct RootView: View {
     private var compactWorkspace: some View {
         TabView(selection: $selectedTab) {
             NavigationStack {
-                ProjectListView(model: model) {
-                    showsPairingScanner = true
-                }
+                ProjectListView(
+                    model: model,
+                    onAddWorker: { showsPairingScanner = true },
+                    onExploreDemo: enterDemo
+                )
             }
             .tabItem {
                 Label("Projects", systemImage: "folder")
@@ -202,25 +216,19 @@ struct RootView: View {
     }
 
     private var splitWorkspace: some View {
-        NavigationSplitView {
-            List(selection: splitTabSelection) {
-                Label(RootTab.projects.label, systemImage: RootTab.projects.systemImage)
-                    .tag(RootTab.projects)
-                Label(RootTab.workers.label, systemImage: RootTab.workers.systemImage)
-                    .tag(RootTab.workers)
-            }
-            .listStyle(.sidebar)
-            .navigationTitle("Terminal Relay")
-            .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 260)
-        } content: {
+        NavigationSplitView(columnVisibility: $splitColumnVisibility) {
             switch selectedTab {
             case .projects:
-                ProjectListView(
+                IPadWorkspaceSidebar(
                     model: model,
-                    selection: $selectedProject
-                ) {
-                    showsPairingScanner = true
-                }
+                    selectedProject: $selectedProject,
+                    onAddWorker: { showsPairingScanner = true },
+                    onExploreDemo: enterDemo,
+                    onShowWorkers: {
+                        selectedTab = .workers
+                        reconcileWorkerSelection()
+                    }
+                )
             case .workers:
                 workerList(usesSplitSelection: true)
             }
@@ -237,6 +245,7 @@ struct RootView: View {
             TerminalScreen(
                 profile: profile,
                 route: route,
+                isDemo: model.isDemoMode,
                 onClose: closeEmbeddedTerminal
             )
             .id(route.id)
@@ -313,6 +322,8 @@ struct RootView: View {
                             showsProjectsAfterSave: true
                         )
                     }
+
+                    Button("Explore Demo", action: enterDemo)
                 }
             } else {
                 Group {
@@ -342,6 +353,15 @@ struct RootView: View {
             }
         }
         .toolbar {
+            if usesSplitSelection {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        selectedTab = .projects
+                    } label: {
+                        Label("Projects", systemImage: "chevron.left")
+                    }
+                }
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
                     Button {
@@ -458,6 +478,25 @@ struct RootView: View {
     private func closeEmbeddedTerminal() {
         model.terminalRoute = nil
         refreshAfterTerminal()
+    }
+
+    private func enterDemo() {
+        model.enterDemo()
+        selectedTab = .projects
+        selectedProject = ProjectSelection(
+            workerID: DemoWorkspace.worker.id,
+            repositoryName: DemoWorkspace.projects[0]
+        )
+        if usesSplitWorkspace, let session = DemoWorkspace.sessions.first {
+            model.openTerminal(session)
+        }
+    }
+
+    private func exitDemo() {
+        selectedProject = nil
+        selectedWorkerID = nil
+        selectedTab = .projects
+        model.exitDemo()
     }
 }
 

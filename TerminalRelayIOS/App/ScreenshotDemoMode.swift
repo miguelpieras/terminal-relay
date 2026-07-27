@@ -2,6 +2,7 @@ import Foundation
 
 enum ScreenshotDemoMode {
     static let launchArgument = "--terminal-relay-screenshot-demo"
+    static let terminalLaunchArgument = "--terminal-relay-screenshot-demo-terminal"
 
     static var isEnabled: Bool {
 #if DEBUG
@@ -11,7 +12,16 @@ enum ScreenshotDemoMode {
 #endif
     }
 
+    static var opensTerminal: Bool {
 #if DEBUG
+        ProcessInfo.processInfo.arguments.contains(terminalLaunchArgument)
+#else
+        false
+#endif
+    }
+}
+
+enum DemoWorkspace {
     private static let sessionIdentifiers = [
         "00000000-0000-4000-8000-000000002001",
         "00000000-0000-4000-8000-000000002002",
@@ -90,5 +100,4 @@ enum ScreenshotDemoMode {
         connectionError: nil,
         updateStatus: nil
     )
-#endif
 }

@@ -35,6 +35,7 @@ struct ProjectSelection: Hashable, Identifiable {
 struct ProjectListView: View {
     @ObservedObject var model: WorkerSessionModel
     let onAddWorker: () -> Void
+    let onExploreDemo: () -> Void
     @Binding private var selection: ProjectSelection?
     private let usesSplitSelection: Bool
     @State private var searchText = ""
@@ -91,10 +92,12 @@ struct ProjectListView: View {
 
     init(
         model: WorkerSessionModel,
-        onAddWorker: @escaping () -> Void
+        onAddWorker: @escaping () -> Void,
+        onExploreDemo: @escaping () -> Void
     ) {
         self.model = model
         self.onAddWorker = onAddWorker
+        self.onExploreDemo = onExploreDemo
         _selection = .constant(nil)
         usesSplitSelection = false
     }
@@ -102,10 +105,12 @@ struct ProjectListView: View {
     init(
         model: WorkerSessionModel,
         selection: Binding<ProjectSelection?>,
-        onAddWorker: @escaping () -> Void
+        onAddWorker: @escaping () -> Void,
+        onExploreDemo: @escaping () -> Void
     ) {
         self.model = model
         self.onAddWorker = onAddWorker
+        self.onExploreDemo = onExploreDemo
         _selection = selection
         usesSplitSelection = true
     }
@@ -120,6 +125,8 @@ struct ProjectListView: View {
                 } actions: {
                     Button("Scan Mac Pairing Code", action: onAddWorker)
                         .buttonStyle(.borderedProminent)
+
+                    Button("Explore Demo", action: onExploreDemo)
                 }
             } else {
                 projectList

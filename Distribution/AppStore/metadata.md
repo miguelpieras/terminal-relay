@@ -50,9 +50,20 @@ by the Mac app; the code contains a short-lived SSH key restricted to
 authorizing that device key and cannot open a shell. Camera frames are
 processed only on the device.
 
-Before submitting, replace this paragraph with exact instructions for an
-Apple-accessible review worker or an in-app demonstration path. Do not expose a
-production worker, reusable credential, or private Tailscale network.
+No account or worker is required for review:
+
+1. Launch Terminal Relay on iPhone or iPad.
+2. Tap **Explore Demo** on the Projects screen.
+3. The app loads a clearly labeled, read-only workspace containing example
+   workers, projects, sessions, resource usage, and account status.
+4. On iPad, the demo opens an example Codex terminal beside the combined
+   project and terminal sidebar. On iPhone, select a project and terminal to
+   open the same example transcript full screen.
+5. Tap **Exit Demo** at any time to return to normal onboarding.
+
+The demo is bundled local data. It contains no credentials, creates no account,
+and makes no network connection. Real users connect only to workers they
+control.
 
 Also answer App Store Connect's export-compliance questionnaire for the bundled
 SSH and Swift Crypto implementation. Do not add

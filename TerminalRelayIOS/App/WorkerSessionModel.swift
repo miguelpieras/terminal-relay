@@ -48,6 +48,7 @@ final class WorkerSessionModel: ObservableObject {
     @Published private(set) var publicKey = ""
     @Published private(set) var isLoading = false
     @Published private(set) var isPairing = false
+    @Published private(set) var isDemoMode: Bool
     @Published var errorMessage: String?
     @Published var terminalRoute: TerminalRoute?
 
@@ -56,7 +57,6 @@ final class WorkerSessionModel: ObservableObject {
     private let workerClient: SSHWorkerClient
     private let pairingClient: MobilePairingClient
     private let readStateDefaults: UserDefaults
-    private let isScreenshotDemo: Bool
     private var readActivityBySession: [String: Int]
     private var lastOpenedTerminalRoute: TerminalRoute?
     private var refreshToken = UUID()
@@ -73,32 +73,26 @@ final class WorkerSessionModel: ObservableObject {
         self.workerClient = SSHWorkerClient(identityStore: identityStore)
         self.pairingClient = MobilePairingClient(identityStore: identityStore)
         self.readStateDefaults = readStateDefaults
-        self.isScreenshotDemo = screenshotDemo
+        self.isDemoMode = screenshotDemo
         self.readActivityBySession = Self.loadReadState(from: readStateDefaults)
         let profiles: [WorkerProfile]
-#if DEBUG
         if screenshotDemo {
-            profiles = [ScreenshotDemoMode.worker]
+            profiles = [DemoWorkspace.worker]
         } else {
             profiles = profileStore.load()
         }
-#else
-        profiles = profileStore.load()
-#endif
         self.profiles = profiles
         self.profile = profileStore.selectedProfileID()
             .flatMap { selectedID in profiles.first { $0.id == selectedID } }
             ?? profiles.first
 
-#if DEBUG
         if screenshotDemo {
-            projects = ScreenshotDemoMode.projects
-            sessions = ScreenshotDemoMode.sessions
-            workerOverviews = [ScreenshotDemoMode.worker.id: ScreenshotDemoMode.overview]
+            projects = DemoWorkspace.projects
+            sessions = DemoWorkspace.sessions
+            workerOverviews = [DemoWorkspace.worker.id: DemoWorkspace.overview]
             publicKey = "ssh-ed25519 screenshot-demo-device"
             return
         }
-#endif
 
         do {
             self.publicKey = try identityStore.publicKeyForAuthorizedKeys()
@@ -126,6 +120,7 @@ final class WorkerSessionModel: ObservableObject {
                 existingProfileID: existingProfileID
             )
             try profileStore.save(pairedProfile)
+            isDemoMode = false
             profiles = profileStore.load()
             profileStore.setSelectedProfileID(pairedProfile.id)
             profile = pairedProfile
@@ -159,6 +154,7 @@ final class WorkerSessionModel: ObservableObject {
             expectedHostKeyFingerprint: fingerprint
         )
         try profileStore.save(profile)
+        isDemoMode = false
         profiles = profileStore.load()
         profileStore.setSelectedProfileID(profile.id)
         self.profile = profile
@@ -168,12 +164,17 @@ final class WorkerSessionModel: ObservableObject {
 
     func selectProfile(id: UUID) {
         guard let selectedProfile = profiles.first(where: { $0.id == id }) else { return }
+        if isDemoMode {
+            profile = selectedProfile
+            return
+        }
         profileStore.setSelectedProfileID(id)
         profile = selectedProfile
         resetWorkerState()
     }
 
     func deleteProfile(id: UUID) {
+        guard !isDemoMode else { return }
         profileStore.delete(id: id)
         profiles = profileStore.load()
         workerOverviews[id] = nil
@@ -193,6 +194,50 @@ final class WorkerSessionModel: ObservableObject {
         sessions = []
     }
 
+    func enterDemo() {
+        refreshToken = UUID()
+        isLoading = false
+        isPairing = false
+        isDemoMode = true
+        profiles = [DemoWorkspace.worker]
+        profile = DemoWorkspace.worker
+        projects = DemoWorkspace.projects
+        sessions = DemoWorkspace.sessions
+        workerOverviews = [DemoWorkspace.worker.id: DemoWorkspace.overview]
+        workerLoadingIDs = []
+        projectLoadingIDs = []
+        publicKey = "ssh-ed25519 demo-device"
+        errorMessage = nil
+        terminalRoute = nil
+        lastOpenedTerminalRoute = nil
+    }
+
+    func exitDemo() {
+        refreshToken = UUID()
+        isLoading = false
+        isPairing = false
+        isDemoMode = false
+        profiles = profileStore.load()
+        profile = profileStore.selectedProfileID()
+            .flatMap { selectedID in profiles.first { $0.id == selectedID } }
+            ?? profiles.first
+        projects = []
+        sessions = []
+        workerOverviews = [:]
+        workerLoadingIDs = []
+        projectLoadingIDs = []
+        errorMessage = nil
+        terminalRoute = nil
+        lastOpenedTerminalRoute = nil
+
+        do {
+            publicKey = try identityStore.publicKeyForAuthorizedKeys()
+        } catch {
+            publicKey = ""
+            errorMessage = error.localizedDescription
+        }
+    }
+
     func updateWarning(for profileID: UUID) -> String? {
         guard let status = workerOverviews[profileID]?.updateStatus,
               dismissedUpdateTimestamps[profileID] != status.timestamp else {
@@ -209,7 +254,7 @@ final class WorkerSessionModel: ObservableObject {
     }
 
     func refresh() async {
-        guard !isScreenshotDemo else { return }
+        guard !isDemoMode else { return }
         guard let profile, !isLoading else { return }
         let token = UUID()
         refreshToken = token
@@ -290,6 +335,10 @@ final class WorkerSessionModel: ObservableObject {
         repositoryName: String,
         expectedInstanceToken: String
     ) async {
+        if isDemoMode {
+            terminalRoute = nil
+            return
+        }
         guard let profile else { return }
         do {
             let statusData = try await workerClient.execute(WorkerRemoteCommand.status, on: profile)
@@ -347,7 +396,7 @@ final class WorkerSessionModel: ObservableObject {
     }
 
     func refreshWorkerOverviews() async {
-        guard !isScreenshotDemo else { return }
+        guard !isDemoMode else { return }
         let profilesToRefresh = profiles.filter { !workerLoadingIDs.contains($0.id) }
         guard !profilesToRefresh.isEmpty else { return }
         workerLoadingIDs.formUnion(profilesToRefresh.map(\.id))
@@ -370,7 +419,7 @@ final class WorkerSessionModel: ObservableObject {
     }
 
     func refreshProjectCatalogs() async {
-        guard !isScreenshotDemo else { return }
+        guard !isDemoMode else { return }
         let profilesToRefresh = profiles.filter { !projectLoadingIDs.contains($0.id) }
         guard !profilesToRefresh.isEmpty else { return }
         projectLoadingIDs.formUnion(profilesToRefresh.map(\.id))
@@ -398,7 +447,7 @@ final class WorkerSessionModel: ObservableObject {
     }
 
     func refreshProjectActivity() async {
-        guard !isScreenshotDemo else { return }
+        guard !isDemoMode else { return }
         let profilesToRefresh = profiles.filter { !projectLoadingIDs.contains($0.id) }
         guard !profilesToRefresh.isEmpty else { return }
 
