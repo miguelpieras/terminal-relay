@@ -7,11 +7,11 @@
 - Primary category: Developer Tools
 - Bundle ID: `com.mpieras.TerminalRelay.iOS`
 - Privacy policy:
-  `https://github.com/miguelpieras/terminal-relay/blob/main/PRIVACY.md`
+  `https://miguelpieras.com/terminal-relay/privacy`
 - Support:
-  `https://github.com/miguelpieras/terminal-relay/issues`
+  `https://miguelpieras.com/terminal-relay/support`
 - Marketing:
-  `https://github.com/miguelpieras/terminal-relay`
+  `https://miguelpieras.com/terminal-relay`
 
 ## Promotional text
 
