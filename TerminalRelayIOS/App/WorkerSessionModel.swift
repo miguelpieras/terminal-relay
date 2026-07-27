@@ -56,6 +56,7 @@ final class WorkerSessionModel: ObservableObject {
     private let workerClient: SSHWorkerClient
     private let pairingClient: MobilePairingClient
     private let readStateDefaults: UserDefaults
+    private let isScreenshotDemo: Bool
     private var readActivityBySession: [String: Int]
     private var lastOpenedTerminalRoute: TerminalRoute?
     private var refreshToken = UUID()
@@ -64,19 +65,40 @@ final class WorkerSessionModel: ObservableObject {
     init(
         profileStore: WorkerProfileStore = WorkerProfileStore(),
         identityStore: SSHIdentityStore = SSHIdentityStore(),
-        readStateDefaults: UserDefaults = .standard
+        readStateDefaults: UserDefaults = .standard,
+        screenshotDemo: Bool = false
     ) {
         self.profileStore = profileStore
         self.identityStore = identityStore
         self.workerClient = SSHWorkerClient(identityStore: identityStore)
         self.pairingClient = MobilePairingClient(identityStore: identityStore)
         self.readStateDefaults = readStateDefaults
+        self.isScreenshotDemo = screenshotDemo
         self.readActivityBySession = Self.loadReadState(from: readStateDefaults)
-        let profiles = profileStore.load()
+        let profiles: [WorkerProfile]
+#if DEBUG
+        if screenshotDemo {
+            profiles = [ScreenshotDemoMode.worker]
+        } else {
+            profiles = profileStore.load()
+        }
+#else
+        profiles = profileStore.load()
+#endif
         self.profiles = profiles
         self.profile = profileStore.selectedProfileID()
             .flatMap { selectedID in profiles.first { $0.id == selectedID } }
             ?? profiles.first
+
+#if DEBUG
+        if screenshotDemo {
+            projects = ScreenshotDemoMode.projects
+            sessions = ScreenshotDemoMode.sessions
+            workerOverviews = [ScreenshotDemoMode.worker.id: ScreenshotDemoMode.overview]
+            publicKey = "ssh-ed25519 screenshot-demo-device"
+            return
+        }
+#endif
 
         do {
             self.publicKey = try identityStore.publicKeyForAuthorizedKeys()
@@ -187,6 +209,7 @@ final class WorkerSessionModel: ObservableObject {
     }
 
     func refresh() async {
+        guard !isScreenshotDemo else { return }
         guard let profile, !isLoading else { return }
         let token = UUID()
         refreshToken = token
@@ -324,6 +347,7 @@ final class WorkerSessionModel: ObservableObject {
     }
 
     func refreshWorkerOverviews() async {
+        guard !isScreenshotDemo else { return }
         let profilesToRefresh = profiles.filter { !workerLoadingIDs.contains($0.id) }
         guard !profilesToRefresh.isEmpty else { return }
         workerLoadingIDs.formUnion(profilesToRefresh.map(\.id))
@@ -346,6 +370,7 @@ final class WorkerSessionModel: ObservableObject {
     }
 
     func refreshProjectCatalogs() async {
+        guard !isScreenshotDemo else { return }
         let profilesToRefresh = profiles.filter { !projectLoadingIDs.contains($0.id) }
         guard !profilesToRefresh.isEmpty else { return }
         projectLoadingIDs.formUnion(profilesToRefresh.map(\.id))
@@ -373,6 +398,7 @@ final class WorkerSessionModel: ObservableObject {
     }
 
     func refreshProjectActivity() async {
+        guard !isScreenshotDemo else { return }
         let profilesToRefresh = profiles.filter { !projectLoadingIDs.contains($0.id) }
         guard !profilesToRefresh.isEmpty else { return }
 

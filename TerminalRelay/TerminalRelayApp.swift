@@ -145,25 +145,61 @@ struct TerminalRelayApp: App {
     private let updaterController: SPUStandardUpdaterController
     @StateObject private var serverStore: ServerStore
     @StateObject private var projectStore: ProjectStore
-    @StateObject private var sessionManager = SessionManager()
+    @StateObject private var sessionManager: SessionManager
     @StateObject private var workerSessionService = WorkerSessionService()
     @StateObject private var githubService = GitHubProjectService()
-    @StateObject private var accountUsageService = AccountUsageService()
+    @StateObject private var accountUsageService: AccountUsageService
     @StateObject private var workerMetricsService = WorkerMetricsService()
     @StateObject private var projectGitService = ProjectGitService()
     @State private var workerRegistrationAlert: WorkerRegistrationAlert?
 
     init() {
         updaterController = SPUStandardUpdaterController(
-            startingUpdater: ApplicationUpdateConfiguration.shouldStartUpdater(),
+            startingUpdater: ApplicationUpdateConfiguration.shouldStartUpdater()
+                && !ScreenshotDemoMode.isEnabled,
             updaterDelegate: nil,
             userDriverDelegate: nil
         )
-        let serverStore = ServerStore()
+
+        let serverStore: ServerStore
+        let projectStore: ProjectStore
+        let sessionManager: SessionManager
+        let accountUsageService: AccountUsageService
+#if DEBUG
+        if ScreenshotDemoMode.isEnabled {
+            let fixture = ScreenshotDemoMode.fixture()
+            let defaults = ScreenshotDemoMode.isolatedDefaults()
+            serverStore = ServerStore(
+                defaults: defaults,
+                initialServers: [fixture.worker]
+            )
+            projectStore = ProjectStore(
+                defaults: defaults,
+                servers: serverStore.servers,
+                initialProjects: fixture.projects
+            )
+            sessionManager = SessionManager(defaults: defaults)
+            sessionManager.loadScreenshotDemo(fixture.sessions, on: fixture.worker)
+            accountUsageService = AccountUsageService(
+                screenshotDemoWorkerID: fixture.worker.id
+            )
+        } else {
+            serverStore = ServerStore()
+            projectStore = ProjectStore(servers: serverStore.servers)
+            sessionManager = SessionManager()
+            accountUsageService = AccountUsageService()
+        }
+#else
+        serverStore = ServerStore()
+        projectStore = ProjectStore(servers: serverStore.servers)
+        sessionManager = SessionManager()
+        accountUsageService = AccountUsageService()
+#endif
+
         _serverStore = StateObject(wrappedValue: serverStore)
-        _projectStore = StateObject(
-            wrappedValue: ProjectStore(servers: serverStore.servers)
-        )
+        _projectStore = StateObject(wrappedValue: projectStore)
+        _sessionManager = StateObject(wrappedValue: sessionManager)
+        _accountUsageService = StateObject(wrappedValue: accountUsageService)
     }
 
     var body: some Scene {
@@ -181,6 +217,16 @@ struct TerminalRelayApp: App {
                 .preferredColorScheme(.dark)
                 .frame(minWidth: 980, minHeight: 640)
                 .onAppear {
+#if DEBUG
+                    if ScreenshotDemoMode.isEnabled {
+                        DispatchQueue.main.async {
+                            guard let window = NSApplication.shared.windows.first(where: \.isVisible)
+                            else { return }
+                            window.setContentSize(NSSize(width: 1_260, height: 820))
+                            window.center()
+                        }
+                    }
+#endif
                     appDelegate.sessionManager = sessionManager
                     appDelegate.attach(
                         serverStore: serverStore,

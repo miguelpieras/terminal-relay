@@ -411,6 +411,9 @@ struct ContentView: View {
     private var lifecycleContent: some View {
         navigationContent
             .onAppear {
+                if ScreenshotDemoMode.isEnabled {
+                    searchQuery = ""
+                }
                 selectFirstProjectIfNeeded()
                 clearInitialFilterFocus()
             }
@@ -746,13 +749,13 @@ struct ContentView: View {
                         ZStack {
                             Circle()
                                 .fill(Color(red: 0.49, green: 0.28, blue: 0.63))
-                            Text("MP")
+                            Text(ScreenshotDemoMode.isEnabled ? "EU" : "MP")
                                 .font(.system(size: 7.5, weight: .medium))
                                 .foregroundStyle(.white)
                         }
                         .frame(width: 18, height: 18)
 
-                        Text("Miguel Pieras")
+                        Text(ScreenshotDemoMode.isEnabled ? "Example User" : "Miguel Pieras")
                             .font(.system(size: 14, weight: .regular))
                             .foregroundStyle(SidebarPalette.primary)
                     }
@@ -1022,6 +1025,7 @@ struct ContentView: View {
     }
 
     private func refreshWorkerSessions() async {
+        guard !ScreenshotDemoMode.isEnabled else { return }
         for worker in serverStore.servers {
             guard !Task.isCancelled else { return }
             let didRefresh = await sessionManager.refresh(

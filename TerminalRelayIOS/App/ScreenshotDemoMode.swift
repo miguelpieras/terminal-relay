@@ -1,0 +1,94 @@
+import Foundation
+
+enum ScreenshotDemoMode {
+    static let launchArgument = "--terminal-relay-screenshot-demo"
+
+    static var isEnabled: Bool {
+#if DEBUG
+        ProcessInfo.processInfo.arguments.contains(launchArgument)
+#else
+        false
+#endif
+    }
+
+#if DEBUG
+    private static let sessionIdentifiers = [
+        "00000000-0000-4000-8000-000000002001",
+        "00000000-0000-4000-8000-000000002002",
+        "00000000-0000-4000-8000-000000002003",
+    ]
+
+    static let worker = WorkerProfile(
+        id: UUID(uuidString: "00000000-0000-4000-8000-000000000001")!,
+        name: "Private Worker",
+        host: "worker.example.com",
+        port: 22,
+        username: "example-user",
+        expectedHostKeyFingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    )
+
+    static let projects = ["atlas", "launchpad", "northstar"]
+
+    static let sessions = [
+        WorkerSessionSnapshot(
+            kind: .codex,
+            repositoryName: "atlas",
+            attachedClientCount: 2,
+            instanceToken: sessionIdentifiers[0],
+            title: "Build adaptive iPad workspace",
+            lastActivityAt: 1_800_000_000,
+            reportedWorking: true
+        ),
+        WorkerSessionSnapshot(
+            kind: .claude,
+            repositoryName: "atlas",
+            attachedClientCount: 1,
+            instanceToken: sessionIdentifiers[1],
+            title: "Review private pairing flow",
+            lastActivityAt: 1_799_999_980,
+            reportedWorking: false,
+            threadID: "00000000-0000-4000-8000-000000003002"
+        ),
+        WorkerSessionSnapshot(
+            kind: .codex,
+            repositoryName: "launchpad",
+            attachedClientCount: 1,
+            instanceToken: sessionIdentifiers[2],
+            title: "Prepare App Store release",
+            lastActivityAt: 1_799_999_960,
+            reportedWorking: false
+        ),
+    ]
+
+    static let overview = WorkerOverviewSnapshot(
+        projects: projects,
+        sessions: sessions,
+        resources: WorkerResourceSnapshot(
+            cpuUsedPercent: 18,
+            memoryUsedPercent: 42,
+            diskUsedPercent: 31
+        ),
+        accounts: [
+            .codex: WorkerAccountSnapshot(
+                account: "demo@example.com",
+                plan: "Team",
+                limits: [
+                    WorkerAccountLimitSnapshot(name: "5-hour", usedPercent: 24),
+                    WorkerAccountLimitSnapshot(name: "Weekly", usedPercent: 36),
+                ]
+            ),
+            .claude: WorkerAccountSnapshot(
+                account: "demo@example.com",
+                plan: "Pro",
+                limits: [
+                    WorkerAccountLimitSnapshot(name: "Session", usedPercent: 18),
+                    WorkerAccountLimitSnapshot(name: "Weekly", usedPercent: 29),
+                ]
+            ),
+        ],
+        accountErrors: [],
+        connectionError: nil,
+        updateStatus: nil
+    )
+#endif
+}

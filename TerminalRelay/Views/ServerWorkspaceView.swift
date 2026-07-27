@@ -27,7 +27,7 @@ struct ProjectWorkspaceView: View {
     @State private var isShowingCodexResets = false
     @State private var isWritingCommitMessage = false
     @State private var commitMessage = ""
-    @State private var isShowingEnvironmentSidebar = true
+    @State private var isShowingEnvironmentSidebar = !ScreenshotDemoMode.isEnabled
 
     private var launchDefaults: AgentLaunchDefaults {
         AgentLaunchDefaults(
@@ -109,10 +109,12 @@ struct ProjectWorkspaceView: View {
             }
         }
         .task(id: usageTaskID) {
+            guard !ScreenshotDemoMode.isEnabled else { return }
             guard selectedSession == nil else { return }
             await accountUsageService.refresh(worker: worker)
         }
         .task(id: project.id) {
+            guard !ScreenshotDemoMode.isEnabled else { return }
             repeat {
                 _ = await projectGitService.refresh(
                     project: project,

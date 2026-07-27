@@ -75,6 +75,23 @@ final class SessionManager: ObservableObject {
         }
     }
 
+#if DEBUG
+    func loadScreenshotDemo(
+        _ fixtures: [(project: ProjectProfile, snapshot: WorkerSessionSnapshot)],
+        on worker: ServerProfile
+    ) {
+        for fixture in fixtures {
+            _ = openConfirmedRemote(
+                project: fixture.project,
+                on: worker,
+                snapshot: fixture.snapshot,
+                selectResult: false
+            )
+        }
+        selectSession(nil)
+    }
+#endif
+
     func session(projectID: UUID, kind: AgentKind) -> TerminalSession? {
         activeSession(projectID: projectID, kind: kind)
             ?? sessions.last { $0.projectID == projectID && $0.kind == kind }

@@ -64,6 +64,7 @@
 		8273E578B2270DE06F2929AD /* AgentKind.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95F329024A646D63DF51C026 /* AgentKind.swift */; };
 		8468152A7D1F28988F3C528E /* ProjectStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A9FBF0D79F64B491FF61EA8 /* ProjectStore.swift */; };
 		8F8D21539A1804FFABF72511 /* THIRD_PARTY_NOTICES.md in Resources */ = {isa = PBXBuildFile; fileRef = 0FF91CF92B1EA335FEE3D31F /* THIRD_PARTY_NOTICES.md */; };
+		913625A11B43409B227A6744 /* ScreenshotDemoMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE2C28DBAE616E1130C47849 /* ScreenshotDemoMode.swift */; };
 		9271FF5CDD1B8FDF00EA1FE6 /* ProjectGitServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20DDC4D787D741BAF50C5483 /* ProjectGitServiceTests.swift */; };
 		9608B29F68045C58EDBD4960 /* SwiftTerm in Frameworks */ = {isa = PBXBuildFile; productRef = 551DCCFC78D5C88FB7787442 /* SwiftTerm */; };
 		9C9080C99E862B01B2501009 /* TerminalScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2812F2F38DC528ED2610ED2A /* TerminalScreen.swift */; };
@@ -102,6 +103,7 @@
 		F5EE3DAF7D692B86C8FCBED7 /* TaskCompletionNotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB57CC1C71DA630F71FFF06B /* TaskCompletionNotificationService.swift */; };
 		F65709DF14A6D5CDE965E57C /* MobilePairingPayload.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2F6A3C26CB12506F67A3C7B /* MobilePairingPayload.swift */; };
 		F6693B26956A1182277D3400 /* WorkerSessionServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7BA492BA581F2C2B0C2AF051 /* WorkerSessionServiceTests.swift */; };
+		F90DF7D1E42E1FCED189DCD4 /* ScreenshotDemoMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBBBC2A7155C8A4197F1FD2A /* ScreenshotDemoMode.swift */; };
 		FB4A6F2362CE2E84DD4A957D /* ServerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 93E0F148244B4D209F63EB35 /* ServerStore.swift */; };
 		FBBC4D4AF4F128602EFD9112 /* AccountAuthenticationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 273C71F1BE8EDFC5433EB578 /* AccountAuthenticationService.swift */; };
 		FEAEA6D07CCFB231F82203C3 /* WorkerUpdateStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = 42B3415016E40E746420EBA8 /* WorkerUpdateStatus.swift */; };
@@ -215,6 +217,8 @@
 		F1BE14175A44909F00948D51 /* ProjectListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectListView.swift; sourceTree = "<group>"; };
 		F2459D0DFD20B6A437841971 /* AgentKindStyle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentKindStyle.swift; sourceTree = "<group>"; };
 		F4C76B0396E10CAF3945C3EB /* SessionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionManager.swift; sourceTree = "<group>"; };
+		FBBBC2A7155C8A4197F1FD2A /* ScreenshotDemoMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenshotDemoMode.swift; sourceTree = "<group>"; };
+		FE2C28DBAE616E1130C47849 /* ScreenshotDemoMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenshotDemoMode.swift; sourceTree = "<group>"; };
 		FF68598718838E8064DF0C45 /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -368,6 +372,7 @@
 		939436E54A5B69766421376B /* App */ = {
 			isa = PBXGroup;
 			children = (
+				FBBBC2A7155C8A4197F1FD2A /* ScreenshotDemoMode.swift */,
 				A69DA6CF7B2592BF444DB18E /* TerminalRelayIOSApp.swift */,
 				5064842EB86544CB74E12A08 /* WorkerSessionModel.swift */,
 			);
@@ -405,6 +410,7 @@
 				86CC14D081ABBDBDC564291F /* Assets.xcassets */,
 				97DEABBF57F733EA24665AE8 /* Info.plist */,
 				01417C38DCD882AE840B1999 /* PrivacyInfo.xcprivacy */,
+				FE2C28DBAE616E1130C47849 /* ScreenshotDemoMode.swift */,
 				0A02BB8092DDF8AED8C6F603 /* TerminalRelayApp.swift */,
 				D87781E3C80903DEE64C46E7 /* Models */,
 				26148FB26C95BCDAEEF01846 /* Services */,
@@ -635,6 +641,7 @@
 				5FFF07C89F2D695D5506B7CD /* ProjectProfile.swift in Sources */,
 				8468152A7D1F28988F3C528E /* ProjectStore.swift in Sources */,
 				0B69126CE70C815298882288 /* SSHCommandBuilder.swift in Sources */,
+				913625A11B43409B227A6744 /* ScreenshotDemoMode.swift in Sources */,
 				AE9E989F48F3B3EEAF0FC2D4 /* ServerEditorView.swift in Sources */,
 				354AC532DA7ABB9688F98244 /* ServerProfile.swift in Sources */,
 				FB4A6F2362CE2E84DD4A957D /* ServerStore.swift in Sources */,
@@ -669,6 +676,7 @@
 				D1B54B829875C80E2FD689A8 /* RootView.swift in Sources */,
 				E2ADDC0EA215EBD53200AD46 /* SSHIdentityStore.swift in Sources */,
 				643FB349DC4C4DF21D981030 /* SSHTransport.swift in Sources */,
+				F90DF7D1E42E1FCED189DCD4 /* ScreenshotDemoMode.swift in Sources */,
 				034F2FEC41EB660A56480C8C /* TerminalRelayIOSApp.swift in Sources */,
 				2653CA2FF73C430E73EB9F6D /* TerminalRepresentable.swift in Sources */,
 				9C9080C99E862B01B2501009 /* TerminalScreen.swift in Sources */,

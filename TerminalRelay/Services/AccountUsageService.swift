@@ -128,6 +128,60 @@ final class AccountUsageService: ObservableObject {
     private var resetRedemptionKeys: [ResetRedemptionKey: UUID] = [:]
     private var workersRedeemingCodexReset: Set<UUID> = []
 
+    init(screenshotDemoWorkerID: UUID? = nil) {
+#if DEBUG
+        if let workerID = screenshotDemoWorkerID {
+            let fetchedAt = Date()
+            snapshots = [
+                Key(workerID: workerID, kind: .codex): AccountUsageSnapshot(
+                    account: "demo@example.com",
+                    plan: "Team",
+                    limits: [
+                        AccountUsageLimit(
+                            id: "codex-5-hour",
+                            name: "5-hour limit",
+                            usedPercent: 24,
+                            resetsAt: nil,
+                            resetText: "in 3 hours"
+                        ),
+                        AccountUsageLimit(
+                            id: "codex-weekly",
+                            name: "Weekly limit",
+                            usedPercent: 36,
+                            resetsAt: nil,
+                            resetText: "Monday"
+                        ),
+                    ],
+                    codexResetCredits: nil,
+                    fetchedAt: fetchedAt
+                ),
+                Key(workerID: workerID, kind: .claude): AccountUsageSnapshot(
+                    account: "demo@example.com",
+                    plan: "Pro",
+                    limits: [
+                        AccountUsageLimit(
+                            id: "claude-session",
+                            name: "Current session",
+                            usedPercent: 18,
+                            resetsAt: nil,
+                            resetText: "in 2 hours"
+                        ),
+                        AccountUsageLimit(
+                            id: "claude-weekly",
+                            name: "Weekly · all models",
+                            usedPercent: 29,
+                            resetsAt: nil,
+                            resetText: "Sunday"
+                        ),
+                    ],
+                    codexResetCredits: nil,
+                    fetchedAt: fetchedAt
+                ),
+            ]
+        }
+#endif
+    }
+
     func snapshot(for workerID: UUID, kind: AgentKind) -> AccountUsageSnapshot? {
         snapshots[Key(workerID: workerID, kind: kind)]
     }

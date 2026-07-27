@@ -58,10 +58,18 @@ Also answer App Store Connect's export-compliance questionnaire for the bundled
 SSH and Swift Crypto implementation. Do not add
 `ITSAppUsesNonExemptEncryption` until that classification is confirmed.
 
-## Required assets outside the repository
+## Captured screenshots
 
-- At least one current iPhone screenshot.
-- At least one current iPad screenshot.
+- iPhone: `Distribution/Screenshots/iphone.png`
+- iPad: `Distribution/Screenshots/ipad.png`
+- Mac marketing site: `Distribution/Screenshots/mac.png`
+
+All three images are direct captures of the native apps running with the
+Debug-only screenshot demo. The fixtures use example worker, repository, and
+account values and never connect to a real worker.
+
+## Remaining assets and decisions
+
 - App Review contact information.
 - Age rating, territories, price, and release method.
 - Export-compliance answers and any requested documentation.
