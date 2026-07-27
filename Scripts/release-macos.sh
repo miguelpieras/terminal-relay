@@ -9,7 +9,7 @@ development_team="${DEVELOPMENT_TEAM:-6EBZ756H9Q}"
 signing_identity="${DEVELOPER_ID_APPLICATION:-Developer ID Application}"
 bundle_version="${MACOS_BUNDLE_VERSION:-$(git -C "$repository_root" show -s --format=%ct HEAD)}"
 appcast_url="https://miguelpieras.github.io/terminal-relay/appcast.xml"
-download_url_prefix="https://github.com/miguelpieras/terminal-relay/releases/download/v${version}/"
+download_url_prefix="https://miguelpieras.github.io/terminal-relay/"
 derived_data="$repository_root/DerivedData"
 release_root="$repository_root/build/macos-release"
 archive_path="$release_root/TerminalRelay.xcarchive"
@@ -270,6 +270,7 @@ fi
 }
 /bin/mkdir -p "$pages_directory"
 /bin/cp "$appcast_path" "$pages_directory/appcast.xml"
+/bin/cp "$update_archive" "$pages_directory/Terminal-Relay-${version}.zip"
 
 echo "Created notarized macOS release artifacts:"
 echo "  $update_archive"
