@@ -741,43 +741,18 @@ struct ContentView: View {
                 .fill(SidebarPalette.footerSeparator)
                 .frame(height: 1)
 
-            HStack(spacing: 10) {
-                Button {
+            HStack(spacing: 8) {
+                SidebarFooterButton(title: "Settings", systemImage: "gearshape") {
                     navigate(to: .settings)
-                } label: {
-                    HStack(spacing: 7) {
-                        ZStack {
-                            Circle()
-                                .fill(Color(red: 0.49, green: 0.28, blue: 0.63))
-                            Text(ScreenshotDemoMode.isEnabled ? "EU" : "MP")
-                                .font(.system(size: 7.5, weight: .medium))
-                                .foregroundStyle(.white)
-                        }
-                        .frame(width: 18, height: 18)
-
-                        Text(ScreenshotDemoMode.isEnabled ? "Example User" : "Miguel Pieras")
-                            .font(.system(size: 14, weight: .regular))
-                            .foregroundStyle(SidebarPalette.primary)
-                    }
-                    .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
 
                 Spacer()
 
-                Button {
+                SidebarFooterButton(title: "Workers", systemImage: "server.rack") {
                     navigate(to: .workers)
-                } label: {
-                    Image(systemName: "server.rack")
-                        .font(.system(size: 11.5, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .frame(width: 20, height: 20)
-                        .background(Color.accentColor, in: Circle())
                 }
-                .buttonStyle(.plain)
-                .help("Manage workers")
             }
-            .padding(.horizontal, 9)
+            .padding(.horizontal, 10)
             .frame(height: 47)
         }
         .background(SidebarPalette.background)
@@ -1392,6 +1367,32 @@ private struct SidebarActionButton: View {
         .padding(.horizontal, SidebarRowGeometry.horizontalMargin)
         .frame(maxWidth: .infinity)
         .onHover { isHovering = $0 }
+    }
+}
+
+private struct SidebarFooterButton: View {
+    let title: String
+    let systemImage: String
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage)
+                .font(.system(size: 12.5, weight: .medium))
+                .foregroundStyle(SidebarPalette.secondary)
+                .padding(.horizontal, 9)
+                .frame(height: 29)
+                .background(
+                    isHovering ? SidebarPalette.hover : Color.clear,
+                    in: RoundedRectangle(cornerRadius: 6)
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+        .help(title)
     }
 }
 
