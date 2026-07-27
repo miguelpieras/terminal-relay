@@ -1,0 +1,20 @@
+<?xml version="1.0" standalone="yes"?><!-- sparkle-sign-warning:
+IMPORTANT: This file was signed by Sparkle. Any modifications to this file requires re-signing this file with generate_appcast or sign_update! The signed signature will be embedded at the end of this file.
+--><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>Terminal Relay</title>
+        <item>
+            <title>1.0</title>
+            <pubDate>Mon, 27 Jul 2026 08:52:31 +0200</pubDate>
+            <sparkle:version>1785134988</sparkle:version>
+            <sparkle:shortVersionString>1.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <description sparkle:format="markdown"><![CDATA[**Full Changelog**: https://github.com/miguelpieras/terminal-relay/commits/v1.0
+]]></description>
+            <enclosure url="https://github.com/miguelpieras/terminal-relay/releases/download/v1.0/Terminal-Relay-1.0.zip" length="4427894" type="application/octet-stream" sparkle:edSignature="DWTM/Z5pvFxOokjcny80FFRNgEYjxZeh0bPNiuApppZTLodeo+sNU1wnfrfqT01ctn2FqIxkWXX1lietvMxVDw=="></enclosure>
+        </item>
+    </channel>
+</rss><!-- sparkle-signatures:
+edSignature: wIuhICX/yqyFWGXbk/xOGAUrolWaSYTLnAW/l0G1LFx5p2GjZZEz+QKTjnA2gjx9RS1OzKziNe8dQFxP1giGBg==
+length: 1222
+-->
