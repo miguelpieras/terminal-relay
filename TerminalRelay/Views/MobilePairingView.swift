@@ -56,6 +56,7 @@ struct MobilePairingView: View {
             await prepareInvitation()
         }
         .onDisappear {
+            guard !ScreenshotDemoMode.isEnabled else { return }
             guard let invitation else { return }
             Task {
                 try? await MobilePairingService.revoke(
@@ -107,6 +108,20 @@ struct MobilePairingView: View {
         errorMessage = nil
         let previousInvitation = invitation
         invitation = nil
+
+#if DEBUG
+        if ScreenshotDemoMode.isEnabled {
+            invitation = MobilePairingInvitation(
+                id: "00000000-0000-4000-8000-000000004001",
+                worker: worker,
+                code: "terminal-relay-demo-pairing-code",
+                expiresAt: Date().addingTimeInterval(MobilePairingService.invitationLifetime)
+            )
+            isPreparing = false
+            return
+        }
+#endif
+
         if let previousInvitation {
             try? await MobilePairingService.revoke(
                 token: previousInvitation.id,

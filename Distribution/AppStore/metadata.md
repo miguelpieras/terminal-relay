@@ -60,13 +60,22 @@ SSH and Swift Crypto implementation. Do not add
 
 ## Captured screenshots
 
-- iPhone: `Distribution/Screenshots/iphone.png`
-- iPad: `Distribution/Screenshots/ipad.png`
+- iPhone 6.9-inch:
+  - `Distribution/Screenshots/AppStore/iPhone-6.9/01-projects.png`
+  - `Distribution/Screenshots/AppStore/iPhone-6.9/02-active-sessions.png`
+  - `Distribution/Screenshots/AppStore/iPhone-6.9/03-worker-dashboard.png`
+  - `Distribution/Screenshots/AppStore/iPhone-6.9/04-private-connection.png`
+- iPad 13-inch:
+  - `Distribution/Screenshots/AppStore/iPad-13/01-adaptive-workspace.png`
+  - `Distribution/Screenshots/AppStore/iPad-13/02-worker-dashboard.png`
+  - `Distribution/Screenshots/AppStore/iPad-13/03-private-connection.png`
+  - `Distribution/Screenshots/AppStore/iPad-13/04-agent-choice.png`
 - Mac marketing site: `Distribution/Screenshots/mac.png`
+- Mac pairing close-up: `Distribution/Screenshots/mac-pairing.png`
 
-All three images are direct captures of the native apps running with the
-Debug-only screenshot demo. The fixtures use example worker, repository, and
-account values and never connect to a real worker.
+All images are direct captures of the native apps running with the Debug-only
+screenshot demo. The fixtures use example worker, repository, session, account,
+SSH-key, and pairing values and never connect to a real worker.
 
 ## Remaining assets and decisions
 
