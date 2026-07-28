@@ -10,6 +10,8 @@ application_installer="$repository_root/Server/install-worker.sh"
 session_helper="$repository_root/Server/terminal-relay-session"
 agent_updater="$repository_root/Server/terminal-relay-agent-update"
 lifecycle="$repository_root/Scripts/manage-worker.sh"
+review_lifecycle="$repository_root/Scripts/manage-review-worker.sh"
+review_tests="$repository_root/Server/Tests/review-worker-tests.sh"
 bootstrap="$repository_root/Scripts/bootstrap-worker.sh"
 temporary_root="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
 temporary_directory="$(mktemp -d "$temporary_root/terminal-relay-lifecycle-tests.XXXXXX")"
@@ -39,10 +41,13 @@ for file in \
     "$host_installer" \
     "$repository_root/Server/node-exporter.service.template" \
     "$lifecycle" \
+    "$review_lifecycle" \
+    "$review_tests" \
     "$bootstrap"; do
     [[ -f "$file" && ! -L "$file" ]] || fail "missing or unsafe lifecycle file: $file"
 done
-[[ -x "$host_installer" && -x "$lifecycle" && -x "$bootstrap" ]] \
+[[ -x "$host_installer" && -x "$lifecycle" && -x "$review_lifecycle" \
+    && -x "$review_tests" && -x "$bootstrap" ]] \
     || fail "lifecycle commands are not executable"
 
 # shellcheck disable=SC1090
@@ -66,10 +71,12 @@ if [[ -f "$local_baseline" ]]; then
 fi
 
 bash -n "$host_installer" "$lifecycle" "$bootstrap" \
+    "$review_lifecycle" \
     "$application_installer" \
     "$agent_updater"
 if command -v shellcheck >/dev/null 2>&1; then
     shellcheck -x "$host_installer" "$lifecycle" "$bootstrap" \
+        "$review_lifecycle" \
         "$application_installer" \
         "$agent_updater"
 fi
@@ -125,3 +132,4 @@ grep -Fq "PATH=\"\$safe_path\"" "$agent_updater" \
     || fail "Codex updater does not use the explicit worker PATH"
 
 printf 'worker lifecycle tests passed\n'
+"$review_tests"

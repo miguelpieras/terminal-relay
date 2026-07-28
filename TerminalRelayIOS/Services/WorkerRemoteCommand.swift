@@ -18,7 +18,11 @@ enum WorkerRemoteCommand {
     static let listProjects = "\(WorkerSessionProtocol.helperPath) list-projects"
     static let status = "\(WorkerSessionProtocol.helperPath) status"
     static let updateStatus = "\(WorkerSessionProtocol.helperPath) update-status"
-    static let resources = """
+    static let resources = "\(WorkerSessionProtocol.helperPath) resources"
+    static let codexAccount = "\(WorkerSessionProtocol.helperPath) codex-account"
+    static let claudeAccount = "\(WorkerSessionProtocol.helperPath) claude-account"
+
+    static let legacyResources = """
         set -eu
 
         exporter_address=$(/usr/bin/tailscale ip -4 | /usr/bin/awk 'NR == 1 { print; exit }')
@@ -92,7 +96,7 @@ enum WorkerRemoteCommand {
         printf 'memory|%s|%s\\n' "$memory_total" "$memory_available"
         printf 'disk|%s|%s\\n' "$disk_total" "$disk_used"
         """
-    static let codexAccount = """
+    static let legacyCodexAccount = """
         cd "$HOME" || exit 1
         { printf '%s\\n' \
         '{"method":"initialize","id":0,"params":{"clientInfo":{"name":"terminal_relay_ios","title":"Terminal Relay","version":"1.0.0"}}}' \
@@ -101,7 +105,7 @@ enum WorkerRemoteCommand {
         '{"method":"account/read","id":2,"params":{"refreshToken":false}}'; sleep 2; } \
         | timeout 10s codex app-server 2>/dev/null
         """
-    static let claudeAccount = """
+    static let legacyClaudeAccount = """
         cd "$HOME" || exit 1
         printf '%s\\n' '__TERMINAL_RELAY_CLAUDE_AUTH__'
         claude auth status --json 2>/dev/null || true

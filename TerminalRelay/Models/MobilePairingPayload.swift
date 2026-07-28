@@ -1,8 +1,13 @@
 import Foundation
 
+enum MobilePairingInvitationKind: String, Codable, Equatable {
+    case appReview = "app-review"
+}
+
 struct MobilePairingPayload: Codable, Equatable {
     static let currentVersion = 1
     static let maximumLifetime: TimeInterval = 15 * 60
+    static let reviewMaximumLifetime: TimeInterval = 60 * 24 * 60 * 60
 
     let version: Int
     let workerName: String
@@ -13,6 +18,31 @@ struct MobilePairingPayload: Codable, Equatable {
     let temporaryPrivateKey: String
     let pairingToken: String
     let expiresAt: Int64
+    let invitationKind: MobilePairingInvitationKind?
+
+    init(
+        version: Int,
+        workerName: String,
+        host: String,
+        port: Int,
+        username: String,
+        hostKeyFingerprint: String,
+        temporaryPrivateKey: String,
+        pairingToken: String,
+        expiresAt: Int64,
+        invitationKind: MobilePairingInvitationKind? = nil
+    ) {
+        self.version = version
+        self.workerName = workerName
+        self.host = host
+        self.port = port
+        self.username = username
+        self.hostKeyFingerprint = hostKeyFingerprint
+        self.temporaryPrivateKey = temporaryPrivateKey
+        self.pairingToken = pairingToken
+        self.expiresAt = expiresAt
+        self.invitationKind = invitationKind
+    }
 
     func validate(now: Date = Date()) throws {
         guard version == Self.currentVersion else {
@@ -72,7 +102,10 @@ struct MobilePairingPayload: Codable, Equatable {
         guard expiresAt > nowSeconds else {
             throw MobilePairingPayloadError.expired
         }
-        guard expiresAt <= nowSeconds + Int64(Self.maximumLifetime) else {
+        let maximumLifetime = invitationKind == .appReview
+            ? Self.reviewMaximumLifetime
+            : Self.maximumLifetime
+        guard expiresAt <= nowSeconds + Int64(maximumLifetime) else {
             throw MobilePairingPayloadError.invalidPayload
         }
     }

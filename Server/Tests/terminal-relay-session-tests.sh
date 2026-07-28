@@ -358,6 +358,12 @@ if [[ "${1:-}" == "auth" && "${2:-}" == "status" && "${3:-}" == "--json" ]]; the
     exit 0
 fi
 
+if [[ "$*" == *"-p /usage"* ]]; then
+    printf '%s\n' 'Current session: 12% used'
+    printf '%s\n' 'Current week (all models): 34% used'
+    exit 0
+fi
+
 printf 'start|pid=%s|cwd=%s' "$$" "$PWD" >> "$TERMINAL_RELAY_TEST_AGENT_LOG"
 if [[ -n "${ConEmuANSI:-}" ]]; then
     printf '|ConEmuANSI=%s' "$ConEmuANSI" >> "$TERMINAL_RELAY_TEST_AGENT_LOG"
@@ -1149,5 +1155,15 @@ assert_equal \
 unset TERMINAL_RELAY_TEST_CODEX_SHARED_ACCOUNT
 "$tmux_path" -f /dev/null -L "$tmux_socket" \
     kill-session -t "$claude_rotation_guard"
+
+claude_account_output="$(/bin/bash "$helper" claude-account)"
+assert_contains \
+    "$claude_account_output" \
+    "__TERMINAL_RELAY_CLAUDE_AUTH__" \
+    "Claude account auth marker"
+assert_contains \
+    "$claude_account_output" \
+    "Current session: 12% used" \
+    "Claude account usage output"
 
 echo "PASS: terminal-relay-session integration tests"

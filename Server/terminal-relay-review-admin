@@ -1,0 +1,467 @@
+#!/usr/bin/python3
+"""Root-only lifecycle helper for the isolated App Review worker."""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+
+RUNTIME_USER = "terminal-relay"
+RUNTIME_GROUP = "terminal-relay"
+HELPER = "/usr/local/bin/terminal-relay-session"
+REPOSITORIES = ("atlas", "launchpad", "northstar")
+INVITATION_PREFIX = "terminal-relay-review-invitation:"
+DEVICE_PREFIX = "terminal-relay-review-device:"
+SECRET_PATTERN = re.compile(
+    r"(?:AKIA|ASIA)[A-Z0-9]{16}|"
+    r"github_pat_[A-Za-z0-9_]{20,}|"
+    r"gh[pousr]_[A-Za-z0-9_]{20,}|"
+    r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}|"
+    r"xox[baprs]-[A-Za-z0-9-]{10,}|"
+    r"tskey-[A-Za-z0-9-]{10,}|"
+    r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----"
+)
+FORBIDDEN_NAMES = {
+    ".env",
+    "auth.json",
+    "credentials",
+    "id_ed25519",
+    "id_rsa",
+}
+SSH_CONFIGURATION = """\
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin prohibit-password
+AllowAgentForwarding no
+AllowTcpForwarding no
+GatewayPorts no
+PermitTunnel no
+X11Forwarding no
+"""
+SLICE_CONFIGURATION = """\
+[Slice]
+CPUQuota=200%
+MemoryMax=3G
+TasksMax=256
+"""
+FIXTURES = {
+    "atlas": {
+        "README.md": """\
+# Atlas
+
+A synthetic Swift workspace used to demonstrate Terminal Relay during App Review.
+All names, tasks, and source files in this repository are fictional.
+""",
+        "Sources/Dashboard.swift": """\
+struct Dashboard {
+    let title = "Adaptive workspace"
+    let columns = ["Projects", "Terminal"]
+}
+""",
+        "NOTES.md": "- Verify the wide iPad terminal layout.\n- Keep the sidebar compact.\n",
+    },
+    "launchpad": {
+        "README.md": "# Launchpad\n\nSynthetic release-planning data for App Review.\n",
+        "src/release.ts": """\
+export const release = {
+  platform: "iPhone and iPad",
+  status: "ready for review",
+};
+""",
+        "package.json": '{"name":"launchpad-demo","private":true,"version":"1.0.0"}\n',
+    },
+    "northstar": {
+        "README.md": "# Northstar\n\nSynthetic worker-health examples for App Review.\n",
+        "metrics.json": '{"cpu":18,"memory":42,"disk":31}\n',
+        "CHECKLIST.md": "- [x] Pair device\n- [ ] Review terminal workflow\n",
+    },
+}
+
+
+def fail(message: str) -> "NoReturn":
+    print(f"terminal-relay-review-admin: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def test_root() -> Path | None:
+    value = os.environ.get("TERMINAL_RELAY_REVIEW_TEST_ROOT")
+    if not value:
+        return None
+    if os.path.realpath(__file__) == "/usr/local/bin/terminal-relay-review-admin":
+        fail("test-root overrides are unavailable in the installed helper")
+    root = Path(value).resolve()
+    if not root.is_dir() or root == Path("/"):
+        fail("the test root is invalid")
+    return root
+
+
+TEST_ROOT = test_root()
+
+
+def rooted(path: str) -> Path:
+    source = Path(path)
+    if TEST_ROOT is None:
+        return source
+    return TEST_ROOT / source.relative_to("/")
+
+
+def runtime_identity() -> tuple[int, int]:
+    if TEST_ROOT is not None:
+        return os.getuid(), os.getgid()
+    account = pwd.getpwnam(RUNTIME_USER)
+    return account.pw_uid, account.pw_gid
+
+
+def root_identity() -> tuple[int, int]:
+    if TEST_ROOT is not None:
+        return os.getuid(), os.getgid()
+    return 0, 0
+
+
+def require_root() -> None:
+    if TEST_ROOT is None and os.geteuid() != 0:
+        fail("root privileges are required")
+
+
+def atomic_write(path: Path, content: str, mode: int, uid: int, gid: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        dir=path.parent,
+        text=True,
+    )
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.chown(temporary_name, uid, gid)
+        os.replace(temporary_name, path)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+
+
+def run_as_runtime(arguments: list[str], *, capture: bool = False) -> subprocess.CompletedProcess:
+    if TEST_ROOT is not None:
+        return subprocess.run(
+            arguments,
+            check=True,
+            capture_output=capture,
+            text=True,
+        )
+    return subprocess.run(
+        ["/usr/sbin/runuser", "-u", RUNTIME_USER, "--", *arguments],
+        check=True,
+        capture_output=capture,
+        text=True,
+    )
+
+
+def chown_tree(path: Path, uid: int, gid: int) -> None:
+    os.chown(path, uid, gid)
+    for root, directories, files in os.walk(path):
+        for name in directories:
+            os.chown(Path(root) / name, uid, gid)
+        for name in files:
+            os.chown(Path(root) / name, uid, gid)
+
+
+def configure() -> None:
+    require_root()
+    if TEST_ROOT is None and shutil.which("tailscale") is not None:
+        fail("the review worker must not be enrolled in Tailscale")
+    uid, gid = runtime_identity()
+    root_uid, root_gid = root_identity()
+    ssh_configuration = rooted("/etc/ssh/sshd_config.d/99-terminal-relay-review.conf")
+    slice_configuration = rooted(
+        f"/etc/systemd/system/user-{uid}.slice.d/terminal-relay-review.conf"
+    )
+    atomic_write(
+        ssh_configuration,
+        SSH_CONFIGURATION,
+        0o644,
+        root_uid,
+        root_gid,
+    )
+    atomic_write(
+        slice_configuration,
+        SLICE_CONFIGURATION,
+        0o644,
+        root_uid,
+        root_gid,
+    )
+    state_directory = rooted("/var/lib/terminal-relay-review")
+    state_directory.mkdir(parents=True, exist_ok=True)
+    os.chmod(state_directory, 0o700)
+    if TEST_ROOT is None:
+        subprocess.run(["/usr/sbin/sshd", "-t"], check=True)
+        subprocess.run(["/usr/bin/systemctl", "daemon-reload"], check=True)
+        subprocess.run(["/usr/bin/systemctl", "reload", "ssh"], check=True)
+
+
+def stop_sessions() -> None:
+    if TEST_ROOT is not None:
+        return
+    result = run_as_runtime([HELPER, "status"], capture=True)
+    for line in result.stdout.splitlines():
+        fields = line.split("|")
+        if len(fields) != 9 or fields[0] != "session":
+            continue
+        tool, repository, instance = fields[1], fields[2], fields[4]
+        run_as_runtime([HELPER, "stop", tool, repository, instance])
+
+
+def seed() -> None:
+    require_root()
+    uid, gid = runtime_identity()
+    workspace = rooted("/workspace")
+    workspace.mkdir(parents=True, exist_ok=True)
+    os.chmod(workspace, 0o750)
+    os.chown(workspace, uid, gid)
+    root_marker = workspace / ".terminal-relay-review-root"
+    existing_entries = list(workspace.iterdir())
+    if existing_entries and not root_marker.is_file():
+        fail("refusing to reset an unmarked workspace")
+    if root_marker.is_file():
+        for entry in existing_entries:
+            if entry == root_marker:
+                continue
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+    root_marker.write_text("synthetic-app-review-workspace-v1\n", encoding="utf-8")
+    os.chown(root_marker, uid, gid)
+    os.chmod(root_marker, 0o640)
+
+    for repository in REPOSITORIES:
+        destination = workspace / repository
+        marker = destination / ".terminal-relay-review-fixture"
+        destination.mkdir(mode=0o750)
+        marker.write_text("synthetic-app-review-data-v1\n", encoding="utf-8")
+        for relative_path, content in FIXTURES[repository].items():
+            file_path = destination / relative_path
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(content, encoding="utf-8")
+        chown_tree(destination, uid, gid)
+        if TEST_ROOT is None:
+            run_as_runtime(["/usr/bin/git", "-C", str(destination), "init", "-q", "-b", "main"])
+            run_as_runtime(
+                ["/usr/bin/git", "-C", str(destination), "config", "user.name", "Example User"]
+            )
+            run_as_runtime(
+                [
+                    "/usr/bin/git",
+                    "-C",
+                    str(destination),
+                    "config",
+                    "user.email",
+                    "example-user@example.com",
+                ]
+            )
+            run_as_runtime(["/usr/bin/git", "-C", str(destination), "add", "."])
+            run_as_runtime(
+                [
+                    "/usr/bin/git",
+                    "-C",
+                    str(destination),
+                    "commit",
+                    "-q",
+                    "-m",
+                    "Seed synthetic review workspace",
+                ]
+            )
+
+
+def authorized_keys_path() -> Path:
+    path = rooted(f"/home/{RUNTIME_USER}/.ssh/authorized_keys")
+    if not path.is_file() or path.is_symlink():
+        fail("the runtime authorized_keys file is unsafe")
+    return path
+
+
+def write_authorized_keys(lines: list[str]) -> None:
+    uid, gid = runtime_identity()
+    authorized_keys = authorized_keys_path()
+    atomic_write(authorized_keys, "\n".join(lines) + "\n", 0o600, uid, gid)
+
+
+def install_invitation() -> None:
+    require_root()
+    entry = sys.stdin.read().strip()
+    pattern = re.compile(
+        r'^restrict,command="/usr/local/bin/terminal-relay-review-enroll '
+        r'([a-f0-9-]{36}) ([0-9]{10}) ([0-9]{1,2})" '
+        r'ssh-ed25519 ([A-Za-z0-9+/=]+) '
+        r'terminal-relay-review-invitation:\1$'
+    )
+    match = pattern.fullmatch(entry)
+    if not match:
+        fail("the review invitation entry is invalid")
+    expires_at = int(match.group(2))
+    maximum_devices = int(match.group(3))
+    now = int(time.time())
+    if not now < expires_at <= now + 60 * 24 * 60 * 60:
+        fail("the review invitation lifetime is invalid")
+    if not 1 <= maximum_devices <= 20:
+        fail("the review invitation device limit is invalid")
+    lines = [
+        line
+        for line in authorized_keys_path().read_text(encoding="utf-8").splitlines()
+        if INVITATION_PREFIX not in line and DEVICE_PREFIX not in line
+    ]
+    lines.append(entry)
+    write_authorized_keys(lines)
+
+
+def remove_review_keys(*, devices_only: bool) -> None:
+    require_root()
+    lines = authorized_keys_path().read_text(encoding="utf-8").splitlines()
+    filtered = [
+        line
+        for line in lines
+        if DEVICE_PREFIX not in line
+        and (devices_only or INVITATION_PREFIX not in line)
+    ]
+    write_authorized_keys(filtered)
+
+
+def reset() -> None:
+    stop_sessions()
+    seed()
+    remove_review_keys(devices_only=True)
+
+
+def verify() -> None:
+    require_root()
+    uid, gid = runtime_identity()
+    root_uid, root_gid = root_identity()
+    expected_files = {
+        rooted("/etc/ssh/sshd_config.d/99-terminal-relay-review.conf"): (
+            root_uid,
+            root_gid,
+            0o644,
+        ),
+        rooted(
+            f"/etc/systemd/system/user-{uid}.slice.d/terminal-relay-review.conf"
+        ): (root_uid, root_gid, 0o644),
+    }
+    if TEST_ROOT is None:
+        expected_files.update(
+            {
+                rooted("/usr/local/bin/terminal-relay-review-admin"): (0, 0, 0o755),
+                rooted("/usr/local/bin/terminal-relay-review-enroll"): (0, 0, 0o755),
+                rooted("/usr/local/bin/terminal-relay-review-gateway"): (0, 0, 0o755),
+            }
+        )
+    for path, expected in expected_files.items():
+        if not path.is_file() or path.is_symlink():
+            fail(f"required review-worker file is missing: {path.name}")
+        metadata = path.stat()
+        actual = (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode))
+        if actual != expected:
+            fail(f"review-worker file permissions are invalid: {path.name}")
+    if rooted("/etc/ssh/sshd_config.d/99-terminal-relay-review.conf").read_text(
+        encoding="utf-8"
+    ) != SSH_CONFIGURATION:
+        fail("the review SSH policy changed")
+    if rooted(
+        f"/etc/systemd/system/user-{uid}.slice.d/terminal-relay-review.conf"
+    ).read_text(encoding="utf-8") != SLICE_CONFIGURATION:
+        fail("the review resource policy changed")
+    if TEST_ROOT is None and shutil.which("tailscale") is not None:
+        fail("the review worker unexpectedly has a Tailscale client")
+
+    workspace = rooted("/workspace")
+    if not (workspace / ".terminal-relay-review-root").is_file():
+        fail("the synthetic workspace marker is unavailable")
+    expected_entries = {
+        ".terminal-relay-review-root",
+        *REPOSITORIES,
+    }
+    if {entry.name for entry in workspace.iterdir()} != expected_entries:
+        fail("the review workspace contains an unexpected top-level path")
+    for repository in REPOSITORIES:
+        destination = workspace / repository
+        if (
+            not destination.is_dir()
+            or destination.is_symlink()
+            or not (destination / ".terminal-relay-review-fixture").is_file()
+        ):
+            fail(f"synthetic repository is unavailable: {repository}")
+    for root, directories, files in os.walk(workspace):
+        for name in [*directories, *files]:
+            path = Path(root) / name
+            if path.is_symlink():
+                fail("the review workspace contains a symbolic link")
+            if name in FORBIDDEN_NAMES or name.endswith((".pem", ".p8", ".key")):
+                fail(f"the review workspace contains a forbidden file: {name}")
+            if path.is_file() and path.stat().st_size <= 1_000_000:
+                try:
+                    content = path.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
+                    continue
+                if SECRET_PATTERN.search(content):
+                    fail(f"the review workspace contains credential-like data: {name}")
+    for repository in REPOSITORIES:
+        git_configuration = workspace / repository / ".git" / "config"
+        if git_configuration.is_file() and "[remote " in git_configuration.read_text(
+            encoding="utf-8"
+        ):
+            fail(f"the synthetic repository has a configured remote: {repository}")
+
+    runtime_lines = authorized_keys_path().read_text(encoding="utf-8").splitlines()
+    if not runtime_lines:
+        fail("the runtime authorized_keys file is empty")
+    if TEST_ROOT is None:
+        root_keys = rooted("/root/.ssh/authorized_keys").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        ordinary_runtime_lines = [
+            line
+            for line in runtime_lines
+            if INVITATION_PREFIX not in line and DEVICE_PREFIX not in line
+        ]
+        if ordinary_runtime_lines != root_keys:
+            fail("the review worker contains an unexpected unrestricted SSH key")
+    print("review worker verification passed")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "command",
+        choices=(
+            "configure",
+            "seed",
+            "install-invitation",
+            "reset",
+            "revoke",
+            "verify",
+        ),
+    )
+    arguments = parser.parse_args()
+    {
+        "configure": configure,
+        "seed": seed,
+        "install-invitation": install_invitation,
+        "reset": reset,
+        "revoke": lambda: remove_review_keys(devices_only=False),
+        "verify": verify,
+    }[arguments.command]()
+
+
+if __name__ == "__main__":
+    main()

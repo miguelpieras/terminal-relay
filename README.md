@@ -215,6 +215,12 @@ authentication keys must never enter this repository.
 See [Distribution/AppStore/metadata.md](Distribution/AppStore/metadata.md) for
 the prepared listing copy and the remaining submission-only fields.
 
+Maintainers provide App Review with an isolated, synthetic worker reached
+through the production iPhone and iPad pairing flow. Its lifecycle and
+reviewer instructions are documented in
+[docs/app-review-worker.md](docs/app-review-worker.md); reusable review access
+never applies to normal user workers.
+
 ## Security and privacy
 
 Read [SECURITY.md](SECURITY.md) before reporting a vulnerability and

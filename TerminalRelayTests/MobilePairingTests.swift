@@ -35,6 +35,30 @@ final class MobilePairingTests: XCTestCase {
         )
     }
 
+    func testReviewPairingCodeAllowsAReusableReviewWindowOnlyWhenExplicit() throws {
+        let reviewPayload = makePayload(
+            expiresAt: Int64(
+                now.addingTimeInterval(30 * 24 * 60 * 60).timeIntervalSince1970
+            ),
+            invitationKind: .appReview
+        )
+
+        let code = try MobilePairingPayloadCodec.encode(reviewPayload, now: now)
+
+        XCTAssertEqual(
+            try MobilePairingPayloadCodec.decode(code, now: now),
+            reviewPayload
+        )
+        XCTAssertThrowsError(
+            try MobilePairingPayloadCodec.encode(
+                makePayload(expiresAt: reviewPayload.expiresAt),
+                now: now
+            )
+        ) { error in
+            XCTAssertEqual(error as? MobilePairingPayloadError, .invalidPayload)
+        }
+    }
+
     func testTemporaryAuthorizedKeyIsRestrictedToOneEnrollmentCommand() {
         let entry = MobilePairingService.authorizedKeyEntry(
             publicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest terminal-relay-pairing:\(pairingIdentifier)",
@@ -77,7 +101,10 @@ final class MobilePairingTests: XCTestCase {
         )
     }
 
-    private func makePayload() -> MobilePairingPayload {
+    private func makePayload(
+        expiresAt: Int64 = 1_800_000_600,
+        invitationKind: MobilePairingInvitationKind? = nil
+    ) -> MobilePairingPayload {
         MobilePairingPayload(
             version: MobilePairingPayload.currentVersion,
             workerName: "Worker 1",
@@ -87,7 +114,8 @@ final class MobilePairingTests: XCTestCase {
             hostKeyFingerprint: "SHA256:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
             temporaryPrivateKey: Data(repeating: 7, count: 32).base64EncodedString(),
             pairingToken: pairingIdentifier,
-            expiresAt: 1_800_000_600
+            expiresAt: expiresAt,
+            invitationKind: invitationKind
         )
     }
 

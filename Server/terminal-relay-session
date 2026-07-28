@@ -110,6 +110,7 @@ usage() {
 usage:
   terminal-relay-session list-projects
   terminal-relay-session status
+  terminal-relay-session resources
   terminal-relay-session update-status
   terminal-relay-session restore
   terminal-relay-session start <codex|claude> <repository> [agent arguments...]
@@ -117,6 +118,7 @@ usage:
   terminal-relay-session reattach <codex|claude> <repository> <instance>
   terminal-relay-session stop <codex|claude> <repository> <instance>
   terminal-relay-session codex-account
+  terminal-relay-session claude-account
   terminal-relay-session codex-login
   terminal-relay-session codex-reset <idempotency-key> [credit-id]
   terminal-relay-session <codex|claude> [agent arguments...]
@@ -1482,6 +1484,100 @@ list_projects() {
 
     if [[ ${#repositories[@]} -gt 0 ]]; then
         printf 'project|%s\n' "${repositories[@]}" | LC_ALL=C /usr/bin/sort
+    fi
+}
+
+system_resources() {
+    local cpu_before
+    local cpu_after
+    local cpu_total_before
+    local cpu_idle_before
+    local cpu_total_after
+    local cpu_idle_after
+    local cpu_total
+    local cpu_idle
+    local cpu_used
+    local memory_total
+    local memory_available
+    local disk_total
+    local disk_used
+
+    read_cpu_sample() {
+        /usr/bin/awk '
+            $1 == "cpu" {
+                total = 0
+                for (field = 2; field <= 9; field += 1) total += $field
+                print total, $5 + $6
+                exit
+            }
+        ' /proc/stat
+    }
+
+    cpu_before="$(read_cpu_sample)"
+    /bin/sleep 1
+    cpu_after="$(read_cpu_sample)"
+    read -r cpu_total_before cpu_idle_before <<< "$cpu_before"
+    read -r cpu_total_after cpu_idle_after <<< "$cpu_after"
+    cpu_total=$((cpu_total_after - cpu_total_before))
+    cpu_idle=$((cpu_idle_after - cpu_idle_before))
+    cpu_used=$((cpu_total - cpu_idle))
+
+    read -r memory_total memory_available < <(
+        /usr/bin/awk '
+            $1 == "MemTotal:" { total = $2 }
+            $1 == "MemAvailable:" { available = $2 }
+            END {
+                if (total > 0 && available >= 0 && available <= total) {
+                    print total, available
+                }
+            }
+        ' /proc/meminfo
+    )
+    read -r disk_total disk_used < <(
+        /bin/df -Pk / | /usr/bin/awk 'NR == 2 { print $2, $3 }'
+    )
+
+    [[ "$cpu_total" -gt 0 \
+        && "$cpu_idle" -ge 0 \
+        && "$cpu_idle" -le "$cpu_total" \
+        && "$memory_total" -gt 0 \
+        && "$memory_available" -ge 0 \
+        && "$memory_available" -le "$memory_total" \
+        && "$disk_total" -gt 0 \
+        && "$disk_used" -ge 0 \
+        && "$disk_used" -le "$disk_total" ]] || {
+        echo "Worker resource usage is unavailable." >&2
+        return 70
+    }
+
+    printf '%s\n' '__TERMINAL_RELAY_METRICS_V1__'
+    printf 'cpu|%s|%s\n' "$cpu_used" "$cpu_total"
+    printf 'memory|%s|%s\n' "$memory_total" "$memory_available"
+    printf 'disk|%s|%s\n' "$disk_total" "$disk_used"
+}
+
+claude_account() {
+    cd "${runtime_home:-${HOME:?HOME is required}}" || return 1
+    printf '%s\n' '__TERMINAL_RELAY_CLAUDE_AUTH__'
+    "$claude_path" auth status --json 2>/dev/null || true
+    printf '%s\n' '__TERMINAL_RELAY_CLAUDE_USAGE__'
+    if [[ -x /usr/bin/timeout ]]; then
+        DISABLE_AUTOUPDATER=1 /usr/bin/timeout 20s "$claude_path" \
+            -p '/usage' \
+            --output-format text \
+            --no-session-persistence \
+            --safe-mode \
+            --tools ''
+    elif [[ $test_mode -eq 1 ]]; then
+        DISABLE_AUTOUPDATER=1 "$claude_path" \
+            -p '/usage' \
+            --output-format text \
+            --no-session-persistence \
+            --safe-mode \
+            --tools ''
+    else
+        echo "The worker timeout command is unavailable." >&2
+        return 69
     fi
 }
 
@@ -3179,6 +3275,10 @@ case "$command_name" in
         [[ $# -eq 0 ]] || fail_usage "status does not accept arguments."
         status_sessions
         ;;
+    resources)
+        [[ $# -eq 0 ]] || fail_usage "resources does not accept arguments."
+        system_resources
+        ;;
     update-status)
         [[ $# -eq 0 ]] || fail_usage "update-status does not accept arguments."
         agent_update_status
@@ -3206,6 +3306,10 @@ case "$command_name" in
     codex-account)
         [[ $# -eq 0 ]] || fail_usage "codex-account does not accept arguments."
         run_codex_rpc_with_app_server_lock account
+        ;;
+    claude-account)
+        [[ $# -eq 0 ]] || fail_usage "claude-account does not accept arguments."
+        claude_account
         ;;
     codex-login)
         [[ $# -eq 0 ]] || fail_usage "codex-login does not accept arguments."

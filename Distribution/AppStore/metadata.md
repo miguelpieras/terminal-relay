@@ -50,20 +50,26 @@ by the Mac app; the code contains a short-lived SSH key restricted to
 authorizing that device key and cannot open a shell. Camera frames are
 processed only on the device.
 
-No account or worker is required for review:
+For App Review, we provide an isolated worker containing only synthetic
+repositories and dedicated, limited agent accounts. It is not connected to our
+private workers or Tailscale network. The private review pairing code is:
+
+`[PASTE CURRENT CODE FROM MAINTAINER KEYCHAIN BEFORE SUBMISSION]`
 
 1. Launch Terminal Relay on iPhone or iPad.
-2. Tap **Explore Demo** on the Projects screen.
-3. The app loads a clearly labeled, read-only workspace containing example
-   workers, projects, sessions, resource usage, and account status.
-4. On iPad, the demo opens an example Codex terminal beside the combined
-   project and terminal sidebar. On iPhone, select a project and terminal to
-   open the same example transcript full screen.
-5. Tap **Exit Demo** at any time to return to normal onboarding.
+2. On the Projects screen, choose **Scan Mac Pairing Code**.
+3. Choose **Paste Pairing Code** and paste the code above.
+4. Open `atlas` and start Codex or Claude. This is the real interactive terminal
+   and SSH/session flow, not the bundled read-only interface preview.
+5. Switch between `atlas`, `launchpad`, and `northstar`, reconnect to the active
+   terminal, stop it, and open **Workers** to inspect account and resource
+   status.
 
-The demo is bundled local data. It contains no credentials, creates no account,
-and makes no network connection. Real users connect only to workers they
-control.
+The invitation is valid through `[REVIEW EXPIRATION DATE]` for up to eight
+review devices. Review device keys can run only Terminal Relay worker commands
+and cannot request a general SSH shell or forwarding. The worker will remain
+online throughout review. Real users pair with their own private workers using
+the normal ten-minute, single-use Mac QR code.
 
 Also answer App Store Connect's export-compliance questionnaire for the bundled
 SSH and Swift Crypto implementation. Do not add

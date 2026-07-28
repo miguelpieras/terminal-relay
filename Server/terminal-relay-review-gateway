@@ -1,0 +1,134 @@
+#!/usr/bin/python3
+"""Forced-command gateway for devices enrolled on the App Review worker."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import sys
+
+
+HELPER = "/usr/local/bin/terminal-relay-session"
+WORKSPACE = "/workspace"
+REPOSITORY = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
+INSTANCE = re.compile(
+    r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+)
+CODEX_ARGUMENTS = [
+    "--model",
+    "gpt-5.6-sol",
+    "--config",
+    'model_reasoning_effort="max"',
+    "--config",
+    'tui.terminal_title=["thread-title","run-state"]',
+    "--dangerously-bypass-approvals-and-sandbox",
+]
+CLAUDE_ARGUMENTS = [
+    "--model",
+    "fable",
+    "--effort",
+    "max",
+    "--settings",
+    '{"terminalProgressBarEnabled":true}',
+    "--mcp-config",
+    '{"mcpServers":{}}',
+    "--strict-mcp-config",
+    "--dangerously-skip-permissions",
+]
+
+
+def reject(message: str) -> "NoReturn":
+    print(message, file=sys.stderr)
+    raise SystemExit(64)
+
+
+def parse_command(original: str) -> tuple[list[str], str | None]:
+    if not original or len(original.encode("utf-8")) > 16_384:
+        reject("This review key only accepts Terminal Relay commands.")
+    try:
+        tokens = shlex.split(original, posix=True)
+    except ValueError:
+        reject("The Terminal Relay command is malformed.")
+
+    working_directory = None
+    if len(tokens) >= 6 and tokens[:2] == ["cd", "--"]:
+        working_directory = tokens[2]
+        if tokens[3:5] != ["&&", "exec"]:
+            reject("The Terminal Relay working directory command is invalid.")
+        tokens = tokens[5:]
+    elif tokens[:1] == ["exec"]:
+        tokens = tokens[1:]
+
+    if not tokens or tokens[0] != HELPER:
+        reject("This review key cannot open a general-purpose shell.")
+    return tokens[1:], working_directory
+
+
+def validate_command(arguments: list[str], working_directory: str | None) -> list[str]:
+    if not arguments:
+        reject("The Terminal Relay command is incomplete.")
+    action = arguments[0]
+
+    if action in {
+        "list-projects",
+        "status",
+        "resources",
+        "update-status",
+        "codex-account",
+        "claude-account",
+    }:
+        if len(arguments) != 1 or working_directory is not None:
+            reject("The Terminal Relay command has unexpected arguments.")
+        return arguments
+
+    if action == "start":
+        if len(arguments) < 3:
+            reject("The Terminal Relay start command is incomplete.")
+        tool, repository = arguments[1:3]
+        expected_arguments = CODEX_ARGUMENTS if tool == "codex" else CLAUDE_ARGUMENTS
+        if tool not in {"codex", "claude"} or arguments[3:] != expected_arguments:
+            reject("The Terminal Relay review launch settings are not allowed.")
+        if not REPOSITORY.fullmatch(repository):
+            reject("The Terminal Relay repository name is invalid.")
+        expected_directory = f"{WORKSPACE}/{repository}"
+        if working_directory != expected_directory:
+            reject("The Terminal Relay working directory is invalid.")
+        if not os.path.isdir(expected_directory) or os.path.islink(expected_directory):
+            reject("The Terminal Relay review repository is unavailable.")
+        os.chdir(expected_directory)
+        return arguments
+
+    if action in {"reattach", "stop"}:
+        if len(arguments) != 4:
+            reject(f"The Terminal Relay {action} command is incomplete.")
+        tool, repository, instance = arguments[1:]
+        if tool not in {"codex", "claude"}:
+            reject("The Terminal Relay agent kind is invalid.")
+        if not REPOSITORY.fullmatch(repository) or not INSTANCE.fullmatch(instance):
+            reject("The Terminal Relay session identity is invalid.")
+        if working_directory is not None:
+            reject("The Terminal Relay session command has an unexpected directory.")
+        return arguments
+
+    reject("This review key cannot run that command.")
+
+
+def main() -> None:
+    arguments, working_directory = parse_command(
+        os.environ.get("SSH_ORIGINAL_COMMAND", "")
+    )
+    validated = validate_command(arguments, working_directory)
+    command = [HELPER, *validated]
+    if (
+        os.environ.get("TERMINAL_RELAY_REVIEW_GATEWAY_DRY_RUN") == "1"
+        and os.path.realpath(__file__) != "/usr/local/bin/terminal-relay-review-gateway"
+    ):
+        print(json.dumps(command))
+        return
+    os.execv(HELPER, command)
+
+
+if __name__ == "__main__":
+    main()

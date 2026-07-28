@@ -572,18 +572,21 @@ final class WorkerSessionModel: ObservableObject {
             profile: profile,
             workerClient: workerClient
         )
-        async let resourcesResult = commandResult(
+        async let resourcesResult = compatibleCommandResult(
             WorkerRemoteCommand.resources,
+            legacyCommand: WorkerRemoteCommand.legacyResources,
             profile: profile,
             workerClient: workerClient
         )
-        async let codexResult = commandResult(
+        async let codexResult = compatibleCommandResult(
             WorkerRemoteCommand.codexAccount,
+            legacyCommand: WorkerRemoteCommand.legacyCodexAccount,
             profile: profile,
             workerClient: workerClient
         )
-        async let claudeResult = commandResult(
+        async let claudeResult = compatibleCommandResult(
             WorkerRemoteCommand.claudeAccount,
+            legacyCommand: WorkerRemoteCommand.legacyClaudeAccount,
             profile: profile,
             workerClient: workerClient
         )
@@ -673,11 +676,31 @@ final class WorkerSessionModel: ObservableObject {
         do {
             return try WorkerOverviewParser.codexAccount(initialResult.get())
         } catch {
-            let retryData = try await workerClient.execute(
+            let retryResult = await compatibleCommandResult(
                 WorkerRemoteCommand.codexAccount,
-                on: profile
+                legacyCommand: WorkerRemoteCommand.legacyCodexAccount,
+                profile: profile,
+                workerClient: workerClient
             )
+            let retryData = try retryResult.get()
             return try WorkerOverviewParser.codexAccount(retryData)
+        }
+    }
+
+    private static func compatibleCommandResult(
+        _ command: String,
+        legacyCommand: String,
+        profile: WorkerProfile,
+        workerClient: SSHWorkerClient
+    ) async -> Result<Data, Error> {
+        do {
+            return .success(try await workerClient.execute(command, on: profile))
+        } catch {
+            return await commandResult(
+                legacyCommand,
+                profile: profile,
+                workerClient: workerClient
+            )
         }
     }
 
