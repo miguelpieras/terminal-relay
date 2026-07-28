@@ -458,6 +458,25 @@ def send_json(connection, value):
     connection.sendall(header + payload)
 
 
+def saved_thread_name(thread_id):
+    name = None
+    index_path = os.path.join(
+        os.path.expanduser("~"), ".codex", "session_index.jsonl"
+    )
+    try:
+        with open(index_path, encoding="utf-8") as records:
+            for line in records:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("id") == thread_id:
+                    name = record.get("thread_name")
+    except FileNotFoundError:
+        pass
+    return name
+
+
 def serve_connection(connection):
     request = b""
     while b"\r\n\r\n" not in request:
@@ -490,11 +509,70 @@ def serve_connection(connection):
         if request_id is None:
             continue
         method = request_value.get("method")
+        notifications = []
         if method == "account/read":
             result = {"account": {"type": "chatgpt"}}
+        elif method == "thread/read":
+            thread_id = request_value.get("params", {}).get("threadId")
+            result = {
+                "thread": {
+                    "id": thread_id,
+                    "name": saved_thread_name(thread_id),
+                }
+            }
+        elif method == "thread/start":
+            result = {
+                "thread": {
+                    "id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+                }
+            }
+        elif method == "turn/start":
+            generated_thread_id = request_value.get("params", {}).get("threadId")
+            turn_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+            result = {"turn": {"id": turn_id, "status": "inProgress"}}
+            notifications = [
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": generated_thread_id,
+                        "turnId": turn_id,
+                        "item": {
+                            "type": "agentMessage",
+                            "text": '{"title":"Generated Codex title"}',
+                        },
+                    },
+                },
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": generated_thread_id,
+                        "turn": {"id": turn_id, "status": "completed"},
+                    },
+                },
+            ]
+        elif method == "thread/name/set":
+            params = request_value.get("params", {})
+            index_path = os.path.join(
+                os.path.expanduser("~"), ".codex", "session_index.jsonl"
+            )
+            os.makedirs(os.path.dirname(index_path), exist_ok=True)
+            with open(index_path, "a", encoding="utf-8") as index:
+                index.write(
+                    json.dumps(
+                        {
+                            "id": params.get("threadId"),
+                            "thread_name": params.get("name"),
+                        },
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
+            result = {}
         else:
             result = {}
         send_json(connection, {"id": request_id, "result": result})
+        for notification in notifications:
+            send_json(connection, notification)
 
 
 if sys.argv[1:3] != ["app-server", "--listen"] or len(sys.argv) != 4:
@@ -695,6 +773,14 @@ assert_equal \
     "$(encode_title "First Codex prompt")" \
     "$(title_hex_from_line "$codex_fallback_title_status")" \
     "Codex database title fallback"
+printf '%s\n' \
+    '{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","thread_name":"Generated Codex title"}' \
+    > "$test_home/.codex/session_index.jsonl"
+codex_persisted_title_status="$(wait_for_session codex alpha 0)"
+assert_equal \
+    "$(encode_title "Generated Codex title")" \
+    "$(title_hex_from_line "$codex_persisted_title_status")" \
+    "Codex persisted thread name"
 "$tmux_path" -f /dev/null -L "$tmux_socket" \
     select-pane -t "terminal-relay-codex-$first_instance" \
     -T "Renamed live thread | Working"
@@ -1006,6 +1092,28 @@ if ! /bin/bash "$helper" codex-account >/dev/null; then
     /bin/cat "$codex_app_server_log" >&2
     fail "initial Codex app-server launch did not become ready"
 fi
+/bin/rm -f -- "$test_home/.codex/session_index.jsonl"
+TERMINAL_RELAY_TEST_CODEX_TITLE_GENERATION=1 \
+    /bin/bash "$helper" __generate-codex-titles "$codex_thread_id"
+generated_codex_title="$("$python_path" - "$test_home/.codex/session_index.jsonl" \
+    "$codex_thread_id" <<'PYTHON_GENERATED_CODEX_TITLE'
+import json
+import sys
+
+index_path, thread_id = sys.argv[1:]
+title = ""
+with open(index_path, encoding="utf-8") as records:
+    for line in records:
+        record = json.loads(line)
+        if record.get("id") == thread_id:
+            title = record.get("thread_name", "")
+print(title)
+PYTHON_GENERATED_CODEX_TITLE
+)"
+assert_equal \
+    "Generated Codex title" \
+    "$generated_codex_title" \
+    "Codex generated title persistence"
 assert_equal \
     "1" \
     "$(/usr/bin/awk -F'|' '$1 == "launch" { count++ } END { print count + 0 }' "$codex_app_server_log")" \

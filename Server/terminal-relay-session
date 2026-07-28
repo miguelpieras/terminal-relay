@@ -74,6 +74,7 @@ if [[ $test_mode -eq 1 ]]; then
     signal_path="${TERMINAL_RELAY_TEST_SIGNAL_PATH:-}"
     boot_id_path="${TERMINAL_RELAY_TEST_BOOT_ID_PATH:-$default_boot_id_path}"
     codex_shared_account_enabled="${TERMINAL_RELAY_TEST_CODEX_SHARED_ACCOUNT:-0}"
+    codex_title_generation_enabled="${TERMINAL_RELAY_TEST_CODEX_TITLE_GENERATION:-0}"
     codex_app_server_socket="${TERMINAL_RELAY_TEST_CODEX_APP_SERVER_SOCKET:-$runtime_directory/codex.sock}"
     agent_update_status_path="${TERMINAL_RELAY_TEST_AGENT_UPDATE_STATUS_PATH:-$default_agent_update_status_path}"
 else
@@ -100,10 +101,12 @@ else
     signal_path=""
     boot_id_path="$default_boot_id_path"
     codex_shared_account_enabled=1
+    codex_title_generation_enabled=1
     codex_app_server_socket="$runtime_directory/codex.sock"
     agent_update_status_path="$default_agent_update_status_path"
 fi
 readonly codex_app_server_session="terminal-relay-account-server"
+readonly codex_title_generator_session="terminal-relay-title-generator"
 
 usage() {
     cat >&2 <<'EOF'
@@ -199,11 +202,14 @@ import base64
 import hashlib
 import json
 import os
+import re
 import signal
 import socket
+import sqlite3
 import struct
 import sys
 import time
+import uuid
 
 socket_path, mode, *arguments = sys.argv[1:]
 maximum_frame_bytes = 8 * 1024 * 1024
@@ -355,12 +361,249 @@ def initialize(client):
     client.send_json({"method": "initialized", "params": {}})
 
 
-def wait_for_response(client, request_id, timeout):
+def wait_for_response(client, request_id, timeout, notifications=None):
     deadline = time.monotonic() + timeout
     while True:
         value = client.receive_json(deadline)
         if value.get("id") == request_id:
             return value
+        if notifications is not None:
+            notifications.append(value)
+
+
+def result_from(response):
+    if not isinstance(response, dict) or "error" in response:
+        raise RuntimeError("Codex app-server request failed.")
+    result = response.get("result")
+    if not isinstance(result, dict):
+        raise RuntimeError("Codex app-server returned an invalid result.")
+    return result
+
+
+def thread_prompt(thread_id):
+    database = os.path.join(os.path.expanduser("~"), ".codex", "state_5.sqlite")
+    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+    try:
+        columns = {
+            row[1] for row in connection.execute("pragma table_info(threads)")
+        }
+        prompt_columns = [
+            column
+            for column in ("preview", "title", "first_user_message")
+            if column in columns
+        ]
+        if not prompt_columns:
+            return "", os.path.expanduser("~")
+        selected = prompt_columns + (["cwd"] if "cwd" in columns else [])
+        row = connection.execute(
+            f"select {', '.join(selected)} from threads where id = ? limit 1",
+            (thread_id,),
+        ).fetchone()
+        if not row:
+            return "", os.path.expanduser("~")
+        values = dict(zip(selected, row))
+        prompt = next(
+            (
+                values[column].strip()
+                for column in prompt_columns
+                if isinstance(values.get(column), str) and values[column].strip()
+            ),
+            "",
+        )
+        cwd = values.get("cwd")
+        if not isinstance(cwd, str) or not os.path.isabs(cwd) or not os.path.isdir(cwd):
+            cwd = os.path.expanduser("~")
+        return prompt[:2000], cwd
+    finally:
+        connection.close()
+
+
+def normalized_generated_title(text):
+    if not isinstance(text, str):
+        return ""
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(value, dict):
+        return ""
+    title = value.get("title")
+    if not isinstance(title, str):
+        return ""
+    title = re.sub(r"\s+", " ", title).strip().strip("\"'")
+    title = title.rstrip(".!?")
+    if not title or len(title) > 36:
+        return ""
+    return title
+
+
+def generate_titles(client, thread_ids):
+    request_id = 10
+    for thread_id in thread_ids:
+        try:
+            canonical_id = str(uuid.UUID(thread_id))
+            if canonical_id != thread_id.lower():
+                continue
+
+            client.send_json(
+                {
+                    "method": "thread/read",
+                    "id": request_id,
+                    "params": {"threadId": canonical_id, "includeTurns": False},
+                }
+            )
+            original = result_from(wait_for_response(client, request_id, 15))
+            request_id += 1
+            thread = original.get("thread")
+            if not isinstance(thread, dict):
+                continue
+            current_name = thread.get("name")
+            if isinstance(current_name, str) and current_name.strip():
+                continue
+
+            prompt, cwd = thread_prompt(canonical_id)
+            if not prompt:
+                continue
+            instruction = (
+                "Create a concise UI title for this coding task. Return only JSON "
+                "matching the provided schema. Use at most 36 characters and about "
+                "five words. Start with an imperative verb, preserve ticket IDs, "
+                "use the user's language, and omit ending punctuation.\n\n"
+                f"User prompt:\n{prompt}"
+            )
+            client.send_json(
+                {
+                    "method": "thread/start",
+                    "id": request_id,
+                    "params": {
+                        "model": "gpt-5.6-luna",
+                        "cwd": cwd,
+                        "approvalPolicy": "never",
+                        "sandbox": "read-only",
+                        "ephemeral": True,
+                        "threadSource": "system",
+                        "config": {
+                            "model_reasoning_effort": "low",
+                            "features.enable_fanout": False,
+                            "features.hooks": False,
+                            "features.multi_agent": False,
+                            "features.multi_agent_v2": False,
+                            "features.plugins": False,
+                            "features.tool_suggest": False,
+                            "web_search": "disabled",
+                        },
+                    },
+                }
+            )
+            started = result_from(wait_for_response(client, request_id, 15))
+            request_id += 1
+            generated_thread = started.get("thread")
+            if not isinstance(generated_thread, dict):
+                continue
+            generated_thread_id = generated_thread.get("id")
+            if not isinstance(generated_thread_id, str):
+                continue
+
+            pending = []
+            client.send_json(
+                {
+                    "method": "turn/start",
+                    "id": request_id,
+                    "params": {
+                        "threadId": generated_thread_id,
+                        "clientUserMessageId": str(uuid.uuid4()),
+                        "input": [{"type": "text", "text": instruction}],
+                        "outputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "title": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 36,
+                                }
+                            },
+                            "required": ["title"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            )
+            turn_result = result_from(
+                wait_for_response(client, request_id, 15, pending)
+            )
+            request_id += 1
+            turn = turn_result.get("turn")
+            turn_id = turn.get("id") if isinstance(turn, dict) else None
+            if not isinstance(turn_id, str):
+                continue
+
+            message_text = ""
+            completed = False
+            deadline = time.monotonic() + 45
+            while not completed:
+                value = pending.pop(0) if pending else client.receive_json(deadline)
+                method = value.get("method")
+                params = value.get("params")
+                if not isinstance(params, dict):
+                    continue
+                notification_thread_id = params.get("threadId")
+                if (
+                    isinstance(notification_thread_id, str)
+                    and notification_thread_id != generated_thread_id
+                ):
+                    continue
+                if method == "item/completed":
+                    item = params.get("item")
+                    if (
+                        isinstance(item, dict)
+                        and item.get("type") == "agentMessage"
+                        and isinstance(item.get("text"), str)
+                    ):
+                        message_text = item["text"]
+                elif method == "turn/completed":
+                    completed_turn = params.get("turn")
+                    if not isinstance(completed_turn, dict):
+                        continue
+                    if completed_turn.get("id") != turn_id:
+                        continue
+                    completed = completed_turn.get("status") == "completed"
+                    if not completed:
+                        break
+
+            title = normalized_generated_title(message_text) if completed else ""
+            if not title:
+                continue
+            client.send_json(
+                {
+                    "method": "thread/name/set",
+                    "id": request_id,
+                    "params": {"threadId": canonical_id, "name": title},
+                }
+            )
+            result_from(wait_for_response(client, request_id, 15))
+            request_id += 1
+
+            client.send_json(
+                {
+                    "method": "thread/unsubscribe",
+                    "id": request_id,
+                    "params": {"threadId": generated_thread_id},
+                }
+            )
+            wait_for_response(client, request_id, 5)
+            request_id += 1
+        except (
+            AttributeError,
+            EOFError,
+            OSError,
+            RuntimeError,
+            TimeoutError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            sqlite3.Error,
+        ):
+            continue
 
 
 def account_is_available(response):
@@ -482,6 +725,8 @@ try:
                 break
             print("Codex sign-in was not completed.", file=sys.stderr)
             raise SystemExit(77)
+    elif mode == "generate-titles":
+        generate_titles(client, arguments)
     else:
         raise RuntimeError("Unsupported Codex account operation.")
 except InterruptedError:
@@ -672,6 +917,45 @@ run_codex_rpc_with_app_server_lock() {
     run_codex_rpc "$mode" "$@" || status=$?
     unlock_codex_app_server
     return "$status"
+}
+
+schedule_codex_title_generation() {
+    local launch_command
+    local thread_id
+
+    [[ "$codex_title_generation_enabled" == "1" && $# -gt 0 ]] || return 0
+    if tmux_command has-session -t "$codex_title_generator_session" 2>/dev/null; then
+        return 0
+    fi
+
+    printf -v launch_command 'exec %q __generate-codex-titles' "$helper_path"
+    for thread_id in "$@"; do
+        is_valid_instance "$thread_id" || continue
+        printf -v launch_command '%s %q' "$launch_command" "$thread_id"
+    done
+    tmux_command new-session -d -s "$codex_title_generator_session" \
+        -c "${runtime_home:-${HOME:-/}}" "$launch_command" >/dev/null 2>&1 || true
+}
+
+generate_codex_titles() {
+    local status=0
+    local thread_id
+    local -a thread_ids=()
+
+    [[ "$codex_title_generation_enabled" == "1" ]] || return 0
+    for thread_id in "$@"; do
+        is_valid_instance "$thread_id" || continue
+        thread_ids+=("$thread_id")
+    done
+    [[ ${#thread_ids[@]} -gt 0 ]] || return 0
+    lock_codex_app_server || return $?
+    ensure_codex_app_server_locked || {
+        status=$?
+        unlock_codex_app_server
+        return "$status"
+    }
+    unlock_codex_app_server
+    run_codex_rpc generate-titles "${thread_ids[@]}"
 }
 
 pause_after_codex_reservation_for_test() {
@@ -1635,6 +1919,7 @@ resolve_session_title() {
     local instance="$2"
     local pane_title="$3"
     local home_directory="${runtime_home:-${HOME:-}}"
+    local fallback_title
 
     if [[ -x "$default_python_path" ]]; then
         "$default_python_path" - "$tool" "$instance" "$pane_title" "$home_directory" <<'PYTHON_TITLE'
@@ -1647,6 +1932,7 @@ import sys
 
 tool, instance, pane_title, home = sys.argv[1:]
 title = ""
+needs_generation = False
 if tool == "codex":
     display_title = re.sub(
         r"\s+\|\s+(Ready|Working|Thinking|Waiting|Starting)\s*$",
@@ -1658,27 +1944,60 @@ if tool == "codex":
         display_title.lower(),
     )
     if match:
+        thread_id = match.group(0)
+        index = os.path.join(home, ".codex", "session_index.jsonl")
+        persisted_name = ""
+        try:
+            with open(index, encoding="utf-8") as records:
+                for line in records:
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if record.get("id") != thread_id:
+                        continue
+                    name = record.get("thread_name")
+                    if isinstance(name, str) and name.strip():
+                        persisted_name = name
+        except OSError:
+            pass
+
+        database_name = ""
+        database_title = ""
         database = os.path.join(home, ".codex", "state_5.sqlite")
         try:
             connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
             columns = {
                 row[1] for row in connection.execute("pragma table_info(threads)")
             }
-            if "name" in columns and "title" in columns:
-                title_expression = "coalesce(nullif(trim(name), ''), title)"
-            elif "name" in columns:
-                title_expression = "name"
-            else:
-                title_expression = "title"
+            selected = [
+                column
+                for column in ("name", "title", "preview", "first_user_message")
+                if column in columns
+            ]
             row = connection.execute(
-                f"select {title_expression} from threads where id = ? limit 1",
-                (match.group(0),),
-            ).fetchone()
+                f"select {', '.join(selected)} from threads where id = ? limit 1",
+                (thread_id,),
+            ).fetchone() if selected else None
             connection.close()
-            if row and isinstance(row[0], str):
-                title = row[0]
+            if row:
+                values = dict(zip(selected, row))
+                name = values.get("name")
+                if isinstance(name, str) and name.strip():
+                    database_name = name
+                database_title = next(
+                    (
+                        values[column]
+                        for column in ("title", "preview", "first_user_message")
+                        if isinstance(values.get(column), str)
+                        and values[column].strip()
+                    ),
+                    "",
+                )
         except (OSError, sqlite3.Error):
             pass
+        title = persisted_name or database_name or database_title
+        needs_generation = bool(database_title and not (persisted_name or database_name))
     else:
         title = display_title
 elif tool == "claude":
@@ -1711,10 +2030,14 @@ elif tool == "claude":
 title = "".join(character if character.isprintable() else " " for character in title)
 title = re.sub(r"\s+", " ", title).strip()
 print(title[:200])
+print("1" if needs_generation else "0")
 PYTHON_TITLE
         return
     fi
-    printf '%s\n' "$pane_title" | /usr/bin/tr '\r\n' '  ' | /usr/bin/cut -c1-200
+    fallback_title="$(printf '%s\n' "$pane_title" \
+        | /usr/bin/tr '\r\n' '  ' \
+        | /usr/bin/cut -c1-200)"
+    printf '%s\n0\n' "$fallback_title"
 }
 
 session_display_fields() {
@@ -1723,11 +2046,14 @@ session_display_fields() {
     local session_name
     local display
     local pane_title
+    local resolved_title_fields
+    local resolved_title
 
     session_activity=0
     session_title_hex=""
     session_working=""
     session_thread_id=""
+    session_needs_title_generation=0
     session_name="$(session_name_for "$tool" "$instance")"
     display="$(tmux_command display-message -p -t "$session_name" \
         '#{window_activity}|#{pane_title}' 2>/dev/null)" || return 1
@@ -1748,7 +2074,12 @@ session_display_fields() {
     else
         session_thread_id="$instance"
     fi
-    session_title_hex="$(encode_argument_hex "$(resolve_session_title "$tool" "$instance" "$pane_title")")"
+    resolved_title_fields="$(resolve_session_title "$tool" "$instance" "$pane_title")"
+    resolved_title="${resolved_title_fields%%$'\n'*}"
+    if [[ "$resolved_title_fields" == *$'\n1' ]]; then
+        session_needs_title_generation=1
+    fi
+    session_title_hex="$(encode_argument_hex "$resolved_title")"
 }
 
 status_sessions() {
@@ -1761,6 +2092,7 @@ status_sessions() {
     local boot_id
     local intent_status
     local -a records=()
+    local -a title_generation_thread_ids=()
 
     [[ -x "$tmux_path" ]] || {
         echo "Required tmux executable is unavailable: $tmux_path" >&2
@@ -1822,6 +2154,11 @@ status_sessions() {
             session_title_hex=""
             session_working=""
             session_thread_id=""
+            session_needs_title_generation=0
+        fi
+        if [[ "$session_needs_title_generation" == "1" \
+            && -n "$session_thread_id" ]]; then
+            title_generation_thread_ids+=("$session_thread_id")
         fi
         records+=("session|$tool|$repository|$attached_client_count|$instance|$session_activity|$session_title_hex|$session_working|$session_thread_id")
     done
@@ -1830,6 +2167,9 @@ status_sessions() {
     printf '%s\n' "$protocol_marker"
     if [[ ${#records[@]} -gt 0 ]]; then
         printf '%s\n' "${records[@]}" | LC_ALL=C /usr/bin/sort
+    fi
+    if [[ ${#title_generation_thread_ids[@]} -gt 0 ]]; then
+        schedule_codex_title_generation "${title_generation_thread_ids[@]}"
     fi
 }
 
@@ -3339,6 +3679,10 @@ case "$command_name" in
     __schedule-codex-app-server-restart)
         [[ $# -eq 0 ]] || fail_usage "Invalid internal Codex restart request."
         schedule_codex_app_server_restart
+        ;;
+    __generate-codex-titles)
+        [[ $# -ge 1 ]] || fail_usage "Invalid internal Codex title request."
+        generate_codex_titles "$@"
         ;;
     *) fail_usage "Unknown command: $command_name" ;;
 esac
