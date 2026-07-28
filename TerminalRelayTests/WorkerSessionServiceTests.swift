@@ -446,6 +446,183 @@ final class WorkerSessionServiceTests: XCTestCase {
         XCTAssertEqual(service.error(for: worker.id), "The worker could not start this agent.")
     }
 
+    func testThreadCatalogPaginatesDeduplicatesMergesLiveStateAndKeepsLastGoodValue() async {
+        let worker = makeWorker()
+        let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let otherThreadID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        let instanceID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        let recorder = WorkerSessionCommandRecorder(
+            results: [
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data(
+                        """
+                        \(WorkerSessionProtocol.marker)
+                        session|codex|terminal-relay|1|\(instanceID)|30|4c697665|1|\(threadID)
+                        """.utf8
+                    ),
+                    standardError: Data()
+                ),
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data("\(WorkerUpdateStatusProtocol.marker)\n".utf8),
+                    standardError: Data()
+                ),
+                threadResult(
+                    """
+                    {"threads":[{"provider":"codex","threadID":"\(threadID)","title":"Older","updatedAt":10,"archived":false,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":"page-2"}
+                    """
+                ),
+                threadResult(
+                    """
+                    {"threads":[{"provider":"codex","threadID":"\(threadID)","title":"Newer","updatedAt":20,"archived":false,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}},{"provider":"codex","threadID":"\(otherThreadID)","title":"Other","updatedAt":15,"archived":false,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":null}
+                    """
+                ),
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data("\(WorkerSessionProtocol.marker)\n".utf8),
+                    standardError: Data()
+                ),
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data("\(WorkerUpdateStatusProtocol.marker)\n".utf8),
+                    standardError: Data()
+                ),
+                WorkerSessionCommandResult(
+                    exitCode: 64,
+                    standardOutput: Data(),
+                    standardError: Data("unsupported command".utf8)
+                )
+            ]
+        )
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+
+        _ = await service.refresh(worker: worker)
+        let response = await service.loadThreads(
+            repositoryName: "terminal-relay",
+            archived: false,
+            on: worker
+        )
+
+        XCTAssertEqual(response?.threads.map(\.threadID), [threadID, otherThreadID])
+        XCTAssertEqual(response?.threads.first?.title, "Live")
+        XCTAssertEqual(response?.threads.first?.activeInstanceToken, instanceID)
+        XCTAssertTrue(response?.threads.first?.reportedWorking == true)
+        XCTAssertEqual(
+            recorder.configurations.suffix(2),
+            [
+                SSHCommandBuilder.workerThreadListConfiguration(
+                    for: worker,
+                    repositoryName: "terminal-relay",
+                    archived: false
+                ),
+                SSHCommandBuilder.workerThreadListConfiguration(
+                    for: worker,
+                    repositoryName: "terminal-relay",
+                    archived: false,
+                    cursor: "page-2"
+                )
+            ]
+        )
+
+        _ = await service.refresh(worker: worker)
+        XCTAssertNil(
+            service.threads(
+                repositoryName: "terminal-relay",
+                archived: false,
+                on: worker
+            ).first?.activeInstanceToken
+        )
+        XCTAssertEqual(
+            service.threads(
+                repositoryName: "terminal-relay",
+                archived: false,
+                on: worker
+            ).first?.capabilities,
+            .dormantCodex
+        )
+        let dormantThreads = service.threads(
+            repositoryName: "terminal-relay",
+            archived: false,
+            on: worker
+        )
+
+        let failed = await service.loadThreads(
+            repositoryName: "terminal-relay",
+            archived: false,
+            on: worker
+        )
+        XCTAssertNil(failed)
+        XCTAssertEqual(
+            service.threads(
+                repositoryName: "terminal-relay",
+                archived: false,
+                on: worker
+            ),
+            dormantThreads
+        )
+    }
+
+    func testResumeThreadRequiresAndStoresTheExactProviderThreadID() async {
+        let worker = makeWorker()
+        let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let instanceID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        let recorder = WorkerSessionCommandRecorder(
+            results: [
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data(
+                        """
+                        \(WorkerSessionProtocol.marker)
+                        session|codex|terminal-relay|0|\(instanceID)|200||0|\(threadID)
+                        """.utf8
+                    ),
+                    standardError: Data()
+                ),
+                threadResult(
+                    """
+                    {"threads":[{"provider":"codex","threadID":"\(threadID)","title":"Exact thread","updatedAt":200,"archived":false,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":null}
+                    """
+                )
+            ]
+        )
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+
+        let snapshot = await service.resumeThread(
+            repositoryName: "terminal-relay",
+            threadID: threadID,
+            launchDefaults: .standard,
+            on: worker
+        )
+
+        XCTAssertEqual(snapshot?.threadID, threadID)
+        XCTAssertEqual(snapshot?.instanceToken, instanceID)
+        XCTAssertEqual(service.response(for: worker.id)?.sessions, [snapshot].compactMap { $0 })
+        XCTAssertEqual(
+            recorder.configurations.first,
+            SSHCommandBuilder.workerThreadResumeConfiguration(
+                for: worker,
+                repositoryName: "terminal-relay",
+                threadID: threadID,
+                launchDefaults: .standard
+            )
+        )
+    }
+
+    private func threadResult(_ json: String) -> WorkerSessionCommandResult {
+        WorkerSessionCommandResult(
+            exitCode: 0,
+            standardOutput: Data(
+                "\(WorkerThreadProtocol.marker)\n\(json)\n".utf8
+            ),
+            standardError: Data()
+        )
+    }
+
     private func makeWorker() -> ServerProfile {
         ServerProfile(
             name: "Worker 1",

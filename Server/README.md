@@ -1,10 +1,11 @@
 # Dedicated worker helper
 
 `terminal-relay-session` is the root-owned `/usr/local/bin/terminal-relay-session`
-entry point used by Terminal Relay clients. The worker needs Bash, `flock`,
-`/usr/bin/python3` with Linux pidfd support, and tmux, plus Codex and Claude at
-their standard `/usr/bin` paths. Projects are immediate directories below
-`/workspace`.
+entry point used by Terminal Relay clients. `terminal-relay-mcp` is the
+root-owned `/usr/local/bin/terminal-relay-mcp` stdio MCP exposed inside managed
+Codex and Claude terminals. The worker needs Bash, `flock`, `/usr/bin/python3`
+with Linux pidfd support, and tmux, plus Codex and Claude at their standard
+`/usr/bin` paths. Projects are immediate directories below `/workspace`.
 
 ## Standardized fleet lifecycle
 
@@ -27,11 +28,12 @@ workers are discovered automatically by Prometheus. Worker-specific addresses,
 host keys, Tailscale identities, UUIDs, provider credentials, project checkouts,
 and repository deploy keys remain local and unique.
 
-`manage-worker.sh verify` also compares the deployed session helper with the
-current checkout, runs Codex's required bubblewrap user/network namespace probe,
-schedules or completes a shared app-server rotation after terminals have
-drained, and rejects a worker whose restart remains pending or whose live
-app-server lacks the managed safe `PATH`.
+`manage-worker.sh verify` also compares the deployed session helper and MCP
+digests with the current checkout, checks their root ownership and mode, runs
+Codex's required bubblewrap user/network namespace probe, schedules or
+completes a shared app-server rotation after terminals have drained, and
+rejects a worker whose restart remains pending or whose live app-server lacks
+the managed safe `PATH`.
 
 The shared operator **public** key and its fingerprint are intentionally the
 same on every worker. Private machine and project identities must never be
@@ -74,10 +76,10 @@ account, managed path, or non-empty `/workspace`. It then:
 - installs the explicit OS dependencies, the current Codex standalone release,
   and Claude from its signed latest apt channel, exposing `/usr/bin/codex` and
   `/usr/bin/claude` without using npm;
-- installs this helper as root-owned mode `0755`, installs the root-owned
-  `terminal-relay-session-restore@.service` template, enables its instance for
-  `terminal-relay`, and installs the worker-wide guidance as the unprivileged
-  account;
+- installs the session helper and stdio MCP as root-owned mode `0755`, installs
+  the root-owned `terminal-relay-session-restore@.service` template, enables its
+  instance for `terminal-relay`, and installs the worker-wide guidance as the
+  unprivileged account;
 - installs and enables the root-owned `terminal-relay-agent-update.timer`,
   which updates only Claude Code and Codex after boot and four times daily.
 
@@ -91,9 +93,9 @@ Replaying bootstrap reuses the stable UUID and updates one app profile; it does
 not duplicate the worker or replace valid credentials.
 
 The managed server surface is `/etc/terminal-relay`, `/home/terminal-relay`,
-`/workspace`, the two agent executable paths, this helper, its systemd restore
-unit, the automatic updater and timer, and the guidance files beneath the
-worker's home directory. A changed managed file gets a sibling
+`/workspace`, the two agent executable paths, the session helper and MCP, the
+systemd restore unit, the automatic updater and timer, and the guidance files
+beneath the worker's home directory. A changed managed file gets a sibling
 `.backup.<UTC-timestamp>` copy (with a numeric suffix when needed), and an
 install failure restores files changed during that run. The UUID and installer
 marker intentionally remain after a partial failure. To recover from an
@@ -138,8 +140,8 @@ repository details, credentials, host data, or terminal contents.
 
 ## Install or update the session runtime
 
-From the repository root, install the helper and restore service with the
-application SSH target and an optional privileged SSH target:
+From the repository root, install the session helper, MCP, and restore service
+with the application SSH target and an optional privileged SSH target:
 
 ```bash
 ./Scripts/install-worker-session-helper.sh \
@@ -155,17 +157,20 @@ write. It then uses either the root account or non-interactive `sudo`. The full
 inspect, backup, stage, atomic rename, daemon reload, unit verification, service
 enablement, and automatic-restore path holds the root-owned
 `/run/lock/terminal-relay-session-helper.lock`. Differing helper and unit files
-are retained as timestamped backups. A failed install restores both files and
-the prior service enabled/active state. The printed rollback takes the same lock,
-rechecks worker identity, refuses symlinks, and requires both installed SHA-256
-digests and inode states to still match this deployment, so it cannot overwrite
-or delete a later deployment. Replacing the helper also schedules the shared
-Codex app-server to restart after active Codex terminals drain.
+are retained as timestamped backups, while the MCP is staged, atomically renamed,
+and verified in place. A failed install restores the helper, unit, and prior
+service enabled/active state. The printed rollback takes the same lock, rechecks
+worker identity, refuses symlinks, and requires installed helper and unit
+SHA-256 digests and inode states to still match this deployment, so it cannot
+overwrite or delete a later deployment. Replacing the helper or MCP also
+schedules the shared Codex app-server to restart after active Codex terminals
+drain.
 
 Run the isolated local helper coverage before installation:
 
 ```bash
 ./Server/Tests/terminal-relay-session-tests.sh
+./Server/Tests/terminal-relay-mcp-tests.sh
 ```
 
 The test owns a unique tmux socket label, temporary workspace, state directory,
@@ -173,7 +178,9 @@ fake boot ID, stub agents, a real `flock(2)` adapter, and an isolated
 process-identity signal adapter. It covers concurrent starts, multi-client
 reattach, stale instance rejection, exact Stop, normal exit, same-UUID Codex and
 Claude recovery, concurrent restore, corrupt state, same-boot death, and actual
-agent-lock release. Its cleanup targets only those private resources.
+agent-lock release. The MCP suite covers its handshake, seven-tool allowlist,
+annotations, helper delegation, framing, input/output/time bounds, and error
+redaction. Cleanup targets only private temporary resources.
 
 ## Version 1 command contract
 
@@ -194,17 +201,29 @@ terminal-relay-session start <codex|claude> <repository> [agent arguments...]
 terminal-relay-session attach <codex|claude> <repository> [agent arguments...]
 terminal-relay-session reattach <codex|claude> <repository> <instance-uuid>
 terminal-relay-session stop <codex|claude> <repository> <instance-uuid>
+terminal-relay-session threads <repository> <active|archived> [cursor]
+terminal-relay-session thread-read <repository> <thread-uuid>
+terminal-relay-session thread-create <repository>
+terminal-relay-session thread-resume <repository> <thread-uuid> [Codex arguments...]
+terminal-relay-session thread-rename <repository> <thread-uuid> <name>
+terminal-relay-session thread-archive <repository> <thread-uuid>
+terminal-relay-session thread-unarchive <repository> <thread-uuid>
 ```
 
 `list-projects` emits sorted `project|<repository>` records. Names must match
 `^[A-Za-z0-9._-]+$`, contain at most 100 characters, and name real immediate
 directories (not symlinks) below `/workspace`.
 
-`status` emits one record for each active agent:
+The V1 parser contract retains the original five-field record for older clients.
+Current workers emit one extended record for each active agent:
 
 ```text
-session|<codex|claude>|<repository>|<attached-client-count>|<instance-uuid>
+session|<codex|claude>|<repository>|<attached-client-count>|<instance-uuid>|<activity-epoch>|<hex-UTF-8-title>|<0|1|empty-working>|<provider-thread-uuid>
 ```
+
+The relay instance UUID is a new immutable terminal identity on every launch.
+The provider thread UUID is the persisted conversation identity. For Claude
+they are currently the same; for Codex they are deliberately separate.
 
 `update-status` begins with a separate versioned marker and emits at most one
 record:
@@ -220,11 +239,9 @@ unexpected ownership or permissions, malformed timestamps, and non-version
 fields, and exits `70` for malformed state.
 
 The instance is a canonical lowercase UUID and changes on every new agent
-launch. `start` is the non-PTY, create-or-identify operation used by apps. Under
-the per-tool control lock it starts the repository when the slot is empty, or
-returns the existing same-repository launch while ignoring new arguments. Its
-response is the marker followed by that launch's exact five-field session
-record. A different repository receives exit status `75`.
+launch. `start` is the non-PTY create operation used by apps. It creates an
+independent UUID-scoped terminal and returns the marker followed by that
+launch's extended session record.
 
 `reattach` never creates. Under the same lock it requires an exact tool,
 repository, and instance match, then attaches to the tmux session whose name
@@ -233,9 +250,29 @@ including if replacement occurs between lock release and the tmux client exec.
 Apps therefore use `start` followed by exact `reattach` rather than a
 status-then-create-capable attach sequence.
 
-`attach` remains create-capable for legacy clients: it creates when absent or
-attaches the same-repository launch without evicting existing clients. Only the
-first launch's arguments are used.
+`attach` remains create-capable for legacy clients. Its older per-provider slot
+semantics are retained for compatibility; new clients use `start` followed by
+exact `reattach`.
+
+Thread catalog responses use a separate marker followed by one bounded JSON
+object:
+
+```text
+__TERMINAL_RELAY_THREADS_V1__
+{"threads":[{"provider":"codex","threadID":"<uuid>","title":"<optional>","updatedAt":0,"archived":false,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":null}
+```
+
+`threads` pages Codex's app-server catalog and filters it by the exact canonical
+directory `/workspace/<repository>`. Because Codex intentionally omits a
+newly-created thread until it has a non-empty preview, the first page also reads
+only that thread's ID, directory, title, activity time, archive flag, and source
+from Codex's worker-local metadata index; it never selects preview, prompt, or
+turn content. `thread-read` requests metadata with turns excluded. Create,
+resume, rename, archive, and unarchive accept only canonical UUIDs and real,
+non-symlinked project directories. Resume starts
+`codex resume <thread-uuid>` in a new relay terminal. Rename/archive/unarchive
+reject a thread that already has a live relay instance. No command returns
+turns, prompts, account data, or arbitrary app-server responses.
 
 For compatibility, `<codex|claude> [agent arguments...]` infers the immediate
 project name from the current directory inside `/workspace/<repository>` and
@@ -251,20 +288,21 @@ individual terminal only disconnects that tmux client.
 
 Each successful initial launch writes a mode-`0600` restart intent below the
 runtime user's mode-`0700` `~/.local/state/terminal-relay` directory. The record
-contains data only: repository, Terminal Relay UUID, boot ID, and the original
-argument array. `restore` holds the same per-tool locks and acts only on a valid
-intent from an earlier boot. It recreates the same UUID-named tmux session,
-starts Claude with `--resume <uuid>`, or starts Codex with `resume --last` from
-the recorded repository. Caller-supplied lifecycle flags are rejected. A normal
-CLI exit, failed initial launch, or exact `stop` removes only its matching
-intent; shutdown retains it. The enabled
+contains data only: repository, Terminal Relay UUID, provider thread UUID, boot
+ID, and the original argument array. `restore` holds the same instance locks
+and acts only on a valid intent from an earlier boot. It recreates the same
+UUID-named tmux session, starts Claude with `--resume <uuid>`, or starts Codex
+with `resume <provider-thread-uuid>` from the recorded repository. A legacy
+intent with no Codex provider ID retains the old `resume --last` fallback.
+Caller-supplied lifecycle flags are rejected. A normal CLI exit, failed initial
+launch, or exact `stop` removes only its matching intent; shutdown retains it.
+The enabled
 `terminal-relay-session-restore@<user>.service` runs this path after filesystems
 and network readiness, without SSH, the Mac, or iPhone.
 
 Provider recovery depends on local transcript data remaining on the worker.
-Claude is bound to the relay UUID; Codex uses the latest local Codex session for
-the recorded repository, so an out-of-band newer session in that repository can
-be selected instead. Reboot recovery is not disk-loss recovery: back up
+Claude is bound to the relay UUID and Codex is bound to its recorded provider
+thread UUID. Reboot recovery is not disk-loss recovery: back up
 `~/.codex/sessions` and `~/.claude/projects` separately if host-loss recovery is
 required.
 
@@ -286,11 +324,22 @@ progress sequence in this relay path (confirmed with tmux 3.6a even when
 passthrough is enabled), so that progress-only signal cannot cross this helper;
 the agent session and ordinary terminal output are not affected. Repository
 metadata, restart intents, and the control and agent locks live below
-`~/.local/state/terminal-relay`. The original nonblocking `flock`
-still surrounds the actual Codex or Claude process, preserving the one-Codex and
-one-Claude limit even if a tmux session is started unexpectedly. Codex MCP
-servers declared in system, user, or project config are disabled at launch;
-Claude receives its client-supplied strict MCP arguments unchanged.
+`~/.local/state/terminal-relay`. New terminals use UUID-scoped locks, so
+multiple Codex and Claude processes can run concurrently without weakening
+exact-instance stop or stale-attach checks. Legacy create-capable attachment
+keeps its provider-scoped lock.
+
+The shared Codex app server adds the built-in `terminal_relay` MCP without
+changing Codex's existing configuration policy for other servers. Managed
+Claude launches receive the same fixed
+`/usr/local/bin/terminal-relay-mcp` through strict MCP configuration. The MCP is
+a dependency-free Python stdio server and exposes exactly `list_projects`,
+`list_threads`, `start_thread`, `resume_thread`, `rename_thread`,
+`archive_thread`, and `unarchive_thread`. It invokes only the fixed session
+helper under a safe `PATH`, enforces canonical inputs plus 30-second and 1 MiB
+bounds, redacts helper stderr, and has no listener, shell, transcript access,
+terminal input, permanent deletion, or cross-worker capability. Claude's strict
+launch policy prevents unrequested servers.
 
 For the isolated integration test only, a helper invoked from a path other than
 `/usr/local/bin/terminal-relay-session` accepts these settings:

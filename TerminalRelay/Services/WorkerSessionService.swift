@@ -17,6 +17,7 @@ enum WorkerSessionServiceError: LocalizedError, Equatable {
     case statusFailed
     case startFailed
     case stopFailed
+    case threadFailed
 
     var errorDescription: String? {
         switch self {
@@ -26,6 +27,8 @@ enum WorkerSessionServiceError: LocalizedError, Equatable {
             "The worker could not start this agent."
         case .stopFailed:
             "The worker could not stop this agent."
+        case .threadFailed:
+            "The worker could not complete that thread action."
         }
     }
 }
@@ -46,6 +49,7 @@ final class WorkerSessionService: ObservableObject {
     @Published private(set) var loadingWorkerIDs: Set<UUID> = []
     @Published private(set) var startingSlots: Set<SessionSlot> = []
     @Published private(set) var stoppingSlots: Set<SessionSlot> = []
+    @Published private(set) var threadCatalogs: [WorkerThreadCatalogKey: WorkerThreadResponse] = [:]
 
     private let runCommand: CommandRunner
     private var refreshTasks: [UUID: Task<WorkerSessionResponse?, Never>] = [:]
@@ -79,6 +83,20 @@ final class WorkerSessionService: ObservableObject {
 
     func dismissError(for workerID: UUID) {
         errors[workerID] = nil
+    }
+
+    func threads(
+        repositoryName: String,
+        archived: Bool,
+        on worker: ServerProfile
+    ) -> [WorkerThreadSnapshot] {
+        threadCatalogs[
+            WorkerThreadCatalogKey(
+                workerID: worker.id,
+                repositoryName: repositoryName,
+                archived: archived
+            )
+        ]?.threads ?? []
     }
 
     func updateWarning(for workerID: UUID) -> String? {
@@ -145,6 +163,10 @@ final class WorkerSessionService: ObservableObject {
             let response = try WorkerSessionProtocol.parse(result.standardOutput)
             apply(await fetchUpdateStatus(worker: worker), to: worker.id)
             responses[worker.id] = response
+            mergeLiveSessionsIntoThreadCatalogs(
+                workerID: worker.id,
+                sessions: response.sessions
+            )
             errors[worker.id] = nil
             workerSessionLogger.info(
                 "Session refresh succeeded on \(worker.destination, privacy: .public); found \(response.sessions.count, privacy: .public) sessions"
@@ -353,6 +375,247 @@ final class WorkerSessionService: ObservableObject {
             }
         }
         return true
+    }
+
+    @discardableResult
+    func loadThreads(
+        repositoryName: String,
+        archived: Bool,
+        on worker: ServerProfile
+    ) async -> WorkerThreadResponse? {
+        guard WorkerSessionProtocol.isValidRepositoryName(repositoryName) else {
+            errors[worker.id] = WorkerSessionServiceError.threadFailed.localizedDescription
+            return nil
+        }
+        do {
+            var cursor: String?
+            var pages = 0
+            var threads: [WorkerThreadSnapshot] = []
+            repeat {
+                let result = try await runCommand(
+                    SSHCommandBuilder.workerThreadListConfiguration(
+                        for: worker,
+                        repositoryName: repositoryName,
+                        archived: archived,
+                        cursor: cursor
+                    )
+                )
+                guard result.exitCode == 0 else {
+                    throw WorkerSessionServiceError.threadFailed
+                }
+                let page = try WorkerThreadProtocol.parse(
+                    result.standardOutput,
+                    repositoryName: repositoryName
+                )
+                threads.append(contentsOf: page.threads)
+                cursor = page.nextCursor
+                pages += 1
+            } while cursor != nil && pages < 20
+
+            var threadsByID: [String: WorkerThreadSnapshot] = [:]
+            for thread in threads {
+                threadsByID[thread.id] = thread
+            }
+            var response = WorkerThreadResponse(
+                threads: threadsByID.values.sorted {
+                    if $0.updatedAt != $1.updatedAt { return $0.updatedAt > $1.updatedAt }
+                    return $0.threadID < $1.threadID
+                },
+                nextCursor: cursor
+            )
+            if !archived {
+                response = response.merging(
+                    liveSessions: responses[worker.id]?.sessions.filter {
+                        $0.repositoryName == repositoryName
+                    } ?? []
+                )
+            }
+            threadCatalogs[
+                WorkerThreadCatalogKey(
+                    workerID: worker.id,
+                    repositoryName: repositoryName,
+                    archived: archived
+                )
+            ] = response
+            errors[worker.id] = nil
+            return response
+        } catch {
+            errors[worker.id] = WorkerSessionServiceError.threadFailed.localizedDescription
+            return nil
+        }
+    }
+
+    func createThread(
+        repositoryName: String,
+        on worker: ServerProfile
+    ) async -> WorkerThreadSnapshot? {
+        await mutateThreadCatalog(
+            configuration: SSHCommandBuilder.workerThreadCreateConfiguration(
+                for: worker,
+                repositoryName: repositoryName
+            ),
+            repositoryName: repositoryName,
+            on: worker
+        )
+    }
+
+    func resumeThread(
+        repositoryName: String,
+        threadID: String,
+        launchDefaults: AgentLaunchDefaults,
+        on worker: ServerProfile
+    ) async -> WorkerSessionSnapshot? {
+        guard Self.isCanonicalUUID(threadID) else {
+            errors[worker.id] = WorkerSessionServiceError.threadFailed.localizedDescription
+            return nil
+        }
+        do {
+            let result = try await runCommand(
+                SSHCommandBuilder.workerThreadResumeConfiguration(
+                    for: worker,
+                    repositoryName: repositoryName,
+                    threadID: threadID,
+                    launchDefaults: launchDefaults
+                )
+            )
+            guard result.exitCode == 0 else {
+                throw WorkerSessionServiceError.threadFailed
+            }
+            let response = try WorkerSessionProtocol.parse(result.standardOutput)
+            guard response.sessions.count == 1,
+                  let snapshot = response.sessions.first,
+                  snapshot.kind == .codex,
+                  snapshot.repositoryName == repositoryName,
+                  snapshot.threadID == threadID else {
+                throw WorkerSessionServiceError.threadFailed
+            }
+            let current = responses[worker.id] ?? WorkerSessionResponse(
+                projects: [repositoryName],
+                sessions: []
+            )
+            responses[worker.id] = WorkerSessionResponse(
+                projects: Array(Set(current.projects + [repositoryName])).sorted {
+                    $0.localizedStandardCompare($1) == .orderedAscending
+                },
+                sessions: (current.sessions.filter {
+                    $0.instanceToken != snapshot.instanceToken
+                } + [snapshot]).sorted {
+                    if $0.repositoryName != $1.repositoryName {
+                        return $0.repositoryName.localizedStandardCompare($1.repositoryName)
+                            == .orderedAscending
+                    }
+                    return $0.instanceToken < $1.instanceToken
+                }
+            )
+            _ = await loadThreads(
+                repositoryName: repositoryName,
+                archived: false,
+                on: worker
+            )
+            return snapshot
+        } catch {
+            errors[worker.id] = WorkerSessionServiceError.threadFailed.localizedDescription
+            return nil
+        }
+    }
+
+    @discardableResult
+    func renameThread(
+        repositoryName: String,
+        threadID: String,
+        name: String,
+        on worker: ServerProfile
+    ) async -> Bool {
+        let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard Self.isCanonicalUUID(threadID), !normalized.isEmpty,
+              !normalized.contains("\n"), normalized.utf8.count <= 200 else {
+            errors[worker.id] = WorkerSessionServiceError.threadFailed.localizedDescription
+            return false
+        }
+        return await mutateThreadCatalog(
+            configuration: SSHCommandBuilder.workerThreadRenameConfiguration(
+                for: worker,
+                repositoryName: repositoryName,
+                threadID: threadID,
+                name: normalized
+            ),
+            repositoryName: repositoryName,
+            on: worker
+        ) != nil
+    }
+
+    @discardableResult
+    func setThreadArchived(
+        repositoryName: String,
+        threadID: String,
+        archived: Bool,
+        on worker: ServerProfile
+    ) async -> Bool {
+        guard Self.isCanonicalUUID(threadID) else {
+            errors[worker.id] = WorkerSessionServiceError.threadFailed.localizedDescription
+            return false
+        }
+        guard await mutateThreadCatalog(
+            configuration: SSHCommandBuilder.workerThreadArchiveConfiguration(
+                for: worker,
+                repositoryName: repositoryName,
+                threadID: threadID,
+                unarchive: !archived
+            ),
+            repositoryName: repositoryName,
+            on: worker
+        ) != nil else {
+            return false
+        }
+        _ = await loadThreads(repositoryName: repositoryName, archived: false, on: worker)
+        _ = await loadThreads(repositoryName: repositoryName, archived: true, on: worker)
+        return true
+    }
+
+    private func mutateThreadCatalog(
+        configuration: SSHLaunchConfiguration,
+        repositoryName: String,
+        on worker: ServerProfile
+    ) async -> WorkerThreadSnapshot? {
+        do {
+            let result = try await runCommand(configuration)
+            guard result.exitCode == 0 else {
+                throw WorkerSessionServiceError.threadFailed
+            }
+            let response = try WorkerThreadProtocol.parse(
+                result.standardOutput,
+                repositoryName: repositoryName
+            )
+            guard response.threads.count == 1, let thread = response.threads.first else {
+                throw WorkerSessionServiceError.threadFailed
+            }
+            errors[worker.id] = nil
+            return thread
+        } catch {
+            errors[worker.id] = WorkerSessionServiceError.threadFailed.localizedDescription
+            return nil
+        }
+    }
+
+    private static func isCanonicalUUID(_ value: String) -> Bool {
+        UUID(uuidString: value)?.uuidString.lowercased() == value
+    }
+
+    private func mergeLiveSessionsIntoThreadCatalogs(
+        workerID: UUID,
+        sessions: [WorkerSessionSnapshot]
+    ) {
+        let keys = threadCatalogs.keys.filter {
+            $0.workerID == workerID && !$0.archived
+        }
+        for key in keys {
+            guard let catalog = threadCatalogs[key] else { continue }
+            threadCatalogs[key] = catalog.merging(
+                liveSessions: sessions.filter {
+                    $0.repositoryName == key.repositoryName
+                }
+            )
+        }
     }
 
     private static func logDetail(_ data: Data) -> String {

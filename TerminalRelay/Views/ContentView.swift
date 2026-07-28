@@ -15,6 +15,12 @@ private struct SessionArchiveRequest: Identifiable {
     let sessionIDs: Set<UUID>
 }
 
+private struct LiveThreadArchiveRequest: Identifiable {
+    let id = UUID()
+    let sessionID: UUID
+    let threadID: String
+}
+
 private enum SidebarDragItem: Equatable {
     private static let projectPrefix = "terminal-relay-project:"
     private static let folderPrefix = "terminal-relay-folder:"
@@ -313,6 +319,7 @@ struct ContentView: View {
     @State private var navigationIndex = -1
     @State private var selectedSessionIDs: Set<UUID> = []
     @State private var sessionArchiveRequest: SessionArchiveRequest?
+    @State private var liveThreadArchiveRequest: LiveThreadArchiveRequest?
     @State private var isNamingSidebarFolder = false
     @State private var newSidebarFolderName = ""
     @State private var expandedSidebarFolderIDs: Set<UUID> = []
@@ -333,7 +340,25 @@ struct ContentView: View {
         guard !query.isEmpty else { return projectStore.sidebarProjects }
 
         return projectStore.sidebarProjects.filter { project in
-            project.displayName.localizedCaseInsensitiveContains(query)
+            if project.displayName.localizedCaseInsensitiveContains(query) {
+                return true
+            }
+            guard let worker = serverStore.server(id: project.serverID) else {
+                return false
+            }
+            let activeThreads = workerSessionService.threads(
+                repositoryName: project.displayName,
+                archived: false,
+                on: worker
+            )
+            let archivedThreads = workerSessionService.threads(
+                repositoryName: project.displayName,
+                archived: true,
+                on: worker
+            )
+            return (activeThreads + archivedThreads).contains {
+                ($0.title ?? "").localizedCaseInsensitiveContains(query)
+            }
         }
     }
 
@@ -404,6 +429,25 @@ struct ContentView: View {
             } message: {
                 Text(
                     "Running agents will be stopped and the selected terminal rows will be removed. Project files are not deleted."
+                )
+            }
+            .confirmationDialog(
+                "Archive Codex thread?",
+                isPresented: isShowingLiveThreadArchiveConfirmation,
+                titleVisibility: .visible
+            ) {
+                if let request = liveThreadArchiveRequest {
+                    Button("Stop and Archive", role: .destructive) {
+                        liveThreadArchiveRequest = nil
+                        archiveLiveThread(request)
+                    }
+                }
+                Button("Cancel", role: .cancel) {
+                    liveThreadArchiveRequest = nil
+                }
+            } message: {
+                Text(
+                    "Terminal Relay will verify the live task, stop that exact worker session, and only then archive its Codex thread."
                 )
             }
     }
@@ -576,9 +620,31 @@ struct ContentView: View {
         _ project: ProjectProfile,
         folderID: UUID?
     ) -> some View {
-        ProjectSidebarSection(
+        let worker = serverStore.server(id: project.serverID)
+        let demoThreads = ScreenshotDemoMode.isEnabled
+            ? ScreenshotDemoMode.fixture().threads.filter {
+                $0.repositoryName == project.displayName
+            }
+            : []
+        return ProjectSidebarSection(
             project: project,
             searchQuery: searchQuery,
+            dormantThreads: ScreenshotDemoMode.isEnabled ? demoThreads.filter {
+                !$0.isArchived
+            } : worker.map {
+                workerSessionService.threads(
+                    repositoryName: project.displayName,
+                    archived: false,
+                    on: $0
+                ).filter { !$0.isActive }
+            } ?? [],
+            archivedThreads: ScreenshotDemoMode.isEnabled ? demoThreads.filter(\.isArchived) : worker.map {
+                workerSessionService.threads(
+                    repositoryName: project.displayName,
+                    archived: true,
+                    on: $0
+                )
+            } ?? [],
             selectedSessionID: sessionManager.selectedSessionID,
             selectedSessionIDs: selectedSessionIDs,
             onSelectProject: {
@@ -593,8 +659,76 @@ struct ContentView: View {
                 )
             },
             onArchiveSession: presentArchiveConfirmation,
+            onArchiveLiveThread: { session in
+                guard let threadID = session.threadID else { return }
+                liveThreadArchiveRequest = LiveThreadArchiveRequest(
+                    sessionID: session.id,
+                    threadID: threadID
+                )
+            },
             onOpenTerminal: { kind in
                 openTerminal(kind, for: project)
+            },
+            onRefreshThreads: {
+                guard !ScreenshotDemoMode.isEnabled, let worker else { return }
+                async let active: WorkerThreadResponse? = workerSessionService.loadThreads(
+                    repositoryName: project.displayName,
+                    archived: false,
+                    on: worker
+                )
+                async let archived: WorkerThreadResponse? = workerSessionService.loadThreads(
+                    repositoryName: project.displayName,
+                    archived: true,
+                    on: worker
+                )
+                _ = await (active, archived)
+            },
+            onCreateThread: {
+                guard let worker else { return }
+                _ = await workerSessionService.createThread(
+                    repositoryName: project.displayName,
+                    on: worker
+                )
+                _ = await workerSessionService.loadThreads(
+                    repositoryName: project.displayName,
+                    archived: false,
+                    on: worker
+                )
+            },
+            onResumeThread: { thread in
+                guard let worker,
+                      let result = await sessionManager.resumeThreadAfterRefresh(
+                          thread,
+                          project: project,
+                          on: worker,
+                          projects: projectStore.projects,
+                          launchDefaults: launchDefaults,
+                          using: workerSessionService
+                      ) else { return }
+                handleOpenResult(result, for: project)
+            },
+            onRenameThread: { thread, name in
+                guard let worker else { return }
+                _ = await workerSessionService.renameThread(
+                    repositoryName: project.displayName,
+                    threadID: thread.threadID,
+                    name: name,
+                    on: worker
+                )
+                _ = await workerSessionService.loadThreads(
+                    repositoryName: project.displayName,
+                    archived: false,
+                    on: worker
+                )
+            },
+            onSetThreadArchived: { thread, archived in
+                guard let worker else { return }
+                _ = await workerSessionService.setThreadArchived(
+                    repositoryName: project.displayName,
+                    threadID: thread.threadID,
+                    archived: archived,
+                    on: worker
+                )
             },
             onNewProject: addProject,
             onNewParentFolder: beginCreatingSidebarFolder,
@@ -1054,6 +1188,17 @@ struct ContentView: View {
         )
     }
 
+    private var isShowingLiveThreadArchiveConfirmation: Binding<Bool> {
+        Binding(
+            get: { liveThreadArchiveRequest != nil },
+            set: { isPresented in
+                if !isPresented {
+                    liveThreadArchiveRequest = nil
+                }
+            }
+        )
+    }
+
     private func createSidebarFolder() {
         guard let folder = projectStore.createSidebarFolder(named: newSidebarFolderName) else {
             return
@@ -1204,6 +1349,42 @@ struct ContentView: View {
             }
 
             selectedSessionIDs.subtract(archivedSessionIDs)
+        }
+    }
+
+    private func archiveLiveThread(_ request: LiveThreadArchiveRequest) {
+        Task {
+            guard let session = sessionManager.sessions.first(where: {
+                $0.id == request.sessionID
+            }),
+            session.kind == .codex,
+            session.threadID == request.threadID,
+            session.status.occupiesSlot,
+            let project = projectStore.project(id: session.projectID),
+            let worker = serverStore.servers.first(where: {
+                $0.concurrencyKey == session.serverKey
+            }) else {
+                return
+            }
+
+            let didStop = await sessionManager.stopAgentAfterRefresh(
+                sessionID: session.id,
+                on: worker,
+                projects: projectStore.projects,
+                launchDefaults: launchDefaults,
+                using: workerSessionService
+            )
+            guard didStop else { return }
+
+            let didArchive = await workerSessionService.setThreadArchived(
+                repositoryName: project.displayName,
+                threadID: request.threadID,
+                archived: true,
+                on: worker
+            )
+            if didArchive {
+                sessionManager.close(sessionID: session.id)
+            }
         }
     }
 
@@ -1459,12 +1640,20 @@ private struct ProjectSidebarSection: View {
 
     let project: ProjectProfile
     let searchQuery: String
+    let dormantThreads: [WorkerThreadSnapshot]
+    let archivedThreads: [WorkerThreadSnapshot]
     let selectedSessionID: UUID?
     let selectedSessionIDs: Set<UUID>
     let onSelectProject: () -> Void
     let onSelectSession: (UUID, Bool) -> Void
     let onArchiveSession: (UUID) -> Void
+    let onArchiveLiveThread: (TerminalSession) -> Void
     let onOpenTerminal: (AgentKind) -> Void
+    let onRefreshThreads: () async -> Void
+    let onCreateThread: () async -> Void
+    let onResumeThread: (WorkerThreadSnapshot) async -> Void
+    let onRenameThread: (WorkerThreadSnapshot, String) async -> Void
+    let onSetThreadArchived: (WorkerThreadSnapshot, Bool) async -> Void
     let onNewProject: () -> Void
     let onNewParentFolder: () -> Void
     let onEdit: () -> Void
@@ -1476,6 +1665,9 @@ private struct ProjectSidebarSection: View {
     @State private var isExpanded = false
     @State private var isProjectHovering = false
     @State private var projectDropPosition: SidebarDropPosition?
+    @State private var showsArchivedThreads = false
+    @State private var threadPendingRename: WorkerThreadSnapshot?
+    @State private var threadName = ""
 
     private var allSessions: [TerminalSession] {
         sessionManager.sidebarSessions(forProjectID: project.id)
@@ -1513,6 +1705,30 @@ private struct ProjectSidebarSection: View {
             return allSessions
         }
         return allSessions.filter { $0.displayTitle.localizedCaseInsensitiveContains(query) }
+    }
+
+    private var matchingDormantThreads: [WorkerThreadSnapshot] {
+        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty,
+              !project.displayName.localizedCaseInsensitiveContains(query) else {
+            return dormantThreads
+        }
+        return dormantThreads.filter {
+            ($0.title ?? "").localizedCaseInsensitiveContains(query)
+                || $0.threadID.localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    private var matchingArchivedThreads: [WorkerThreadSnapshot] {
+        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty,
+              !project.displayName.localizedCaseInsensitiveContains(query) else {
+            return archivedThreads
+        }
+        return archivedThreads.filter {
+            ($0.title ?? "").localizedCaseInsensitiveContains(query)
+                || $0.threadID.localizedCaseInsensitiveContains(query)
+        }
     }
 
     private var visibleSessions: [TerminalSession] {
@@ -1606,6 +1822,9 @@ private struct ProjectSidebarSection: View {
                 Divider()
                 Button("Open Codex") { onOpenTerminal(.codex) }
                 Button("Open Claude Code") { onOpenTerminal(.claude) }
+                Button("New Codex Thread") {
+                    Task { await onCreateThread() }
+                }
                 Divider()
                 projectReferenceMenu
                 Divider()
@@ -1615,7 +1834,7 @@ private struct ProjectSidebarSection: View {
             }
 
             if !isCollapsed {
-                if matchingSessions.isEmpty {
+                if matchingSessions.isEmpty && matchingDormantThreads.isEmpty {
                     Text("No sessions")
                         .font(.system(size: 14))
                         .foregroundStyle(SidebarPalette.tertiary)
@@ -1704,6 +1923,70 @@ private struct ProjectSidebarSection: View {
                             Button("Archive Terminal", role: .destructive) {
                                 onArchiveSession(session.id)
                             }
+                            if session.kind == .codex, session.threadID != nil {
+                                Button("Archive Codex Thread", role: .destructive) {
+                                    onArchiveLiveThread(session)
+                                }
+                                .disabled(!session.status.occupiesSlot)
+                            }
+                        }
+                    }
+
+                    ForEach(matchingDormantThreads) { thread in
+                        DormantThreadRow(thread: thread) {
+                            Task { await onResumeThread(thread) }
+                        }
+                        .contextMenu {
+                            Button("Resume Thread") {
+                                Task { await onResumeThread(thread) }
+                            }
+                            .disabled(!thread.capabilities.resume)
+                            Button("Rename Thread") {
+                                threadName = thread.title ?? ""
+                                threadPendingRename = thread
+                            }
+                            .disabled(!thread.capabilities.rename)
+                            Button("Copy Thread ID", systemImage: "number") {
+                                copyToPasteboard(thread.threadID)
+                            }
+                            Divider()
+                            Button("Archive Thread", role: .destructive) {
+                                Task { await onSetThreadArchived(thread, true) }
+                            }
+                            .disabled(!thread.capabilities.archive)
+                        }
+                    }
+
+                    if !matchingArchivedThreads.isEmpty {
+                        Button {
+                            showsArchivedThreads.toggle()
+                        } label: {
+                            Label(
+                                showsArchivedThreads
+                                    ? "Hide archived threads"
+                                    : "Archived threads (\(matchingArchivedThreads.count))",
+                                systemImage: "archivebox"
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 13))
+                        .foregroundStyle(SidebarPalette.secondary)
+                        .padding(.leading, 40)
+                        .frame(height: 31)
+
+                        if showsArchivedThreads || !searchQuery.isEmpty {
+                            ForEach(matchingArchivedThreads) { thread in
+                                DormantThreadRow(thread: thread, isArchived: true) {}
+                                    .contextMenu {
+                                        Button("Unarchive Thread") {
+                                            Task { await onSetThreadArchived(thread, false) }
+                                        }
+                                        .disabled(!thread.capabilities.unarchive)
+                                        Button("Copy Thread ID", systemImage: "number") {
+                                            copyToPasteboard(thread.threadID)
+                                        }
+                                    }
+                            }
                         }
                     }
 
@@ -1725,6 +2008,29 @@ private struct ProjectSidebarSection: View {
             if !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 isCollapsed = false
             }
+        }
+        .task(id: "\(project.serverID.uuidString):\(project.displayName)") {
+            await onRefreshThreads()
+        }
+        .alert(
+            "Rename Thread",
+            isPresented: Binding(
+                get: { threadPendingRename != nil },
+                set: { if !$0 { threadPendingRename = nil } }
+            )
+        ) {
+            TextField("Thread name", text: $threadName)
+            Button("Cancel", role: .cancel) {
+                threadPendingRename = nil
+            }
+            Button("Rename") {
+                guard let thread = threadPendingRename else { return }
+                let name = threadName
+                threadPendingRename = nil
+                Task { await onRenameThread(thread, name) }
+            }
+        } message: {
+            Text("This changes the provider thread name on this worker.")
         }
     }
 
@@ -1797,6 +2103,38 @@ private struct ProjectSidebarSection: View {
         }
         sessionManager.moveSidebarSession(id: sessionID, before: targetID)
         return true
+    }
+}
+
+private struct DormantThreadRow: View {
+    let thread: WorkerThreadSnapshot
+    var isArchived = false
+    let onResume: () -> Void
+
+    var body: some View {
+        Button(action: onResume) {
+            HStack(spacing: 7) {
+                AgentBrandIcon(kind: thread.kind, size: 17)
+                    .frame(width: 18, height: 18)
+                    .opacity(0.55)
+                Text(thread.title ?? "Untitled thread")
+                    .font(.system(size: 14))
+                    .foregroundStyle(SidebarPalette.secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 5)
+                Image(systemName: isArchived ? "archivebox.fill" : "pause.circle")
+                    .font(.system(size: 11))
+                    .foregroundStyle(SidebarPalette.tertiary)
+            }
+            .padding(.horizontal, 8)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(isArchived || !thread.capabilities.resume)
+        .padding(.leading, 18)
+        .frame(height: 35)
+        .help(isArchived ? "Archived provider thread" : "Resume provider thread")
     }
 }
 

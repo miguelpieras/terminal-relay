@@ -33,7 +33,7 @@ CLAUDE_ARGUMENTS = [
     "--settings",
     '{"terminalProgressBarEnabled":true}',
     "--mcp-config",
-    '{"mcpServers":{}}',
+    '{"mcpServers":{"terminal_relay":{"command":"/usr/local/bin/terminal-relay-mcp"}}}',
     "--strict-mcp-config",
     "--dangerously-skip-permissions",
 ]
@@ -110,6 +110,69 @@ def validate_command(arguments: list[str], working_directory: str | None) -> lis
             reject("The Terminal Relay session identity is invalid.")
         if working_directory is not None:
             reject("The Terminal Relay session command has an unexpected directory.")
+        return arguments
+
+    if action == "threads":
+        if len(arguments) not in {3, 4}:
+            reject("The Terminal Relay thread list command is incomplete.")
+        repository, archive_filter = arguments[1:3]
+        if (
+            not REPOSITORY.fullmatch(repository)
+            or archive_filter not in {"active", "archived"}
+            or working_directory is not None
+            or (
+                len(arguments) == 4
+                and (
+                    not arguments[3]
+                    or "\n" in arguments[3]
+                    or len(arguments[3].encode("utf-8")) > 2_048
+                )
+            )
+        ):
+            reject("The Terminal Relay thread list command is invalid.")
+        return arguments
+
+    if action == "thread-create":
+        if (
+            len(arguments) != 2
+            or not REPOSITORY.fullmatch(arguments[1])
+            or working_directory is not None
+        ):
+            reject("The Terminal Relay thread create command is invalid.")
+        return arguments
+
+    if action == "thread-resume":
+        if (
+            len(arguments) != 3 + len(CODEX_ARGUMENTS)
+            or not REPOSITORY.fullmatch(arguments[1])
+            or not INSTANCE.fullmatch(arguments[2])
+            or arguments[3:] != CODEX_ARGUMENTS
+            or working_directory is not None
+        ):
+            reject("The Terminal Relay thread resume command is invalid.")
+        return arguments
+
+    if action in {"thread-read", "thread-archive", "thread-unarchive"}:
+        if (
+            len(arguments) != 3
+            or not REPOSITORY.fullmatch(arguments[1])
+            or not INSTANCE.fullmatch(arguments[2])
+            or working_directory is not None
+        ):
+            reject("The Terminal Relay thread command is invalid.")
+        return arguments
+
+    if action == "thread-rename":
+        if (
+            len(arguments) != 4
+            or not REPOSITORY.fullmatch(arguments[1])
+            or not INSTANCE.fullmatch(arguments[2])
+            or not arguments[3]
+            or "\n" in arguments[3]
+            or len(arguments[3].encode("utf-8")) > 200
+            or working_directory is not None
+        ):
+            reject("The Terminal Relay thread rename command is invalid.")
         return arguments
 
     reject("This review key cannot run that command.")

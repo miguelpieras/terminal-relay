@@ -119,7 +119,7 @@ enum WorkerSessionProtocol {
                     }
                     lastActivityAt = activity
                     title = decodedTitle.isEmpty ? nil : decodedTitle
-                    if fields.count == 8 {
+                    if fields.count >= 8 {
                         guard fields[7].isEmpty || fields[7] == "0" || fields[7] == "1" else {
                             throw WorkerSessionProtocolError.invalidRecord
                         }

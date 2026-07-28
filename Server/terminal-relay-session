@@ -2,6 +2,7 @@
 set -euo pipefail
 
 readonly protocol_marker="__TERMINAL_RELAY_SESSION_V1__"
+readonly thread_protocol_marker="__TERMINAL_RELAY_THREADS_V1__"
 readonly agent_update_protocol_marker="__TERMINAL_RELAY_AGENT_UPDATE_V1__"
 readonly installed_helper_path="/usr/local/bin/terminal-relay-session"
 readonly default_agent_update_status_path="/var/lib/terminal-relay/agent-update-status"
@@ -116,6 +117,13 @@ usage:
   terminal-relay-session resources
   terminal-relay-session update-status
   terminal-relay-session restore
+  terminal-relay-session threads <repository> <active|archived> [cursor]
+  terminal-relay-session thread-read <repository> <thread-id>
+  terminal-relay-session thread-create <repository>
+  terminal-relay-session thread-resume <repository> <thread-id> [agent arguments...]
+  terminal-relay-session thread-rename <repository> <thread-id> <name>
+  terminal-relay-session thread-archive <repository> <thread-id>
+  terminal-relay-session thread-unarchive <repository> <thread-id>
   terminal-relay-session start <codex|claude> <repository> [agent arguments...]
   terminal-relay-session attach <codex|claude> <repository> [agent arguments...]
   terminal-relay-session reattach <codex|claude> <repository> <instance>
@@ -644,6 +652,127 @@ def account_is_available(response):
     )
 
 
+def canonical_thread_id(value):
+    if not isinstance(value, str):
+        raise RuntimeError("Invalid Codex thread identifier.")
+    canonical = str(uuid.UUID(value))
+    if canonical != value:
+        raise RuntimeError("Invalid Codex thread identifier.")
+    return canonical
+
+
+def normalized_thread(thread, expected_cwd=None, archived_override=None):
+    if not isinstance(thread, dict):
+        raise RuntimeError("Codex returned an invalid thread.")
+    thread_id = canonical_thread_id(thread.get("id"))
+    cwd = thread.get("cwd")
+    if not isinstance(cwd, str) or not cwd:
+        raise RuntimeError("Codex returned an invalid thread directory.")
+    if expected_cwd is not None and (
+        cwd != expected_cwd
+        or os.path.realpath(cwd) != cwd
+        or os.path.realpath(expected_cwd) != expected_cwd
+    ):
+        raise RuntimeError("The Codex thread belongs to another project.")
+    name = thread.get("name")
+    if name is not None and not isinstance(name, str):
+        raise RuntimeError("Codex returned an invalid thread title.")
+    if isinstance(name, str):
+        name = name.strip().encode("utf-8")[:200].decode("utf-8", errors="ignore")
+    updated_at = thread.get("updatedAt")
+    if not isinstance(updated_at, int) or updated_at < 0:
+        raise RuntimeError("Codex returned an invalid thread activity time.")
+    archived = (
+        archived_override
+        if isinstance(archived_override, bool)
+        else thread.get("archived")
+    )
+    if not isinstance(archived, bool):
+        archived = False
+    return {
+        "provider": "codex",
+        "threadID": thread_id,
+        "title": name if name else None,
+        "updatedAt": updated_at,
+        "archived": archived,
+        "capabilities": {
+            "resume": not archived,
+            "rename": not archived,
+            "archive": not archived,
+            "unarchive": archived,
+        },
+    }
+
+
+def empty_indexed_threads(expected_cwd, archived):
+    database = os.path.join(os.path.expanduser("~"), ".codex", "state_5.sqlite")
+    if not os.path.isfile(database):
+        return []
+    try:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+        try:
+            columns = {
+                row[1] for row in connection.execute("pragma table_info(threads)")
+            }
+            required = {
+                "id",
+                "cwd",
+                "title",
+                "updated_at",
+                "archived",
+                "source",
+                "preview",
+            }
+            if not required.issubset(columns):
+                return []
+            title_expression = (
+                "coalesce(nullif(name, ''), nullif(title, ''))"
+                if "name" in columns
+                else "nullif(title, '')"
+            )
+            rows = connection.execute(
+                f"""
+                select id, cwd, {title_expression}, updated_at
+                from threads
+                where cwd = ?
+                  and archived = ?
+                  and preview = ''
+                  and source in ('cli', 'vscode', 'exec', 'appServer')
+                order by updated_at desc, id
+                limit 100
+                """,
+                (expected_cwd, 1 if archived else 0),
+            ).fetchall()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error):
+        return []
+    return [
+        normalized_thread(
+            {
+                "id": thread_id,
+                "cwd": cwd,
+                "name": title,
+                "updatedAt": updated_at,
+            },
+            expected_cwd,
+            archived,
+        )
+        for thread_id, cwd, title, updated_at in rows
+    ]
+
+
+def print_thread_catalog(threads, next_cursor=None):
+    print("__TERMINAL_RELAY_THREADS_V1__", flush=True)
+    print(
+        json.dumps(
+            {"threads": threads, "nextCursor": next_cursor},
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
+
+
 client = None
 pending_login_id = None
 login_completed = False
@@ -757,8 +886,167 @@ try:
             raise SystemExit(77)
     elif mode == "generate-titles":
         generate_titles(client, arguments)
+    elif mode == "threads":
+        if not (2 <= len(arguments) <= 3):
+            raise RuntimeError("Invalid Codex thread list request.")
+        cwd, archived_text, *cursor_values = arguments
+        if archived_text not in ("0", "1"):
+            raise RuntimeError("Invalid Codex archive filter.")
+        params = {
+            "cwd": cwd,
+            "archived": archived_text == "1",
+            "limit": 100,
+            "sourceKinds": ["cli", "vscode", "exec", "appServer"],
+        }
+        if cursor_values and cursor_values[0]:
+            params["cursor"] = cursor_values[0]
+        client.send_json({"method": "thread/list", "id": 2, "params": params})
+        result = result_from(wait_for_response(client, 2, 15))
+        data = result.get("data")
+        if not isinstance(data, list):
+            raise RuntimeError("Codex returned an invalid thread list.")
+        next_cursor = result.get("nextCursor")
+        if next_cursor is not None and (
+            not isinstance(next_cursor, str)
+            or len(next_cursor.encode("utf-8")) > 2_048
+            or "\n" in next_cursor
+        ):
+            raise RuntimeError("Codex returned an invalid thread cursor.")
+        threads = [
+            normalized_thread(thread, cwd, archived_text == "1")
+            for thread in data
+        ]
+        if not cursor_values or not cursor_values[0]:
+            known_ids = {thread["threadID"] for thread in threads}
+            threads.extend(
+                thread
+                for thread in empty_indexed_threads(
+                    cwd,
+                    archived_text == "1",
+                )
+                if thread["threadID"] not in known_ids
+            )
+            threads.sort(key=lambda thread: (-thread["updatedAt"], thread["threadID"]))
+        print_thread_catalog(threads, next_cursor)
+    elif mode in ("thread-read", "thread-create"):
+        if mode == "thread-read":
+            if len(arguments) != 2:
+                raise RuntimeError("Invalid Codex thread read request.")
+            cwd, thread_id = arguments
+            client.send_json(
+                {
+                    "method": "thread/read",
+                    "id": 2,
+                    "params": {
+                        "threadId": canonical_thread_id(thread_id),
+                        "includeTurns": False,
+                    },
+                }
+            )
+        else:
+            if len(arguments) != 1:
+                raise RuntimeError("Invalid Codex thread create request.")
+            cwd = arguments[0]
+            client.send_json(
+                {
+                    "method": "thread/start",
+                    "id": 2,
+                    "params": {"cwd": cwd},
+                }
+            )
+        result = result_from(wait_for_response(client, 2, 15))
+        print_thread_catalog(
+            [
+                normalized_thread(
+                    result.get("thread"),
+                    cwd,
+                    False if mode == "thread-create" else None,
+                )
+            ]
+        )
+    elif mode in ("thread-rename", "thread-archive", "thread-unarchive"):
+        expected_count = 3 if mode == "thread-rename" else 2
+        if len(arguments) != expected_count:
+            raise RuntimeError("Invalid Codex thread mutation request.")
+        cwd, thread_id, *remaining = arguments
+        canonical_id = canonical_thread_id(thread_id)
+        try:
+            client.send_json(
+                {
+                    "method": "thread/read",
+                    "id": 2,
+                    "params": {"threadId": canonical_id, "includeTurns": False},
+                }
+            )
+            original = result_from(wait_for_response(client, 2, 15))
+            normalized_thread(original.get("thread"), cwd)
+        except RuntimeError:
+            previously_archived = mode == "thread-unarchive"
+            if canonical_id not in {
+                thread["threadID"]
+                for thread in empty_indexed_threads(cwd, previously_archived)
+            }:
+                raise
+        method = {
+            "thread-rename": "thread/name/set",
+            "thread-archive": "thread/archive",
+            "thread-unarchive": "thread/unarchive",
+        }[mode]
+        params = {"threadId": canonical_id}
+        if mode == "thread-rename":
+            params["name"] = remaining[0]
+        client.send_json({"method": method, "id": 3, "params": params})
+        mutation_response = wait_for_response(client, 3, 15)
+        try:
+            mutation = result_from(mutation_response)
+        except RuntimeError:
+            if mode != "thread-unarchive":
+                raise
+            mutation = {}
+        archived_after_mutation = mode == "thread-archive"
+        normalized = None
+        if mode == "thread-unarchive":
+            try:
+                normalized = normalized_thread(mutation.get("thread"), cwd, False)
+            except RuntimeError:
+                pass
+        else:
+            try:
+                client.send_json(
+                    {
+                        "method": "thread/read",
+                        "id": 4,
+                        "params": {
+                            "threadId": canonical_id,
+                            "includeTurns": False,
+                        },
+                    }
+                )
+                updated = result_from(wait_for_response(client, 4, 15))
+                normalized = normalized_thread(
+                    updated.get("thread"),
+                    cwd,
+                    archived_after_mutation,
+                )
+            except RuntimeError:
+                pass
+        if normalized is None:
+            normalized = next(
+                (
+                    thread
+                    for thread in empty_indexed_threads(
+                        cwd,
+                        archived_after_mutation,
+                    )
+                    if thread["threadID"] == canonical_id
+                ),
+                None,
+            )
+        if normalized is None:
+            raise RuntimeError("Codex returned an invalid updated thread.")
+        print_thread_catalog([normalized])
     else:
-        raise RuntimeError("Unsupported Codex account operation.")
+        raise RuntimeError("Unsupported Codex service operation.")
 except InterruptedError:
     raise SystemExit(130)
 except SystemExit:
@@ -773,7 +1061,7 @@ except (
     ValueError,
     json.JSONDecodeError,
 ):
-    print("Codex account service is unavailable.", file=sys.stderr)
+    print("Codex service is unavailable.", file=sys.stderr)
     raise SystemExit(70)
 finally:
     if client is not None:
@@ -881,8 +1169,10 @@ ensure_codex_app_server_locked() {
         printf '#!/bin/bash\n'
         printf '/bin/rm -f -- %q\n' "$launch_file"
         printf 'export PATH=%q\n' "$default_safe_path"
-        printf 'exec %q app-server --listen %q\n' \
-            "$codex_path" "unix://$codex_app_server_socket"
+        printf 'exec %q --config %q app-server --listen %q\n' \
+            "$codex_path" \
+            'mcp_servers.terminal_relay={command="/usr/local/bin/terminal-relay-mcp",enabled=true}' \
+            "unix://$codex_app_server_socket"
     } > "$launch_file"
     /bin/chmod 700 "$launch_file"
     printf -v launch_command '%q' "$launch_file"
@@ -1123,12 +1413,14 @@ load_metadata_unlocked() {
     local instance_seen=0
     local pid_seen=0
     local start_seen=0
+    local thread_seen=0
 
     metadata_tool=""
     metadata_repository=""
     metadata_instance=""
     metadata_pid=""
     metadata_start=""
+    metadata_thread_id=""
     metadata_file="$(metadata_file_for "$instance")"
     [[ -f "$metadata_file" && ! -L "$metadata_file" ]] || return 1
 
@@ -1160,6 +1452,11 @@ load_metadata_unlocked() {
                 metadata_start="$value"
                 start_seen=1
                 ;;
+            thread)
+                [[ $thread_seen -eq 0 ]] || return 1
+                metadata_thread_id="$value"
+                thread_seen=1
+                ;;
             *) return 1 ;;
         esac
     done < "$metadata_file"
@@ -1179,6 +1476,7 @@ load_metadata_unlocked() {
     else
         is_valid_process_identity "$metadata_start" || return 1
     fi
+    [[ -z "$metadata_thread_id" ]] || is_valid_instance "$metadata_thread_id" || return 1
 }
 
 write_metadata_unlocked() {
@@ -1187,13 +1485,15 @@ write_metadata_unlocked() {
     local instance="$3"
     local pid="$4"
     local start="$5"
+    local thread_id="${6:-}"
     local metadata_file
     local temporary_file
 
     metadata_file="$(metadata_file_for "$instance")"
     temporary_file="$metadata_file.$$.$RANDOM.tmp"
-    printf 'tool|%s\nrepository|%s\ninstance|%s\npid|%s\nstart|%s\n' \
-        "$tool" "$repository" "$instance" "$pid" "$start" > "$temporary_file"
+    [[ -z "$thread_id" ]] || is_valid_instance "$thread_id" || return 70
+    printf 'tool|%s\nrepository|%s\ninstance|%s\npid|%s\nstart|%s\nthread|%s\n' \
+        "$tool" "$repository" "$instance" "$pid" "$start" "$thread_id" > "$temporary_file"
     /bin/chmod 600 "$temporary_file"
     /bin/mv -f "$temporary_file" "$metadata_file"
 }
@@ -1295,12 +1595,15 @@ load_intent_path_unlocked() {
     local instance_seen=0
     local boot_seen=0
     local argc_seen=0
+    local thread_seen=0
+    local intent_version=""
     local declared_argc=""
     local argument_count=0
 
     intent_repository=""
     intent_instance=""
     intent_boot_id=""
+    intent_thread_id=""
     intent_arguments=()
 
     [[ -f "$intent_file" && ! -L "$intent_file" ]] || return 1
@@ -1311,7 +1614,8 @@ load_intent_path_unlocked() {
         [[ -z "${extra:-}" ]] || return 2
         case "$key" in
             version)
-                [[ $version_seen -eq 0 && "$value" == "1" ]] || return 2
+                [[ $version_seen -eq 0 && "$value" =~ ^(1|2)$ ]] || return 2
+                intent_version="$value"
                 version_seen=1
                 ;;
             tool)
@@ -1333,6 +1637,11 @@ load_intent_path_unlocked() {
                 intent_boot_id="$value"
                 boot_seen=1
                 ;;
+            thread)
+                [[ $thread_seen -eq 0 ]] || return 2
+                intent_thread_id="$value"
+                thread_seen=1
+                ;;
             argc)
                 [[ $argc_seen -eq 0 && "$value" =~ ^(0|[1-9][0-9]*)$ \
                     && $value -le 64 ]] || return 2
@@ -1352,9 +1661,15 @@ load_intent_path_unlocked() {
     [[ $version_seen -eq 1 && $tool_seen -eq 1 && $repository_seen -eq 1 \
         && $instance_seen -eq 1 && $boot_seen -eq 1 && $argc_seen -eq 1 \
         && "$argument_count" == "$declared_argc" ]] || return 2
+    if [[ "$intent_version" == "2" ]]; then
+        [[ $thread_seen -eq 1 ]] || return 2
+    else
+        [[ $thread_seen -eq 0 ]] || return 2
+    fi
     is_valid_repository_name "$intent_repository" || return 2
     is_valid_instance "$intent_instance" || return 2
     is_valid_boot_id "$intent_boot_id" || return 2
+    [[ -z "$intent_thread_id" ]] || is_valid_instance "$intent_thread_id" || return 2
     validate_launch_arguments "$tool" "${intent_arguments[@]}" >/dev/null || return 2
 }
 
@@ -1379,6 +1694,33 @@ write_intent_unlocked() {
     {
         printf 'version|1\ntool|%s\nrepository|%s\ninstance|%s\nboot|%s\nargc|%s\n' \
             "$tool" "$repository" "$instance" "$boot_id" "$#"
+        for argument in "$@"; do
+            printf 'arg|%s\n' "$(encode_argument_hex "$argument")"
+        done
+    } > "$temporary_file"
+    /bin/chmod 600 "$temporary_file"
+    /bin/mv -f "$temporary_file" "$intent_file"
+}
+
+write_thread_intent_unlocked() {
+    local tool="$1"
+    local repository="$2"
+    local instance="$3"
+    local boot_id="$4"
+    local thread_id="$5"
+    shift 5
+    local intent_file
+    local temporary_file
+    local argument
+
+    validate_launch_arguments "$tool" "$@" || return $?
+    is_valid_boot_id "$boot_id" || return 70
+    [[ -z "$thread_id" ]] || is_valid_instance "$thread_id" || return 70
+    intent_file="$(intent_file_for "$instance")"
+    temporary_file="$intent_file.$$.$RANDOM.tmp"
+    {
+        printf 'version|2\ntool|%s\nrepository|%s\ninstance|%s\nboot|%s\nthread|%s\nargc|%s\n' \
+            "$tool" "$repository" "$instance" "$boot_id" "$thread_id" "$#"
         for argument in "$@"; do
             printf 'arg|%s\n' "$(encode_argument_hex "$argument")"
         done
@@ -1801,6 +2143,118 @@ list_projects() {
     fi
 }
 
+validate_thread_id() {
+    is_valid_instance "$1" || fail_usage "Invalid provider thread identifier."
+}
+
+validate_thread_name() {
+    local name="$1"
+    local name_bytes
+    name_bytes="$(printf '%s' "$name" | /usr/bin/wc -c | /usr/bin/tr -d '[:space:]')"
+    [[ -n "$name" && "$name" != *$'\n'* && "$name_bytes" =~ ^[0-9]+$ \
+        && $name_bytes -le 200 ]] || fail_usage "Invalid provider thread name."
+}
+
+thread_is_active() {
+    local requested_thread_id="$1"
+    local metadata_file
+    local instance
+    local tool
+
+    shopt -s nullglob
+    for metadata_file in "$runtime_directory"/*.session; do
+        instance="${metadata_file##*/}"
+        instance="${instance%.session}"
+        is_valid_instance "$instance" || continue
+        tool="$(/usr/bin/sed -n 's/^tool|//p' "$metadata_file")"
+        [[ "$tool" == "codex" || "$tool" == "claude" ]] || continue
+        lock_tool_metadata "$instance"
+        if load_metadata_unlocked "$tool" "$instance" \
+            && [[ "$metadata_thread_id" == "$requested_thread_id" ]] \
+            && { session_exists "$tool" "$instance" \
+                || metadata_launch_is_running "$instance"; }; then
+            unlock_tool_metadata
+            shopt -u nullglob
+            return 0
+        fi
+        unlock_tool_metadata
+    done
+    shopt -u nullglob
+    return 1
+}
+
+record_thread_binding() {
+    local tool="$1"
+    local repository="$2"
+    local instance="$3"
+    local thread_id="$4"
+
+    is_valid_instance "$thread_id" || return 0
+    lock_tool_metadata "$instance"
+    if load_metadata_unlocked "$tool" "$instance" \
+        && [[ "$metadata_repository" == "$repository" ]] \
+        && [[ -z "$metadata_thread_id" ]]; then
+        write_metadata_unlocked "$tool" "$repository" "$instance" \
+            "$metadata_pid" "$metadata_start" "$thread_id"
+        if load_intent_unlocked "$tool" "$instance" \
+            && [[ "$intent_repository" == "$repository" \
+                && "$intent_instance" == "$instance" ]]; then
+            write_thread_intent_unlocked "$tool" "$repository" "$instance" \
+                "$intent_boot_id" "$thread_id" "${intent_arguments[@]}"
+        fi
+    fi
+    unlock_tool_metadata
+}
+
+codex_threads() {
+    local repository="$1"
+    local archive_filter="$2"
+    local cursor="${3:-}"
+    local project_directory
+
+    project_directory="$(project_directory_for "$repository")" || return $?
+    case "$archive_filter" in
+        active) run_codex_rpc_with_app_server_lock threads "$project_directory" 0 "$cursor" ;;
+        archived) run_codex_rpc_with_app_server_lock threads "$project_directory" 1 "$cursor" ;;
+        *) fail_usage "threads requires an active or archived filter." ;;
+    esac
+}
+
+codex_thread_read() {
+    local repository="$1"
+    local thread_id="$2"
+    local project_directory
+
+    validate_thread_id "$thread_id"
+    project_directory="$(project_directory_for "$repository")" || return $?
+    run_codex_rpc_with_app_server_lock thread-read "$project_directory" "$thread_id"
+}
+
+codex_thread_create() {
+    local repository="$1"
+    local project_directory
+
+    project_directory="$(project_directory_for "$repository")" || return $?
+    run_codex_rpc_with_app_server_lock thread-create "$project_directory"
+}
+
+codex_thread_mutate() {
+    local operation="$1"
+    local repository="$2"
+    local thread_id="$3"
+    shift 3
+    local project_directory
+
+    validate_thread_id "$thread_id"
+    thread_is_active "$thread_id" && {
+        echo "Active threads cannot be renamed or archived." >&2
+        return 75
+    }
+    project_directory="$(project_directory_for "$repository")" || return $?
+    run_codex_rpc_with_app_server_lock "$operation" \
+        "$project_directory" "$thread_id" "$@"
+}
+
 system_resources() {
     local cpu_before
     local cpu_after
@@ -2189,6 +2643,7 @@ status_sessions() {
     local attached_client_count
     local boot_id
     local intent_status
+    local bound_thread_id
     local needs_active_title_generation=0
     local -a records=()
     local -a title_generation_thread_ids=()
@@ -2220,6 +2675,7 @@ status_sessions() {
             return 70
         fi
         repository="$metadata_repository"
+        bound_thread_id="$metadata_thread_id"
         session_name="$(session_name_for "$tool" "$instance")"
         if session_exists "$tool" "$instance"; then
             if ! attached_client_count="$(tmux_command display-message -p -t "$session_name" \
@@ -2254,6 +2710,12 @@ status_sessions() {
             session_working=""
             session_thread_id=""
             session_needs_title_generation=0
+        fi
+        if [[ -z "$session_thread_id" && -n "$bound_thread_id" ]]; then
+            session_thread_id="$bound_thread_id"
+        fi
+        if [[ -n "$session_thread_id" ]]; then
+            record_thread_binding "$tool" "$repository" "$instance" "$session_thread_id"
         fi
         if [[ "$session_needs_title_generation" == "1" \
             && -n "$session_thread_id" ]]; then
@@ -2507,9 +2969,10 @@ restore_sessions() {
         fi
 
         remove_metadata_unlocked "$instance"
-        write_metadata_unlocked "$tool" "$repository" "$instance" 0 pending
-        if ! write_intent_unlocked \
-            "$tool" "$repository" "$instance" "$boot_id" "${intent_arguments[@]}"; then
+        write_metadata_unlocked "$tool" "$repository" "$instance" 0 pending "$intent_thread_id"
+        if ! write_thread_intent_unlocked \
+            "$tool" "$repository" "$instance" "$boot_id" "$intent_thread_id" \
+            "${intent_arguments[@]}"; then
             remove_metadata_unlocked "$instance"
             unlock_tool_metadata
             if [[ $codex_app_server_reserved -eq 1 ]]; then
@@ -3043,6 +3506,8 @@ start_instance_session() {
     local boot_id
     local account_status=0
     local codex_app_server_reserved=0
+    local provider_thread_id="${requested_provider_thread_id:-}"
+    local launch_mode="${requested_launch_mode:-initial}"
 
     validate_tool "$tool"
     validate_launch_arguments "$tool" "$@" || exit $?
@@ -3064,6 +3529,9 @@ start_instance_session() {
         echo "Unable to generate a launch instance token." >&2
         exit 70
     }
+    if [[ "$tool" == "claude" ]]; then
+        provider_thread_id="$instance"
+    fi
     session_name="$(session_name_for "$tool" "$instance")"
 
     lock_tool_control "$instance"
@@ -3082,8 +3550,9 @@ start_instance_session() {
         }
     fi
     lock_tool_metadata "$instance"
-    write_metadata_unlocked "$tool" "$repository" "$instance" 0 pending
-    if ! write_intent_unlocked "$tool" "$repository" "$instance" "$boot_id" "$@"; then
+    write_metadata_unlocked "$tool" "$repository" "$instance" 0 pending "$provider_thread_id"
+    if ! write_thread_intent_unlocked \
+        "$tool" "$repository" "$instance" "$boot_id" "$provider_thread_id" "$@"; then
         remove_metadata_unlocked "$instance"
         unlock_tool_metadata
         if [[ $codex_app_server_reserved -eq 1 ]]; then
@@ -3096,7 +3565,7 @@ start_instance_session() {
     unlock_tool_metadata
 
     launch_file="$runtime_directory/$instance.launch.$$.$RANDOM"
-    write_launch_script "$launch_file" "$tool" "$repository" "$instance" initial "$@"
+    write_launch_script "$launch_file" "$tool" "$repository" "$instance" "$launch_mode" "$@"
     printf -v launch_command '%q' "$launch_file"
     if ! tmux_command new-session -d -s "$session_name" -c "$project_directory" "$launch_command"; then
         /bin/rm -f -- "$launch_file"
@@ -3138,10 +3607,29 @@ start_instance_session() {
         session_working=""
         session_thread_id=""
     fi
+    if [[ -z "$session_thread_id" && -n "$provider_thread_id" ]]; then
+        session_thread_id="$provider_thread_id"
+    fi
     printf '%s\n' "$protocol_marker"
     printf 'session|%s|%s|%s|%s|%s|%s|%s|%s\n' \
         "$tool" "$repository" "$attached_client_count" "$instance" \
         "$session_activity" "$session_title_hex" "$session_working" "$session_thread_id"
+}
+
+resume_codex_thread() {
+    local repository="$1"
+    local thread_id="$2"
+    shift 2
+
+    validate_thread_id "$thread_id"
+    thread_is_active "$thread_id" && {
+        echo "The requested Codex thread is already active." >&2
+        return 75
+    }
+    codex_thread_read "$repository" "$thread_id" >/dev/null || return $?
+    requested_provider_thread_id="$thread_id"
+    requested_launch_mode=resume
+    start_instance_session codex "$repository" "$@"
 }
 
 reattach_instance_session() {
@@ -3341,6 +3829,7 @@ run_agent_instance() {
     local agent_pid
     local agent_status
     local start_identity
+    local launch_thread_id=""
     local preserve_intent=0
     local -a agent_arguments=("$@")
     local -a agent_command
@@ -3354,6 +3843,17 @@ run_agent_instance() {
     validate_launch_arguments "$tool" "${agent_arguments[@]}" || exit $?
     project_directory="$(project_directory_for "$repository")" || exit $?
     cd "$project_directory"
+
+    lock_tool_metadata "$instance"
+    if ! load_intent_unlocked "$tool" "$instance" \
+        || [[ "$intent_repository" != "$repository" \
+            || "$intent_instance" != "$instance" ]]; then
+        unlock_tool_metadata
+        echo "The $tool restart intent changed before the agent started." >&2
+        exit 75
+    fi
+    launch_thread_id="$intent_thread_id"
+    unlock_tool_metadata
 
     case "$tool" in
         codex)
@@ -3376,7 +3876,7 @@ run_agent_instance() {
                     agent_command=(
                         "$executable"
                         --remote "unix://$codex_app_server_socket"
-                        resume --last
+                        resume "${launch_thread_id:---last}"
                         "${agent_arguments[@]}"
                     )
                 else
@@ -3387,7 +3887,7 @@ run_agent_instance() {
                     )
                 fi
             elif [[ "$launch_mode" == "resume" ]]; then
-                agent_command=("$executable" resume --last "${agent_arguments[@]}")
+                agent_command=("$executable" resume "${launch_thread_id:---last}" "${agent_arguments[@]}")
             else
                 agent_command=("$executable" "${agent_arguments[@]}")
             fi
@@ -3449,7 +3949,8 @@ run_agent_instance() {
         echo "The $tool terminal state changed before the agent process was released." >&2
         exit 75
     fi
-    write_metadata_unlocked "$tool" "$repository" "$instance" "$agent_pid" "$start_identity"
+    write_metadata_unlocked "$tool" "$repository" "$instance" \
+        "$agent_pid" "$start_identity" "$launch_thread_id"
     unlock_tool_metadata
 
     trap 'preserve_intent=1; /bin/rm -f -- "$gate_file"; /bin/kill -TERM "$agent_pid" 2>/dev/null || true' \
@@ -3735,6 +4236,36 @@ case "$command_name" in
     restore)
         [[ $# -eq 0 ]] || fail_usage "restore does not accept arguments."
         restore_sessions
+        ;;
+    threads)
+        [[ $# -ge 2 && $# -le 3 ]] \
+            || fail_usage "threads requires a repository, filter, and optional cursor."
+        codex_threads "$@"
+        ;;
+    thread-read)
+        [[ $# -eq 2 ]] || fail_usage "thread-read requires a repository and thread id."
+        codex_thread_read "$1" "$2"
+        ;;
+    thread-create)
+        [[ $# -eq 1 ]] || fail_usage "thread-create requires a repository."
+        codex_thread_create "$1"
+        ;;
+    thread-resume)
+        [[ $# -ge 2 ]] || fail_usage "thread-resume requires a repository and thread id."
+        resume_codex_thread "$@"
+        ;;
+    thread-rename)
+        [[ $# -eq 3 ]] || fail_usage "thread-rename requires a repository, thread id, and name."
+        validate_thread_name "$3"
+        codex_thread_mutate thread-rename "$1" "$2" "$3"
+        ;;
+    thread-archive)
+        [[ $# -eq 2 ]] || fail_usage "thread-archive requires a repository and thread id."
+        codex_thread_mutate thread-archive "$1" "$2"
+        ;;
+    thread-unarchive)
+        [[ $# -eq 2 ]] || fail_usage "thread-unarchive requires a repository and thread id."
+        codex_thread_mutate thread-unarchive "$1" "$2"
         ;;
     start)
         [[ $# -ge 2 ]] || fail_usage "start requires a tool and repository."

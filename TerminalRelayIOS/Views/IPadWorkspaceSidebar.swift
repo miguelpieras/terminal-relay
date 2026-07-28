@@ -5,6 +5,7 @@ private struct IPadSidebarProject: Identifiable {
     let workerName: String
     let repositoryName: String
     let sessions: [WorkerSessionSnapshot]
+    let threads: [WorkerThreadSnapshot]
 
     var id: String {
         "\(workerID.uuidString):\(repositoryName)"
@@ -37,7 +38,12 @@ struct IPadWorkspaceSidebar: View {
                         .sorted {
                             ($0.title ?? "").localizedStandardCompare($1.title ?? "")
                                 == .orderedAscending
-                        }
+                        },
+                    threads: model.threads(
+                        workerID: profile.id,
+                        repositoryName: repositoryName,
+                        archived: false
+                    ).filter { !$0.isActive }
                 )
             }
         }
@@ -57,6 +63,16 @@ struct IPadWorkspaceSidebar: View {
             project.repositoryName.localizedCaseInsensitiveContains(query)
                 || project.workerName.localizedCaseInsensitiveContains(query)
                 || project.sessions.contains {
+                    ($0.title ?? "").localizedCaseInsensitiveContains(query)
+                }
+                || project.threads.contains {
+                    ($0.title ?? "").localizedCaseInsensitiveContains(query)
+                }
+                || model.threads(
+                    workerID: project.workerID,
+                    repositoryName: project.repositoryName,
+                    archived: true
+                ).contains {
                     ($0.title ?? "").localizedCaseInsensitiveContains(query)
                 }
         }
@@ -125,6 +141,10 @@ struct IPadWorkspaceSidebar: View {
                         ForEach(project.sessions) { session in
                             terminalRow(session, project: project)
                         }
+
+                        ForEach(project.threads) { thread in
+                            dormantThreadRow(thread, project: project)
+                        }
                     }
                 }
             }
@@ -145,9 +165,11 @@ struct IPadWorkspaceSidebar: View {
         .searchable(text: $searchText, prompt: "Projects or terminals")
         .refreshable {
             await model.refreshProjectCatalogs()
+            await model.refreshAllThreads()
         }
         .task(id: refreshTaskID) {
             await model.refreshProjectCatalogs()
+            await model.refreshAllThreads()
             reconcileSelection()
             while !Task.isCancelled {
                 do {
@@ -260,6 +282,51 @@ struct IPadWorkspaceSidebar: View {
         return route.kind == session.kind
             && route.repositoryName == session.repositoryName
             && route.instanceToken == session.instanceToken
+    }
+
+    private func dormantThreadRow(
+        _ thread: WorkerThreadSnapshot,
+        project: IPadSidebarProject
+    ) -> some View {
+        Button {
+            selectedProject = project.selection
+            Task {
+                await model.resumeThread(workerID: project.workerID, thread: thread)
+            }
+        } label: {
+            HStack(spacing: 9) {
+                Image(systemName: thread.kind.systemImage)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.blue.opacity(0.65))
+                    .frame(width: 18)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(thread.title ?? "Untitled thread")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                    Text("Paused")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                Spacer(minLength: 4)
+                Image(systemName: "play.circle")
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.leading, 20)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            Button("Archive Thread", role: .destructive) {
+                Task {
+                    await model.setThreadArchived(
+                        workerID: project.workerID,
+                        thread: thread,
+                        archived: true
+                    )
+                }
+            }
+        }
     }
 
     private func reconcileSelection() {

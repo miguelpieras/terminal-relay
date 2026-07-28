@@ -23,6 +23,7 @@ readonly display_name_file="$state_directory/display-name"
 readonly ssh_keys_marker="$state_directory/authorized-keys-installed"
 readonly workspace_directory="/workspace"
 readonly launcher_destination="/usr/local/bin/terminal-relay-session"
+readonly mcp_destination="/usr/local/bin/terminal-relay-mcp"
 readonly restore_unit_destination="/etc/systemd/system/terminal-relay-session-restore@.service"
 readonly restore_service="terminal-relay-session-restore@$runtime_user.service"
 readonly agent_update_destination="/usr/local/sbin/terminal-relay-agent-update"
@@ -46,6 +47,7 @@ readonly CODEX_RELEASE="latest"
 readonly minimum_memory_kib=3900000
 
 launcher_source="$script_directory/terminal-relay-session"
+mcp_source="$script_directory/terminal-relay-mcp"
 restore_unit_source="$script_directory/terminal-relay-session-restore@.service"
 agent_update_source="$script_directory/terminal-relay-agent-update"
 agent_update_service_source="$script_directory/terminal-relay-agent-update.service"
@@ -274,6 +276,7 @@ validate_source_bundle() {
 
     for required_file in \
         "$launcher_source" \
+        "$mcp_source" \
         "$restore_unit_source" \
         "$agent_update_source" \
         "$agent_update_service_source" \
@@ -453,6 +456,7 @@ validate_managed_state() {
 
         for entry in \
             "$launcher_destination" \
+            "$mcp_destination" \
             "$restore_unit_destination" \
             "$agent_update_destination" \
             "$agent_update_service_destination" \
@@ -480,6 +484,7 @@ validate_managed_state() {
     else
         for entry in \
             "$launcher_destination" \
+            "$mcp_destination" \
             "$restore_unit_destination" \
             "$agent_update_destination" \
             "$agent_update_service_destination" \
@@ -795,6 +800,7 @@ prepare_worker_guidance() {
 install_runtime_files() {
     /usr/bin/install -d -o "$runtime_user" -g "$runtime_group" -m 0750 "$workspace_directory"
     install_managed_file "$launcher_source" "$launcher_destination" 755
+    install_managed_file "$mcp_source" "$mcp_destination" 755
     install_managed_file "$restore_unit_source" "$restore_unit_destination" 644
     install_managed_file "$agent_update_source" "$agent_update_destination" 755
     install_managed_file "$agent_update_service_source" "$agent_update_service_destination" 644
@@ -903,6 +909,8 @@ verify_readiness() {
         || fail "Unexpected ownership or mode on $workspace_directory."
     [[ "$(/usr/bin/stat -c '%U:%G:%a' "$launcher_destination")" == "root:root:755" ]] \
         || fail "Unexpected ownership or mode on $launcher_destination."
+    [[ "$(/usr/bin/stat -c '%U:%G:%a' "$mcp_destination")" == "root:root:755" ]] \
+        || fail "Unexpected ownership or mode on $mcp_destination."
     [[ "$(/usr/bin/stat -c '%U:%G:%a' "$restore_unit_destination")" == "root:root:644" ]] \
         || fail "Unexpected ownership or mode on $restore_unit_destination."
     [[ "$(/usr/bin/stat -c '%U:%G:%a' "$agent_update_destination")" == "root:root:755" ]] \
@@ -926,7 +934,7 @@ verify_readiness() {
     [[ "$(/usr/bin/stat -c '%U:%G:%a' "$runtime_home/.ssh/authorized_keys")" == "$runtime_user:$runtime_group:600" ]] \
         || fail "Unexpected ownership or mode on worker authorized keys."
 
-    for required_command in git ssh awk df nproc flock tmux python3 bwrap codex claude terminal-relay-session; do
+    for required_command in git ssh awk df nproc flock tmux python3 bwrap codex claude terminal-relay-session terminal-relay-mcp; do
         login_command_path="$(run_as_worker /bin/bash -lc \
             "cd \"\$HOME\" && command -v $required_command")" \
             || fail "$required_command is unavailable in the worker login shell."

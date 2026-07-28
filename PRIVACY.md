@@ -6,8 +6,11 @@ developer-operated data service.
 ## Data stored on your devices
 
 The apps store worker connection settings, project references, display
-preferences, and account labels locally. The universal iPhone and iPad app
-creates an SSH private key in the device Keychain. Terminal Relay does not
+preferences, account labels, last-known thread catalog metadata, and read state
+locally. Thread catalog metadata is limited to the configured worker, project
+name, provider thread identifier, relay instance identifier, title, activity
+time, archive/run state, and supported actions. The universal iPhone and iPad
+app creates an SSH private key in the device Keychain. Terminal Relay does not
 upload that private key.
 
 The iPhone and iPad app uses the camera only to scan a pairing code displayed
@@ -22,6 +25,16 @@ directly to workers and services configured by you, including SSH servers,
 Tailscale, GitHub, Codex, or Claude. Those services process data under their own
 terms and privacy policies. The Terminal Relay project and its maintainers do
 not receive this traffic.
+
+Thread catalog and mutation requests travel over the same direct SSH
+connection. The built-in worker MCP runs only as stdio inside Codex or Claude
+on that worker and invokes the root-owned session helper locally. Its tools
+return project names and thread metadata, not prompts, transcript items,
+terminal contents, credentials, or account data. It has no network listener and
+cannot access another worker. Codex cataloging reads only IDs, project paths,
+titles, activity times, archive flags, and source kinds from Codex's local
+metadata index when a new preview-empty thread is not yet returned by the app
+server; message and preview content are not selected.
 
 Maintainer-signed macOS builds check a public GitHub Pages appcast once per day
 and download accepted updates from GitHub Releases. Sparkle system profiling is

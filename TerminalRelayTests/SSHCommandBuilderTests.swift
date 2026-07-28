@@ -343,7 +343,58 @@ final class SSHCommandBuilderTests: XCTestCase {
         )
         XCTAssertTrue(
             AgentLaunchDefaults.standard.arguments(for: .claude)
-                .contains("{\"mcpServers\":{}}")
+                .contains(
+                    "{\"mcpServers\":{\"terminal_relay\":{\"command\":\"/usr/local/bin/terminal-relay-mcp\"}}}"
+                )
+        )
+    }
+
+    func testThreadCommandsUseTheFixedHelperAndQuoteDynamicValues() {
+        let server = makeServer()
+        let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+        XCTAssertEqual(
+            SSHCommandBuilder.workerThreadListConfiguration(
+                for: server,
+                repositoryName: "relay's repo",
+                archived: true,
+                cursor: "next page"
+            ).arguments.suffix(3),
+            [
+                "--",
+                server.destination,
+                "'/usr/local/bin/terminal-relay-session' 'threads' 'relay'\"'\"'s repo' 'archived' 'next page'"
+            ]
+        )
+        XCTAssertEqual(
+            SSHCommandBuilder.workerThreadResumeConfiguration(
+                for: server,
+                repositoryName: "terminal-relay",
+                threadID: threadID,
+                launchDefaults: .standard
+            ).arguments.last,
+            (
+                [WorkerSessionProtocol.helperPath, "thread-resume", "terminal-relay", threadID]
+                    + AgentLaunchDefaults.standard.arguments(for: .codex)
+            ).map(SSHCommandBuilder.shellQuote).joined(separator: " ")
+        )
+        XCTAssertEqual(
+            SSHCommandBuilder.workerThreadRenameConfiguration(
+                for: server,
+                repositoryName: "terminal-relay",
+                threadID: threadID,
+                name: "It's renamed"
+            ).arguments.last,
+            "'/usr/local/bin/terminal-relay-session' 'thread-rename' 'terminal-relay' '\(threadID)' 'It'\"'\"'s renamed'"
+        )
+        XCTAssertEqual(
+            SSHCommandBuilder.workerThreadArchiveConfiguration(
+                for: server,
+                repositoryName: "terminal-relay",
+                threadID: threadID,
+                unarchive: true
+            ).arguments.last,
+            "'/usr/local/bin/terminal-relay-session' 'thread-unarchive' 'terminal-relay' '\(threadID)'"
         )
     }
 

@@ -3,6 +3,7 @@ import Foundation
 enum WorkerRemoteCommandError: LocalizedError, Equatable {
     case invalidRepositoryName
     case invalidInstanceToken
+    case invalidThreadName
 
     var errorDescription: String? {
         switch self {
@@ -10,6 +11,8 @@ enum WorkerRemoteCommandError: LocalizedError, Equatable {
             "The repository name is not safe to use on the worker."
         case .invalidInstanceToken:
             "The worker session identifier is invalid."
+        case .invalidThreadName:
+            "The thread name is invalid."
         }
     }
 }
@@ -170,6 +173,82 @@ enum WorkerRemoteCommand {
         return "\(WorkerSessionProtocol.helperPath) stop \(arguments)"
     }
 
+    static func threads(
+        repositoryName: String,
+        archived: Bool,
+        cursor: String? = nil
+    ) throws -> String {
+        try validateRepository(repositoryName)
+        var arguments = [
+            WorkerSessionProtocol.helperPath,
+            "threads",
+            repositoryName,
+            archived ? "archived" : "active",
+        ]
+        if let cursor {
+            arguments.append(cursor)
+        }
+        return arguments.map(shellQuote).joined(separator: " ")
+    }
+
+    static func createThread(repositoryName: String) throws -> String {
+        try validateRepository(repositoryName)
+        return [
+            WorkerSessionProtocol.helperPath,
+            "thread-create",
+            repositoryName,
+        ].map(shellQuote).joined(separator: " ")
+    }
+
+    static func resumeThread(
+        repositoryName: String,
+        threadID: String,
+        launchArguments: [String]
+    ) throws -> String {
+        try validateThread(repositoryName: repositoryName, threadID: threadID)
+        return ([
+            WorkerSessionProtocol.helperPath,
+            "thread-resume",
+            repositoryName,
+            threadID,
+        ] + launchArguments).map(shellQuote).joined(separator: " ")
+    }
+
+    static func renameThread(
+        repositoryName: String,
+        threadID: String,
+        name: String
+    ) throws -> String {
+        try validateThread(repositoryName: repositoryName, threadID: threadID)
+        let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty,
+              !normalized.contains("\n"),
+              normalized.utf8.count <= 200 else {
+            throw WorkerRemoteCommandError.invalidThreadName
+        }
+        return [
+            WorkerSessionProtocol.helperPath,
+            "thread-rename",
+            repositoryName,
+            threadID,
+            normalized,
+        ].map(shellQuote).joined(separator: " ")
+    }
+
+    static func archiveThread(
+        repositoryName: String,
+        threadID: String,
+        unarchive: Bool
+    ) throws -> String {
+        try validateThread(repositoryName: repositoryName, threadID: threadID)
+        return [
+            WorkerSessionProtocol.helperPath,
+            unarchive ? "thread-unarchive" : "thread-archive",
+            repositoryName,
+            threadID,
+        ].map(shellQuote).joined(separator: " ")
+    }
+
     static func shellQuote(_ value: String) -> String {
         "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
@@ -182,6 +261,22 @@ enum WorkerRemoteCommand {
             throw WorkerRemoteCommandError.invalidRepositoryName
         }
         guard UUID(uuidString: instanceToken)?.uuidString.lowercased() == instanceToken else {
+            throw WorkerRemoteCommandError.invalidInstanceToken
+        }
+    }
+
+    private static func validateRepository(_ repositoryName: String) throws {
+        guard WorkerSessionProtocol.isValidRepositoryName(repositoryName) else {
+            throw WorkerRemoteCommandError.invalidRepositoryName
+        }
+    }
+
+    private static func validateThread(
+        repositoryName: String,
+        threadID: String
+    ) throws {
+        try validateRepository(repositoryName)
+        guard UUID(uuidString: threadID)?.uuidString.lowercased() == threadID else {
             throw WorkerRemoteCommandError.invalidInstanceToken
         }
     }

@@ -51,4 +51,32 @@ final class DemoWorkspaceTests: XCTestCase {
         XCTAssertFalse(model.isUnread(session, profileID: DemoWorkspace.worker.id))
         XCTAssertTrue(model.isUnread(session, profileID: otherWorkerID))
     }
+
+    func testUnreadStateSurvivesANewRelayInstanceForTheSameThread() {
+        let suiteName = "DemoWorkspaceTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let model = WorkerSessionModel(
+            readStateDefaults: defaults,
+            screenshotDemo: true
+        )
+        let original = DemoWorkspace.sessions[0]
+        model.openTerminal(original)
+        let replacement = WorkerSessionSnapshot(
+            kind: original.kind,
+            repositoryName: original.repositoryName,
+            attachedClientCount: 0,
+            instanceToken:
+                "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            title: original.title,
+            lastActivityAt: original.lastActivityAt,
+            reportedWorking: false,
+            threadID: original.threadID
+        )
+
+        XCTAssertFalse(
+            model.isUnread(replacement, profileID: DemoWorkspace.worker.id)
+        )
+    }
 }

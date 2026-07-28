@@ -1,0 +1,486 @@
+#!/usr/bin/python3
+"""Local stdio MCP server for one Terminal Relay worker."""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import uuid
+
+
+INSTALLED_PATH = "/usr/local/bin/terminal-relay-mcp"
+INSTALLED_HELPER = "/usr/local/bin/terminal-relay-session"
+SESSION_MARKER = "__TERMINAL_RELAY_SESSION_V1__"
+THREAD_MARKER = "__TERMINAL_RELAY_THREADS_V1__"
+MAXIMUM_MESSAGE_BYTES = 1024 * 1024
+REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
+
+
+def helper_path():
+    current_path = os.path.realpath(__file__)
+    if current_path == INSTALLED_PATH:
+        return INSTALLED_HELPER
+    if os.environ.get("TERMINAL_RELAY_MCP_TEST_MODE") == "1":
+        candidate = os.environ.get("TERMINAL_RELAY_MCP_TEST_HELPER", "")
+        if os.path.isabs(candidate) and os.path.isfile(candidate):
+            return candidate
+    return INSTALLED_HELPER
+
+
+def helper_timeout_seconds():
+    if (
+        os.path.realpath(__file__) != INSTALLED_PATH
+        and os.environ.get("TERMINAL_RELAY_MCP_TEST_MODE") == "1"
+    ):
+        value = os.environ.get("TERMINAL_RELAY_MCP_TEST_TIMEOUT_SECONDS")
+        if value is not None:
+            try:
+                timeout = float(value)
+            except ValueError:
+                timeout = 30
+            if 0.05 <= timeout <= 30:
+                return timeout
+    return 30
+
+
+def require_repository(value):
+    if not isinstance(value, str) or not REPOSITORY_PATTERN.fullmatch(value):
+        raise ValueError("repository must be a valid worker project name")
+    return value
+
+
+def require_thread_id(value):
+    if not isinstance(value, str):
+        raise ValueError("thread_id must be a UUID")
+    try:
+        canonical = str(uuid.UUID(value))
+    except ValueError as error:
+        raise ValueError("thread_id must be a UUID") from error
+    if canonical != value:
+        raise ValueError("thread_id must be a canonical UUID")
+    return canonical
+
+
+def require_name(value):
+    if not isinstance(value, str) or not value.strip() or "\n" in value:
+        raise ValueError("name must be a non-empty single line")
+    name = value.strip()
+    if len(name.encode("utf-8")) > 200:
+        raise ValueError("name must be at most 200 UTF-8 bytes")
+    return name
+
+
+def run_helper(*arguments):
+    environment = {"PATH": "/usr/local/bin:/usr/bin:/bin"}
+    if (
+        os.path.realpath(__file__) != INSTALLED_PATH
+        and os.environ.get("TERMINAL_RELAY_MCP_TEST_MODE") == "1"
+        and os.environ.get("TERMINAL_RELAY_MCP_HELPER_LOG")
+    ):
+        environment["TERMINAL_RELAY_MCP_HELPER_LOG"] = os.environ[
+            "TERMINAL_RELAY_MCP_HELPER_LOG"
+        ]
+    try:
+        result = subprocess.run(
+            [helper_path(), *arguments],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=helper_timeout_seconds(),
+            check=False,
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError("The worker session helper is unavailable.") from error
+    if result.returncode != 0:
+        raise RuntimeError("The worker rejected the requested operation.")
+    if len(result.stdout.encode("utf-8")) > MAXIMUM_MESSAGE_BYTES:
+        raise RuntimeError("The worker returned an oversized response.")
+    return result.stdout
+
+
+def parse_projects(output):
+    lines = output.splitlines()
+    try:
+        marker_index = lines.index(SESSION_MARKER)
+    except ValueError as error:
+        raise RuntimeError("The worker returned an invalid project catalog.") from error
+    projects = []
+    for line in lines[marker_index + 1 :]:
+        if not line:
+            continue
+        fields = line.split("|")
+        if len(fields) != 2 or fields[0] != "project":
+            raise RuntimeError("The worker returned an invalid project catalog.")
+        projects.append(require_repository(fields[1]))
+    return sorted(set(projects))
+
+
+def parse_thread_catalog(output, repository):
+    lines = output.splitlines()
+    try:
+        marker_index = lines.index(THREAD_MARKER)
+        value = json.loads(lines[marker_index + 1])
+    except (ValueError, IndexError, json.JSONDecodeError) as error:
+        raise RuntimeError("The worker returned an invalid thread catalog.") from error
+    if not isinstance(value, dict) or not isinstance(value.get("threads"), list):
+        raise RuntimeError("The worker returned an invalid thread catalog.")
+    normalized = []
+    seen_thread_ids = set()
+    for thread in value["threads"]:
+        if not isinstance(thread, dict):
+            raise RuntimeError("The worker returned an invalid thread catalog.")
+        if thread.get("provider") != "codex":
+            raise RuntimeError("The worker returned an invalid thread provider.")
+        thread_id = require_thread_id(thread.get("threadID"))
+        if thread_id in seen_thread_ids:
+            raise RuntimeError("The worker returned a duplicate thread.")
+        seen_thread_ids.add(thread_id)
+        title = thread.get("title")
+        if title is not None and (
+            not isinstance(title, str) or len(title.encode("utf-8")) > 200
+        ):
+            raise RuntimeError("The worker returned an invalid thread title.")
+        updated_at = thread.get("updatedAt")
+        if not isinstance(updated_at, int) or updated_at < 0:
+            raise RuntimeError("The worker returned an invalid activity time.")
+        if not isinstance(thread.get("archived"), bool):
+            raise RuntimeError("The worker returned an invalid archive state.")
+        archived = thread["archived"]
+        normalized.append(
+            {
+                "provider": "codex",
+                "repositoryName": repository,
+                "threadID": thread_id,
+                "title": title,
+                "updatedAt": updated_at,
+                "archived": archived,
+                "activeInstanceToken": None,
+                "isWorking": None,
+                "capabilities": {
+                    "resume": not archived,
+                    "rename": not archived,
+                    "archive": not archived,
+                    "unarchive": archived,
+                },
+            }
+        )
+    next_cursor = value.get("nextCursor")
+    if next_cursor is not None and (
+        not isinstance(next_cursor, str)
+        or len(next_cursor.encode("utf-8")) > 2048
+        or "\n" in next_cursor
+    ):
+        raise RuntimeError("The worker returned an invalid thread cursor.")
+    return {"threads": normalized, "nextCursor": next_cursor}
+
+
+def parse_live_sessions(output, repository):
+    lines = output.splitlines()
+    try:
+        marker_index = lines.index(SESSION_MARKER)
+    except ValueError as error:
+        raise RuntimeError("The worker returned invalid live sessions.") from error
+    sessions = []
+    for line in lines[marker_index + 1 :]:
+        if not line:
+            continue
+        fields = line.split("|")
+        if fields[0] != "session":
+            continue
+        if len(fields) not in (5, 7, 8, 9) or fields[2] != repository:
+            continue
+        provider = fields[1]
+        if provider not in ("codex", "claude"):
+            continue
+        instance_id = require_thread_id(fields[4])
+        thread_id = instance_id if provider == "claude" else None
+        if len(fields) == 9 and fields[8]:
+            thread_id = require_thread_id(fields[8])
+        if thread_id is None:
+            continue
+        title = None
+        if len(fields) >= 7 and fields[6]:
+            try:
+                title = bytes.fromhex(fields[6]).decode("utf-8")
+            except (ValueError, UnicodeDecodeError) as error:
+                raise RuntimeError("The worker returned an invalid session title.") from error
+            if len(title.encode("utf-8")) > 200:
+                raise RuntimeError("The worker returned an invalid session title.")
+        working = None
+        if len(fields) >= 8 and fields[7] in ("0", "1"):
+            working = fields[7] == "1"
+        sessions.append(
+            {
+                "provider": provider,
+                "repositoryName": repository,
+                "threadID": thread_id,
+                "title": title,
+                "updatedAt": int(fields[5]) if len(fields) >= 7 else 0,
+                "archived": False,
+                "activeInstanceToken": instance_id,
+                "isWorking": working,
+                "capabilities": {
+                    "resume": False,
+                    "rename": False,
+                    "archive": False,
+                    "unarchive": False,
+                },
+            }
+        )
+    return sessions
+
+
+def list_threads(arguments):
+    repository = require_repository(arguments.get("repository"))
+    archived = arguments.get("archived", False)
+    if not isinstance(archived, bool):
+        raise ValueError("archived must be a boolean")
+    cursor = arguments.get("cursor")
+    if cursor is not None and (
+        not isinstance(cursor, str)
+        or len(cursor.encode("utf-8")) > 2048
+        or "\n" in cursor
+    ):
+        raise ValueError("cursor is invalid")
+    helper_arguments = ["threads", repository, "archived" if archived else "active"]
+    if cursor:
+        helper_arguments.append(cursor)
+    catalog = parse_thread_catalog(run_helper(*helper_arguments), repository)
+    if archived:
+        return catalog
+    live = parse_live_sessions(run_helper("status"), repository)
+    by_identity = {
+        (thread["provider"], thread["threadID"]): thread
+        for thread in catalog["threads"]
+    }
+    for thread in live:
+        by_identity[(thread["provider"], thread["threadID"])] = thread
+    catalog["threads"] = sorted(
+        by_identity.values(),
+        key=lambda thread: (-thread["updatedAt"], thread["threadID"]),
+    )
+    return catalog
+
+
+def tool_result(value):
+    text = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    return {
+        "content": [{"type": "text", "text": text}],
+        "structuredContent": value,
+    }
+
+
+TOOLS = [
+    {
+        "name": "list_projects",
+        "description": "List repositories available on this worker.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "annotations": {"readOnlyHint": True, "destructiveHint": False},
+    },
+    {
+        "name": "list_threads",
+        "description": "List active or archived threads for one project on this worker.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repository": {"type": "string"},
+                "archived": {"type": "boolean", "default": False},
+                "cursor": {"type": "string"},
+            },
+            "required": ["repository"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": True, "destructiveHint": False},
+    },
+    {
+        "name": "start_thread",
+        "description": "Create a new dormant Codex thread in one worker project.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"repository": {"type": "string"}},
+            "required": ["repository"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False},
+    },
+    {
+        "name": "resume_thread",
+        "description": "Resume one dormant Codex thread in a persistent worker terminal.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repository": {"type": "string"},
+                "thread_id": {"type": "string", "format": "uuid"},
+            },
+            "required": ["repository", "thread_id"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False},
+    },
+    {
+        "name": "rename_thread",
+        "description": "Rename one dormant Codex thread.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repository": {"type": "string"},
+                "thread_id": {"type": "string", "format": "uuid"},
+                "name": {"type": "string", "minLength": 1, "maxLength": 200},
+            },
+            "required": ["repository", "thread_id", "name"],
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True,
+        },
+    },
+    {
+        "name": "archive_thread",
+        "description": "Archive one dormant Codex thread.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repository": {"type": "string"},
+                "thread_id": {"type": "string", "format": "uuid"},
+            },
+            "required": ["repository", "thread_id"],
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": True,
+        },
+    },
+    {
+        "name": "unarchive_thread",
+        "description": "Restore one archived Codex thread to its project.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repository": {"type": "string"},
+                "thread_id": {"type": "string", "format": "uuid"},
+            },
+            "required": ["repository", "thread_id"],
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True,
+        },
+    },
+]
+
+TOOL_ARGUMENT_KEYS = {
+    "list_projects": set(),
+    "list_threads": {"repository", "archived", "cursor"},
+    "start_thread": {"repository"},
+    "resume_thread": {"repository", "thread_id"},
+    "rename_thread": {"repository", "thread_id", "name"},
+    "archive_thread": {"repository", "thread_id"},
+    "unarchive_thread": {"repository", "thread_id"},
+}
+
+
+def call_tool(name, arguments):
+    if not isinstance(arguments, dict):
+        raise ValueError("tool arguments must be an object")
+    allowed_keys = TOOL_ARGUMENT_KEYS.get(name)
+    if allowed_keys is None:
+        raise ValueError("unknown tool")
+    if set(arguments) - allowed_keys:
+        raise ValueError("tool arguments contain unsupported fields")
+    if name == "list_projects":
+        return {"projects": parse_projects(run_helper("list-projects"))}
+    if name == "list_threads":
+        return list_threads(arguments)
+    repository = require_repository(arguments.get("repository"))
+    if name == "start_thread":
+        return parse_thread_catalog(run_helper("thread-create", repository), repository)
+    thread_id = require_thread_id(arguments.get("thread_id"))
+    if name == "resume_thread":
+        output = run_helper("thread-resume", repository, thread_id)
+        live = parse_live_sessions(output, repository)
+        if len(live) != 1 or live[0]["threadID"] != thread_id:
+            raise RuntimeError("The worker did not resume the requested thread.")
+        return {"threads": live, "nextCursor": None}
+    if name == "rename_thread":
+        name_value = require_name(arguments.get("name"))
+        return parse_thread_catalog(
+            run_helper("thread-rename", repository, thread_id, name_value),
+            repository,
+        )
+    if name in ("archive_thread", "unarchive_thread"):
+        command = "thread-archive" if name == "archive_thread" else "thread-unarchive"
+        return parse_thread_catalog(
+            run_helper(command, repository, thread_id),
+            repository,
+        )
+    raise ValueError("unknown tool")
+
+
+def response(request_id, result=None, error=None):
+    value = {"jsonrpc": "2.0", "id": request_id}
+    if error is not None:
+        value["error"] = error
+    else:
+        value["result"] = result
+    sys.stdout.write(json.dumps(value, separators=(",", ":"), ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def handle(message):
+    if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
+        raise ValueError("invalid JSON-RPC request")
+    request_id = message.get("id")
+    method = message.get("method")
+    if request_id is None:
+        return
+    if method == "initialize":
+        response(
+            request_id,
+            {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "terminal-relay", "version": "1.0.0"},
+            },
+        )
+    elif method == "ping":
+        response(request_id, {})
+    elif method == "tools/list":
+        response(request_id, {"tools": TOOLS})
+    elif method == "tools/call":
+        params = message.get("params")
+        if not isinstance(params, dict) or not isinstance(params.get("name"), str):
+            raise ValueError("invalid tool call")
+        try:
+            result = tool_result(call_tool(params["name"], params.get("arguments", {})))
+        except (RuntimeError, ValueError) as error:
+            result = {
+                "content": [{"type": "text", "text": str(error)}],
+                "isError": True,
+            }
+        response(request_id, result)
+    else:
+        response(request_id, error={"code": -32601, "message": "Method not found"})
+
+
+def main():
+    for encoded_line in sys.stdin.buffer:
+        if len(encoded_line) > MAXIMUM_MESSAGE_BYTES:
+            response(None, error={"code": -32600, "message": "Request too large"})
+            continue
+        try:
+            handle(json.loads(encoded_line))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            response(None, error={"code": -32600, "message": "Invalid Request"})
+
+
+if __name__ == "__main__":
+    main()

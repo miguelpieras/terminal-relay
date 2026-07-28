@@ -13,6 +13,7 @@ private struct WorkerProject: Identifiable {
     let workerName: String
     let repositoryName: String
     let sessions: [WorkerSessionSnapshot]
+    let threads: [WorkerThreadSnapshot]
 
     var id: String {
         "\(workerID.uuidString):\(repositoryName)"
@@ -55,7 +56,12 @@ struct ProjectListView: View {
                     repositoryName: repositoryName,
                     sessions: overview.sessions.filter {
                         $0.repositoryName == repositoryName
-                    }
+                    },
+                    threads: model.threads(
+                        workerID: profile.id,
+                        repositoryName: repositoryName,
+                        archived: false
+                    )
                 )
             }
         }
@@ -73,6 +79,13 @@ struct ProjectListView: View {
         return projects.filter {
             $0.repositoryName.localizedCaseInsensitiveContains(searchText)
                 || $0.workerName.localizedCaseInsensitiveContains(searchText)
+                || ($0.threads + model.threads(
+                    workerID: $0.workerID,
+                    repositoryName: $0.repositoryName,
+                    archived: true
+                )).contains {
+                    ($0.title ?? "").localizedCaseInsensitiveContains(searchText)
+                }
         }
     }
 
@@ -140,6 +153,7 @@ struct ProjectListView: View {
                 self.workerFilterID = nil
             }
             await model.refreshProjectCatalogs()
+            await model.refreshAllThreads()
             reconcileSelection()
             while !Task.isCancelled {
                 do {
@@ -355,6 +369,9 @@ struct ProjectDetailView: View {
     @ObservedObject var model: WorkerSessionModel
     @State private var stopRequest: StopRequest?
     @State private var showsNewTerminalOptions = false
+    @State private var showsArchivedThreads = false
+    @State private var threadPendingRename: WorkerThreadSnapshot?
+    @State private var threadName = ""
 
     private var sessions: [WorkerSessionSnapshot] {
         guard model.profile?.id == workerID else { return [] }
@@ -369,18 +386,56 @@ struct ProjectDetailView: View {
             }
     }
 
+    private var dormantThreads: [WorkerThreadSnapshot] {
+        model.threads(
+            workerID: workerID,
+            repositoryName: repositoryName,
+            archived: false
+        ).filter { !$0.isActive }
+    }
+
+    private var archivedThreads: [WorkerThreadSnapshot] {
+        model.threads(
+            workerID: workerID,
+            repositoryName: repositoryName,
+            archived: true
+        )
+    }
+
     var body: some View {
         List {
-            if sessions.isEmpty {
+            if sessions.isEmpty && dormantThreads.isEmpty {
                 ContentUnavailableView {
-                    Label("No Terminals", systemImage: "terminal")
+                    Label("No Threads", systemImage: "terminal")
                 } description: {
-                    Text("Start a terminal for this project to work from this device.")
+                    Text("Start a terminal or create a Codex thread for this project.")
                 }
                 .listRowBackground(Color.clear)
-            } else {
-                ForEach(sessions) { session in
-                    terminalRow(session)
+            }
+            if !sessions.isEmpty {
+                Section("Active Terminals") {
+                    ForEach(sessions) { session in
+                        terminalRow(session)
+                    }
+                }
+            }
+            if !dormantThreads.isEmpty {
+                Section("Paused Threads") {
+                    ForEach(dormantThreads) { thread in
+                        dormantThreadRow(thread)
+                    }
+                }
+            }
+            if !archivedThreads.isEmpty {
+                Section {
+                    DisclosureGroup(
+                        "Archived Threads (\(archivedThreads.count))",
+                        isExpanded: $showsArchivedThreads
+                    ) {
+                        ForEach(archivedThreads) { thread in
+                            archivedThreadRow(thread)
+                        }
+                    }
                 }
             }
         }
@@ -390,8 +445,18 @@ struct ProjectDetailView: View {
                 model.selectProfile(id: workerID)
             }
             await model.refresh()
+            await model.refreshThreads(
+                workerID: workerID,
+                repositoryName: repositoryName
+            )
         }
-        .refreshable { await model.refresh() }
+        .refreshable {
+            await model.refresh()
+            await model.refreshThreads(
+                workerID: workerID,
+                repositoryName: repositoryName
+            )
+        }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button {
@@ -407,6 +472,14 @@ struct ProjectDetailView: View {
             isPresented: $showsNewTerminalOptions,
             titleVisibility: .visible
         ) {
+            Button("New Codex Thread") {
+                Task {
+                    await model.createThread(
+                        workerID: workerID,
+                        repositoryName: repositoryName
+                    )
+                }
+            }
             ForEach(AgentKind.allCases) { kind in
                 Button(kind.displayName) {
                     model.startTerminal(kind: kind, repositoryName: repositoryName)
@@ -428,6 +501,32 @@ struct ProjectDetailView: View {
                 },
                 secondaryButton: .cancel()
             )
+        }
+        .alert(
+            "Rename Thread",
+            isPresented: Binding(
+                get: { threadPendingRename != nil },
+                set: { if !$0 { threadPendingRename = nil } }
+            )
+        ) {
+            TextField("Thread name", text: $threadName)
+            Button("Cancel", role: .cancel) {
+                threadPendingRename = nil
+            }
+            Button("Rename") {
+                guard let thread = threadPendingRename else { return }
+                let name = threadName
+                threadPendingRename = nil
+                Task {
+                    await model.renameThread(
+                        workerID: workerID,
+                        thread: thread,
+                        name: name
+                    )
+                }
+            }
+        } message: {
+            Text("This changes the provider thread name on this worker.")
         }
     }
 
@@ -482,6 +581,77 @@ struct ProjectDetailView: View {
             } label: {
                 Label("Stop Terminal", systemImage: "stop.fill")
             }
+        }
+    }
+
+    private func dormantThreadRow(_ thread: WorkerThreadSnapshot) -> some View {
+        Button {
+            Task { await model.resumeThread(workerID: workerID, thread: thread) }
+        } label: {
+            HStack(spacing: 12) {
+                AgentTaskIcon(kind: thread.kind)
+                    .opacity(0.62)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(thread.title ?? "Untitled thread")
+                        .font(.body.weight(.medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                    Text("Paused · tap to resume")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Image(systemName: "play.fill")
+                    .foregroundStyle(.secondary)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .swipeActions {
+            Button(role: .destructive) {
+                Task {
+                    await model.setThreadArchived(
+                        workerID: workerID,
+                        thread: thread,
+                        archived: true
+                    )
+                }
+            } label: {
+                Label("Archive Thread", systemImage: "archivebox")
+            }
+        }
+        .contextMenu {
+            Button("Rename Thread") {
+                threadName = thread.title ?? ""
+                threadPendingRename = thread
+            }
+            Button("Archive Thread", role: .destructive) {
+                Task {
+                    await model.setThreadArchived(
+                        workerID: workerID,
+                        thread: thread,
+                        archived: true
+                    )
+                }
+            }
+        }
+    }
+
+    private func archivedThreadRow(_ thread: WorkerThreadSnapshot) -> some View {
+        HStack {
+            Label(thread.title ?? "Untitled thread", systemImage: "archivebox")
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button("Unarchive") {
+                Task {
+                    await model.setThreadArchived(
+                        workerID: workerID,
+                        thread: thread,
+                        archived: false
+                    )
+                }
+            }
+            .buttonStyle(.borderless)
         }
     }
 }

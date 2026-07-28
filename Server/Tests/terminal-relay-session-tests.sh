@@ -396,6 +396,7 @@ import json
 import os
 import signal
 import socket
+import sqlite3
 import struct
 import sys
 import traceback
@@ -404,6 +405,33 @@ import traceback
 root = os.path.dirname(os.path.realpath(__file__))
 log_path = os.path.join(root, "codex-app-server.log")
 control_path = os.path.join(root, "codex-app-server.control")
+threads_path = os.path.join(root, "codex-app-server-threads.json")
+
+
+def load_threads():
+    workspace = os.environ.get("TERMINAL_RELAY_TEST_WORKSPACE_ROOT", "/workspace")
+    values = {
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa": {
+            "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "name": saved_thread_name("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            "cwd": os.path.join(workspace, "alpha"),
+            "updatedAt": 100,
+            "archived": False,
+        }
+    }
+    try:
+        with open(threads_path, encoding="utf-8") as threads_file:
+            saved = json.load(threads_file)
+        if isinstance(saved, dict):
+            values.update(saved)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return values
+
+
+def save_threads(values):
+    with open(threads_path, "w", encoding="utf-8") as threads_file:
+        json.dump(values, threads_file, separators=(",", ":"))
 
 
 def report_uncaught(exception_type, exception, exception_traceback):
@@ -511,6 +539,7 @@ def serve_connection(connection):
             continue
         method = request_value.get("method")
         notifications = []
+        response_error = None
         if method == "account/read":
             account_state = ""
             if os.path.exists(control_path):
@@ -522,21 +551,73 @@ def serve_connection(connection):
                 result = {"account": {"type": "chatgpt"}}
         elif method == "thread/read":
             thread_id = request_value.get("params", {}).get("threadId")
-            result = {
-                "thread": {
+            threads = load_threads()
+            thread = threads.get(thread_id)
+            if thread is None:
+                workspace = os.environ.get("TERMINAL_RELAY_TEST_WORKSPACE_ROOT", "/workspace")
+                thread = {
                     "id": thread_id,
                     "name": saved_thread_name(thread_id),
+                    "cwd": os.path.join(workspace, "alpha"),
+                    "updatedAt": 100,
+                    "archived": False,
                 }
+            result = {
+                "thread": thread
+            }
+        elif method == "thread/list":
+            params = request_value.get("params", {})
+            if params.get("sourceKinds") != ["cli", "vscode", "exec", "appServer"]:
+                raise RuntimeError("thread/list omitted managed primary thread sources")
+            threads = load_threads()
+            result = {
+                "data": [
+                    thread for thread in threads.values()
+                    if thread.get("cwd") == params.get("cwd")
+                    and thread.get("archived", False) is params.get("archived", False)
+                    and thread.get("id") != "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+                ],
+                "nextCursor": None,
             }
         elif method == "thread/loaded/list":
             result = {
                 "data": ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]
             }
         elif method == "thread/start":
+            params = request_value.get("params", {})
+            threads = load_threads()
+            thread = {
+                "id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "name": None,
+                "cwd": params.get("cwd"),
+                "updatedAt": 200,
+                "archived": False,
+            }
+            threads[thread["id"]] = thread
+            save_threads(threads)
+            database = os.path.join(
+                os.path.expanduser("~"), ".codex", "state_5.sqlite"
+            )
+            with sqlite3.connect(database) as database_connection:
+                database_connection.execute(
+                    "insert or replace into threads "
+                    "(id, title, preview, first_user_message, name, cwd, "
+                    "updated_at, archived, source) "
+                    "values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        thread["id"],
+                        "",
+                        "",
+                        "",
+                        None,
+                        thread["cwd"],
+                        thread["updatedAt"],
+                        0,
+                        "vscode",
+                    ),
+                )
             result = {
-                "thread": {
-                    "id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
-                }
+                "thread": thread
             }
         elif method == "turn/start":
             generated_thread_id = request_value.get("params", {}).get("threadId")
@@ -564,6 +645,20 @@ def serve_connection(connection):
             ]
         elif method == "thread/name/set":
             params = request_value.get("params", {})
+            threads = load_threads()
+            thread = threads.get(params.get("threadId"))
+            if thread is not None:
+                thread["name"] = params.get("name")
+                thread["updatedAt"] = 300
+                save_threads(threads)
+                database = os.path.join(
+                    os.path.expanduser("~"), ".codex", "state_5.sqlite"
+                )
+                with sqlite3.connect(database) as database_connection:
+                    database_connection.execute(
+                        "update threads set title = ?, updated_at = ? where id = ?",
+                        (params.get("name"), 300, params.get("threadId")),
+                    )
             index_path = os.path.join(
                 os.path.expanduser("~"), ".codex", "session_index.jsonl"
             )
@@ -580,9 +675,38 @@ def serve_connection(connection):
                     + "\n"
                 )
             result = {}
+        elif method in ("thread/archive", "thread/unarchive"):
+            params = request_value.get("params", {})
+            threads = load_threads()
+            thread = threads.get(params.get("threadId"))
+            if thread is not None:
+                thread["archived"] = method == "thread/archive"
+                thread["updatedAt"] = 400
+                save_threads(threads)
+                database = os.path.join(
+                    os.path.expanduser("~"), ".codex", "state_5.sqlite"
+                )
+                with sqlite3.connect(database) as database_connection:
+                    database_connection.execute(
+                        "update threads set archived = ?, updated_at = ? where id = ?",
+                        (
+                            1 if method == "thread/archive" else 0,
+                            400,
+                            params.get("threadId"),
+                        ),
+                    )
+            result = {}
+            if method == "thread/unarchive":
+                response_error = {
+                    "code": -32603,
+                    "message": "thread metadata is not loaded",
+                }
         else:
             result = {}
-        send_json(connection, {"id": request_id, "result": result})
+        if response_error is not None:
+            send_json(connection, {"id": request_id, "error": response_error})
+        else:
+            send_json(connection, {"id": request_id, "result": result})
         for notification in notifications:
             send_json(connection, notification)
 
@@ -630,7 +754,10 @@ PYTHON_CODEX_APP_SERVER
 
 {
     printf '#!/bin/bash\n'
-    printf "if [[ \"\${1:-}\" == app-server ]]; then\n"
+    printf "if [[ \"\${1:-}\" == --config && \"\${3:-}\" == app-server ]]; then\n"
+    printf '    shift 2\n'
+    printf '    exec %q "$@"\n' "$stub_codex_app_server"
+    printf "elif [[ \"\${1:-}\" == app-server ]]; then\n"
     printf '    exec %q "$@"\n' "$stub_codex_app_server"
     printf 'fi\n'
     printf 'exec %q "$@"\n' "$stub_agent"
@@ -746,17 +873,23 @@ connection = sqlite3.connect(database)
 connection.execute(
     "create table threads ("
     "id text primary key, title text not null, preview text, "
-    "first_user_message text, name text)"
+    "first_user_message text, name text, cwd text, "
+    "updated_at integer, archived integer, source text)"
 )
 connection.execute(
     "insert into threads "
-    "(id, title, preview, first_user_message, name) values (?, ?, ?, ?, ?)",
+    "(id, title, preview, first_user_message, name, cwd, "
+    "updated_at, archived, source) values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     (
         thread_id,
         "First Codex prompt",
         "Original user prompt",
         "Original user prompt",
         "Generated Codex name",
+        None,
+        100,
+        0,
+        "cli",
     ),
 )
 connection.commit()
@@ -979,6 +1112,12 @@ codex_reboot_output="$(/bin/bash "$helper" start codex alpha --reboot-codex)"
 codex_reboot_instance="$(printf '%s\n' "$codex_reboot_output" \
     | /usr/bin/awk -F'|' '$1 == "session" { print $5; exit }')"
 wait_for_log_lines 7
+"$tmux_path" -f /dev/null -L "$tmux_socket" \
+    select-pane -t "terminal-relay-codex-$codex_reboot_instance" \
+    -T "$codex_thread_id | Ready"
+codex_bound_status="$(wait_for_session codex alpha 0)"
+assert_equal "$codex_thread_id" "$(thread_id_from_line "$codex_bound_status")" \
+    "Codex reboot provider thread binding"
 "$tmux_path" -f /dev/null -L "$tmux_socket" kill-server
 wait_for_agent_lock_free "$codex_reboot_instance"
 printf '%s\n' '22222222-2222-4222-8222-222222222222' > "$boot_id_file"
@@ -992,7 +1131,8 @@ restored_codex_status="$(wait_for_session codex alpha 0)"
 assert_equal "$codex_reboot_instance" "$(instance_from_line "$restored_codex_status")" "restored Codex instance"
 wait_for_log_lines 8
 codex_resume_log="$(/usr/bin/sed -n '8p' "$agent_log")"
-assert_contains "$codex_resume_log" "|resume|--last|--reboot-codex" "Codex resume arguments"
+assert_contains "$codex_resume_log" "|resume|$codex_thread_id|--reboot-codex" \
+    "Codex exact resume arguments"
 assert_equal "8" "$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")" "idempotent restore count"
 
 echo "14/18 explicit stop prevents a later Codex reboot restore"
@@ -1334,6 +1474,35 @@ assert_equal \
 unset TERMINAL_RELAY_TEST_CODEX_SHARED_ACCOUNT
 "$tmux_path" -f /dev/null -L "$tmux_socket" \
     kill-session -t "$claude_rotation_guard"
+
+echo "Thread catalog mutations and exact resume stay worker-scoped"
+export TERMINAL_RELAY_TEST_CODEX_SHARED_ACCOUNT=1
+active_threads="$(/bin/bash "$helper" threads alpha active)"
+assert_contains "$active_threads" "__TERMINAL_RELAY_THREADS_V1__" \
+    "thread protocol marker"
+assert_contains "$active_threads" "$codex_thread_id" "active thread catalog"
+created_thread_output="$(/bin/bash "$helper" thread-create alpha)"
+created_thread_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+assert_contains "$created_thread_output" "$created_thread_id" "created thread"
+renamed_thread_output="$(/bin/bash "$helper" thread-rename alpha "$created_thread_id" "Worker task")"
+assert_contains "$renamed_thread_output" '"title":"Worker task"' "renamed thread"
+resumed_thread_output="$(/bin/bash "$helper" thread-resume alpha "$created_thread_id" --managed-thread)"
+resumed_thread_instance="$(instance_from_line "$(printf '%s\n' "$resumed_thread_output" \
+    | /usr/bin/awk -F'|' '$1 == "session" { print; exit }')")"
+assert_equal "$created_thread_id" "$(thread_id_from_line "$resumed_thread_output")" \
+    "resumed thread provider id"
+set +e
+active_archive_output="$(/bin/bash "$helper" thread-archive alpha "$created_thread_id" 2>&1)"
+active_archive_status=$?
+set -e
+assert_equal "75" "$active_archive_status" "active thread archive rejection"
+assert_contains "$active_archive_output" "Active threads cannot" "active thread rejection diagnostic"
+/bin/bash "$helper" stop codex alpha "$resumed_thread_instance"
+/bin/bash "$helper" thread-archive alpha "$created_thread_id" >/dev/null
+archived_threads="$(/bin/bash "$helper" threads alpha archived)"
+assert_contains "$archived_threads" "$created_thread_id" "archived thread catalog"
+/bin/bash "$helper" thread-unarchive alpha "$created_thread_id" >/dev/null
+unset TERMINAL_RELAY_TEST_CODEX_SHARED_ACCOUNT
 
 claude_account_output="$(/bin/bash "$helper" claude-account)"
 assert_contains \

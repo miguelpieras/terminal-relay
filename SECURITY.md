@@ -27,6 +27,13 @@ Terminal Relay is a client for infrastructure controlled by its user:
 - Agent credentials and repositories remain on user-configured workers.
 - Worker host keys are verified or explicitly pinned.
 - The project does not operate a shared Terminal Relay backend.
+- Provider thread IDs and relay instance UUIDs are separate identities. Resume
+  uses the provider thread ID; attach and stop remain bound to the immutable
+  relay UUID so stale clients cannot target a replacement terminal.
+- The built-in MCP is a root-owned, worker-local stdio process. It delegates
+  seven typed project/thread operations to the fixed helper path, validates
+  project and UUID inputs, bounds runtime and output, and exposes no shell,
+  terminal input, transcript access, deletion, listener, or cross-worker route.
 
 Users are responsible for their worker operating systems, Tailscale policy,
 SSH authorization, agent accounts, repository permissions, backups, and

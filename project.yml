@@ -99,6 +99,7 @@ targets:
       - path: TerminalRelay/Models/AgentLaunchDefaults.swift
       - path: TerminalRelay/Models/MobilePairingPayload.swift
       - path: TerminalRelay/Models/WorkerSessionState.swift
+      - path: TerminalRelay/Models/WorkerThreadState.swift
       - path: TerminalRelay/Models/WorkerUpdateStatus.swift
       - path: LICENSE
         buildPhase: resources

@@ -115,6 +115,27 @@ TERMINAL_RELAY_REVIEW_GATEWAY_DRY_RUN=1 \
     "$gateway" \
     | grep -Fq 'terminal-relay-session' \
     || fail "review gateway rejected an app status command"
+for review_command in \
+    "/usr/local/bin/terminal-relay-session threads atlas active" \
+    "/usr/local/bin/terminal-relay-session threads atlas archived next-page" \
+    "/usr/local/bin/terminal-relay-session thread-create atlas" \
+    "/usr/local/bin/terminal-relay-session thread-read atlas aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" \
+    "/usr/local/bin/terminal-relay-session thread-resume atlas aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa --model gpt-5.6-sol --config 'model_reasoning_effort=\"max\"' --config 'tui.terminal_title=[\"thread-title\",\"run-state\"]' --dangerously-bypass-approvals-and-sandbox" \
+    "/usr/local/bin/terminal-relay-session thread-rename atlas aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa 'Review task'" \
+    "/usr/local/bin/terminal-relay-session thread-archive atlas aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" \
+    "/usr/local/bin/terminal-relay-session thread-unarchive atlas aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+do
+    TERMINAL_RELAY_REVIEW_GATEWAY_DRY_RUN=1 \
+        SSH_ORIGINAL_COMMAND="$review_command" \
+        "$gateway" >/dev/null \
+        || fail "review gateway rejected a typed thread command"
+done
+if TERMINAL_RELAY_REVIEW_GATEWAY_DRY_RUN=1 \
+    SSH_ORIGINAL_COMMAND="/usr/local/bin/terminal-relay-session thread-rename atlas aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa 'line
+break'" \
+    "$gateway" >/dev/null 2>&1; then
+    fail "review gateway accepted a multiline thread name"
+fi
 if TERMINAL_RELAY_REVIEW_GATEWAY_DRY_RUN=1 \
     SSH_ORIGINAL_COMMAND='/bin/sh -lc whoami' \
     "$gateway" >/dev/null 2>&1; then

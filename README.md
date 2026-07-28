@@ -12,6 +12,10 @@ over SSH.
 
 - Project-first macOS workspace with embedded interactive terminals.
 - Shared, persistent Codex and Claude sessions backed by worker-side `tmux`.
+- Recent and archived Codex threads can be searched, resumed exactly, renamed,
+  archived, and restored from macOS, iPhone, and iPad.
+- Every managed agent terminal includes a worker-local MCP for safe project and
+  thread operations on that worker.
 - Handoff between Mac, iPhone, and iPad without stopping the remote agent.
 - GitHub repository creation, deploy-key setup, and worker checkout from macOS.
 - Multiple reusable workers and pinned SSH identities.
@@ -55,17 +59,32 @@ The macOS app starts the system SSH client inside a pseudo-terminal. The
 universal iPhone and iPad app uses SwiftNIO SSH and SwiftTerm. Both clients talk
 to the `terminal-relay-session` helper installed on each worker.
 
-The helper keeps one Codex and one Claude process per worker user, permits
-multiple client attachments, and preserves restart intent across worker
-reboots. Disconnecting a client leaves the remote agent running; **Stop Agent**
-ends the exact shared session.
+The helper supports concurrent Codex and Claude terminals, permits multiple
+client attachments to each one, and preserves exact restart intent across
+worker reboots. Disconnecting a client leaves the remote agent running;
+**Stop Agent** ends only the relay UUID that was selected.
+
+Codex's worker-local app server also provides a paginated catalog of persisted
+threads. The apps keep the Codex thread UUID separate from the relay terminal
+UUID, so selecting an inactive thread resumes that exact conversation and a
+reboot restores the same provider thread. Claude continues to expose its live
+session UUID, title, run state, reattach, stop, handoff, and reboot behavior;
+inactive Claude history and provider-level rename/archive are not claimed.
+
+Managed Codex and Claude terminals receive
+`/usr/local/bin/terminal-relay-mcp`, a root-owned stdio MCP server with only
+seven bounded tools: list projects and threads, start or resume a Codex thread,
+and rename, archive, or unarchive an inactive Codex thread. It delegates to the
+same typed worker helper and has no listener, shell, transcript reader, terminal
+input, deletion, or cross-worker access.
 
 Terminal Relay does not operate a central backend:
 
 ```text
 macOS app ───────┐
                  ├─ SSH over your network ─ worker ─ Codex / Claude
-iPhone/iPad app ┘                         └ repositories in /workspace
+iPhone/iPad app ┘                         ├ repositories in /workspace
+                                          └ local thread MCP (stdio only)
 ```
 
 ## Requirements

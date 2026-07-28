@@ -28,6 +28,7 @@ jobs:
       - name: Test worker scripts
         run: |
           ./Server/Tests/terminal-relay-session-tests.sh
+          ./Server/Tests/terminal-relay-mcp-tests.sh
           ./Server/Tests/install-worker-session-helper-generation-tests.sh
           ./Server/Tests/worker-lifecycle-tests.sh
 

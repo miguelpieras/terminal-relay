@@ -41,6 +41,7 @@ final class WorkerSessionModel: ObservableObject {
     @Published private(set) var profile: WorkerProfile?
     @Published private(set) var projects: [String] = []
     @Published private(set) var sessions: [WorkerSessionSnapshot] = []
+    @Published private(set) var threadCatalogs: [WorkerThreadCatalogKey: WorkerThreadResponse] = [:]
     @Published private(set) var workerOverviews: [UUID: WorkerOverviewSnapshot] = [:]
     @Published private(set) var workerLoadingIDs: Set<UUID> = []
     @Published private(set) var projectLoadingIDs: Set<UUID> = []
@@ -90,6 +91,7 @@ final class WorkerSessionModel: ObservableObject {
             projects = DemoWorkspace.projects
             sessions = DemoWorkspace.sessions
             workerOverviews = [DemoWorkspace.worker.id: DemoWorkspace.overview]
+            loadDemoThreads()
             publicKey = "ssh-ed25519 screenshot-demo-device"
             return
         }
@@ -192,6 +194,7 @@ final class WorkerSessionModel: ObservableObject {
         isLoading = false
         projects = []
         sessions = []
+        threadCatalogs = [:]
     }
 
     func enterDemo() {
@@ -204,6 +207,8 @@ final class WorkerSessionModel: ObservableObject {
         projects = DemoWorkspace.projects
         sessions = DemoWorkspace.sessions
         workerOverviews = [DemoWorkspace.worker.id: DemoWorkspace.overview]
+        threadCatalogs = [:]
+        loadDemoThreads()
         workerLoadingIDs = []
         projectLoadingIDs = []
         publicKey = "ssh-ed25519 demo-device"
@@ -224,6 +229,7 @@ final class WorkerSessionModel: ObservableObject {
         projects = []
         sessions = []
         workerOverviews = [:]
+        threadCatalogs = [:]
         workerLoadingIDs = []
         projectLoadingIDs = []
         errorMessage = nil
@@ -298,6 +304,10 @@ final class WorkerSessionModel: ObservableObject {
                 connectionError: nil,
                 updateStatus: updateStatus ?? currentOverview?.updateStatus
             )
+            mergeLiveSessionsIntoThreadCatalogs(
+                workerID: profile.id,
+                sessions: visibleSessions
+            )
             errorMessage = nil
         } catch {
             guard refreshToken == token else { return }
@@ -317,6 +327,184 @@ final class WorkerSessionModel: ObservableObject {
         )
         lastOpenedTerminalRoute = route
         terminalRoute = route
+    }
+
+    func threads(
+        workerID: UUID,
+        repositoryName: String,
+        archived: Bool
+    ) -> [WorkerThreadSnapshot] {
+        threadCatalogs[
+            WorkerThreadCatalogKey(
+                workerID: workerID,
+                repositoryName: repositoryName,
+                archived: archived
+            )
+        ]?.threads ?? []
+    }
+
+    func refreshThreads(workerID: UUID, repositoryName: String) async {
+        guard !isDemoMode,
+              let worker = profiles.first(where: { $0.id == workerID }) else {
+            return
+        }
+        async let active = loadThreads(
+            worker: worker,
+            repositoryName: repositoryName,
+            archived: false
+        )
+        async let archived = loadThreads(
+            worker: worker,
+            repositoryName: repositoryName,
+            archived: true
+        )
+        let responses = await (active, archived)
+        if let response = responses.0 {
+            threadCatalogs[
+                WorkerThreadCatalogKey(
+                    workerID: workerID,
+                    repositoryName: repositoryName,
+                    archived: false
+                )
+            ] = response
+        }
+        if let response = responses.1 {
+            threadCatalogs[
+                WorkerThreadCatalogKey(
+                    workerID: workerID,
+                    repositoryName: repositoryName,
+                    archived: true
+                )
+            ] = response
+        }
+    }
+
+    func refreshAllThreads() async {
+        guard !isDemoMode else { return }
+        await withTaskGroup(of: Void.self) { group in
+            for worker in profiles {
+                for repositoryName in workerOverviews[worker.id]?.projects ?? [] {
+                    group.addTask { [weak self] in
+                        await self?.refreshThreads(
+                            workerID: worker.id,
+                            repositoryName: repositoryName
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    func createThread(workerID: UUID, repositoryName: String) async {
+        guard !isDemoMode,
+              let worker = profiles.first(where: { $0.id == workerID }) else {
+            return
+        }
+        do {
+            let command = try WorkerRemoteCommand.createThread(
+                repositoryName: repositoryName
+            )
+            _ = try await workerClient.execute(command, on: worker)
+            await refreshThreads(workerID: workerID, repositoryName: repositoryName)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func resumeThread(workerID: UUID, thread: WorkerThreadSnapshot) async {
+        guard thread.kind == .codex,
+              !thread.isActive,
+              thread.capabilities.resume else {
+            return
+        }
+        if isDemoMode {
+            terminalRoute = TerminalRoute(
+                kind: thread.kind,
+                repositoryName: thread.repositoryName,
+                instanceToken: nil
+            )
+            return
+        }
+        guard let worker = profiles.first(where: { $0.id == workerID }) else { return }
+        do {
+            let command = try WorkerRemoteCommand.resumeThread(
+                repositoryName: thread.repositoryName,
+                threadID: thread.threadID,
+                launchArguments: AgentLaunchDefaults.standard.arguments(for: .codex)
+            )
+            let data = try await workerClient.execute(command, on: worker)
+            let response = try WorkerSessionProtocol.parse(data)
+            guard response.sessions.count == 1,
+                  let snapshot = response.sessions.first,
+                  snapshot.threadID == thread.threadID else {
+                throw WorkerThreadProtocolError.invalidResponse
+            }
+            if profile?.id != workerID {
+                selectProfile(id: workerID)
+            }
+            sessions = sessions.filter { $0.instanceToken != snapshot.instanceToken } + [snapshot]
+            if let overview = workerOverviews[workerID] {
+                let workerSessions = overview.sessions.filter {
+                    $0.instanceToken != snapshot.instanceToken
+                } + [snapshot]
+                workerOverviews[workerID] = WorkerOverviewSnapshot(
+                    projects: overview.projects,
+                    sessions: workerSessions,
+                    resources: overview.resources,
+                    accounts: overview.accounts,
+                    accountErrors: overview.accountErrors,
+                    connectionError: overview.connectionError,
+                    updateStatus: overview.updateStatus
+                )
+                mergeLiveSessionsIntoThreadCatalogs(
+                    workerID: workerID,
+                    sessions: workerSessions
+                )
+            }
+            openTerminal(snapshot)
+            await refreshThreads(
+                workerID: workerID,
+                repositoryName: thread.repositoryName
+            )
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func renameThread(
+        workerID: UUID,
+        thread: WorkerThreadSnapshot,
+        name: String
+    ) async {
+        await mutateThread(
+            workerID: workerID,
+            thread: thread,
+            command: {
+                try WorkerRemoteCommand.renameThread(
+                    repositoryName: thread.repositoryName,
+                    threadID: thread.threadID,
+                    name: name
+                )
+            }
+        )
+    }
+
+    func setThreadArchived(
+        workerID: UUID,
+        thread: WorkerThreadSnapshot,
+        archived: Bool
+    ) async {
+        await mutateThread(
+            workerID: workerID,
+            thread: thread,
+            command: {
+                try WorkerRemoteCommand.archiveThread(
+                    repositoryName: thread.repositoryName,
+                    threadID: thread.threadID,
+                    unarchive: !archived
+                )
+            }
+        )
     }
 
     func openTerminal(_ session: WorkerSessionSnapshot) {
@@ -375,10 +563,15 @@ final class WorkerSessionModel: ObservableObject {
 
     func isUnread(_ session: WorkerSessionSnapshot, profileID: UUID) -> Bool {
         guard let lastActivityAt = session.lastActivityAt else { return false }
-        return lastActivityAt > (readActivityBySession[readKey(
+        let durableReadAt = readActivityBySession[readKey(
             profileID: profileID,
-            instanceToken: session.instanceToken
-        )] ?? 0)
+            identity: session.threadID ?? session.instanceToken
+        )] ?? 0
+        let legacyReadAt = readActivityBySession[readKey(
+            profileID: profileID,
+            identity: session.instanceToken
+        )] ?? 0
+        return lastActivityAt > max(durableReadAt, legacyReadAt)
     }
 
     func markLastOpenedTerminalRead() {
@@ -417,6 +610,10 @@ final class WorkerSessionModel: ObservableObject {
 
             for await (profileID, overview) in group {
                 workerOverviews[profileID] = overview
+                mergeLiveSessionsIntoThreadCatalogs(
+                    workerID: profileID,
+                    sessions: overview.sessions
+                )
                 workerLoadingIDs.remove(profileID)
             }
         }
@@ -445,6 +642,10 @@ final class WorkerSessionModel: ObservableObject {
 
             for await (profileID, overview) in group {
                 workerOverviews[profileID] = overview
+                mergeLiveSessionsIntoThreadCatalogs(
+                    workerID: profileID,
+                    sessions: overview.sessions
+                )
                 projectLoadingIDs.remove(profileID)
             }
         }
@@ -487,6 +688,10 @@ final class WorkerSessionModel: ObservableObject {
                     accountErrors: currentOverview.accountErrors,
                     connectionError: nil,
                     updateStatus: currentOverview.updateStatus
+                )
+                mergeLiveSessionsIntoThreadCatalogs(
+                    workerID: profileID,
+                    sessions: refreshedSessions
                 )
                 if profile?.id == profileID, !isLoading {
                     sessions = refreshedSessions
@@ -704,6 +909,111 @@ final class WorkerSessionModel: ObservableObject {
         }
     }
 
+    private func loadThreads(
+        worker: WorkerProfile,
+        repositoryName: String,
+        archived: Bool
+    ) async -> WorkerThreadResponse? {
+        do {
+            var cursor: String?
+            var pages = 0
+            var threads: [WorkerThreadSnapshot] = []
+            repeat {
+                let command = try WorkerRemoteCommand.threads(
+                    repositoryName: repositoryName,
+                    archived: archived,
+                    cursor: cursor
+                )
+                let data = try await workerClient.execute(command, on: worker)
+                let response = try WorkerThreadProtocol.parse(
+                    data,
+                    repositoryName: repositoryName
+                )
+                threads.append(contentsOf: response.threads)
+                cursor = response.nextCursor
+                pages += 1
+            } while cursor != nil && pages < 20
+            var threadsByID: [String: WorkerThreadSnapshot] = [:]
+            for thread in threads {
+                threadsByID[thread.id] = thread
+            }
+            var response = WorkerThreadResponse(
+                threads: threadsByID.values.sorted {
+                    if $0.updatedAt != $1.updatedAt { return $0.updatedAt > $1.updatedAt }
+                    return $0.threadID < $1.threadID
+                },
+                nextCursor: cursor
+            )
+            if !archived {
+                response = response.merging(
+                    liveSessions: workerOverviews[worker.id]?.sessions.filter {
+                        $0.repositoryName == repositoryName
+                    } ?? []
+                )
+            }
+            return response
+        } catch {
+            return nil
+        }
+    }
+
+    private func mutateThread(
+        workerID: UUID,
+        thread: WorkerThreadSnapshot,
+        command: () throws -> String
+    ) async {
+        guard !isDemoMode,
+              let worker = profiles.first(where: { $0.id == workerID }) else {
+            return
+        }
+        do {
+            _ = try await workerClient.execute(try command(), on: worker)
+            await refreshThreads(
+                workerID: workerID,
+                repositoryName: thread.repositoryName
+            )
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func loadDemoThreads() {
+        for archived in [false, true] {
+            for repositoryName in DemoWorkspace.projects {
+                threadCatalogs[
+                    WorkerThreadCatalogKey(
+                        workerID: DemoWorkspace.worker.id,
+                        repositoryName: repositoryName,
+                        archived: archived
+                    )
+                ] = WorkerThreadResponse(
+                    threads: DemoWorkspace.threads.filter {
+                        $0.repositoryName == repositoryName
+                            && $0.isArchived == archived
+                    },
+                    nextCursor: nil
+                )
+            }
+        }
+    }
+
+    private func mergeLiveSessionsIntoThreadCatalogs(
+        workerID: UUID,
+        sessions: [WorkerSessionSnapshot]
+    ) {
+        let keys = threadCatalogs.keys.filter {
+            $0.workerID == workerID && !$0.archived
+        }
+        for key in keys {
+            guard let catalog = threadCatalogs[key] else { continue }
+            threadCatalogs[key] = catalog.merging(
+                liveSessions: sessions.filter {
+                    $0.repositoryName == key.repositoryName
+                }
+            )
+        }
+    }
+
     private static func commandResult(
         _ command: String,
         profile: WorkerProfile,
@@ -726,15 +1036,15 @@ final class WorkerSessionModel: ObservableObject {
         }
         readActivityBySession[readKey(
             profileID: profileID,
-            instanceToken: session.instanceToken
+            identity: session.threadID ?? session.instanceToken
         )] = lastActivityAt
         if let data = try? JSONEncoder().encode(readActivityBySession) {
             readStateDefaults.set(data, forKey: Self.readStateKey)
         }
     }
 
-    private func readKey(profileID: UUID, instanceToken: String) -> String {
-        "\(profileID.uuidString.lowercased()):\(instanceToken)"
+    private func readKey(profileID: UUID, identity: String) -> String {
+        "\(profileID.uuidString.lowercased()):\(identity)"
     }
 
     private static func loadReadState(from defaults: UserDefaults) -> [String: Int] {

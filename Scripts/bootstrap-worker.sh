@@ -207,7 +207,7 @@ fi
 if /usr/bin/grep -Eq '="REPLACE_ME"$' "$BASELINE_FILE"; then
     die "local worker baseline still contains REPLACE_ME values"
 fi
-for payload_path in install-worker.sh terminal-relay-session terminal-relay-session-restore@.service terminal-relay-agent-update terminal-relay-agent-update.service terminal-relay-agent-update.timer worker-config/install.sh worker-config/AGENTS.md worker-config/CLAUDE.md; do
+for payload_path in install-worker.sh terminal-relay-session terminal-relay-mcp terminal-relay-session-restore@.service terminal-relay-agent-update terminal-relay-agent-update.service terminal-relay-agent-update.timer worker-config/install.sh worker-config/AGENTS.md worker-config/CLAUDE.md; do
     [[ -f "$SERVER_DIRECTORY/$payload_path" ]] || die "missing bootstrap payload: Server/$payload_path"
 done
 
@@ -369,7 +369,7 @@ fi
 result_file="$temporary_directory/install-result"
 /usr/bin/tar --no-xattrs -cf - \
     -C "$temporary_directory" worker-baseline.env \
-    -C "$SERVER_DIRECTORY" install-worker.sh terminal-relay-session terminal-relay-session-restore@.service terminal-relay-agent-update terminal-relay-agent-update.service terminal-relay-agent-update.timer worker-config | \
+    -C "$SERVER_DIRECTORY" install-worker.sh terminal-relay-session terminal-relay-mcp terminal-relay-session-restore@.service terminal-relay-agent-update terminal-relay-agent-update.service terminal-relay-agent-update.timer worker-config | \
     /usr/bin/ssh "${ssh_options[@]}" "$target" '
 set -eu
 worker_number='"$worker_number"'
@@ -439,6 +439,7 @@ test "$(id -un)" = terminal-relay
 test "$HOME" = /home/terminal-relay
 test -d /workspace && test -w /workspace
 test -x /usr/local/bin/terminal-relay-session
+test -x /usr/local/bin/terminal-relay-mcp
 test -f /etc/systemd/system/terminal-relay-session-restore@.service
 test -x /usr/local/sbin/terminal-relay-agent-update
 test -f /etc/systemd/system/terminal-relay-agent-update.service

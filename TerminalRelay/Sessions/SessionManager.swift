@@ -220,6 +220,45 @@ final class SessionManager: ObservableObject {
         return shouldSelectResult ? result : nil
     }
 
+    @discardableResult
+    func resumeThreadAfterRefresh(
+        _ thread: WorkerThreadSnapshot,
+        project: ProjectProfile,
+        on server: ServerProfile,
+        projects: [ProjectProfile],
+        launchDefaults: AgentLaunchDefaults,
+        using service: WorkerSessionService
+    ) async -> SessionOpenResult? {
+        let openSelectionRevision = claimOpenSelectionIntent()
+        guard thread.kind == .codex,
+              !thread.isActive,
+              thread.capabilities.resume,
+              thread.repositoryName == project.displayName,
+              project.serverID == server.id,
+              await refresh(
+                  worker: server,
+                  projects: projects,
+                  launchDefaults: launchDefaults,
+                  using: service
+              ),
+              let snapshot = await service.resumeThread(
+                  repositoryName: project.displayName,
+                  threadID: thread.threadID,
+                  launchDefaults: launchDefaults,
+                  on: server
+              ) else {
+            return nil
+        }
+        let shouldSelectResult = selectionRevision == openSelectionRevision
+        let result = openConfirmedRemote(
+            project: project,
+            on: server,
+            snapshot: snapshot,
+            selectResult: shouldSelectResult
+        )
+        return shouldSelectResult ? result : nil
+    }
+
     func invalidatePendingOpenSelection() {
         selectionRevision &+= 1
     }

@@ -4,6 +4,7 @@ set -euo pipefail
 script_directory="$(cd "$(dirname "$0")" && pwd -P)"
 repository_root="$(cd "$script_directory/.." && pwd -P)"
 source_helper="$repository_root/Server/terminal-relay-session"
+source_mcp="$repository_root/Server/terminal-relay-mcp"
 source_restore_unit="$repository_root/Server/terminal-relay-session-restore@.service"
 remote_lock_path="/run/lock/terminal-relay-session-helper.lock"
 
@@ -96,6 +97,8 @@ validate_ssh_target "admin" "$admin_target"
     || { echo "Missing regular restore unit source: $source_restore_unit" >&2; exit 66; }
 /bin/bash -n "$source_helper" \
     || { echo "Worker helper source failed Bash syntax validation." >&2; exit 65; }
+[[ -f "$source_mcp" && ! -L "$source_mcp" ]] \
+    || { echo "Missing regular worker MCP source: $source_mcp" >&2; exit 66; }
 
 probe_target() {
     local target="$1"
@@ -275,12 +278,15 @@ privileged() {
 privileged /usr/bin/true
 
 helper_target=/usr/local/bin/terminal-relay-session
+mcp_target=/usr/local/bin/terminal-relay-mcp
 unit_target=/etc/systemd/system/terminal-relay-session-restore@.service
 service="terminal-relay-session-restore@$application_user.service"
 temporary_directory=""
 temporary_helper=""
+temporary_mcp=""
 temporary_unit=""
 helper_staged=""
+mcp_staged=""
 unit_staged=""
 helper_backup=""
 unit_backup=""
@@ -293,6 +299,7 @@ unit_applied=0
 helper_installed_digest=""
 unit_installed_digest=""
 helper_installed_state=""
+mcp_changed=0
 unit_installed_state=""
 service_initial_enabled=false
 service_initial_active=false
@@ -397,6 +404,14 @@ cleanup() {
             *) echo "Refusing to clean unexpected helper stage: $helper_staged" >&2 ;;
         esac
     fi
+    if [ -n "$mcp_staged" ]; then
+        case "$mcp_staged" in
+            /usr/local/bin/.terminal-relay-mcp.install.*)
+                privileged /bin/rm -f -- "$mcp_staged" || true
+                ;;
+            *) echo "Refusing to clean unexpected MCP stage: $mcp_staged" >&2 ;;
+        esac
+    fi
     if [ -n "$unit_staged" ]; then
         case "$unit_staged" in
             /etc/systemd/system/.terminal-relay-session-restore.install.*)
@@ -419,15 +434,18 @@ cleanup() {
 temporary_directory=$(mktemp -d /tmp/terminal-relay-session.install.XXXXXX)
 trap cleanup EXIT
 temporary_helper="$temporary_directory/terminal-relay-session"
+temporary_mcp="$temporary_directory/terminal-relay-mcp"
 temporary_unit="$temporary_directory/terminal-relay-session-restore@.service"
 /usr/bin/tar -xf - -C "$temporary_directory"
-/bin/chmod 600 "$temporary_helper" "$temporary_unit"
+/bin/chmod 600 "$temporary_helper" "$temporary_mcp" "$temporary_unit"
 /bin/bash -n "$temporary_helper"
 privileged /usr/bin/systemd-analyze verify "$temporary_unit"
 helper_source_digest=$(/usr/bin/sha256sum "$temporary_helper")
 helper_source_digest=${helper_source_digest%% *}
 unit_source_digest=$(/usr/bin/sha256sum "$temporary_unit")
 unit_source_digest=${unit_source_digest%% *}
+mcp_source_digest=$(/usr/bin/sha256sum "$temporary_mcp")
+mcp_source_digest=${mcp_source_digest%% *}
 
 if privileged /usr/bin/test -L "$helper_target"; then
     echo "Refusing to replace a symlinked helper: $helper_target" >&2
@@ -532,7 +550,29 @@ privileged /usr/bin/systemctl is-enabled --quiet "$service"
 privileged /usr/bin/systemctl is-active --quiet "$service"
 [ "$(privileged /usr/bin/systemctl show -p User --value "$service")" = "$application_user" ]
 
-if [ "$helper_result" != unchanged ]; then
+if privileged /usr/bin/test -L "$mcp_target"; then
+    echo "Refusing to replace a symlinked MCP server: $mcp_target" >&2
+    exit 1
+fi
+if privileged /usr/bin/test -e "$mcp_target"; then
+    privileged /usr/bin/test -f "$mcp_target" \
+        || { echo "Refusing to replace a non-regular MCP server: $mcp_target" >&2; exit 1; }
+fi
+if ! privileged /usr/bin/test -f "$mcp_target" \
+    || ! privileged /usr/bin/cmp -s "$temporary_mcp" "$mcp_target" \
+    || [ "$(privileged /usr/bin/stat -c "%u:%g:%a" "$mcp_target" 2>/dev/null || true)" != "0:0:755" ]; then
+    mcp_staged=$(privileged /usr/bin/mktemp /usr/local/bin/.terminal-relay-mcp.install.XXXXXX)
+    privileged /usr/bin/install -o root -g root -m 0755 "$temporary_mcp" "$mcp_staged"
+    privileged /usr/bin/cmp -s "$temporary_mcp" "$mcp_staged"
+    privileged /bin/mv -fT -- "$mcp_staged" "$mcp_target"
+    mcp_staged=""
+    mcp_changed=1
+fi
+[ "$(privileged /usr/bin/sha256sum "$mcp_target" | /usr/bin/awk '{ print $1; exit }')" \
+    = "$mcp_source_digest" ]
+[ "$(privileged /usr/bin/stat -c "%u:%g:%a" "$mcp_target")" = "0:0:755" ]
+
+if [ "$helper_result" != unchanged ] || [ "$mcp_changed" -eq 1 ]; then
     restart_marker="$application_home/.local/state/terminal-relay/codex-app-server-restart-required"
     privileged /usr/sbin/runuser -u "$application_user" -- \
         /usr/bin/env \
@@ -682,7 +722,7 @@ fi
 # The validated installer is explicitly quoted for remote Bash; tar remains stdin.
 # shellcheck disable=SC2029
 install_output="$(/usr/bin/tar --no-xattrs -C "$repository_root/Server" -cf - \
-    terminal-relay-session terminal-relay-session-restore@.service \
+    terminal-relay-session terminal-relay-mcp terminal-relay-session-restore@.service \
     | /usr/bin/ssh "$admin_target" "$remote_install_command")"
 
 install_record="$(printf '%s\n' "$install_output" | /usr/bin/sed -n \

@@ -17,6 +17,7 @@ echo "Checking public repository hygiene"
 
 echo "Running worker tests"
 "$repository_root/Server/Tests/terminal-relay-session-tests.sh"
+"$repository_root/Server/Tests/terminal-relay-mcp-tests.sh"
 "$repository_root/Server/Tests/install-worker-session-helper-generation-tests.sh"
 "$repository_root/Server/Tests/worker-lifecycle-tests.sh"
 

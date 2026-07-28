@@ -24,7 +24,8 @@ The categories are:
 
 - `account-authentication`: sign-in start, authorization handoff, completion,
   cancellation, and failure.
-- `worker-session`: session refresh, start, and stop results.
+- `worker-session`: session/thread refresh, start, resume, mutation, and stop
+  results.
 - `terminal-session`: terminal attachment start and exit.
 
 The app deliberately does not log authorization URL or code contents,
@@ -66,8 +67,9 @@ Compare the installed helper with the repository source:
 
 ```bash
 shasum -a 256 Server/terminal-relay-session
+shasum -a 256 Server/terminal-relay-mcp
 ssh terminal-relay-worker-N \
-  'sha256sum /usr/local/bin/terminal-relay-session'
+  'sha256sum /usr/local/bin/terminal-relay-session /usr/local/bin/terminal-relay-mcp'
 ```
 
 Install the tested repository helper on an existing worker with:
@@ -79,6 +81,44 @@ Install the tested repository helper on an existing worker with:
 
 The installer verifies that both SSH targets reach the same machine, installs
 atomically, preserves the systemd service state, and prints a rollback command.
+
+## Thread catalog or built-in MCP is unavailable
+
+Inspect active and archived Codex metadata for one repository without reading
+its transcript:
+
+```bash
+ssh terminal-relay-worker-N \
+  '/usr/local/bin/terminal-relay-session threads example-repository active'
+ssh terminal-relay-worker-N \
+  '/usr/local/bin/terminal-relay-session threads example-repository archived'
+```
+
+Each successful response contains `__TERMINAL_RELAY_THREADS_V1__` followed by
+one bounded JSON catalog. A missing marker usually means the worker still has
+the V1-only helper; existing live terminals continue to work and the helper-only
+installer above upgrades both the session helper and MCP.
+
+Check the MCP handshake and discovered tool names locally on the worker:
+
+```bash
+ssh terminal-relay-worker-N \
+  "printf '%s\n' \
+  '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}' \
+  '{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}' \
+  | /usr/local/bin/terminal-relay-mcp"
+```
+
+Expected tools are `list_projects`, `list_threads`, `start_thread`,
+`resume_thread`, `rename_thread`, `archive_thread`, and `unarchive_thread`.
+The process exits at end-of-input. Do not add an HTTP wrapper or paste
+unredacted app-server, agent, or terminal output into an issue.
+
+Codex receives the MCP through the shared app-server configuration. If the
+binary changed while Codex terminals were live, reconciliation records a
+pending app-server restart and completes it after those terminals drain.
+Claude receives the same fixed executable through its strict per-launch MCP
+configuration.
 
 ## Codex account and terminal disagree
 
@@ -141,16 +181,16 @@ authorization URLs, or unredacted terminal captures into logs or issues.
 
 ## Current and future workers
 
-`Server/terminal-relay-session` is the canonical helper. Fresh-worker bootstrap
-includes that file in its payload, and `Server/install-worker.sh` installs it at
-`/usr/local/bin/terminal-relay-session`. Therefore newly provisioned workers
-receive the fix from the checked-out repository version. Existing workers must
-be reconciled with `Scripts/install-worker-session-helper.sh` after a helper
-change.
+`Server/terminal-relay-session` and `Server/terminal-relay-mcp` are the
+canonical worker control executables. Fresh-worker bootstrap includes both, and
+`Server/install-worker.sh` installs them at their fixed `/usr/local/bin` paths.
+Existing workers must be reconciled with
+`Scripts/install-worker-session-helper.sh` after either executable changes.
 
 For helper changes, run:
 
 ```bash
 ./Server/Tests/terminal-relay-session-tests.sh
+./Server/Tests/terminal-relay-mcp-tests.sh
 ./Scripts/build-and-install.sh
 ```

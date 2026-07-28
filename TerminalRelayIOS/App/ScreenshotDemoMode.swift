@@ -47,7 +47,8 @@ enum DemoWorkspace {
             instanceToken: sessionIdentifiers[0],
             title: "Build adaptive iPad workspace",
             lastActivityAt: 1_800_000_000,
-            reportedWorking: true
+            reportedWorking: true,
+            threadID: "00000000-0000-4000-8000-000000003001"
         ),
         WorkerSessionSnapshot(
             kind: .claude,
@@ -66,7 +67,33 @@ enum DemoWorkspace {
             instanceToken: sessionIdentifiers[2],
             title: "Prepare App Store release",
             lastActivityAt: 1_799_999_960,
-            reportedWorking: false
+            reportedWorking: false,
+            threadID: "00000000-0000-4000-8000-000000003003"
+        ),
+    ]
+
+    static let threads = [
+        WorkerThreadSnapshot(
+            kind: .codex,
+            repositoryName: "atlas",
+            threadID: "00000000-0000-4000-8000-000000004001",
+            title: "Polish onboarding empty state",
+            updatedAt: 1_799_999_900,
+            isArchived: false,
+            activeInstanceToken: nil,
+            reportedWorking: nil,
+            capabilities: .dormantCodex
+        ),
+        WorkerThreadSnapshot(
+            kind: .codex,
+            repositoryName: "atlas",
+            threadID: "00000000-0000-4000-8000-000000004002",
+            title: "Retire old pairing copy",
+            updatedAt: 1_799_990_000,
+            isArchived: true,
+            activeInstanceToken: nil,
+            reportedWorking: nil,
+            capabilities: .archivedCodex
         ),
     ]
 

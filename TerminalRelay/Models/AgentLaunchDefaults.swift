@@ -79,7 +79,7 @@ struct AgentLaunchDefaults: Equatable {
                 "--model", claudeModel,
                 "--effort", claudeReasoningEffort.rawValue,
                 "--settings", "{\"terminalProgressBarEnabled\":true}",
-                "--mcp-config", "{\"mcpServers\":{}}",
+                "--mcp-config", "{\"mcpServers\":{\"terminal_relay\":{\"command\":\"/usr/local/bin/terminal-relay-mcp\"}}}",
                 "--strict-mcp-config"
             ]
             if fullAccessEnabled {

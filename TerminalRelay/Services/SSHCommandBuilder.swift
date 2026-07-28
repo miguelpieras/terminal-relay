@@ -105,6 +105,74 @@ enum SSHCommandBuilder {
         )
     }
 
+    static func workerThreadListConfiguration(
+        for server: ServerProfile,
+        repositoryName: String,
+        archived: Bool,
+        cursor: String? = nil
+    ) -> SSHLaunchConfiguration {
+        var arguments = [
+            "threads",
+            repositoryName,
+            archived ? "archived" : "active",
+        ]
+        if let cursor {
+            arguments.append(cursor)
+        }
+        return workerSessionConfiguration(for: server, arguments: arguments)
+    }
+
+    static func workerThreadCreateConfiguration(
+        for server: ServerProfile,
+        repositoryName: String
+    ) -> SSHLaunchConfiguration {
+        workerSessionConfiguration(
+            for: server,
+            arguments: ["thread-create", repositoryName]
+        )
+    }
+
+    static func workerThreadResumeConfiguration(
+        for server: ServerProfile,
+        repositoryName: String,
+        threadID: String,
+        launchDefaults: AgentLaunchDefaults
+    ) -> SSHLaunchConfiguration {
+        workerSessionConfiguration(
+            for: server,
+            arguments: ["thread-resume", repositoryName, threadID]
+                + launchDefaults.arguments(for: .codex)
+        )
+    }
+
+    static func workerThreadRenameConfiguration(
+        for server: ServerProfile,
+        repositoryName: String,
+        threadID: String,
+        name: String
+    ) -> SSHLaunchConfiguration {
+        workerSessionConfiguration(
+            for: server,
+            arguments: ["thread-rename", repositoryName, threadID, name]
+        )
+    }
+
+    static func workerThreadArchiveConfiguration(
+        for server: ServerProfile,
+        repositoryName: String,
+        threadID: String,
+        unarchive: Bool
+    ) -> SSHLaunchConfiguration {
+        workerSessionConfiguration(
+            for: server,
+            arguments: [
+                unarchive ? "thread-unarchive" : "thread-archive",
+                repositoryName,
+                threadID,
+            ]
+        )
+    }
+
     static func attachmentUploadConfiguration(
         for server: ServerProfile,
         instanceToken: String,
