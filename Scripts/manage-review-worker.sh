@@ -15,6 +15,7 @@ readonly keychain_account="pairing-code"
 temporary_directory=""
 temporary_root=""
 server_address=""
+review_hcloud_config=""
 ssh_options=()
 
 die() {
@@ -104,6 +105,7 @@ load_configuration() {
     review_firewall_name="${TERMINAL_RELAY_REVIEW_FIREWALL_NAME:-terminal-relay-app-review-ingress}"
     operator_private_key="${TERMINAL_RELAY_OPERATOR_PRIVATE_KEY:-$HOME/.ssh/terminal-relay-operator}"
     operator_public_key="$operator_private_key.pub"
+    review_hcloud_config="${TERMINAL_RELAY_REVIEW_HCLOUD_CONFIG:-}"
 
     [[ "$review_server_name" =~ ^[a-z0-9][a-z0-9-]{0,62}$ \
         && "$review_firewall_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]] \
@@ -111,10 +113,26 @@ load_configuration() {
     [[ -f "$operator_private_key" && ! -L "$operator_private_key" \
         && -f "$operator_public_key" && ! -L "$operator_public_key" ]] \
         || die "the configured operator SSH identity is unavailable"
+    if [[ -n "$review_hcloud_config" ]]; then
+        [[ "$review_hcloud_config" == /* \
+            && -f "$review_hcloud_config" \
+            && ! -L "$review_hcloud_config" \
+            && "$(/usr/bin/stat -f '%Lp' "$review_hcloud_config")" == 600 ]] \
+            || die "the isolated hcloud config is unavailable or unsafe"
+    fi
 }
 
 hcloud() {
-    /opt/homebrew/bin/hcloud --context "$TERMINAL_RELAY_HCLOUD_CONTEXT" "$@"
+    if [[ -n "$review_hcloud_config" ]]; then
+        /opt/homebrew/bin/hcloud \
+            --config "$review_hcloud_config" \
+            --context "$TERMINAL_RELAY_HCLOUD_CONTEXT" \
+            "$@"
+    else
+        /opt/homebrew/bin/hcloud \
+            --context "$TERMINAL_RELAY_HCLOUD_CONTEXT" \
+            "$@"
+    fi
 }
 
 verify_provider_project() {
@@ -189,7 +207,8 @@ ensure_review_firewall() {
     write_firewall_rules "$mode" "$rules_file" "$source_ipv4"
     if firewall_json="$(hcloud firewall describe "$review_firewall_name" \
         -o json 2>/dev/null)"; then
-        review_firewall_id="$(printf '%s' "$firewall_json" | /usr/bin/jq -er '.id')"
+        review_firewall_id="$(printf '%s' "$firewall_json" \
+            | /usr/bin/jq -er '(.firewall // .).id')"
         hcloud firewall replace-rules "$review_firewall_id" \
             --rules-file "$rules_file" >/dev/null
     else
@@ -199,7 +218,8 @@ ensure_review_firewall() {
             --label purpose=app-review \
             --rules-file "$rules_file" \
             -o json)"
-        review_firewall_id="$(printf '%s' "$firewall_json" | /usr/bin/jq -er '.id')"
+        review_firewall_id="$(printf '%s' "$firewall_json" \
+            | /usr/bin/jq -er '(.firewall // .).id')"
     fi
     [[ "$review_firewall_id" =~ ^[0-9]+$ ]] \
         || die "the review firewall identifier is invalid"

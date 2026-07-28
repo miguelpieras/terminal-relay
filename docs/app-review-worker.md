@@ -25,6 +25,25 @@ The lifecycle reads provider and operator-key settings from the ignored
 `Server/worker-baseline.local.env`. It verifies the configured project before
 making an external change.
 
+To keep the normal `hcloud` configuration completely independent, create a
+dedicated config once and point only the review lifecycle at it:
+
+```bash
+mkdir -p "${HOME}/.config/hcloud-terminal-relay"
+chmod 700 "${HOME}/.config/hcloud-terminal-relay"
+hcloud --config "${HOME}/.config/hcloud-terminal-relay/cli.toml" \
+  context create terminal-relay
+chmod 600 "${HOME}/.config/hcloud-terminal-relay/cli.toml"
+```
+
+Then set this only in the ignored local baseline:
+
+```bash
+TERMINAL_RELAY_REVIEW_HCLOUD_CONFIG="${HOME}/.config/hcloud-terminal-relay/cli.toml"
+```
+
+The default `hcloud` config and its active context are never changed.
+
 ```bash
 ./Scripts/manage-review-worker.sh provision
 ./Scripts/manage-review-worker.sh authenticate
