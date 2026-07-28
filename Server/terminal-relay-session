@@ -1664,9 +1664,14 @@ if tool == "codex":
             columns = {
                 row[1] for row in connection.execute("pragma table_info(threads)")
             }
-            title_column = "name" if "name" in columns else "title"
+            if "name" in columns and "title" in columns:
+                title_expression = "coalesce(nullif(trim(name), ''), title)"
+            elif "name" in columns:
+                title_expression = "name"
+            else:
+                title_expression = "title"
             row = connection.execute(
-                f"select {title_column} from threads where id = ? limit 1",
+                f"select {title_expression} from threads where id = ? limit 1",
                 (match.group(0),),
             ).fetchone()
             connection.close()

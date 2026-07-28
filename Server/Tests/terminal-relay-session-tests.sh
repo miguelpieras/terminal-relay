@@ -677,6 +677,24 @@ assert_equal \
     "$codex_thread_id" \
     "$(thread_id_from_line "$codex_title_status")" \
     "Codex thread id"
+"$python_path" - "$test_home/.codex/state_5.sqlite" "$codex_thread_id" <<'PYTHON_CODEX_TITLE_FALLBACK'
+import sqlite3
+import sys
+
+database, thread_id = sys.argv[1:]
+connection = sqlite3.connect(database)
+connection.execute(
+    "update threads set name = null where id = ?",
+    (thread_id,),
+)
+connection.commit()
+connection.close()
+PYTHON_CODEX_TITLE_FALLBACK
+codex_fallback_title_status="$(wait_for_session codex alpha 0)"
+assert_equal \
+    "$(encode_title "First Codex prompt")" \
+    "$(title_hex_from_line "$codex_fallback_title_status")" \
+    "Codex database title fallback"
 "$tmux_path" -f /dev/null -L "$tmux_socket" \
     select-pane -t "terminal-relay-codex-$first_instance" \
     -T "Renamed live thread | Working"
