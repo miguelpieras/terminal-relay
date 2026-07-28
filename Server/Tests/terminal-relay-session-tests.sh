@@ -520,6 +520,10 @@ def serve_connection(connection):
                     "name": saved_thread_name(thread_id),
                 }
             }
+        elif method == "thread/loaded/list":
+            result = {
+                "data": ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]
+            }
         elif method == "thread/start":
             result = {
                 "thread": {
@@ -730,11 +734,20 @@ import sys
 database, thread_id = sys.argv[1:]
 connection = sqlite3.connect(database)
 connection.execute(
-    "create table threads (id text primary key, title text not null, name text)"
+    "create table threads ("
+    "id text primary key, title text not null, preview text, "
+    "first_user_message text, name text)"
 )
 connection.execute(
-    "insert into threads (id, title, name) values (?, ?, ?)",
-    (thread_id, "First Codex prompt", "Generated Codex name"),
+    "insert into threads "
+    "(id, title, preview, first_user_message, name) values (?, ?, ?, ?, ?)",
+    (
+        thread_id,
+        "First Codex prompt",
+        "Original user prompt",
+        "Original user prompt",
+        "Generated Codex name",
+    ),
 )
 connection.commit()
 connection.close()
@@ -781,6 +794,18 @@ assert_equal \
     "$(encode_title "Generated Codex title")" \
     "$(title_hex_from_line "$codex_persisted_title_status")" \
     "Codex persisted thread name"
+"$tmux_path" -f /dev/null -L "$tmux_socket" \
+    select-pane -t "terminal-relay-codex-$first_instance" \
+    -T "Original user prompt | Ready"
+codex_prompt_pane_status="$(wait_for_session codex alpha 0)"
+assert_equal \
+    "$(encode_title "Generated Codex title")" \
+    "$(title_hex_from_line "$codex_prompt_pane_status")" \
+    "Codex persisted name for a prompt-titled pane"
+assert_equal \
+    "$codex_thread_id" \
+    "$(thread_id_from_line "$codex_prompt_pane_status")" \
+    "Codex inferred thread id for a prompt-titled pane"
 "$tmux_path" -f /dev/null -L "$tmux_socket" \
     select-pane -t "terminal-relay-codex-$first_instance" \
     -T "Renamed live thread | Working"
@@ -1093,8 +1118,12 @@ if ! /bin/bash "$helper" codex-account >/dev/null; then
     fail "initial Codex app-server launch did not become ready"
 fi
 /bin/rm -f -- "$test_home/.codex/session_index.jsonl"
-TERMINAL_RELAY_TEST_CODEX_TITLE_GENERATION=1 \
-    /bin/bash "$helper" __generate-codex-titles "$codex_thread_id"
+generated_title_result="$(TERMINAL_RELAY_TEST_CODEX_TITLE_GENERATION=1 \
+    /bin/bash "$helper" __generate-codex-titles --active)"
+assert_contains \
+    "$generated_title_result" \
+    '"generated":1' \
+    "Codex generated title count"
 generated_codex_title="$("$python_path" - "$test_home/.codex/session_index.jsonl" \
     "$codex_thread_id" <<'PYTHON_GENERATED_CODEX_TITLE'
 import json

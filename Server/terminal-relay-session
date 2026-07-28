@@ -389,7 +389,7 @@ def thread_prompt(thread_id):
         }
         prompt_columns = [
             column
-            for column in ("preview", "title", "first_user_message")
+            for column in ("first_user_message", "preview", "title")
             if column in columns
         ]
         if not prompt_columns:
@@ -437,7 +437,32 @@ def normalized_generated_title(text):
     return title
 
 
+def loaded_thread_ids(client):
+    client.send_json(
+        {
+            "method": "thread/loaded/list",
+            "id": 9,
+            "params": {},
+        }
+    )
+    result = result_from(wait_for_response(client, 9, 15))
+    thread_ids = result.get("data")
+    if not isinstance(thread_ids, list):
+        return []
+    return [thread_id for thread_id in thread_ids if isinstance(thread_id, str)]
+
+
 def generate_titles(client, thread_ids):
+    if "--active" in thread_ids:
+        thread_ids = loaded_thread_ids(client)
+    counts = {
+        "requested": len(thread_ids),
+        "skippedNamed": 0,
+        "missingPrompt": 0,
+        "missingTitle": 0,
+        "generated": 0,
+        "failed": 0,
+    }
     request_id = 10
     for thread_id in thread_ids:
         try:
@@ -445,6 +470,10 @@ def generate_titles(client, thread_ids):
             if canonical_id != thread_id.lower():
                 continue
 
+            prompt, cwd = thread_prompt(canonical_id)
+            if not prompt:
+                counts["missingPrompt"] += 1
+                continue
             client.send_json(
                 {
                     "method": "thread/read",
@@ -459,10 +488,7 @@ def generate_titles(client, thread_ids):
                 continue
             current_name = thread.get("name")
             if isinstance(current_name, str) and current_name.strip():
-                continue
-
-            prompt, cwd = thread_prompt(canonical_id)
-            if not prompt:
+                counts["skippedNamed"] += 1
                 continue
             instruction = (
                 "Create a concise UI title for this coding task. Return only JSON "
@@ -572,6 +598,7 @@ def generate_titles(client, thread_ids):
 
             title = normalized_generated_title(message_text) if completed else ""
             if not title:
+                counts["missingTitle"] += 1
                 continue
             client.send_json(
                 {
@@ -582,6 +609,7 @@ def generate_titles(client, thread_ids):
             )
             result_from(wait_for_response(client, request_id, 15))
             request_id += 1
+            counts["generated"] += 1
 
             client.send_json(
                 {
@@ -603,7 +631,9 @@ def generate_titles(client, thread_ids):
             json.JSONDecodeError,
             sqlite3.Error,
         ):
+            counts["failed"] += 1
             continue
+    print(json.dumps({"titleGeneration": counts}, separators=(",", ":")), flush=True)
 
 
 def account_is_available(response):
@@ -930,7 +960,7 @@ schedule_codex_title_generation() {
 
     printf -v launch_command 'exec %q __generate-codex-titles' "$helper_path"
     for thread_id in "$@"; do
-        is_valid_instance "$thread_id" || continue
+        [[ "$thread_id" == "--active" ]] || is_valid_instance "$thread_id" || continue
         printf -v launch_command '%s %q' "$launch_command" "$thread_id"
     done
     tmux_command new-session -d -s "$codex_title_generator_session" \
@@ -944,7 +974,7 @@ generate_codex_titles() {
 
     [[ "$codex_title_generation_enabled" == "1" ]] || return 0
     for thread_id in "$@"; do
-        is_valid_instance "$thread_id" || continue
+        [[ "$thread_id" == "--active" ]] || is_valid_instance "$thread_id" || continue
         thread_ids+=("$thread_id")
     done
     [[ ${#thread_ids[@]} -gt 0 ]] || return 0
@@ -1933,6 +1963,7 @@ import sys
 tool, instance, pane_title, home = sys.argv[1:]
 title = ""
 needs_generation = False
+resolved_thread_id = ""
 if tool == "codex":
     display_title = re.sub(
         r"\s+\|\s+(Ready|Working|Thinking|Waiting|Starting)\s*$",
@@ -1943,61 +1974,120 @@ if tool == "codex":
         r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
         display_title.lower(),
     )
-    if match:
-        thread_id = match.group(0)
-        index = os.path.join(home, ".codex", "session_index.jsonl")
-        persisted_name = ""
-        try:
-            with open(index, encoding="utf-8") as records:
-                for line in records:
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if record.get("id") != thread_id:
-                        continue
-                    name = record.get("thread_name")
-                    if isinstance(name, str) and name.strip():
-                        persisted_name = name
-        except OSError:
-            pass
+    persisted_names = {}
+    index = os.path.join(home, ".codex", "session_index.jsonl")
+    try:
+        with open(index, encoding="utf-8") as records:
+            for line in records:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                thread_id = record.get("id")
+                name = record.get("thread_name")
+                if isinstance(thread_id, str) and isinstance(name, str) and name.strip():
+                    persisted_names[thread_id] = name.strip()
+    except OSError:
+        pass
+    persisted_match_ids = [
+        thread_id
+        for thread_id, name in persisted_names.items()
+        if name == display_title
+    ]
 
-        database_name = ""
-        database_title = ""
-        database = os.path.join(home, ".codex", "state_5.sqlite")
-        try:
-            connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
-            columns = {
-                row[1] for row in connection.execute("pragma table_info(threads)")
-            }
-            selected = [
-                column
-                for column in ("name", "title", "preview", "first_user_message")
-                if column in columns
-            ]
-            row = connection.execute(
-                f"select {', '.join(selected)} from threads where id = ? limit 1",
-                (thread_id,),
-            ).fetchone() if selected else None
-            connection.close()
-            if row:
-                values = dict(zip(selected, row))
-                name = values.get("name")
-                if isinstance(name, str) and name.strip():
-                    database_name = name
-                database_title = next(
+    candidates = []
+    database = os.path.join(home, ".codex", "state_5.sqlite")
+    try:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+        columns = {
+            row[1] for row in connection.execute("pragma table_info(threads)")
+        }
+        selected = [
+            column
+            for column in ("name", "title", "preview", "first_user_message")
+            if column in columns
+        ]
+        if selected:
+            if match:
+                rows = connection.execute(
+                    f"select id, {', '.join(selected)} "
+                    "from threads where id = ? limit 1",
+                    (match.group(0),),
+                ).fetchall()
+            elif persisted_match_ids:
+                placeholders = ", ".join("?" for _ in persisted_match_ids)
+                rows = connection.execute(
+                    f"select id, {', '.join(selected)} "
+                    f"from threads where id in ({placeholders})",
+                    tuple(persisted_match_ids),
+                ).fetchall()
+            else:
+                raw_columns = [
+                    column
+                    for column in ("title", "preview", "first_user_message")
+                    if column in columns
+                ]
+                where = " or ".join(f"trim({column}) = ?" for column in raw_columns)
+                rows = connection.execute(
+                    f"select id, {', '.join(selected)} from threads where {where}",
+                    tuple(display_title for _ in raw_columns),
+                ).fetchall() if raw_columns else []
+            for row in rows:
+                values = dict(zip(selected, row[1:]))
+                raw_prompt = next(
                     (
-                        values[column]
-                        for column in ("title", "preview", "first_user_message")
+                        values[column].strip()
+                        for column in ("first_user_message", "preview")
                         if isinstance(values.get(column), str)
                         and values[column].strip()
                     ),
                     "",
                 )
-        except (OSError, sqlite3.Error):
-            pass
-        title = persisted_name or database_name or database_title
-        needs_generation = bool(database_title and not (persisted_name or database_name))
+                database_title = values.get("title")
+                if not isinstance(database_title, str):
+                    database_title = ""
+                database_title = database_title.strip()
+                if (
+                    not match
+                    and display_title
+                    not in (
+                        raw_prompt,
+                        database_title,
+                        persisted_names.get(row[0], ""),
+                    )
+                ):
+                    continue
+                database_name = values.get("name")
+                if not isinstance(database_name, str):
+                    database_name = ""
+                candidates.append(
+                    (
+                        row[0],
+                        raw_prompt,
+                        database_title,
+                        persisted_names.get(row[0], "") or database_name.strip(),
+                    )
+                )
+        connection.close()
+    except (OSError, sqlite3.Error):
+        pass
+
+    if match:
+        resolved_thread_id = match.group(0)
+    elif len(candidates) == 1:
+        resolved_thread_id = candidates[0][0]
+    elif len(persisted_match_ids) == 1:
+        resolved_thread_id = persisted_match_ids[0]
+
+    saved_titles = [name for _, _, _, name in candidates if name]
+    if saved_titles:
+        title = saved_titles[0]
+    elif candidates:
+        _, raw_prompt, database_title, _ = candidates[0]
+        title = database_title or raw_prompt or display_title
+        needs_generation = bool(raw_prompt)
+    elif match:
+        title = persisted_names.get(resolved_thread_id, "") or display_title
     else:
         title = display_title
 elif tool == "claude":
@@ -2031,13 +2121,14 @@ title = "".join(character if character.isprintable() else " " for character in t
 title = re.sub(r"\s+", " ", title).strip()
 print(title[:200])
 print("1" if needs_generation else "0")
+print(resolved_thread_id)
 PYTHON_TITLE
         return
     fi
     fallback_title="$(printf '%s\n' "$pane_title" \
         | /usr/bin/tr '\r\n' '  ' \
         | /usr/bin/cut -c1-200)"
-    printf '%s\n0\n' "$fallback_title"
+    printf '%s\n0\n\n' "$fallback_title"
 }
 
 session_display_fields() {
@@ -2048,6 +2139,8 @@ session_display_fields() {
     local pane_title
     local resolved_title_fields
     local resolved_title
+    local resolved_generation
+    local resolved_thread_id
 
     session_activity=0
     session_title_hex=""
@@ -2075,9 +2168,14 @@ session_display_fields() {
         session_thread_id="$instance"
     fi
     resolved_title_fields="$(resolve_session_title "$tool" "$instance" "$pane_title")"
-    resolved_title="${resolved_title_fields%%$'\n'*}"
-    if [[ "$resolved_title_fields" == *$'\n1' ]]; then
+    resolved_title="$(printf '%s\n' "$resolved_title_fields" | /usr/bin/sed -n '1p')"
+    resolved_generation="$(printf '%s\n' "$resolved_title_fields" | /usr/bin/sed -n '2p')"
+    resolved_thread_id="$(printf '%s\n' "$resolved_title_fields" | /usr/bin/sed -n '3p')"
+    if [[ "$resolved_generation" == "1" ]]; then
         session_needs_title_generation=1
+    fi
+    if [[ -z "$session_thread_id" ]] && is_valid_instance "$resolved_thread_id"; then
+        session_thread_id="$resolved_thread_id"
     fi
     session_title_hex="$(encode_argument_hex "$resolved_title")"
 }
@@ -2091,6 +2189,7 @@ status_sessions() {
     local attached_client_count
     local boot_id
     local intent_status
+    local needs_active_title_generation=0
     local -a records=()
     local -a title_generation_thread_ids=()
 
@@ -2159,6 +2258,8 @@ status_sessions() {
         if [[ "$session_needs_title_generation" == "1" \
             && -n "$session_thread_id" ]]; then
             title_generation_thread_ids+=("$session_thread_id")
+        elif [[ "$session_needs_title_generation" == "1" ]]; then
+            needs_active_title_generation=1
         fi
         records+=("session|$tool|$repository|$attached_client_count|$instance|$session_activity|$session_title_hex|$session_working|$session_thread_id")
     done
@@ -2167,6 +2268,9 @@ status_sessions() {
     printf '%s\n' "$protocol_marker"
     if [[ ${#records[@]} -gt 0 ]]; then
         printf '%s\n' "${records[@]}" | LC_ALL=C /usr/bin/sort
+    fi
+    if [[ "$needs_active_title_generation" == "1" ]]; then
+        title_generation_thread_ids+=("--active")
     fi
     if [[ ${#title_generation_thread_ids[@]} -gt 0 ]]; then
         schedule_codex_title_generation "${title_generation_thread_ids[@]}"
