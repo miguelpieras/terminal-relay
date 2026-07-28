@@ -412,11 +412,15 @@ if [[ -n "$worker_number" ]]; then
         || die "installer did not apply the requested worker number"
 fi
 
-if ! /usr/bin/ssh "${ssh_options[@]}" "$runtime_target" '/usr/bin/codex login status >/dev/null 2>&1'; then
+if ! /usr/bin/ssh "${ssh_options[@]}" "$runtime_target" \
+    '/usr/local/bin/terminal-relay-session __verify-codex-account >/dev/null 2>&1'; then
     echo "Codex authentication is required. Follow the device authorization instructions."
-    /usr/bin/ssh -tt "${ssh_options[@]}" "$runtime_target" '/usr/bin/codex login --device-auth'
+    /usr/bin/ssh -tt "${ssh_options[@]}" "$runtime_target" \
+        '/usr/local/bin/terminal-relay-session codex-login'
 fi
-/usr/bin/ssh "${ssh_options[@]}" "$runtime_target" '/usr/bin/codex login status >/dev/null 2>&1' || die "Codex authentication is still missing"
+/usr/bin/ssh "${ssh_options[@]}" "$runtime_target" \
+    '/usr/local/bin/terminal-relay-session __verify-codex-account >/dev/null 2>&1' \
+    || die "Codex authentication is still missing"
 
 claude_is_authenticated() {
     /usr/bin/ssh "${ssh_options[@]}" "$runtime_target" \

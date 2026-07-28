@@ -8,6 +8,7 @@ readonly REPOSITORY_ROOT
 readonly SERVER_DIRECTORY="$REPOSITORY_ROOT/Server"
 readonly BASELINE_FILE="${TERMINAL_RELAY_BASELINE_FILE:-$SERVER_DIRECTORY/worker-baseline.local.env}"
 readonly HOST_INSTALLER="$SERVER_DIRECTORY/install-worker-host.sh"
+readonly SESSION_HELPER_SOURCE="$SERVER_DIRECTORY/terminal-relay-session"
 readonly NODE_EXPORTER_TEMPLATE="$SERVER_DIRECTORY/node-exporter.service.template"
 readonly BOOTSTRAP_SCRIPT="$SCRIPT_DIRECTORY/bootstrap-worker.sh"
 readonly SSH_CONFIG="$HOME/.ssh/config"
@@ -131,6 +132,8 @@ validate_local_prerequisites() {
         || die "the local Tailscale CLI path is unavailable"
     [[ -x "$HOST_INSTALLER" && -x "$BOOTSTRAP_SCRIPT" ]] \
         || die "worker lifecycle scripts must be executable"
+    [[ -f "$SESSION_HELPER_SOURCE" && ! -L "$SESSION_HELPER_SOURCE" ]] \
+        || die "worker session helper source is missing or unsafe"
     [[ -f "$NODE_EXPORTER_TEMPLATE" && ! -L "$NODE_EXPORTER_TEMPLATE" ]] \
         || die "missing or unsafe node-exporter template"
     [[ -f "$OPERATOR_PRIVATE_KEY" && -r "$OPERATOR_PRIVATE_KEY" ]] \
@@ -762,29 +765,79 @@ bootstrap_application() {
 verify_application() {
     local number="$1"
     local alias
+    local expected_helper_digest
     local output
 
     alias="$(worker_name_for_number "$number")"
+    expected_helper_digest="$(/usr/bin/shasum -a 256 "$SESSION_HELPER_SOURCE" \
+        | /usr/bin/awk '{ print $1; exit }')"
+    [[ "$expected_helper_digest" =~ ^[a-f0-9]{64}$ ]] \
+        || die "could not fingerprint the worker session helper source"
     output="$(/usr/bin/ssh \
         -o BatchMode=yes \
         -o ConnectTimeout=15 \
         -o StrictHostKeyChecking=yes \
         "$alias" \
-        "/bin/bash -s" <<'REMOTE'
+        "/bin/bash -s -- '$expected_helper_digest'" <<'REMOTE'
 set -euo pipefail
+expected_helper_digest="$1"
+safe_path="/usr/local/bin:/usr/bin:/bin"
+session_helper="/usr/local/bin/terminal-relay-session"
+codex_restart_marker="/home/terminal-relay/.local/state/terminal-relay/codex-app-server-restart-required"
+codex_app_server_session="terminal-relay-account-server"
+export PATH="$safe_path"
+
 test "$(id -un)" = terminal-relay
 test "$(id -gn)" = terminal-relay
 test "$(stat -c '%U:%G:%a' /workspace)" = terminal-relay:terminal-relay:750
+test "$(sha256sum "$session_helper" | awk '{ print $1; exit }')" = "$expected_helper_digest"
+test "$(command -v bwrap)" = /usr/bin/bwrap
+/usr/bin/bwrap \
+    --unshare-user \
+    --unshare-net \
+    --ro-bind / / \
+    /bin/true
+
+restart_required=0
+if [[ -e "$codex_restart_marker" || -L "$codex_restart_marker" ]]; then
+    restart_required=1
+fi
+if /usr/bin/tmux -f /dev/null -L terminal-relay \
+    has-session -t "$codex_app_server_session" 2>/dev/null; then
+    app_server_pid="$(/usr/bin/tmux -f /dev/null -L terminal-relay \
+        display-message -p -t "$codex_app_server_session" '#{pane_pid}')"
+    [[ "$app_server_pid" =~ ^[1-9][0-9]*$ ]]
+    app_server_path="$(/usr/bin/tr '\0' '\n' < "/proc/$app_server_pid/environ" \
+        | /usr/bin/sed -n 's/^PATH=//p')"
+    if [[ "$app_server_path" != "$safe_path" ]]; then
+        restart_required=1
+    fi
+fi
+if [[ "$restart_required" -eq 1 ]]; then
+    "$session_helper" __schedule-codex-app-server-restart
+fi
+"$session_helper" __verify-codex-account >/dev/null
+test ! -e "$codex_restart_marker"
+test ! -L "$codex_restart_marker"
+
+/usr/bin/tmux -f /dev/null -L terminal-relay \
+    has-session -t "$codex_app_server_session" 2>/dev/null
+app_server_pid="$(/usr/bin/tmux -f /dev/null -L terminal-relay \
+    display-message -p -t "$codex_app_server_session" '#{pane_pid}')"
+[[ "$app_server_pid" =~ ^[1-9][0-9]*$ ]]
+app_server_path="$(/usr/bin/tr '\0' '\n' < "/proc/$app_server_pid/environ" \
+    | /usr/bin/sed -n 's/^PATH=//p')"
+test "$app_server_path" = "$safe_path"
+
 codex --version | grep -Eq '[0-9]+\.[0-9]+\.[0-9]+'
 claude --version | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+'
-codex login status >/dev/null 2>&1
 claude auth status --json 2>/dev/null \
     | grep -Eq '"loggedIn"[[:space:]]*:[[:space:]]*true'
 systemctl is-enabled --quiet terminal-relay-session-restore@terminal-relay.service
 systemctl is-active --quiet terminal-relay-session-restore@terminal-relay.service
 systemctl is-enabled --quiet terminal-relay-agent-update.timer
 systemctl is-active --quiet terminal-relay-agent-update.timer
-/usr/local/bin/terminal-relay-session status >/dev/null
+"$session_helper" status >/dev/null
 printf 'application=ready\n'
 REMOTE
 )"
@@ -956,15 +1009,17 @@ run_for_target() {
     local command="$1"
     local target="$2"
     local number
-    local count=0
+    local -a numbers=()
 
     if [[ "$target" == all ]]; then
         while IFS= read -r number; do
             [[ -n "$number" ]] || continue
-            "$command" "$number"
-            count=$((count + 1))
+            numbers+=("$number")
         done < <(configured_worker_numbers)
-        ((count > 0)) || die "no managed worker aliases are configured"
+        ((${#numbers[@]} > 0)) || die "no managed worker aliases are configured"
+        for number in "${numbers[@]}"; do
+            "$command" "$number"
+        done
     else
         "$command" "$target"
     fi

@@ -99,11 +99,63 @@ grep -Fq 'CODEX_NON_INTERACTIVE=1' "$agent_updater" \
     || fail "Codex automatic updates are not unattended"
 grep -Fq 'apt/latest latest main' "$application_installer" \
     || fail "Claude automatic updates do not follow the latest signed channel"
+grep -Eq '^[[:space:]]+bubblewrap[[:space:]]+\\$' "$application_installer" \
+    || fail "application installer does not provision the bubblewrap package"
+grep -Fq 'SESSION_HELPER_SOURCE="$SERVER_DIRECTORY/terminal-relay-session"' "$lifecycle" \
+    || fail "fleet verification does not fingerprint the repository session helper"
+grep -Fq 'sha256sum "$session_helper"' "$lifecycle" \
+    || fail "fleet verification does not compare the deployed session helper"
+grep -Fq 'expected_helper_digest="$1"' "$lifecycle" \
+    || fail "fleet verification does not pass the expected helper digest remotely"
+grep -Fq '= "$expected_helper_digest"' "$lifecycle" \
+    || fail "fleet verification does not require the deployed helper digest to match"
+
+for bubblewrap_source in "$application_installer" "$lifecycle"; do
+    grep -Fq 'command -v bwrap' "$bubblewrap_source" \
+        || fail "$(basename "$bubblewrap_source") does not resolve bubblewrap through PATH"
+    /usr/bin/awk '
+        /\/usr\/bin\/bwrap[[:space:]]*\\$/ { probe = NR }
+        probe && NR > probe && NR <= probe + 4 && /--unshare-user/ { user = NR }
+        probe && NR > probe && NR <= probe + 4 && /--unshare-net/ { network = NR }
+        probe && NR > probe && NR <= probe + 5 && /--ro-bind \/ \// { bind = NR }
+        END { exit !(probe && user > probe && network > user && bind > network) }
+    ' "$bubblewrap_source" \
+        || fail "$(basename "$bubblewrap_source") does not run the full bubblewrap namespace probe"
+done
 
 for marker_source in "$application_installer" "$session_helper" "$agent_updater"; do
     grep -Fq 'codex-app-server-restart-required' "$marker_source" \
         || fail "$(basename "$marker_source") does not share the Codex restart marker"
 done
+grep -Fq 'codex-app-server-restart-required' "$lifecycle" \
+    || fail "fleet verification does not reject a pending Codex app-server restart"
+grep -Fq '"$session_helper" __schedule-codex-app-server-restart' "$lifecycle" \
+    || fail "fleet verification does not schedule an unsafe Codex app-server rotation"
+grep -Fq '"$session_helper" __verify-codex-account >/dev/null' "$lifecycle" \
+    || fail "fleet verification does not require the shared Codex account after rotation"
+grep -Fq 'run_codex_rpc_with_app_server_lock require-account' "$session_helper" \
+    || fail "worker helper does not expose fail-closed shared Codex account verification"
+[[ "$(grep -Fc '/usr/local/bin/terminal-relay-session __verify-codex-account' "$bootstrap")" -eq 2 ]] \
+    || fail "worker bootstrap does not verify the shared Codex account before and after login"
+grep -Fq '/usr/local/bin/terminal-relay-session codex-login' "$bootstrap" \
+    || fail "worker bootstrap does not authenticate through the shared Codex app-server"
+if grep -Fq '/usr/bin/codex login' "$bootstrap"; then
+    fail "worker bootstrap bypasses the shared Codex app-server during authentication"
+fi
+grep -Fq 'test ! -e "$codex_restart_marker"' "$lifecycle" \
+    || fail "fleet verification does not require the Codex restart marker to clear"
+grep -Fq 'test ! -L "$codex_restart_marker"' "$lifecycle" \
+    || fail "fleet verification does not reject a symlinked Codex restart marker"
+grep -Fq "'#{pane_pid}'" "$lifecycle" \
+    || fail "fleet verification does not resolve the live Codex app-server pid through tmux"
+grep -Fq '"/proc/$app_server_pid/environ"' "$lifecycle" \
+    || fail "fleet verification does not read the live Codex app-server environment"
+grep -Fq 'test "$app_server_path" = "$safe_path"' "$lifecycle" \
+    || fail "fleet verification does not inspect the live Codex app-server PATH"
+grep -Fq 'local -a numbers=()' "$lifecycle" \
+    || fail "fleet-wide lifecycle actions do not snapshot every configured worker number"
+grep -Fq 'for number in "${numbers[@]}"' "$lifecycle" \
+    || fail "fleet-wide lifecycle actions can let SSH consume undispatched workers"
 grep -Fq '__schedule-codex-app-server-restart' "$application_installer" \
     || fail "application reconciliation does not schedule a Codex app-server restart"
 grep -Fq '__schedule-codex-app-server-restart' "$agent_updater" \

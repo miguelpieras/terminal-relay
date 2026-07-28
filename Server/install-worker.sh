@@ -940,9 +940,9 @@ verify_readiness() {
     [[ "$(run_as_worker /bin/bash -lc "cd \"\$HOME\" && command -v bwrap")" == "/usr/bin/bwrap" ]] \
         || fail "Bubblewrap does not resolve to /usr/bin/bwrap in the worker login shell."
     run_as_worker /usr/bin/bwrap \
+        --unshare-user \
+        --unshare-net \
         --ro-bind / / \
-        --proc /proc \
-        --dev /dev \
         /bin/true
     run_as_worker "$codex_destination" --version >/dev/null
     run_as_worker "$claude_destination" --version >/dev/null

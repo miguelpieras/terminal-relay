@@ -45,7 +45,9 @@ rollback_script="$(/usr/bin/sed -n "/<<'REMOTE_ROLLBACK'/,/^REMOTE_ROLLBACK$/p" 
     && "$install_script" == *'"$unit_installed_digest"'* \
     && "$install_script" == *'"$service_initial_enabled"'* \
     && "$install_script" == *'systemctl daemon-reload'* \
-    && "$install_script" == *'systemctl enable "$service"'* ]] \
+    && "$install_script" == *'systemctl enable "$service"'* \
+    && "$install_script" == *'"$helper_target" __schedule-codex-app-server-restart'* \
+    && "$install_script" == *'codex-app-server-restart-required'* ]] \
     || { echo "Install renderer expanded or lost literal remote variables." >&2; exit 1; }
 # shellcheck disable=SC2016
 [[ "$rollback_script" == *'case "$helper_staged" in'* \

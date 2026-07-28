@@ -364,7 +364,8 @@ if [[ "$*" == *"-p /usage"* ]]; then
     exit 0
 fi
 
-printf 'start|pid=%s|cwd=%s' "$$" "$PWD" >> "$TERMINAL_RELAY_TEST_AGENT_LOG"
+printf 'start|pid=%s|cwd=%s|path=%s' "$$" "$PWD" "$PATH" \
+    >> "$TERMINAL_RELAY_TEST_AGENT_LOG"
 if [[ -n "${ConEmuANSI:-}" ]]; then
     printf '|ConEmuANSI=%s' "$ConEmuANSI" >> "$TERMINAL_RELAY_TEST_AGENT_LOG"
 fi
@@ -511,7 +512,14 @@ def serve_connection(connection):
         method = request_value.get("method")
         notifications = []
         if method == "account/read":
-            result = {"account": {"type": "chatgpt"}}
+            account_state = ""
+            if os.path.exists(control_path):
+                with open(control_path, encoding="utf-8") as control_file:
+                    account_state = control_file.read().strip()
+            if account_state == "signed-out":
+                result = {"account": None, "requiresOpenaiAuth": True}
+            else:
+                result = {"account": {"type": "chatgpt"}}
         elif method == "thread/read":
             thread_id = request_value.get("params", {}).get("threadId")
             result = {
@@ -721,6 +729,8 @@ second_parallel_log="$(/usr/bin/sed -n '2p' "$agent_log")"
 assert_contains "$first_log$second_parallel_log" "--candidate-one" "first concurrent launch argument"
 assert_contains "$first_log$second_parallel_log" "--candidate-two" "second concurrent launch argument"
 assert_contains "$first_log$second_parallel_log" "mcp_servers.test_server={enabled=false}" "Codex MCP disable argument"
+assert_contains "$first_log$second_parallel_log" \
+    "|path=/usr/local/bin:/usr/bin:/bin" "Codex client safe PATH"
 sleep 0.2
 assert_equal "2" "$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")" "concurrent launch count"
 /bin/bash "$helper" stop codex alpha "$parallel_instance"
@@ -1117,6 +1127,20 @@ if ! /bin/bash "$helper" codex-account >/dev/null; then
     /bin/cat "$codex_app_server_log" >&2
     fail "initial Codex app-server launch did not become ready"
 fi
+if ! /bin/bash "$helper" __verify-codex-account >/dev/null; then
+    fail "authenticated shared Codex account did not pass verification"
+fi
+printf '%s\n' signed-out > "$codex_app_server_control"
+set +e
+signed_out_output="$(/bin/bash "$helper" __verify-codex-account 2>&1)"
+signed_out_status=$?
+set -e
+assert_equal "77" "$signed_out_status" "signed-out shared Codex account status"
+assert_contains \
+    "$signed_out_output" \
+    "Codex is not authenticated" \
+    "signed-out shared Codex account diagnostic"
+printf '%s\n' ready > "$codex_app_server_control"
 /bin/rm -f -- "$test_home/.codex/session_index.jsonl"
 generated_title_result="$(TERMINAL_RELAY_TEST_CODEX_TITLE_GENERATION=1 \
     /bin/bash "$helper" __generate-codex-titles --active)"

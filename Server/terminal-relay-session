@@ -3756,6 +3756,10 @@ case "$command_name" in
         [[ $# -eq 0 ]] || fail_usage "codex-account does not accept arguments."
         run_codex_rpc_with_app_server_lock account
         ;;
+    __verify-codex-account)
+        [[ $# -eq 0 ]] || fail_usage "Invalid internal Codex account verification request."
+        run_codex_rpc_with_app_server_lock require-account
+        ;;
     claude-account)
         [[ $# -eq 0 ]] || fail_usage "claude-account does not accept arguments."
         claude_account

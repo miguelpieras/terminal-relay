@@ -73,7 +73,9 @@ validate_remote_rendering() {
             [[ "$script" == *'case "$helper_staged" in'* \
                 && "$script" == *'"$helper_installed_digest"'* \
                 && "$script" == *'"$unit_installed_digest"'* \
-                && "$script" == *'"$service_initial_enabled"'* ]] || return 1
+                && "$script" == *'"$service_initial_enabled"'* \
+                && "$script" == *'"$helper_target" __schedule-codex-app-server-restart'* ]] \
+                || return 1
             ;;
         rollback)
             # shellcheck disable=SC2016
@@ -245,6 +247,16 @@ case "$application_user" in
 esac
 /usr/bin/getent passwd "$application_user" >/dev/null \
     || { echo "Refusing to install for a missing application user." >&2; exit 77; }
+application_uid=$(/usr/bin/id -u "$application_user")
+application_home=$(/usr/bin/getent passwd "$application_user" \
+    | /usr/bin/awk -F: -v expected_uid="$application_uid" \
+        '$3 == expected_uid { count++; home = $6 } END { if (count == 1) print home }')
+case "$application_home" in
+    /*) ;;
+    *) echo "Refusing to install for an invalid application home." >&2; exit 77 ;;
+esac
+[ "$application_home" != "/" ] && [ "${application_home#*$'\n'}" = "$application_home" ] \
+    || { echo "Refusing to install for an invalid application home." >&2; exit 77; }
 lock_path=/run/lock/terminal-relay-session-helper.lock
 if [ "$(id -u)" != 0 ] || [ -L "$lock_path" ] || [ ! -f "$lock_path" ] \
     || [ "$(/usr/bin/stat -c "%u:%g" "$lock_path")" != "0:0" ]; then
@@ -519,6 +531,20 @@ fi
 privileged /usr/bin/systemctl is-enabled --quiet "$service"
 privileged /usr/bin/systemctl is-active --quiet "$service"
 [ "$(privileged /usr/bin/systemctl show -p User --value "$service")" = "$application_user" ]
+
+if [ "$helper_result" != unchanged ]; then
+    restart_marker="$application_home/.local/state/terminal-relay/codex-app-server-restart-required"
+    privileged /usr/sbin/runuser -u "$application_user" -- \
+        /usr/bin/env \
+            HOME="$application_home" \
+            USER="$application_user" \
+            LOGNAME="$application_user" \
+            SHELL=/bin/bash \
+            PATH=/usr/local/bin:/usr/bin:/bin \
+            "$helper_target" __schedule-codex-app-server-restart
+    [ "$(privileged /usr/bin/stat -c "%U:%a" "$restart_marker")" \
+        = "$application_user:600" ]
+fi
 
 printf "__TERMINAL_RELAY_WORKER_INSTALL_V3__|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n" \
     "$helper_result" "$helper_backup" "$helper_installed_digest" "$helper_installed_state" \

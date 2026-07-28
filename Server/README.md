@@ -27,6 +27,12 @@ workers are discovered automatically by Prometheus. Worker-specific addresses,
 host keys, Tailscale identities, UUIDs, provider credentials, project checkouts,
 and repository deploy keys remain local and unique.
 
+`manage-worker.sh verify` also compares the deployed session helper with the
+current checkout, runs Codex's required bubblewrap user/network namespace probe,
+schedules or completes a shared app-server rotation after terminals have
+drained, and rejects a worker whose restart remains pending or whose live
+app-server lacks the managed safe `PATH`.
+
 The shared operator **public** key and its fingerprint are intentionally the
 same on every worker. Private machine and project identities must never be
 copied between workers.
@@ -153,7 +159,8 @@ are retained as timestamped backups. A failed install restores both files and
 the prior service enabled/active state. The printed rollback takes the same lock,
 rechecks worker identity, refuses symlinks, and requires both installed SHA-256
 digests and inode states to still match this deployment, so it cannot overwrite
-or delete a later deployment.
+or delete a later deployment. Replacing the helper also schedules the shared
+Codex app-server to restart after active Codex terminals drain.
 
 Run the isolated local helper coverage before installation:
 
