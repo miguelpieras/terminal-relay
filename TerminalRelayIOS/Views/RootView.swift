@@ -37,6 +37,7 @@ struct RootView: View {
     @State private var workerPendingDeletion: WorkerProfile?
     @State private var workerSearchText = ""
     @State private var splitColumnVisibility = NavigationSplitViewVisibility.all
+    @State private var projectNavigationID = UUID()
 
     private var filteredWorkerProfiles: [WorkerProfile] {
         model.profiles.filter {
@@ -118,7 +119,8 @@ struct RootView: View {
                 TerminalScreen(
                     profile: profile,
                     route: route,
-                    isDemo: model.isDemoMode
+                    isDemo: model.isDemoMode,
+                    onExitDemo: exitDemo
                 )
             }
         }
@@ -200,6 +202,7 @@ struct RootView: View {
                     onExploreDemo: enterDemo
                 )
             }
+            .id(projectNavigationID)
             .tabItem {
                 Label("Projects", systemImage: "folder")
             }
@@ -224,10 +227,7 @@ struct RootView: View {
                     selectedProject: $selectedProject,
                     onAddWorker: { showsPairingScanner = true },
                     onExploreDemo: enterDemo,
-                    onShowWorkers: {
-                        selectedTab = .workers
-                        reconcileWorkerSelection()
-                    }
+                    onShowWorkers: showWorkers
                 )
             case .workers:
                 workerList(usesSplitSelection: true)
@@ -246,6 +246,7 @@ struct RootView: View {
                 profile: profile,
                 route: route,
                 isDemo: model.isDemoMode,
+                onExitDemo: exitDemo,
                 onClose: closeEmbeddedTerminal
             )
             .id(route.id)
@@ -480,7 +481,16 @@ struct RootView: View {
         refreshAfterTerminal()
     }
 
+    private func showWorkers() {
+        if model.terminalRoute != nil {
+            closeEmbeddedTerminal()
+        }
+        selectedTab = .workers
+        reconcileWorkerSelection()
+    }
+
     private func enterDemo() {
+        projectNavigationID = UUID()
         model.enterDemo()
         selectedTab = .projects
         selectedProject = ProjectSelection(
@@ -493,6 +503,7 @@ struct RootView: View {
     }
 
     private func exitDemo() {
+        projectNavigationID = UUID()
         selectedProject = nil
         selectedWorkerID = nil
         selectedTab = .projects

@@ -367,12 +367,16 @@ final class WorkerSessionModel: ObservableObject {
     }
 
     func isUnread(_ session: WorkerSessionSnapshot) -> Bool {
-        guard let profile,
-              let lastActivityAt = session.lastActivityAt else {
+        guard let profile else {
             return false
         }
+        return isUnread(session, profileID: profile.id)
+    }
+
+    func isUnread(_ session: WorkerSessionSnapshot, profileID: UUID) -> Bool {
+        guard let lastActivityAt = session.lastActivityAt else { return false }
         return lastActivityAt > (readActivityBySession[readKey(
-            profileID: profile.id,
+            profileID: profileID,
             instanceToken: session.instanceToken
         )] ?? 0)
     }

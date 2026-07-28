@@ -9,15 +9,18 @@ struct TerminalScreen: View {
     @State private var stopError: String?
     @State private var isStopping = false
     private let isDemo: Bool
+    private let onExitDemo: (() -> Void)?
     private let onClose: (() -> Void)?
 
     init(
         profile: WorkerProfile,
         route: TerminalRoute,
         isDemo: Bool = false,
+        onExitDemo: (() -> Void)? = nil,
         onClose: (() -> Void)? = nil
     ) {
         self.isDemo = isDemo
+        self.onExitDemo = onExitDemo
         self.onClose = onClose
         _controller = StateObject(
             wrappedValue: TerminalSessionController(
@@ -86,8 +89,12 @@ struct TerminalScreen: View {
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     if isDemo {
-                        Button("Close Demo") {
-                            close()
+                        Button("Exit Demo") {
+                            if let onExitDemo {
+                                onExitDemo()
+                            } else {
+                                close()
+                            }
                         }
                     } else {
                         Button("Stop", role: .destructive) { confirmsStop = true }

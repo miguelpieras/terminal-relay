@@ -68,6 +68,13 @@ struct IPadWorkspaceSidebar: View {
             .joined(separator: "|")
     }
 
+    private var catalogError: String? {
+        model.profiles.compactMap {
+            model.workerOverviews[$0.id]?.connectionError
+        }
+        .first
+    }
+
     var body: some View {
         List {
             if model.profiles.isEmpty {
@@ -81,6 +88,31 @@ struct IPadWorkspaceSidebar: View {
                     }
                 } footer: {
                     Text("The demo is local, uses example data, and never contacts a worker.")
+                }
+            } else if projects.isEmpty {
+                if !model.projectLoadingIDs.isEmpty {
+                    HStack {
+                        Spacer()
+                        ProgressView("Loading projects…")
+                        Spacer()
+                    }
+                    .listRowBackground(Color.clear)
+                } else if let catalogError {
+                    ContentUnavailableView(
+                        "Couldn’t Load Projects",
+                        systemImage: "exclamationmark.triangle",
+                        description: Text(catalogError)
+                    )
+                    .listRowBackground(Color.clear)
+                } else {
+                    ContentUnavailableView(
+                        "No Projects",
+                        systemImage: "folder",
+                        description: Text(
+                            "Add a repository under /workspace on a worker, then pull to refresh."
+                        )
+                    )
+                    .listRowBackground(Color.clear)
                 }
             } else if filteredProjects.isEmpty {
                 ContentUnavailableView.search(text: searchText)
@@ -117,6 +149,14 @@ struct IPadWorkspaceSidebar: View {
         .task(id: refreshTaskID) {
             await model.refreshProjectCatalogs()
             reconcileSelection()
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: .seconds(4))
+                } catch {
+                    return
+                }
+                await model.refreshProjectActivity()
+            }
         }
         .onChange(of: projects.map(\.selection)) { _, _ in
             reconcileSelection()
@@ -197,7 +237,7 @@ struct IPadWorkspaceSidebar: View {
                     ProgressView()
                         .controlSize(.mini)
                         .accessibilityLabel("Working")
-                } else if model.isUnread(session) {
+                } else if model.isUnread(session, profileID: project.workerID) {
                     Circle()
                         .fill(.blue)
                         .frame(width: 7, height: 7)

@@ -30,4 +30,25 @@ final class DemoWorkspaceTests: XCTestCase {
             ["demo@example.com"]
         )
     }
+
+    func testUnreadStateIsScopedToItsWorker() {
+        let suiteName = "DemoWorkspaceTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let model = WorkerSessionModel(
+            readStateDefaults: defaults,
+            screenshotDemo: true
+        )
+        let session = DemoWorkspace.sessions[0]
+        let otherWorkerID = UUID()
+
+        XCTAssertTrue(model.isUnread(session, profileID: DemoWorkspace.worker.id))
+        XCTAssertTrue(model.isUnread(session, profileID: otherWorkerID))
+
+        model.openTerminal(session)
+
+        XCTAssertFalse(model.isUnread(session, profileID: DemoWorkspace.worker.id))
+        XCTAssertTrue(model.isUnread(session, profileID: otherWorkerID))
+    }
 }
