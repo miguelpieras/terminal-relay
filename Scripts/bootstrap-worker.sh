@@ -10,6 +10,20 @@ REPOSITORY_ROOT="$(cd "$SCRIPT_DIRECTORY/.." && pwd -P)"
 readonly REPOSITORY_ROOT
 readonly SERVER_DIRECTORY="$REPOSITORY_ROOT/Server"
 readonly BASELINE_FILE="${TERMINAL_RELAY_BASELINE_FILE:-$SERVER_DIRECTORY/worker-baseline.local.env}"
+readonly -a WORKER_PAYLOAD_PATHS=(
+    install-worker.sh
+    terminal-relay-session
+    terminal-relay-mcp
+    terminal-relay-claude-sessions
+    claude-agent-sdk-requirements.txt
+    terminal-relay-session-restore@.service
+    terminal-relay-agent-update
+    terminal-relay-agent-update.service
+    terminal-relay-agent-update.timer
+    worker-config/install.sh
+    worker-config/AGENTS.md
+    worker-config/CLAUDE.md
+)
 
 usage() {
     cat <<'EOF'
@@ -207,8 +221,9 @@ fi
 if /usr/bin/grep -Eq '="REPLACE_ME"$' "$BASELINE_FILE"; then
     die "local worker baseline still contains REPLACE_ME values"
 fi
-for payload_path in install-worker.sh terminal-relay-session terminal-relay-mcp terminal-relay-session-restore@.service terminal-relay-agent-update terminal-relay-agent-update.service terminal-relay-agent-update.timer worker-config/install.sh worker-config/AGENTS.md worker-config/CLAUDE.md; do
-    [[ -f "$SERVER_DIRECTORY/$payload_path" ]] || die "missing bootstrap payload: Server/$payload_path"
+for payload_path in "${WORKER_PAYLOAD_PATHS[@]}"; do
+    [[ -f "$SERVER_DIRECTORY/$payload_path" && ! -L "$SERVER_DIRECTORY/$payload_path" ]] \
+        || die "missing or unsafe bootstrap payload: Server/$payload_path"
 done
 
 ssh_options=(-o ControlMaster=no -o ControlPath=none)
@@ -369,7 +384,7 @@ fi
 result_file="$temporary_directory/install-result"
 /usr/bin/tar --no-xattrs -cf - \
     -C "$temporary_directory" worker-baseline.env \
-    -C "$SERVER_DIRECTORY" install-worker.sh terminal-relay-session terminal-relay-mcp terminal-relay-session-restore@.service terminal-relay-agent-update terminal-relay-agent-update.service terminal-relay-agent-update.timer worker-config | \
+    -C "$SERVER_DIRECTORY" "${WORKER_PAYLOAD_PATHS[@]}" | \
     /usr/bin/ssh "${ssh_options[@]}" "$target" '
 set -eu
 worker_number='"$worker_number"'

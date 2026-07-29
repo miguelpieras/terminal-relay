@@ -95,6 +95,12 @@ grep -Fq 'node-exporter.service.template' "$lifecycle" \
     || fail "lifecycle does not deploy the monitoring baseline"
 grep -Fq 'terminal-relay-agent-update.timer' "$bootstrap" \
     || fail "bootstrap does not include automatic agent updates"
+grep -Fq 'terminal-relay-claude-sessions' "$bootstrap" \
+    || fail "bootstrap does not include the Claude session adapter"
+grep -Fq 'claude-agent-sdk-requirements.txt' "$bootstrap" \
+    || fail "bootstrap does not include the pinned Claude session SDK requirements"
+grep -Fq '"${WORKER_PAYLOAD_PATHS[@]}"' "$bootstrap" \
+    || fail "bootstrap validation and archive creation do not share one payload list"
 grep -Fq 'CODEX_NON_INTERACTIVE=1' "$agent_updater" \
     || fail "Codex automatic updates are not unattended"
 grep -Fq 'apt/latest latest main' "$application_installer" \
