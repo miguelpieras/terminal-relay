@@ -166,38 +166,43 @@ final class WorkerRemoteCommandTests: XCTestCase {
 
         XCTAssertEqual(
             try WorkerRemoteCommand.threads(
+                kind: .claude,
                 repositoryName: "terminal-relay",
                 archived: true,
                 cursor: "next page"
             ),
-            "'/usr/local/bin/terminal-relay-session' 'threads' 'terminal-relay' 'archived' 'next page'"
+            "'/usr/local/bin/terminal-relay-session' 'threads-v2' 'claude' 'terminal-relay' 'archived' 'next page'"
         )
         XCTAssertEqual(
             try WorkerRemoteCommand.resumeThread(
+                kind: .claude,
                 repositoryName: "terminal-relay",
                 threadID: threadID,
                 launchArguments: ["--model", "gpt-5.6-sol"]
             ),
-            "'/usr/local/bin/terminal-relay-session' 'thread-resume' 'terminal-relay' '\(threadID)' '--model' 'gpt-5.6-sol'"
+            "'/usr/local/bin/terminal-relay-session' 'thread-resume-v2' 'claude' 'terminal-relay' '\(threadID)' '--model' 'gpt-5.6-sol'"
         )
         XCTAssertEqual(
             try WorkerRemoteCommand.renameThread(
+                kind: .claude,
                 repositoryName: "terminal-relay",
                 threadID: threadID,
                 name: "It's renamed"
             ),
-            "'/usr/local/bin/terminal-relay-session' 'thread-rename' 'terminal-relay' '\(threadID)' 'It'\\''s renamed'"
+            "'/usr/local/bin/terminal-relay-session' 'thread-rename-v2' 'claude' 'terminal-relay' '\(threadID)' 'It'\\''s renamed'"
         )
         XCTAssertEqual(
             try WorkerRemoteCommand.archiveThread(
+                kind: .claude,
                 repositoryName: "terminal-relay",
                 threadID: threadID,
                 unarchive: true
             ),
-            "'/usr/local/bin/terminal-relay-session' 'thread-unarchive' 'terminal-relay' '\(threadID)'"
+            "'/usr/local/bin/terminal-relay-session' 'thread-unarchive-v2' 'claude' 'terminal-relay' '\(threadID)'"
         )
         XCTAssertThrowsError(
             try WorkerRemoteCommand.resumeThread(
+                kind: .claude,
                 repositoryName: "terminal-relay",
                 threadID: threadID.uppercased(),
                 launchArguments: []
@@ -207,6 +212,7 @@ final class WorkerRemoteCommandTests: XCTestCase {
         }
         XCTAssertThrowsError(
             try WorkerRemoteCommand.renameThread(
+                kind: .claude,
                 repositoryName: "terminal-relay",
                 threadID: threadID,
                 name: "line one\nline two"
@@ -222,14 +228,14 @@ final class WorkerRemoteCommandTests: XCTestCase {
         let catalog = try WorkerThreadProtocol.parse(
             """
             \(WorkerThreadProtocol.marker)
-            {"threads":[{"provider":"codex","threadID":"\(threadID)","title":"Dormant","updatedAt":10,"archived":false,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":null}
+            {"threads":[{"provider":"claude","threadID":"\(threadID)","title":"Dormant","updatedAt":10,"archived":false,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":null}
             """,
             repositoryName: "terminal-relay"
         )
         let merged = catalog.merging(
             liveSessions: [
                 WorkerSessionSnapshot(
-                    kind: .codex,
+                    kind: .claude,
                     repositoryName: "terminal-relay",
                     attachedClientCount: 1,
                     instanceToken: instanceID,

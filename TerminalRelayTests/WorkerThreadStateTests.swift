@@ -11,7 +11,7 @@ final class WorkerThreadStateTests: XCTestCase {
             """
             login banner
             \(WorkerThreadProtocol.marker)
-            {"threads":[{"provider":"codex","threadID":"\(threadID)","title":"Fix pagination","updatedAt":1700000000,"archived":false,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":"page-2"}
+            {"threads":[{"provider":"codex","threadID":"\(threadID)","title":"Fix pagination","updatedAt":1700000000,"archived":false,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":"page-2"}
             """,
             repositoryName: "terminal-relay"
         )
@@ -70,6 +70,7 @@ final class WorkerThreadStateTests: XCTestCase {
         XCTAssertEqual(merged.threads[0].activeInstanceToken, instanceToken)
         XCTAssertEqual(merged.threads[0].title, "Live title")
         XCTAssertTrue(merged.threads[0].reportedWorking == true)
+        XCTAssertEqual(merged.threads[0].activityState, .relayActive)
         XCTAssertEqual(merged.threads[0].capabilities, WorkerThreadCapabilities.active)
     }
 
@@ -84,7 +85,7 @@ final class WorkerThreadStateTests: XCTestCase {
         }
         XCTAssertThrowsError(
             try WorkerThreadProtocol.parse(
-                "\(WorkerThreadProtocol.marker)\n{\"threads\":[{\"provider\":\"codex\",\"threadID\":\"\(threadID)\",\"title\":null,\"updatedAt\":1,\"archived\":false,\"capabilities\":{\"resume\":true,\"rename\":true,\"archive\":true,\"unarchive\":true}},{\"provider\":\"codex\",\"threadID\":\"\(threadID)\",\"title\":null,\"updatedAt\":1,\"archived\":false,\"capabilities\":{\"resume\":true,\"rename\":true,\"archive\":true,\"unarchive\":true}}],\"nextCursor\":null}",
+                "\(WorkerThreadProtocol.marker)\n{\"threads\":[{\"provider\":\"codex\",\"threadID\":\"\(threadID)\",\"title\":null,\"updatedAt\":1,\"archived\":false,\"activityState\":\"inactive\",\"activeInstanceToken\":null,\"isWorking\":null,\"capabilities\":{\"resume\":true,\"rename\":true,\"archive\":true,\"unarchive\":true}},{\"provider\":\"codex\",\"threadID\":\"\(threadID)\",\"title\":null,\"updatedAt\":1,\"archived\":false,\"activityState\":\"inactive\",\"activeInstanceToken\":null,\"isWorking\":null,\"capabilities\":{\"resume\":true,\"rename\":true,\"archive\":true,\"unarchive\":true}}],\"nextCursor\":null}",
                 repositoryName: "terminal-relay"
             )
         ) { error in
@@ -98,5 +99,25 @@ final class WorkerThreadStateTests: XCTestCase {
         ) { error in
             XCTAssertEqual(error as? WorkerThreadProtocolError, .missingMarker)
         }
+    }
+
+    func testClaudeInactiveExternalAndUnknownRowsStayDistinct() throws {
+        let externalID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        let unknownID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        let response = try WorkerThreadProtocol.parse(
+            """
+            \(WorkerThreadProtocol.marker)
+            {"threads":[{"provider":"claude","threadID":"\(threadID)","title":"Inactive","updatedAt":3,"archived":false,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}},{"provider":"claude","threadID":"\(externalID)","title":"External","updatedAt":2,"archived":false,"activityState":"external-active","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":false,"rename":false,"archive":false,"unarchive":false}},{"provider":"claude","threadID":"\(unknownID)","title":"Unknown archived","updatedAt":1,"archived":true,"activityState":"unknown","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":false,"rename":false,"archive":false,"unarchive":false}}],"nextCursor":null}
+            """,
+            repositoryName: "terminal-relay"
+        )
+
+        XCTAssertEqual(response.threads.map(\.kind), [.claude, .claude, .claude])
+        XCTAssertTrue(response.threads[0].capabilities.resume)
+        XCTAssertTrue(response.threads[1].isActive)
+        XCTAssertFalse(response.threads[1].isAttachable)
+        XCTAssertEqual(response.threads[2].activityState, .unknown)
+        XCTAssertTrue(response.threads[2].isArchived)
+        XCTAssertFalse(response.threads[2].capabilities.archive)
     }
 }

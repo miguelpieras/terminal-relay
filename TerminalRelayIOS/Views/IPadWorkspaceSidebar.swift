@@ -43,7 +43,7 @@ struct IPadWorkspaceSidebar: View {
                         workerID: profile.id,
                         repositoryName: repositoryName,
                         archived: false
-                    ).filter { !$0.isActive }
+                    ).filter { $0.activityState != .relayActive }
                 )
             }
         }
@@ -304,7 +304,7 @@ struct IPadWorkspaceSidebar: View {
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
-                    Text("Paused")
+                    Text(activityLabel(for: thread))
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
@@ -316,6 +316,7 @@ struct IPadWorkspaceSidebar: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .disabled(!thread.capabilities.resume)
         .contextMenu {
             Button("Archive Thread", role: .destructive) {
                 Task {
@@ -326,6 +327,16 @@ struct IPadWorkspaceSidebar: View {
                     )
                 }
             }
+            .disabled(!thread.capabilities.archive)
+        }
+    }
+
+    private func activityLabel(for thread: WorkerThreadSnapshot) -> String {
+        switch thread.activityState {
+        case .inactive: "Paused"
+        case .relayActive: "Active in Terminal Relay"
+        case .externalActive: "Active elsewhere"
+        case .unknown: "Activity unavailable"
         }
     }
 

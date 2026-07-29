@@ -16,6 +16,45 @@ Terminal Relay includes the following Swift packages:
 The Apache-licensed components are distributed under the repository's
 [Apache License 2.0](LICENSE).
 
+Worker installation also creates a root-owned Python environment for the
+official Claude Agent SDK. The exact versions are pinned in
+`Server/claude-agent-sdk-requirements.txt`; their wheel metadata declares:
+
+- annotated-types 0.7.0 — MIT License
+- anyio 4.14.2 — MIT License
+- attrs 26.1.0 — MIT License
+- certifi 2026.7.22 — Mozilla Public License 2.0
+- cffi 2.1.0 — MIT No Attribution License
+- claude-agent-sdk 0.2.125 — MIT License
+- click 8.4.2 — BSD 3-Clause License
+- cryptography 49.0.0 — Apache License 2.0 or BSD 3-Clause License
+- h11 0.16.0 — MIT License
+- httpcore 1.0.9 — BSD 3-Clause License
+- httpx 0.28.1 — BSD 3-Clause License
+- httpx-sse 0.4.3 — MIT License
+- idna 3.18 — BSD 3-Clause License
+- jsonschema 4.26.0 — MIT License
+- jsonschema-specifications 2025.9.1 — MIT License
+- mcp 1.28.1 — MIT License
+- pycparser 3.0 — BSD 3-Clause License
+- pydantic 2.13.4 — MIT License
+- pydantic-core 2.46.4 — MIT License
+- pydantic-settings 2.14.2 — MIT License
+- PyJWT 2.13.0 — MIT License
+- python-dotenv 1.2.2 — BSD 3-Clause License
+- python-multipart 0.0.32 — Apache License 2.0
+- referencing 0.37.0 — MIT License
+- rpds-py 2026.6.3 — MIT License
+- sniffio 1.3.1 — MIT License or Apache License 2.0
+- sse-starlette 3.4.6 — BSD 3-Clause License
+- starlette 1.3.1 — BSD 3-Clause License
+- typing-inspection 0.4.2 — MIT License
+- typing-extensions 4.16.0 — Python Software Foundation License 2.0
+- uvicorn 0.51.0 — BSD 3-Clause License
+
+Those distributions retain their license and notice files inside the installed
+environment. Terminal Relay does not vendor their source into this repository.
+
 Sparkle is distributed under the following terms:
 
 > Copyright (c) 2006-2013 Andy Matuschak.

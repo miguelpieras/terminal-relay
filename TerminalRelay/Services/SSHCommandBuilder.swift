@@ -107,14 +107,16 @@ enum SSHCommandBuilder {
 
     static func workerThreadListConfiguration(
         for server: ServerProfile,
+        kind: AgentKind,
         repositoryName: String,
         archived: Bool,
         cursor: String? = nil
     ) -> SSHLaunchConfiguration {
         var arguments = [
-            "threads",
+            "threads-v2",
+            kind.rawValue,
             repositoryName,
-            archived ? "archived" : "active",
+            archived ? "archived" : "open",
         ]
         if let cursor {
             arguments.append(cursor)
@@ -134,31 +136,40 @@ enum SSHCommandBuilder {
 
     static func workerThreadResumeConfiguration(
         for server: ServerProfile,
+        kind: AgentKind,
         repositoryName: String,
         threadID: String,
         launchDefaults: AgentLaunchDefaults
     ) -> SSHLaunchConfiguration {
         workerSessionConfiguration(
             for: server,
-            arguments: ["thread-resume", repositoryName, threadID]
-                + launchDefaults.arguments(for: .codex)
+            arguments: ["thread-resume-v2", kind.rawValue, repositoryName, threadID]
+                + launchDefaults.arguments(for: kind)
         )
     }
 
     static func workerThreadRenameConfiguration(
         for server: ServerProfile,
+        kind: AgentKind,
         repositoryName: String,
         threadID: String,
         name: String
     ) -> SSHLaunchConfiguration {
         workerSessionConfiguration(
             for: server,
-            arguments: ["thread-rename", repositoryName, threadID, name]
+            arguments: [
+                "thread-rename-v2",
+                kind.rawValue,
+                repositoryName,
+                threadID,
+                name,
+            ]
         )
     }
 
     static func workerThreadArchiveConfiguration(
         for server: ServerProfile,
+        kind: AgentKind,
         repositoryName: String,
         threadID: String,
         unarchive: Bool
@@ -166,7 +177,8 @@ enum SSHCommandBuilder {
         workerSessionConfiguration(
             for: server,
             arguments: [
-                unarchive ? "thread-unarchive" : "thread-archive",
+                unarchive ? "thread-unarchive-v2" : "thread-archive-v2",
+                kind.rawValue,
                 repositoryName,
                 threadID,
             ]

@@ -356,6 +356,7 @@ final class SSHCommandBuilderTests: XCTestCase {
         XCTAssertEqual(
             SSHCommandBuilder.workerThreadListConfiguration(
                 for: server,
+                kind: .claude,
                 repositoryName: "relay's repo",
                 archived: true,
                 cursor: "next page"
@@ -363,38 +364,41 @@ final class SSHCommandBuilderTests: XCTestCase {
             [
                 "--",
                 server.destination,
-                "'/usr/local/bin/terminal-relay-session' 'threads' 'relay'\"'\"'s repo' 'archived' 'next page'"
+                "'/usr/local/bin/terminal-relay-session' 'threads-v2' 'claude' 'relay'\"'\"'s repo' 'archived' 'next page'"
             ]
         )
         XCTAssertEqual(
             SSHCommandBuilder.workerThreadResumeConfiguration(
                 for: server,
+                kind: .claude,
                 repositoryName: "terminal-relay",
                 threadID: threadID,
                 launchDefaults: .standard
             ).arguments.last,
             (
-                [WorkerSessionProtocol.helperPath, "thread-resume", "terminal-relay", threadID]
-                    + AgentLaunchDefaults.standard.arguments(for: .codex)
+                [WorkerSessionProtocol.helperPath, "thread-resume-v2", "claude", "terminal-relay", threadID]
+                    + AgentLaunchDefaults.standard.arguments(for: .claude)
             ).map(SSHCommandBuilder.shellQuote).joined(separator: " ")
         )
         XCTAssertEqual(
             SSHCommandBuilder.workerThreadRenameConfiguration(
                 for: server,
+                kind: .claude,
                 repositoryName: "terminal-relay",
                 threadID: threadID,
                 name: "It's renamed"
             ).arguments.last,
-            "'/usr/local/bin/terminal-relay-session' 'thread-rename' 'terminal-relay' '\(threadID)' 'It'\"'\"'s renamed'"
+            "'/usr/local/bin/terminal-relay-session' 'thread-rename-v2' 'claude' 'terminal-relay' '\(threadID)' 'It'\"'\"'s renamed'"
         )
         XCTAssertEqual(
             SSHCommandBuilder.workerThreadArchiveConfiguration(
                 for: server,
+                kind: .claude,
                 repositoryName: "terminal-relay",
                 threadID: threadID,
                 unarchive: true
             ).arguments.last,
-            "'/usr/local/bin/terminal-relay-session' 'thread-unarchive' 'terminal-relay' '\(threadID)'"
+            "'/usr/local/bin/terminal-relay-session' 'thread-unarchive-v2' 'claude' 'terminal-relay' '\(threadID)'"
         )
     }
 

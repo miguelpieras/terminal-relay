@@ -10,6 +10,8 @@ readonly BASELINE_FILE="${TERMINAL_RELAY_BASELINE_FILE:-$SERVER_DIRECTORY/worker
 readonly HOST_INSTALLER="$SERVER_DIRECTORY/install-worker-host.sh"
 readonly SESSION_HELPER_SOURCE="$SERVER_DIRECTORY/terminal-relay-session"
 readonly MCP_SOURCE="$SERVER_DIRECTORY/terminal-relay-mcp"
+readonly CLAUDE_SESSIONS_SOURCE="$SERVER_DIRECTORY/terminal-relay-claude-sessions"
+readonly CLAUDE_REQUIREMENTS_SOURCE="$SERVER_DIRECTORY/claude-agent-sdk-requirements.txt"
 readonly NODE_EXPORTER_TEMPLATE="$SERVER_DIRECTORY/node-exporter.service.template"
 readonly BOOTSTRAP_SCRIPT="$SCRIPT_DIRECTORY/bootstrap-worker.sh"
 readonly SSH_CONFIG="$HOME/.ssh/config"
@@ -135,6 +137,12 @@ validate_local_prerequisites() {
         || die "worker lifecycle scripts must be executable"
     [[ -f "$SESSION_HELPER_SOURCE" && ! -L "$SESSION_HELPER_SOURCE" ]] \
         || die "worker session helper source is missing or unsafe"
+    [[ -f "$MCP_SOURCE" && ! -L "$MCP_SOURCE" ]] \
+        || die "worker MCP source is missing or unsafe"
+    [[ -f "$CLAUDE_SESSIONS_SOURCE" && ! -L "$CLAUDE_SESSIONS_SOURCE" ]] \
+        || die "Claude session adapter source is missing or unsafe"
+    [[ -f "$CLAUDE_REQUIREMENTS_SOURCE" && ! -L "$CLAUDE_REQUIREMENTS_SOURCE" ]] \
+        || die "Claude SDK requirements source is missing or unsafe"
     [[ -f "$NODE_EXPORTER_TEMPLATE" && ! -L "$NODE_EXPORTER_TEMPLATE" ]] \
         || die "missing or unsafe node-exporter template"
     [[ -f "$OPERATOR_PRIVATE_KEY" && -r "$OPERATOR_PRIVATE_KEY" ]] \
@@ -768,6 +776,9 @@ verify_application() {
     local alias
     local expected_helper_digest
     local expected_mcp_digest
+    local expected_claude_sessions_digest
+    local expected_claude_requirements_digest
+    local expected_claude_sdk_version
     local output
 
     alias="$(worker_name_for_number "$number")"
@@ -779,18 +790,35 @@ verify_application() {
         | /usr/bin/awk '{ print $1; exit }')"
     [[ "$expected_mcp_digest" =~ ^[a-f0-9]{64}$ ]] \
         || die "could not fingerprint the worker MCP source"
+    expected_claude_sessions_digest="$(/usr/bin/shasum -a 256 "$CLAUDE_SESSIONS_SOURCE" \
+        | /usr/bin/awk '{ print $1; exit }')"
+    [[ "$expected_claude_sessions_digest" =~ ^[a-f0-9]{64}$ ]] \
+        || die "could not fingerprint the Claude session adapter source"
+    expected_claude_requirements_digest="$(/usr/bin/shasum -a 256 "$CLAUDE_REQUIREMENTS_SOURCE" \
+        | /usr/bin/awk '{ print $1; exit }')"
+    [[ "$expected_claude_requirements_digest" =~ ^[a-f0-9]{64}$ ]] \
+        || die "could not fingerprint the Claude SDK requirements"
+    expected_claude_sdk_version="$(/usr/bin/sed -n \
+        's/^claude-agent-sdk==//p' "$CLAUDE_REQUIREMENTS_SOURCE")"
+    [[ "$expected_claude_sdk_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+        || die "could not read the pinned Claude Agent SDK version"
     output="$(/usr/bin/ssh \
         -o BatchMode=yes \
         -o ConnectTimeout=15 \
         -o StrictHostKeyChecking=yes \
         "$alias" \
-        "/bin/bash -s -- '$expected_helper_digest' '$expected_mcp_digest'" <<'REMOTE'
+        "/bin/bash -s -- '$expected_helper_digest' '$expected_mcp_digest' '$expected_claude_sessions_digest' '$expected_claude_requirements_digest' '$expected_claude_sdk_version'" <<'REMOTE'
 set -euo pipefail
 expected_helper_digest="$1"
 expected_mcp_digest="$2"
+expected_claude_sessions_digest="$3"
+expected_claude_requirements_digest="$4"
+expected_claude_sdk_version="$5"
 safe_path="/usr/local/bin:/usr/bin:/bin"
 session_helper="/usr/local/bin/terminal-relay-session"
 mcp_server="/usr/local/bin/terminal-relay-mcp"
+claude_sessions="/usr/local/bin/terminal-relay-claude-sessions"
+claude_sdk="/opt/terminal-relay/claude-session-sdk/current"
 codex_restart_marker="/home/terminal-relay/.local/state/terminal-relay/codex-app-server-restart-required"
 codex_app_server_session="terminal-relay-account-server"
 export PATH="$safe_path"
@@ -800,6 +828,11 @@ test "$(id -gn)" = terminal-relay
 test "$(stat -c '%U:%G:%a' /workspace)" = terminal-relay:terminal-relay:750
 test "$(sha256sum "$session_helper" | awk '{ print $1; exit }')" = "$expected_helper_digest"
 test "$(sha256sum "$mcp_server" | awk '{ print $1; exit }')" = "$expected_mcp_digest"
+test "$(sha256sum "$claude_sessions" | awk '{ print $1; exit }')" = "$expected_claude_sessions_digest"
+test "$(sha256sum "$claude_sdk/requirements.txt" | awk '{ print $1; exit }')" = "$expected_claude_requirements_digest"
+test "$(stat -c '%U:%G:%a' "$claude_sessions")" = root:root:755
+test -x "$claude_sdk/bin/python3"
+test "$("$claude_sdk/bin/python3" "$claude_sessions" version)" = "$expected_claude_sdk_version"
 test "$(command -v bwrap)" = /usr/bin/bwrap
 /usr/bin/bwrap \
     --unshare-user \

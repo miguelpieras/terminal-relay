@@ -44,6 +44,10 @@ rollback_script="$(/usr/bin/sed -n "/<<'REMOTE_ROLLBACK'/,/^REMOTE_ROLLBACK$/p" 
     && "$install_script" == *'"$helper_installed_digest"'* \
     && "$install_script" == *'"$unit_installed_digest"'* \
     && "$install_script" == *'"$service_initial_enabled"'* \
+    && "$install_script" == *'"$claude_sdk_current/bin/python3"'* \
+    && "$install_script" == *'"$claude_sessions_target" version'* \
+    && "$install_script" == *'claude-agent-sdk-requirements.txt'* \
+    && "$install_script" == *'chmod -R a+rX,u+w,go-w "$claude_sdk_environment"'* \
     && "$install_script" == *'systemctl daemon-reload'* \
     && "$install_script" == *'systemctl enable "$service"'* \
     && "$install_script" == *'"$helper_target" __schedule-codex-app-server-restart'* \
@@ -73,7 +77,7 @@ digest=0000000000000000000000000000000000000000000000000000000000000000
 for admin_uid in 0 1000; do
     install_command="$(build_locked_remote_command \
         "$admin_uid" "$install_script" terminal-relay-install \
-        "$machine_id" "$host_name" terminal-relay)"
+        "$machine_id" "$host_name" terminal-relay false)"
     rollback_command="$(build_locked_remote_command \
         "$admin_uid" "$rollback_script" terminal-relay-rollback \
         "$machine_id" "$host_name" terminal-relay \

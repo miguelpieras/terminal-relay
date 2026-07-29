@@ -636,7 +636,7 @@ struct ContentView: View {
                     repositoryName: project.displayName,
                     archived: false,
                     on: $0
-                ).filter { !$0.isActive }
+                ).filter { $0.activityState != .relayActive }
             } ?? [],
             archivedThreads: ScreenshotDemoMode.isEnabled ? demoThreads.filter(\.isArchived) : worker.map {
                 workerSessionService.threads(
@@ -710,6 +710,7 @@ struct ContentView: View {
             onRenameThread: { thread, name in
                 guard let worker else { return }
                 _ = await workerSessionService.renameThread(
+                    kind: thread.kind,
                     repositoryName: project.displayName,
                     threadID: thread.threadID,
                     name: name,
@@ -724,6 +725,7 @@ struct ContentView: View {
             onSetThreadArchived: { thread, archived in
                 guard let worker else { return }
                 _ = await workerSessionService.setThreadArchived(
+                    kind: thread.kind,
                     repositoryName: project.displayName,
                     threadID: thread.threadID,
                     archived: archived,
@@ -1357,7 +1359,6 @@ struct ContentView: View {
             guard let session = sessionManager.sessions.first(where: {
                 $0.id == request.sessionID
             }),
-            session.kind == .codex,
             session.threadID == request.threadID,
             session.status.occupiesSlot,
             let project = projectStore.project(id: session.projectID),
@@ -1377,6 +1378,7 @@ struct ContentView: View {
             guard didStop else { return }
 
             let didArchive = await workerSessionService.setThreadArchived(
+                kind: session.kind,
                 repositoryName: project.displayName,
                 threadID: request.threadID,
                 archived: true,
@@ -1923,8 +1925,8 @@ private struct ProjectSidebarSection: View {
                             Button("Archive Terminal", role: .destructive) {
                                 onArchiveSession(session.id)
                             }
-                            if session.kind == .codex, session.threadID != nil {
-                                Button("Archive Codex Thread", role: .destructive) {
+                            if session.threadID != nil {
+                                Button("Archive Conversation", role: .destructive) {
                                     onArchiveLiveThread(session)
                                 }
                                 .disabled(!session.status.occupiesSlot)
@@ -2111,6 +2113,26 @@ private struct DormantThreadRow: View {
     var isArchived = false
     let onResume: () -> Void
 
+    private var statusIcon: String {
+        if isArchived { return "archivebox.fill" }
+        switch thread.activityState {
+        case .inactive: return "pause.circle"
+        case .relayActive: return "terminal"
+        case .externalActive: return "arrow.up.right.circle"
+        case .unknown: return "questionmark.circle"
+        }
+    }
+
+    private var helpText: String {
+        if isArchived { return "Archived provider conversation" }
+        switch thread.activityState {
+        case .inactive: return "Resume provider conversation"
+        case .relayActive: return "Open in Terminal Relay"
+        case .externalActive: return "Active outside Terminal Relay"
+        case .unknown: return "Provider activity could not be verified"
+        }
+    }
+
     var body: some View {
         Button(action: onResume) {
             HStack(spacing: 7) {
@@ -2122,7 +2144,12 @@ private struct DormantThreadRow: View {
                     .foregroundStyle(SidebarPalette.secondary)
                     .lineLimit(1)
                 Spacer(minLength: 5)
-                Image(systemName: isArchived ? "archivebox.fill" : "pause.circle")
+                if thread.activityState == .externalActive {
+                    Text("External")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(SidebarPalette.tertiary)
+                }
+                Image(systemName: statusIcon)
                     .font(.system(size: 11))
                     .foregroundStyle(SidebarPalette.tertiary)
             }
@@ -2134,7 +2161,7 @@ private struct DormantThreadRow: View {
         .disabled(isArchived || !thread.capabilities.resume)
         .padding(.leading, 18)
         .frame(height: 35)
-        .help(isArchived ? "Archived provider thread" : "Resume provider thread")
+        .help(helpText)
     }
 }
 

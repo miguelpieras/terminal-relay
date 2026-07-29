@@ -68,8 +68,9 @@ Compare the installed helper with the repository source:
 ```bash
 shasum -a 256 Server/terminal-relay-session
 shasum -a 256 Server/terminal-relay-mcp
+shasum -a 256 Server/terminal-relay-claude-sessions
 ssh terminal-relay-worker-N \
-  'sha256sum /usr/local/bin/terminal-relay-session /usr/local/bin/terminal-relay-mcp'
+  'sha256sum /usr/local/bin/terminal-relay-session /usr/local/bin/terminal-relay-mcp /usr/local/bin/terminal-relay-claude-sessions'
 ```
 
 Install the tested repository helper on an existing worker with:
@@ -80,24 +81,47 @@ Install the tested repository helper on an existing worker with:
 ```
 
 The installer verifies that both SSH targets reach the same machine, installs
-atomically, preserves the systemd service state, and prints a rollback command.
+atomically, and preserves the systemd service state. It leaves no retained host
+copies by default. Use `--retain-backups` only when a host-side rollback was
+explicitly requested; that mode prints a guarded rollback command.
 
 ## Thread catalog or built-in MCP is unavailable
 
-Inspect active and archived Codex metadata for one repository without reading
-its transcript:
+Inspect open and archived metadata for one repository without reading its
+transcripts:
 
 ```bash
 ssh terminal-relay-worker-N \
-  '/usr/local/bin/terminal-relay-session threads example-repository active'
+  '/usr/local/bin/terminal-relay-session threads-v2 codex example-repository open'
 ssh terminal-relay-worker-N \
-  '/usr/local/bin/terminal-relay-session threads example-repository archived'
+  '/usr/local/bin/terminal-relay-session threads-v2 claude example-repository open'
+ssh terminal-relay-worker-N \
+  '/usr/local/bin/terminal-relay-session threads-v2 claude example-repository archived'
 ```
 
-Each successful response contains `__TERMINAL_RELAY_THREADS_V1__` followed by
-one bounded JSON catalog. A missing marker usually means the worker still has
-the V1-only helper; existing live terminals continue to work and the helper-only
-installer above upgrades both the session helper and MCP.
+Each successful response contains `__TERMINAL_RELAY_THREADS_V2__` followed by
+one bounded JSON catalog. A missing marker usually means the worker has an older
+helper; existing live terminals continue to work and the helper-only installer
+above upgrades the helper, MCP, Claude adapter, and pinned SDK.
+
+Verify only the installed adapter version:
+
+```bash
+ssh terminal-relay-worker-N \
+  '/opt/terminal-relay/claude-session-sdk/current/bin/python3 /usr/local/bin/terminal-relay-claude-sessions version'
+```
+
+An expected catalog row has an `activityState` of `inactive`,
+`relay-active`, `external-active`, or `unknown`. External-active and unknown
+rows are intentionally read-only. If every Claude row is unknown, first verify
+that `claude agents --json` is supported, but do not paste its raw output into a
+public issue: it can contain process and working-directory metadata. If the SDK
+or activity query is unavailable, the helper returns a sanitized provider
+catalog error and existing relay terminals continue to work.
+
+Do not inspect `~/.claude/projects`, copy Claude JSONL files, or print a session
+object to diagnose cataloging. The adapter deliberately emits only UUID, title,
+activity time, archive state, and activity state.
 
 Check the MCP handshake and discovered tool names locally on the worker:
 
@@ -181,16 +205,19 @@ authorization URLs, or unredacted terminal captures into logs or issues.
 
 ## Current and future workers
 
-`Server/terminal-relay-session` and `Server/terminal-relay-mcp` are the
-canonical worker control executables. Fresh-worker bootstrap includes both, and
-`Server/install-worker.sh` installs them at their fixed `/usr/local/bin` paths.
-Existing workers must be reconciled with
-`Scripts/install-worker-session-helper.sh` after either executable changes.
+`Server/terminal-relay-session`, `Server/terminal-relay-mcp`, and
+`Server/terminal-relay-claude-sessions` are the canonical worker control
+executables. Fresh-worker bootstrap includes all three plus the pinned SDK
+requirements, and `Server/install-worker.sh` installs them at their fixed
+paths. Existing workers must be reconciled with
+`Scripts/install-worker-session-helper.sh` after any of them or the SDK lock
+changes.
 
 For helper changes, run:
 
 ```bash
 ./Server/Tests/terminal-relay-session-tests.sh
 ./Server/Tests/terminal-relay-mcp-tests.sh
+./Server/Tests/terminal-relay-claude-sessions-tests.py
 ./Scripts/build-and-install.sh
 ```

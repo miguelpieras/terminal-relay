@@ -5,20 +5,29 @@ script_directory="$(cd "$(dirname "$0")" && pwd -P)"
 repository_root="$(cd "$script_directory/.." && pwd -P)"
 source_helper="$repository_root/Server/terminal-relay-session"
 source_mcp="$repository_root/Server/terminal-relay-mcp"
+source_claude_sessions="$repository_root/Server/terminal-relay-claude-sessions"
+source_claude_requirements="$repository_root/Server/claude-agent-sdk-requirements.txt"
 source_restore_unit="$repository_root/Server/terminal-relay-session-restore@.service"
 remote_lock_path="/run/lock/terminal-relay-session-helper.lock"
 
 usage() {
     cat >&2 <<'EOF'
-usage: install-worker-session-helper.sh application-ssh-target [admin-ssh-target]
+usage: install-worker-session-helper.sh [--retain-backups] application-ssh-target [admin-ssh-target]
 
 The application target verifies the worker account, systemd, and /usr/bin/tmux.
 The admin target must reach the same machine as root or as an account with
 non-interactive sudo. The application target is required. If the admin target
 is omitted, root@ is combined with the application target's host.
+Managed files are replaced atomically without retained host copies by default.
+Use --retain-backups only when a recoverable host-side rollback was requested.
 EOF
 }
 
+retain_backups=false
+if [[ "${1:-}" == "--retain-backups" ]]; then
+    retain_backups=true
+    shift
+fi
 [[ $# -ge 1 && $# -le 2 ]] || { usage; exit 64; }
 application_target="$1"
 if [[ $# -eq 2 ]]; then
@@ -75,6 +84,8 @@ validate_remote_rendering() {
                 && "$script" == *'"$helper_installed_digest"'* \
                 && "$script" == *'"$unit_installed_digest"'* \
                 && "$script" == *'"$service_initial_enabled"'* \
+                && "$script" == *'"$claude_sdk_current/bin/python3"'* \
+                && "$script" == *'"$claude_sessions_target" version'* \
                 && "$script" == *'"$helper_target" __schedule-codex-app-server-restart'* ]] \
                 || return 1
             ;;
@@ -99,6 +110,14 @@ validate_ssh_target "admin" "$admin_target"
     || { echo "Worker helper source failed Bash syntax validation." >&2; exit 65; }
 [[ -f "$source_mcp" && ! -L "$source_mcp" ]] \
     || { echo "Missing regular worker MCP source: $source_mcp" >&2; exit 66; }
+[[ -f "$source_claude_sessions" && ! -L "$source_claude_sessions" ]] \
+    || { echo "Missing regular Claude session adapter: $source_claude_sessions" >&2; exit 66; }
+[[ -f "$source_claude_requirements" && ! -L "$source_claude_requirements" ]] \
+    || { echo "Missing regular Claude SDK requirements: $source_claude_requirements" >&2; exit 66; }
+/usr/bin/python3 -c \
+    'import pathlib, sys; compile(pathlib.Path(sys.argv[1]).read_text(), sys.argv[1], "exec")' \
+    "$source_claude_sessions" \
+    || { echo "Claude session adapter failed Python syntax validation." >&2; exit 65; }
 
 probe_target() {
     local target="$1"
@@ -236,6 +255,7 @@ set -euo pipefail
 expected_machine="$1"
 expected_host="$2"
 application_user="$3"
+retain_backups="$4"
 actual_machine=$(tr -d "\r\n" < /etc/machine-id)
 actual_host=$(hostname)
 if [ "$actual_machine" != "$expected_machine" ] || [ "$actual_host" != "$expected_host" ]; then
@@ -247,6 +267,10 @@ case "$application_user" in
         echo "Refusing to install for an invalid application user." >&2
         exit 77
         ;;
+esac
+case "$retain_backups" in
+    true|false) ;;
+    *) echo "Refusing to install with an invalid backup policy." >&2; exit 77 ;;
 esac
 /usr/bin/getent passwd "$application_user" >/dev/null \
     || { echo "Refusing to install for a missing application user." >&2; exit 77; }
@@ -279,14 +303,23 @@ privileged /usr/bin/true
 
 helper_target=/usr/local/bin/terminal-relay-session
 mcp_target=/usr/local/bin/terminal-relay-mcp
+claude_sessions_target=/usr/local/bin/terminal-relay-claude-sessions
+claude_sdk_root=/opt/terminal-relay/claude-session-sdk
+claude_sdk_current="$claude_sdk_root/current"
+claude_sdk_version=0.2.125
 unit_target=/etc/systemd/system/terminal-relay-session-restore@.service
 service="terminal-relay-session-restore@$application_user.service"
 temporary_directory=""
 temporary_helper=""
 temporary_mcp=""
+temporary_claude_sessions=""
+temporary_claude_requirements=""
 temporary_unit=""
 helper_staged=""
 mcp_staged=""
+claude_sessions_staged=""
+claude_sdk_staged=""
+claude_current_staged=""
 unit_staged=""
 helper_backup=""
 unit_backup=""
@@ -389,7 +422,9 @@ cleanup() {
                 privileged /usr/bin/systemctl start "$service" >/dev/null 2>&1 || restore_status=1
             fi
         fi
-        if [ "$restore_status" -ne 0 ]; then
+        if [ "$retain_backups" = false ]; then
+            echo "Installation failed; no retained host backups were requested." >&2
+        elif [ "$restore_status" -ne 0 ]; then
             echo "Automatic rollback failed; retained backups were not discarded." >&2
         else
             echo "Restored the previous helper, unit, and service state after installation failed." >&2
@@ -410,6 +445,30 @@ cleanup() {
                 privileged /bin/rm -f -- "$mcp_staged" || true
                 ;;
             *) echo "Refusing to clean unexpected MCP stage: $mcp_staged" >&2 ;;
+        esac
+    fi
+    if [ -n "$claude_sessions_staged" ]; then
+        case "$claude_sessions_staged" in
+            /usr/local/bin/.terminal-relay-claude-sessions.install.*)
+                privileged /bin/rm -f -- "$claude_sessions_staged" || true
+                ;;
+            *) echo "Refusing to clean unexpected Claude adapter stage: $claude_sessions_staged" >&2 ;;
+        esac
+    fi
+    if [ -n "$claude_sdk_staged" ]; then
+        case "$claude_sdk_staged" in
+            /opt/terminal-relay/claude-session-sdk/.terminal-relay-sdk.install.*)
+                privileged /bin/rm -rf -- "$claude_sdk_staged" || true
+                ;;
+            *) echo "Refusing to clean unexpected Claude SDK stage: $claude_sdk_staged" >&2 ;;
+        esac
+    fi
+    if [ -n "$claude_current_staged" ]; then
+        case "$claude_current_staged" in
+            /opt/terminal-relay/claude-session-sdk/.current.install.*)
+                privileged /bin/rm -f -- "$claude_current_staged" || true
+                ;;
+            *) echo "Refusing to clean unexpected Claude SDK link stage: $claude_current_staged" >&2 ;;
         esac
     fi
     if [ -n "$unit_staged" ]; then
@@ -435,10 +494,20 @@ temporary_directory=$(mktemp -d /tmp/terminal-relay-session.install.XXXXXX)
 trap cleanup EXIT
 temporary_helper="$temporary_directory/terminal-relay-session"
 temporary_mcp="$temporary_directory/terminal-relay-mcp"
+temporary_claude_sessions="$temporary_directory/terminal-relay-claude-sessions"
+temporary_claude_requirements="$temporary_directory/claude-agent-sdk-requirements.txt"
 temporary_unit="$temporary_directory/terminal-relay-session-restore@.service"
 /usr/bin/tar -xf - -C "$temporary_directory"
-/bin/chmod 600 "$temporary_helper" "$temporary_mcp" "$temporary_unit"
+/bin/chmod 600 \
+    "$temporary_helper" \
+    "$temporary_mcp" \
+    "$temporary_claude_sessions" \
+    "$temporary_claude_requirements" \
+    "$temporary_unit"
 /bin/bash -n "$temporary_helper"
+/usr/bin/python3 -c \
+    'import pathlib, sys; compile(pathlib.Path(sys.argv[1]).read_text(), sys.argv[1], "exec")' \
+    "$temporary_claude_sessions"
 privileged /usr/bin/systemd-analyze verify "$temporary_unit"
 helper_source_digest=$(/usr/bin/sha256sum "$temporary_helper")
 helper_source_digest=${helper_source_digest%% *}
@@ -446,6 +515,10 @@ unit_source_digest=$(/usr/bin/sha256sum "$temporary_unit")
 unit_source_digest=${unit_source_digest%% *}
 mcp_source_digest=$(/usr/bin/sha256sum "$temporary_mcp")
 mcp_source_digest=${mcp_source_digest%% *}
+claude_sessions_source_digest=$(/usr/bin/sha256sum "$temporary_claude_sessions")
+claude_sessions_source_digest=${claude_sessions_source_digest%% *}
+claude_requirements_digest=$(/usr/bin/sha256sum "$temporary_claude_requirements")
+claude_requirements_digest=${claude_requirements_digest%% *}
 
 if privileged /usr/bin/test -L "$helper_target"; then
     echo "Refusing to replace a symlinked helper: $helper_target" >&2
@@ -458,6 +531,8 @@ if privileged /usr/bin/test -e "$helper_target"; then
     if privileged /usr/bin/cmp -s "$temporary_helper" "$helper_target" \
         && [ "$helper_existing_metadata" = "0:0:755" ]; then
         helper_result=unchanged
+    elif [ "$retain_backups" = false ]; then
+        helper_result=updated
     else
         helper_result=replaced
         helper_backup_metadata="$helper_existing_metadata"
@@ -480,7 +555,9 @@ if [ "$helper_result" != unchanged ]; then
     privileged /usr/bin/install -o root -g root -m 0755 "$temporary_helper" "$helper_staged"
     privileged /usr/bin/cmp -s "$temporary_helper" "$helper_staged"
     [ "$(privileged /usr/bin/stat -c "%u:%g:%a" "$helper_staged")" = "0:0:755" ]
-    helper_applied=1
+    if [ "$helper_result" != updated ]; then
+        helper_applied=1
+    fi
     if ! privileged /bin/mv -fT -- "$helper_staged" "$helper_target"; then
         helper_applied=0
         exit 1
@@ -504,6 +581,8 @@ if privileged /usr/bin/test -e "$unit_target"; then
     if privileged /usr/bin/cmp -s "$temporary_unit" "$unit_target" \
         && [ "$unit_existing_metadata" = "0:0:644" ]; then
         unit_result=unchanged
+    elif [ "$retain_backups" = false ]; then
+        unit_result=updated
     else
         unit_result=replaced
         unit_backup_metadata="$unit_existing_metadata"
@@ -526,7 +605,9 @@ if [ "$unit_result" != unchanged ]; then
     privileged /usr/bin/install -o root -g root -m 0644 "$temporary_unit" "$unit_staged"
     privileged /usr/bin/cmp -s "$temporary_unit" "$unit_staged"
     [ "$(privileged /usr/bin/stat -c "%u:%g:%a" "$unit_staged")" = "0:0:644" ]
-    unit_applied=1
+    if [ "$unit_result" != updated ]; then
+        unit_applied=1
+    fi
     if ! privileged /bin/mv -fT -- "$unit_staged" "$unit_target"; then
         unit_applied=0
         exit 1
@@ -571,6 +652,92 @@ fi
 [ "$(privileged /usr/bin/sha256sum "$mcp_target" | /usr/bin/awk '{ print $1; exit }')" \
     = "$mcp_source_digest" ]
 [ "$(privileged /usr/bin/stat -c "%u:%g:%a" "$mcp_target")" = "0:0:755" ]
+
+if ! privileged /usr/bin/dpkg-query -W -f='${Status}' python3-venv 2>/dev/null \
+    | /bin/grep -q '^install ok installed$'; then
+    privileged /usr/bin/apt-get update
+    privileged /usr/bin/env DEBIAN_FRONTEND=noninteractive \
+        /usr/bin/apt-get install -y --no-install-recommends python3-venv
+fi
+claude_sdk_environment_name="sdk-$claude_sdk_version-${claude_requirements_digest:0:16}"
+claude_sdk_environment="$claude_sdk_root/$claude_sdk_environment_name"
+privileged /usr/bin/install -d -o root -g root -m 0755 "$claude_sdk_root"
+if privileged /usr/bin/test -e "$claude_sdk_environment" \
+    || privileged /usr/bin/test -L "$claude_sdk_environment"; then
+    privileged /usr/bin/test -d "$claude_sdk_environment" \
+        && ! privileged /usr/bin/test -L "$claude_sdk_environment" \
+        || { echo "Refusing to use an unsafe Claude SDK environment." >&2; exit 1; }
+    privileged /usr/bin/test -f "$claude_sdk_environment/requirements.txt" \
+        && ! privileged /usr/bin/test -L "$claude_sdk_environment/requirements.txt" \
+        || { echo "Refusing to use unsafe Claude SDK requirements." >&2; exit 1; }
+    privileged /usr/bin/cmp -s \
+        "$temporary_claude_requirements" \
+        "$claude_sdk_environment/requirements.txt"
+else
+    claude_sdk_staged=$(privileged /usr/bin/mktemp -d \
+        "$claude_sdk_root/.terminal-relay-sdk.install.XXXXXX")
+    privileged /usr/bin/python3 -m venv "$claude_sdk_staged"
+    privileged "$claude_sdk_staged/bin/python3" -m pip install \
+        --disable-pip-version-check \
+        --no-cache-dir \
+        --requirement "$temporary_claude_requirements"
+    privileged /usr/bin/install -o root -g root -m 0644 \
+        "$temporary_claude_requirements" \
+        "$claude_sdk_staged/requirements.txt"
+    [ "$(privileged "$claude_sdk_staged/bin/python3" -c \
+        'import claude_agent_sdk; print(claude_agent_sdk.__version__)')" \
+        = "$claude_sdk_version" ]
+    privileged /bin/chown -R root:root "$claude_sdk_staged"
+    privileged /bin/chmod -R a+rX,u+w,go-w "$claude_sdk_staged"
+    privileged /bin/mv -T "$claude_sdk_staged" "$claude_sdk_environment"
+    claude_sdk_staged=""
+fi
+privileged /bin/chown -R root:root "$claude_sdk_environment"
+privileged /bin/chmod -R a+rX,u+w,go-w "$claude_sdk_environment"
+if privileged /usr/bin/test -e "$claude_sdk_current" \
+    && ! privileged /usr/bin/test -L "$claude_sdk_current"; then
+    echo "Refusing to replace an unsafe Claude SDK current pointer." >&2
+    exit 1
+fi
+claude_current_staged=$(privileged /usr/bin/mktemp \
+    "$claude_sdk_root/.current.install.XXXXXX")
+privileged /bin/rm -f -- "$claude_current_staged"
+privileged /bin/ln -s "$claude_sdk_environment_name" "$claude_current_staged"
+privileged /bin/mv -Tf "$claude_current_staged" "$claude_sdk_current"
+claude_current_staged=""
+privileged /usr/bin/test -x "$claude_sdk_current/bin/python3"
+
+if privileged /usr/bin/test -L "$claude_sessions_target"; then
+    echo "Refusing to replace a symlinked Claude session adapter." >&2
+    exit 1
+fi
+if privileged /usr/bin/test -e "$claude_sessions_target"; then
+    privileged /usr/bin/test -f "$claude_sessions_target" \
+        || { echo "Refusing to replace a non-regular Claude session adapter." >&2; exit 1; }
+fi
+if ! privileged /usr/bin/test -f "$claude_sessions_target" \
+    || ! privileged /usr/bin/cmp -s "$temporary_claude_sessions" "$claude_sessions_target" \
+    || [ "$(privileged /usr/bin/stat -c "%u:%g:%a" \
+        "$claude_sessions_target" 2>/dev/null || true)" != "0:0:755" ]; then
+    claude_sessions_staged=$(privileged /usr/bin/mktemp \
+        /usr/local/bin/.terminal-relay-claude-sessions.install.XXXXXX)
+    privileged /usr/bin/install -o root -g root -m 0755 \
+        "$temporary_claude_sessions" "$claude_sessions_staged"
+    privileged /usr/bin/cmp -s "$temporary_claude_sessions" "$claude_sessions_staged"
+    privileged /bin/mv -fT -- "$claude_sessions_staged" "$claude_sessions_target"
+    claude_sessions_staged=""
+fi
+[ "$(privileged /usr/bin/sha256sum "$claude_sessions_target" \
+    | /usr/bin/awk '{ print $1; exit }')" = "$claude_sessions_source_digest" ]
+[ "$(privileged /usr/bin/stat -c "%u:%g:%a" "$claude_sessions_target")" = "0:0:755" ]
+[ "$(privileged /usr/sbin/runuser -u "$application_user" -- \
+    /usr/bin/env \
+        HOME="$application_home" \
+        USER="$application_user" \
+        LOGNAME="$application_user" \
+        PATH=/usr/local/bin:/usr/bin:/bin \
+        "$claude_sdk_current/bin/python3" \
+        "$claude_sessions_target" version)" = "$claude_sdk_version" ]
 
 if [ "$helper_result" != unchanged ] || [ "$mcp_changed" -eq 1 ]; then
     restart_marker="$application_home/.local/state/terminal-relay/codex-app-server-restart-required"
@@ -705,7 +872,7 @@ REMOTE_ROLLBACK
 remote_rollback_script="$(render_remote_rollback_script)"
 remote_install_command="$(build_locked_remote_command \
     "$admin_uid" "$remote_install_script" terminal-relay-install \
-    "$application_machine" "$application_host" "$application_user")"
+    "$application_machine" "$application_host" "$application_user" "$retain_backups")"
 rollback_validation_command="$(build_locked_remote_command \
     "$admin_uid" "$remote_rollback_script" terminal-relay-rollback \
     "$application_machine" "$application_host" "$application_user" \
@@ -722,7 +889,11 @@ fi
 # The validated installer is explicitly quoted for remote Bash; tar remains stdin.
 # shellcheck disable=SC2029
 install_output="$(/usr/bin/tar --no-xattrs -C "$repository_root/Server" -cf - \
-    terminal-relay-session terminal-relay-mcp terminal-relay-session-restore@.service \
+    terminal-relay-session \
+    terminal-relay-mcp \
+    terminal-relay-claude-sessions \
+    claude-agent-sdk-requirements.txt \
+    terminal-relay-session-restore@.service \
     | /usr/bin/ssh "$admin_target" "$remote_install_command")"
 
 install_record="$(printf '%s\n' "$install_output" | /usr/bin/sed -n \
@@ -745,7 +916,7 @@ case "$helper_result" in
         [[ "$helper_backup" =~ ^/usr/local/bin/terminal-relay-session\.backup\.[A-Za-z0-9.]+$ ]] \
             || { echo "Remote installer returned an invalid helper backup: $helper_backup" >&2; exit 70; }
         ;;
-    new|unchanged)
+    new|updated|unchanged)
         [[ -z "$helper_backup" ]] \
             || { echo "Remote installer returned an unexpected helper backup: $helper_backup" >&2; exit 70; }
         ;;
@@ -756,24 +927,25 @@ case "$unit_result" in
         [[ "$unit_backup" =~ ^/etc/systemd/system/terminal-relay-session-restore@\.service\.backup\.[A-Za-z0-9.]+$ ]] \
             || { echo "Remote installer returned an invalid unit backup: $unit_backup" >&2; exit 70; }
         ;;
-    new|unchanged)
+    new|updated|unchanged)
         [[ -z "$unit_backup" ]] \
             || { echo "Remote installer returned an unexpected unit backup: $unit_backup" >&2; exit 70; }
         ;;
     *) echo "Remote installer returned an invalid unit result: $unit_result" >&2; exit 70 ;;
 esac
 
-rollback_remote="$(build_locked_remote_command \
-    "$admin_uid" "$remote_rollback_script" terminal-relay-rollback \
-    "$application_machine" "$application_host" "$application_user" \
-    "$helper_installed_digest" "$helper_installed_state" "$helper_result" "$helper_backup" \
-    "$unit_installed_digest" "$unit_installed_state" "$unit_result" "$unit_backup" \
-    "$service_initial_enabled" "$service_initial_active")"
-
 echo "Installed helper and restore unit with verified systemd service state."
 [[ "$helper_result" != replaced ]] || echo "Helper backup retained at $helper_backup"
 [[ "$unit_result" != replaced ]] || echo "Unit backup retained at $unit_backup"
 
-printf 'Rollback:'
-printf ' %q' /usr/bin/ssh "$admin_target" "$rollback_remote"
-printf '\n'
+if [[ "$retain_backups" == true ]]; then
+    rollback_remote="$(build_locked_remote_command \
+        "$admin_uid" "$remote_rollback_script" terminal-relay-rollback \
+        "$application_machine" "$application_host" "$application_user" \
+        "$helper_installed_digest" "$helper_installed_state" "$helper_result" "$helper_backup" \
+        "$unit_installed_digest" "$unit_installed_state" "$unit_result" "$unit_backup" \
+        "$service_initial_enabled" "$service_initial_active")"
+    printf 'Rollback:'
+    printf ' %q' /usr/bin/ssh "$admin_target" "$rollback_remote"
+    printf '\n'
+fi

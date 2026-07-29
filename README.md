@@ -12,8 +12,8 @@ over SSH.
 
 - Project-first macOS workspace with embedded interactive terminals.
 - Shared, persistent Codex and Claude sessions backed by worker-side `tmux`.
-- Recent and archived Codex threads can be searched, resumed exactly, renamed,
-  archived, and restored from macOS, iPhone, and iPad.
+- Inactive and archived Codex and Claude conversations can be searched, resumed
+  exactly, renamed, archived, and restored from macOS, iPhone, and iPad.
 - Every managed agent terminal includes a worker-local MCP for safe project and
   thread operations on that worker.
 - Handoff between Mac, iPhone, and iPad without stopping the remote agent.
@@ -61,24 +61,26 @@ For an application-only worker, re-run its original
 
 Then use the apps:
 
-1. Open a project in Terminal Relay. Live terminals and paused Codex threads
-   appear together below the project.
+1. Open a project in Terminal Relay. Live terminals and inactive Codex and
+   Claude conversations appear together below the project.
 2. Choose **New Codex Thread** to create a paused conversation without opening
    a terminal, or choose **Open Codex** / **Open Claude Code** to start working
    immediately.
-3. Select a paused Codex thread to resume that exact conversation. On iPhone
-   and iPad, open the project and tap a row under **Paused Threads**.
+3. Select an inactive Codex or Claude row to resume that exact conversation.
+   On iPhone and iPad, open the project and tap a row under **Paused Threads**.
 4. Control-click on Mac, or use swipe and context actions on iPhone and iPad,
-   to rename or archive an inactive Codex thread. Expand **Archived Threads**
+   to rename or archive an inactive conversation. Expand **Archived Threads**
    to restore one.
 5. Use **Disconnect** when you only want to leave the current device. Use
    **Stop Terminal** to end that exact worker terminal for every attached
-   device. Archiving a live Codex thread stops that exact terminal first.
+   device. Archiving a live conversation stops that exact relay terminal first.
 
-Claude sessions support live status, reconnect, stop, device handoff, and
-reboot recovery. Paused Claude history and provider-level rename/archive are
-not currently exposed because Claude Code does not provide the same durable
-thread-management API.
+Claude list, metadata read, and rename use the official Claude Agent SDK;
+resume uses Claude Code's exact provider session UUID. Terminal Relay archive
+and unarchive are a worker-local visibility overlay: they do not delete, retain,
+or change the Claude transcript and do not block a direct Claude Code resume.
+Claude's configured retention still determines how long a conversation remains
+resumable.
 
 ### Ask an agent to manage worker threads
 
@@ -95,18 +97,19 @@ and tell me its thread ID.
 Resume thread 00000000-0000-4000-8000-000000000000 in example-repo so I can
 attach to it from Terminal Relay.
 
-Archive the inactive Codex thread 00000000-0000-4000-8000-000000000000 in
+Archive the inactive Claude thread 00000000-0000-4000-8000-000000000000 in
 example-repo.
 ```
 
 For the first request, the MCP instructions tell the agent to discover the
-worker's projects and list each project's unarchived threads, including live
-terminals and paused Codex conversations.
+worker's projects and list each project's unarchived conversations, including
+live terminals and inactive Codex and Claude conversations.
 
-The MCP can list projects and threads; start, resume, or rename Codex threads;
-and archive or restore inactive Codex threads on the current worker. It cannot
-read transcripts, type into terminals, run arbitrary shell commands, delete
-projects or threads, or access another worker.
+The MCP can list projects and conversations; start a Codex thread; resume or
+rename Codex and Claude conversations; and archive or restore inactive
+conversations on the current worker. It cannot read transcripts, type into
+terminals, run arbitrary shell commands, delete projects or conversations, or
+access another worker.
 
 Maintainer-signed macOS releases use Sparkle. The app checks the public signed
 feed once per day without sending system-profile data. Use **Terminal Relay →
@@ -125,19 +128,28 @@ client attachments to each one, and preserves exact restart intent across
 worker reboots. Disconnecting a client leaves the remote agent running;
 **Stop Agent** ends only the relay UUID that was selected.
 
-Codex's worker-local app server also provides a paginated catalog of persisted
-threads. The apps keep the Codex thread UUID separate from the relay terminal
-UUID, so selecting an inactive thread resumes that exact conversation and a
-reboot restores the same provider thread. Claude continues to expose its live
-session UUID, title, run state, reattach, stop, handoff, and reboot behavior;
-inactive Claude history and provider-level rename/archive are not claimed.
+Codex's worker-local app server and the official Claude Agent SDK provide
+paginated catalogs of persisted conversations. The apps keep each provider
+session UUID separate from the relay terminal UUID, so selecting an inactive
+row resumes that exact provider conversation and a reboot restores the same
+provider UUID. Claude activity is classified by combining validated
+`claude agents --json` process records with relay state; externally active or
+unknown conversations remain visible but cannot be resumed or mutated.
+
+The provider's worker-local history remains authoritative. Terminal Relay does
+not copy transcripts or provide cross-worker migration. Handoff works between
+clients connected to the same worker, and reboot recovery works while that
+worker's provider data and relay restart intent remain intact. Moving to a
+different worker or replacing its disk requires a separate provider-data
+migration.
 
 Managed Codex and Claude terminals receive
 `/usr/local/bin/terminal-relay-mcp`, a root-owned stdio MCP server with only
-seven bounded tools: list projects and threads, start or resume a Codex thread,
-and rename, archive, or unarchive an inactive Codex thread. It delegates to the
-same typed worker helper and has no listener, shell, transcript reader, terminal
-input, deletion, or cross-worker access.
+seven bounded tools: list projects and conversations, start a Codex thread,
+resume Codex or Claude conversations, and rename, archive, or unarchive an
+inactive conversation. It delegates to the same typed worker helper and has no
+listener, shell, transcript reader, terminal input, deletion, or cross-worker
+access.
 
 Terminal Relay does not operate a central backend:
 

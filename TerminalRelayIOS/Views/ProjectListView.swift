@@ -391,7 +391,7 @@ struct ProjectDetailView: View {
             workerID: workerID,
             repositoryName: repositoryName,
             archived: false
-        ).filter { !$0.isActive }
+        ).filter { $0.activityState != .relayActive }
     }
 
     private var archivedThreads: [WorkerThreadSnapshot] {
@@ -596,7 +596,7 @@ struct ProjectDetailView: View {
                         .font(.body.weight(.medium))
                         .foregroundStyle(.primary)
                         .lineLimit(2)
-                    Text("Paused · tap to resume")
+                    Text(activityLabel(for: thread))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -607,6 +607,7 @@ struct ProjectDetailView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .disabled(!thread.capabilities.resume)
         .swipeActions {
             Button(role: .destructive) {
                 Task {
@@ -619,12 +620,14 @@ struct ProjectDetailView: View {
             } label: {
                 Label("Archive Thread", systemImage: "archivebox")
             }
+            .disabled(!thread.capabilities.archive)
         }
         .contextMenu {
             Button("Rename Thread") {
                 threadName = thread.title ?? ""
                 threadPendingRename = thread
             }
+            .disabled(!thread.capabilities.rename)
             Button("Archive Thread", role: .destructive) {
                 Task {
                     await model.setThreadArchived(
@@ -634,6 +637,16 @@ struct ProjectDetailView: View {
                     )
                 }
             }
+            .disabled(!thread.capabilities.archive)
+        }
+    }
+
+    private func activityLabel(for thread: WorkerThreadSnapshot) -> String {
+        switch thread.activityState {
+        case .inactive: "Paused · tap to resume"
+        case .relayActive: "Active in Terminal Relay"
+        case .externalActive: "Active outside Terminal Relay"
+        case .unknown: "Activity unavailable"
         }
     }
 

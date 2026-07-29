@@ -132,6 +132,27 @@ def validate_command(arguments: list[str], working_directory: str | None) -> lis
             reject("The Terminal Relay thread list command is invalid.")
         return arguments
 
+    if action == "threads-v2":
+        if len(arguments) not in {4, 5}:
+            reject("The Terminal Relay V2 thread list command is incomplete.")
+        provider, repository, archive_filter = arguments[1:4]
+        if (
+            provider not in {"codex", "claude"}
+            or not REPOSITORY.fullmatch(repository)
+            or archive_filter not in {"open", "archived"}
+            or working_directory is not None
+            or (
+                len(arguments) == 5
+                and (
+                    not arguments[4]
+                    or "\n" in arguments[4]
+                    or len(arguments[4].encode("utf-8")) > 2_048
+                )
+            )
+        ):
+            reject("The Terminal Relay V2 thread list command is invalid.")
+        return arguments
+
     if action == "thread-create":
         if (
             len(arguments) != 2
@@ -150,6 +171,22 @@ def validate_command(arguments: list[str], working_directory: str | None) -> lis
             or working_directory is not None
         ):
             reject("The Terminal Relay thread resume command is invalid.")
+        return arguments
+
+    if action == "thread-resume-v2":
+        if len(arguments) < 4:
+            reject("The Terminal Relay V2 thread resume command is incomplete.")
+        provider, repository, thread_id = arguments[1:4]
+        expected_arguments = CODEX_ARGUMENTS if provider == "codex" else CLAUDE_ARGUMENTS
+        if (
+            provider not in {"codex", "claude"}
+            or len(arguments) != 4 + len(expected_arguments)
+            or not REPOSITORY.fullmatch(repository)
+            or not INSTANCE.fullmatch(thread_id)
+            or arguments[4:] != expected_arguments
+            or working_directory is not None
+        ):
+            reject("The Terminal Relay V2 thread resume command is invalid.")
         return arguments
 
     if action in {"thread-read", "thread-archive", "thread-unarchive"}:
@@ -173,6 +210,35 @@ def validate_command(arguments: list[str], working_directory: str | None) -> lis
             or working_directory is not None
         ):
             reject("The Terminal Relay thread rename command is invalid.")
+        return arguments
+
+    if action in {
+        "thread-read-v2",
+        "thread-archive-v2",
+        "thread-unarchive-v2",
+    }:
+        if (
+            len(arguments) != 4
+            or arguments[1] not in {"codex", "claude"}
+            or not REPOSITORY.fullmatch(arguments[2])
+            or not INSTANCE.fullmatch(arguments[3])
+            or working_directory is not None
+        ):
+            reject("The Terminal Relay V2 thread command is invalid.")
+        return arguments
+
+    if action == "thread-rename-v2":
+        if (
+            len(arguments) != 5
+            or arguments[1] not in {"codex", "claude"}
+            or not REPOSITORY.fullmatch(arguments[2])
+            or not INSTANCE.fullmatch(arguments[3])
+            or not arguments[4]
+            or "\n" in arguments[4]
+            or len(arguments[4].encode("utf-8")) > 200
+            or working_directory is not None
+        ):
+            reject("The Terminal Relay V2 thread rename command is invalid.")
         return arguments
 
     reject("This review key cannot run that command.")

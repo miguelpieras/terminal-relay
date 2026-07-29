@@ -230,8 +230,7 @@ final class SessionManager: ObservableObject {
         using service: WorkerSessionService
     ) async -> SessionOpenResult? {
         let openSelectionRevision = claimOpenSelectionIntent()
-        guard thread.kind == .codex,
-              !thread.isActive,
+        guard thread.activityState == .inactive,
               thread.capabilities.resume,
               thread.repositoryName == project.displayName,
               project.serverID == server.id,
@@ -242,6 +241,7 @@ final class SessionManager: ObservableObject {
                   using: service
               ),
               let snapshot = await service.resumeThread(
+                  kind: thread.kind,
                   repositoryName: project.displayName,
                   threadID: thread.threadID,
                   launchDefaults: launchDefaults,

@@ -30,22 +30,34 @@ case "$1" in
             '__TERMINAL_RELAY_SESSION_V1__' \
             'session|claude|alpha|0|cccccccc-cccc-4ccc-8ccc-cccccccccccc|123||0|cccccccc-cccc-4ccc-8ccc-cccccccccccc'
         ;;
-    threads)
-        if [[ "$2" == "slow" ]]; then
+    threads-v2)
+        if [[ "$3" == "slow" ]]; then
             sleep 1
         fi
-        if [[ "$2" == "oversized" ]]; then
+        if [[ "$3" == "oversized" ]]; then
             python3 - <<'PYTHON_OVERSIZED'
-print("__TERMINAL_RELAY_THREADS_V1__")
+print("__TERMINAL_RELAY_THREADS_V2__")
 print('{"threads":[],"padding":"' + ("x" * 1048600) + '","nextCursor":null}')
 PYTHON_OVERSIZED
             exit 0
         fi
-        printf '%s\n' \
-            '__TERMINAL_RELAY_THREADS_V1__' \
-            '{"threads":[{"provider":"codex","threadID":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","title":"Dormant task","updatedAt":100,"archived":false,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":null}'
+        if [[ "$3" == "inconsistent" ]]; then
+            printf '%s\n' \
+                '__TERMINAL_RELAY_THREADS_V2__' \
+                '{"threads":[{"provider":"codex","threadID":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","title":"Unsafe","updatedAt":1,"archived":false,"activityState":"unknown","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":null}'
+            exit 0
+        fi
+        if [[ "$2" == "claude" ]]; then
+            printf '%s\n' \
+                '__TERMINAL_RELAY_THREADS_V2__' \
+                '{"threads":[{"provider":"claude","threadID":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","title":"Inactive Claude task","updatedAt":110,"archived":false,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":null}'
+        else
+            printf '%s\n' \
+                '__TERMINAL_RELAY_THREADS_V2__' \
+                '{"threads":[{"provider":"codex","threadID":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","title":"Dormant task","updatedAt":100,"archived":false,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":null}'
+        fi
         ;;
-    thread-create|thread-rename|thread-unarchive)
+    thread-create)
         if [[ "${2:-}" == "failure" ]]; then
             printf '%s\n' 'private-terminal-output-must-not-escape' >&2
             exit 75
@@ -54,15 +66,30 @@ PYTHON_OVERSIZED
             '__TERMINAL_RELAY_THREADS_V1__' \
             '{"threads":[{"provider":"codex","threadID":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","title":"Managed task","updatedAt":200,"archived":false,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":null}'
         ;;
-    thread-archive)
+    thread-rename-v2|thread-unarchive-v2)
+        provider="$2"
+        thread_id="$4"
+        title='Managed task'
+        [[ "$provider" != "claude" ]] || title='Managed Claude task'
         printf '%s\n' \
-            '__TERMINAL_RELAY_THREADS_V1__' \
-            '{"threads":[{"provider":"codex","threadID":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","title":"Managed task","updatedAt":200,"archived":true,"capabilities":{"resume":false,"rename":false,"archive":false,"unarchive":true}}],"nextCursor":null}'
+            '__TERMINAL_RELAY_THREADS_V2__' \
+            "{\"threads\":[{\"provider\":\"$provider\",\"threadID\":\"$thread_id\",\"title\":\"$title\",\"updatedAt\":200,\"archived\":false,\"activityState\":\"inactive\",\"activeInstanceToken\":null,\"isWorking\":null,\"capabilities\":{\"resume\":true,\"rename\":true,\"archive\":true,\"unarchive\":false}}],\"nextCursor\":null}"
         ;;
-    thread-resume)
+    thread-archive-v2)
+        provider="$2"
+        thread_id="$4"
+        printf '%s\n' \
+            '__TERMINAL_RELAY_THREADS_V2__' \
+            "{\"threads\":[{\"provider\":\"$provider\",\"threadID\":\"$thread_id\",\"title\":\"Managed task\",\"updatedAt\":200,\"archived\":true,\"activityState\":\"inactive\",\"activeInstanceToken\":null,\"isWorking\":null,\"capabilities\":{\"resume\":false,\"rename\":false,\"archive\":false,\"unarchive\":true}}],\"nextCursor\":null}"
+        ;;
+    thread-resume-v2)
+        provider="$2"
+        thread_id="$4"
+        instance='dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+        [[ "$provider" != "claude" ]] || instance='eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
         printf '%s\n' \
             '__TERMINAL_RELAY_SESSION_V1__' \
-            'session|codex|alpha|0|dddddddd-dddd-4ddd-8ddd-dddddddddddd|200||0|aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+            "session|$provider|alpha|0|$instance|200||0|$thread_id"
         ;;
     *) exit 64 ;;
 esac
@@ -185,6 +212,68 @@ requests = [
             },
         },
     },
+    {
+        "jsonrpc": "2.0",
+        "id": 13,
+        "method": "tools/call",
+        "params": {
+            "name": "resume_thread",
+            "arguments": {
+                "repository": "alpha",
+                "provider": "claude",
+                "thread_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            },
+        },
+    },
+    {
+        "jsonrpc": "2.0",
+        "id": 14,
+        "method": "tools/call",
+        "params": {
+            "name": "rename_thread",
+            "arguments": {
+                "repository": "alpha",
+                "provider": "claude",
+                "thread_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "name": "Managed Claude task",
+            },
+        },
+    },
+    {
+        "jsonrpc": "2.0",
+        "id": 15,
+        "method": "tools/call",
+        "params": {
+            "name": "archive_thread",
+            "arguments": {
+                "repository": "alpha",
+                "provider": "claude",
+                "thread_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            },
+        },
+    },
+    {
+        "jsonrpc": "2.0",
+        "id": 16,
+        "method": "tools/call",
+        "params": {
+            "name": "unarchive_thread",
+            "arguments": {
+                "repository": "alpha",
+                "provider": "claude",
+                "thread_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            },
+        },
+    },
+    {
+        "jsonrpc": "2.0",
+        "id": 17,
+        "method": "tools/call",
+        "params": {
+            "name": "list_threads",
+            "arguments": {"repository": "inconsistent"},
+        },
+    },
 ]
 process = subprocess.run(
     [mcp],
@@ -213,11 +302,12 @@ assert set(tools) == {
 assert tools["list_projects"]["annotations"]["readOnlyHint"] is True
 assert tools["archive_thread"]["annotations"]["destructiveHint"] is True
 assert "open threads" in tools["list_projects"]["description"]
-assert "live terminals plus paused Codex threads" in tools["list_threads"]["description"]
+assert "Codex and Claude conversations" in tools["list_threads"]["description"]
 assert responses[2]["result"]["structuredContent"] == {"projects": ["alpha", "beta"]}
 threads = responses[3]["result"]["structuredContent"]["threads"]
 assert {(thread["provider"], thread["threadID"]) for thread in threads} == {
     ("codex", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+    ("claude", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
     ("claude", "cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
 }
 assert responses[4]["result"]["structuredContent"]["threads"][0]["title"] == "Managed task"
@@ -231,31 +321,46 @@ assert responses[9]["result"]["isError"] is True
 assert responses[10]["result"]["isError"] is True
 assert "private-terminal-output" not in responses[10]["result"]["content"][0]["text"]
 assert responses[11]["result"]["isError"] is True
+claude_resumed = responses[12]["result"]["structuredContent"]["threads"][0]
+assert claude_resumed["provider"] == "claude"
+assert claude_resumed["threadID"] == "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+assert claude_resumed["activeInstanceToken"] == "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+assert responses[13]["result"]["structuredContent"]["threads"][0]["title"] == "Managed Claude task"
+assert responses[14]["result"]["structuredContent"]["threads"][0]["archived"] is True
+assert responses[15]["result"]["structuredContent"]["threads"][0]["archived"] is False
+assert responses[16]["result"]["isError"] is True
 with open(response_path, "w", encoding="utf-8") as response_file:
     response_file.write(process.stdout)
 PYTHON_TEST
 
 grep -Fxq 'list-projects' "$helper_log"
-grep -Fxq 'threads alpha active' "$helper_log"
+grep -Fxq 'threads-v2 codex alpha open' "$helper_log"
+grep -Fxq 'threads-v2 claude alpha open' "$helper_log"
 grep -Fxq 'status' "$helper_log"
 grep -Fxq 'thread-create alpha' "$helper_log"
 grep -Fxq \
-    'thread-resume alpha aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' \
+    'thread-resume-v2 codex alpha aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' \
     "$helper_log"
 grep -Fxq \
-    'thread-rename alpha aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa Managed task' \
+    'thread-rename-v2 codex alpha aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa Managed task' \
     "$helper_log"
 grep -Fxq \
-    'thread-archive alpha aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' \
+    'thread-archive-v2 codex alpha aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' \
     "$helper_log"
 grep -Fxq \
-    'thread-unarchive alpha aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' \
+    'thread-unarchive-v2 codex alpha aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' \
+    "$helper_log"
+grep -Fq \
+    'thread-resume-v2 claude alpha bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb --settings {"terminalProgressBarEnabled":true} --mcp-config {"mcpServers":{"terminal_relay":{"command":"/usr/local/bin/terminal-relay-mcp"}}} --strict-mcp-config --dangerously-skip-permissions' \
+    "$helper_log"
+grep -Fxq \
+    'thread-rename-v2 claude alpha bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb Managed Claude task' \
     "$helper_log"
 
 TERMINAL_RELAY_MCP_TEST_MODE=1 \
 TERMINAL_RELAY_MCP_TEST_HELPER="$stub_helper" \
 TERMINAL_RELAY_MCP_HELPER_LOG="$helper_log" \
-TERMINAL_RELAY_MCP_TEST_TIMEOUT_SECONDS=0.05 \
+TERMINAL_RELAY_MCP_TEST_TIMEOUT_SECONDS=0.5 \
 python3 - "$mcp" <<'PYTHON_BOUNDS'
 import json
 import os

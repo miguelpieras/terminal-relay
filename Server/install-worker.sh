@@ -24,6 +24,10 @@ readonly ssh_keys_marker="$state_directory/authorized-keys-installed"
 readonly workspace_directory="/workspace"
 readonly launcher_destination="/usr/local/bin/terminal-relay-session"
 readonly mcp_destination="/usr/local/bin/terminal-relay-mcp"
+readonly claude_sessions_adapter_destination="/usr/local/bin/terminal-relay-claude-sessions"
+readonly claude_sessions_sdk_root="/opt/terminal-relay/claude-session-sdk"
+readonly claude_sessions_sdk_current="$claude_sessions_sdk_root/current"
+readonly claude_sessions_sdk_version="0.2.125"
 readonly restore_unit_destination="/etc/systemd/system/terminal-relay-session-restore@.service"
 readonly restore_service="terminal-relay-session-restore@$runtime_user.service"
 readonly agent_update_destination="/usr/local/sbin/terminal-relay-agent-update"
@@ -48,6 +52,8 @@ readonly minimum_memory_kib=3900000
 
 launcher_source="$script_directory/terminal-relay-session"
 mcp_source="$script_directory/terminal-relay-mcp"
+claude_sessions_adapter_source="$script_directory/terminal-relay-claude-sessions"
+claude_sessions_requirements_source="$script_directory/claude-agent-sdk-requirements.txt"
 restore_unit_source="$script_directory/terminal-relay-session-restore@.service"
 agent_update_source="$script_directory/terminal-relay-agent-update"
 agent_update_service_source="$script_directory/terminal-relay-agent-update.service"
@@ -277,6 +283,8 @@ validate_source_bundle() {
     for required_file in \
         "$launcher_source" \
         "$mcp_source" \
+        "$claude_sessions_adapter_source" \
+        "$claude_sessions_requirements_source" \
         "$restore_unit_source" \
         "$agent_update_source" \
         "$agent_update_service_source" \
@@ -699,6 +707,7 @@ install_dependencies() {
         openssh-client \
         procps \
         python3 \
+        python3-venv \
         sed \
         tar \
         tmux \
@@ -771,6 +780,72 @@ install_claude() {
     [[ -x "$claude_destination" ]] || fail "Claude package did not create $claude_destination."
     /usr/bin/dpkg-query -S "$claude_destination" | /bin/grep -q '^claude-code:' \
         || fail "$claude_destination is not owned by the claude-code package."
+}
+
+install_claude_session_sdk() {
+    local requirements_digest
+    local environment_name
+    local environment_directory
+    local staging_directory
+    local temporary_link
+
+    requirements_digest="$(/usr/bin/sha256sum "$claude_sessions_requirements_source")"
+    requirements_digest="${requirements_digest%% *}"
+    [[ "$requirements_digest" =~ ^[a-f0-9]{64}$ ]] \
+        || fail "Unable to identify the pinned Claude Agent SDK environment."
+    environment_name="sdk-$claude_sessions_sdk_version-${requirements_digest:0:16}"
+    environment_directory="$claude_sessions_sdk_root/$environment_name"
+
+    /usr/bin/install -d -o root -g root -m 0755 "$claude_sessions_sdk_root"
+    if path_exists "$environment_directory"; then
+        [[ -d "$environment_directory" && ! -L "$environment_directory" ]] \
+            || fail "The Claude Agent SDK environment is unsafe."
+        [[ -f "$environment_directory/requirements.txt" \
+            && ! -L "$environment_directory/requirements.txt" ]] \
+            || fail "The Claude Agent SDK requirements record is unsafe."
+        /usr/bin/cmp -s \
+            "$claude_sessions_requirements_source" \
+            "$environment_directory/requirements.txt" \
+            || fail "The Claude Agent SDK environment does not match its pinned requirements."
+    else
+        staging_directory="$(mktemp -d \
+            "$claude_sessions_sdk_root/.terminal-relay-claude-sdk.install.XXXXXX")"
+        /usr/bin/python3 -m venv "$staging_directory"
+        "$staging_directory/bin/python3" -m pip install \
+            --disable-pip-version-check \
+            --no-cache-dir \
+            --requirement "$claude_sessions_requirements_source"
+        /usr/bin/install -o root -g root -m 0644 \
+            "$claude_sessions_requirements_source" \
+            "$staging_directory/requirements.txt"
+        [[ "$("$staging_directory/bin/python3" -c \
+            'import claude_agent_sdk; print(claude_agent_sdk.__version__)')" \
+            == "$claude_sessions_sdk_version" ]] \
+            || fail "The installed Claude Agent SDK version is unexpected."
+        /bin/chown -R root:root "$staging_directory"
+        /bin/chmod -R a+rX,u+w,go-w "$staging_directory"
+        /bin/mv -T "$staging_directory" "$environment_directory"
+    fi
+    /bin/chown -R root:root "$environment_directory"
+    /bin/chmod -R a+rX,u+w,go-w "$environment_directory"
+
+    if path_exists "$claude_sessions_sdk_current" \
+        && [[ ! -L "$claude_sessions_sdk_current" ]]; then
+        fail "The Claude Agent SDK current pointer is unsafe."
+    fi
+    temporary_link="$claude_sessions_sdk_root/.current.$$.$RANDOM"
+    /bin/ln -s "$environment_name" "$temporary_link"
+    /bin/mv -Tf "$temporary_link" "$claude_sessions_sdk_current"
+    [[ -x "$claude_sessions_sdk_current/bin/python3" ]] \
+        || fail "The Claude Agent SDK interpreter is unavailable."
+    install_managed_file \
+        "$claude_sessions_adapter_source" \
+        "$claude_sessions_adapter_destination" \
+        755
+    [[ "$("$claude_sessions_sdk_current/bin/python3" \
+        "$claude_sessions_adapter_destination" version)" \
+        == "$claude_sessions_sdk_version" ]] \
+        || fail "The Claude session adapter could not load its pinned SDK."
 }
 
 prepare_worker_guidance() {
@@ -934,7 +1009,7 @@ verify_readiness() {
     [[ "$(/usr/bin/stat -c '%U:%G:%a' "$runtime_home/.ssh/authorized_keys")" == "$runtime_user:$runtime_group:600" ]] \
         || fail "Unexpected ownership or mode on worker authorized keys."
 
-    for required_command in git ssh awk df nproc flock tmux python3 bwrap codex claude terminal-relay-session terminal-relay-mcp; do
+    for required_command in git ssh awk df nproc flock tmux python3 bwrap codex claude terminal-relay-session terminal-relay-mcp terminal-relay-claude-sessions; do
         login_command_path="$(run_as_worker /bin/bash -lc \
             "cd \"\$HOME\" && command -v $required_command")" \
             || fail "$required_command is unavailable in the worker login shell."
@@ -958,6 +1033,10 @@ verify_readiness() {
     run_as_worker /usr/bin/ssh -V >/dev/null 2>&1
     run_as_worker /usr/bin/nproc >/dev/null
     run_as_worker /usr/bin/python3 --version >/dev/null
+    [[ "$(run_as_worker "$claude_sessions_sdk_current/bin/python3" \
+        "$claude_sessions_adapter_destination" version)" \
+        == "$claude_sessions_sdk_version" ]] \
+        || fail "The worker account cannot use the Claude session adapter."
     run_as_worker /usr/bin/awk 'NR == 1 { found = 1 } END { exit !found }' /proc/stat
     run_as_worker /usr/bin/awk \
         '/^MemTotal:/ { found = 1 } END { exit !found }' /proc/meminfo
@@ -995,6 +1074,7 @@ main() {
     acquire_agent_update_lock
     install_codex
     install_claude
+    install_claude_session_sdk
     install_runtime_files
     schedule_codex_app_server_restart
     configure_restore_service

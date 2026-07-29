@@ -388,29 +388,39 @@ final class WorkerSessionService: ObservableObject {
             return nil
         }
         do {
-            var cursor: String?
-            var pages = 0
+            var remainingCursor: String?
             var threads: [WorkerThreadSnapshot] = []
-            repeat {
-                let result = try await runCommand(
-                    SSHCommandBuilder.workerThreadListConfiguration(
-                        for: worker,
-                        repositoryName: repositoryName,
-                        archived: archived,
-                        cursor: cursor
+            for kind in AgentKind.allCases {
+                var cursor: String?
+                var pages = 0
+                repeat {
+                    let result = try await runCommand(
+                        SSHCommandBuilder.workerThreadListConfiguration(
+                            for: worker,
+                            kind: kind,
+                            repositoryName: repositoryName,
+                            archived: archived,
+                            cursor: cursor
+                        )
                     )
-                )
-                guard result.exitCode == 0 else {
-                    throw WorkerSessionServiceError.threadFailed
+                    guard result.exitCode == 0 else {
+                        throw WorkerSessionServiceError.threadFailed
+                    }
+                    let page = try WorkerThreadProtocol.parse(
+                        result.standardOutput,
+                        repositoryName: repositoryName
+                    )
+                    guard page.threads.allSatisfy({ $0.kind == kind }) else {
+                        throw WorkerSessionServiceError.threadFailed
+                    }
+                    threads.append(contentsOf: page.threads)
+                    cursor = page.nextCursor
+                    pages += 1
+                } while cursor != nil && pages < 20
+                if cursor != nil {
+                    remainingCursor = cursor
                 }
-                let page = try WorkerThreadProtocol.parse(
-                    result.standardOutput,
-                    repositoryName: repositoryName
-                )
-                threads.append(contentsOf: page.threads)
-                cursor = page.nextCursor
-                pages += 1
-            } while cursor != nil && pages < 20
+            }
 
             var threadsByID: [String: WorkerThreadSnapshot] = [:]
             for thread in threads {
@@ -421,7 +431,7 @@ final class WorkerSessionService: ObservableObject {
                     if $0.updatedAt != $1.updatedAt { return $0.updatedAt > $1.updatedAt }
                     return $0.threadID < $1.threadID
                 },
-                nextCursor: cursor
+                nextCursor: remainingCursor
             )
             if !archived {
                 response = response.merging(
@@ -460,6 +470,7 @@ final class WorkerSessionService: ObservableObject {
     }
 
     func resumeThread(
+        kind: AgentKind,
         repositoryName: String,
         threadID: String,
         launchDefaults: AgentLaunchDefaults,
@@ -473,6 +484,7 @@ final class WorkerSessionService: ObservableObject {
             let result = try await runCommand(
                 SSHCommandBuilder.workerThreadResumeConfiguration(
                     for: worker,
+                    kind: kind,
                     repositoryName: repositoryName,
                     threadID: threadID,
                     launchDefaults: launchDefaults
@@ -484,7 +496,7 @@ final class WorkerSessionService: ObservableObject {
             let response = try WorkerSessionProtocol.parse(result.standardOutput)
             guard response.sessions.count == 1,
                   let snapshot = response.sessions.first,
-                  snapshot.kind == .codex,
+                  snapshot.kind == kind,
                   snapshot.repositoryName == repositoryName,
                   snapshot.threadID == threadID else {
                 throw WorkerSessionServiceError.threadFailed
@@ -521,6 +533,7 @@ final class WorkerSessionService: ObservableObject {
 
     @discardableResult
     func renameThread(
+        kind: AgentKind,
         repositoryName: String,
         threadID: String,
         name: String,
@@ -535,6 +548,7 @@ final class WorkerSessionService: ObservableObject {
         return await mutateThreadCatalog(
             configuration: SSHCommandBuilder.workerThreadRenameConfiguration(
                 for: worker,
+                kind: kind,
                 repositoryName: repositoryName,
                 threadID: threadID,
                 name: normalized
@@ -546,6 +560,7 @@ final class WorkerSessionService: ObservableObject {
 
     @discardableResult
     func setThreadArchived(
+        kind: AgentKind,
         repositoryName: String,
         threadID: String,
         archived: Bool,
@@ -558,6 +573,7 @@ final class WorkerSessionService: ObservableObject {
         guard await mutateThreadCatalog(
             configuration: SSHCommandBuilder.workerThreadArchiveConfiguration(
                 for: worker,
+                kind: kind,
                 repositoryName: repositoryName,
                 threadID: threadID,
                 unarchive: !archived

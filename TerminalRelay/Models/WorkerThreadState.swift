@@ -18,12 +18,21 @@ struct WorkerThreadCapabilities: Codable, Equatable {
         archive: false,
         unarchive: true
     )
+    static let dormant = dormantCodex
+    static let archived = archivedCodex
     static let active = WorkerThreadCapabilities(
         resume: false,
         rename: false,
         archive: false,
         unarchive: false
     )
+}
+
+enum WorkerThreadActivityState: String, Codable, Equatable {
+    case inactive
+    case relayActive = "relay-active"
+    case externalActive = "external-active"
+    case unknown
 }
 
 struct WorkerThreadSnapshot: Equatable, Identifiable {
@@ -33,12 +42,42 @@ struct WorkerThreadSnapshot: Equatable, Identifiable {
     let title: String?
     let updatedAt: Int
     let isArchived: Bool
+    let activityState: WorkerThreadActivityState
     let activeInstanceToken: String?
     let reportedWorking: Bool?
     let capabilities: WorkerThreadCapabilities
 
+    init(
+        kind: AgentKind,
+        repositoryName: String,
+        threadID: String,
+        title: String?,
+        updatedAt: Int,
+        isArchived: Bool,
+        activityState: WorkerThreadActivityState = .inactive,
+        activeInstanceToken: String?,
+        reportedWorking: Bool?,
+        capabilities: WorkerThreadCapabilities
+    ) {
+        self.kind = kind
+        self.repositoryName = repositoryName
+        self.threadID = threadID
+        self.title = title
+        self.updatedAt = updatedAt
+        self.isArchived = isArchived
+        self.activityState = activityState
+        self.activeInstanceToken = activeInstanceToken
+        self.reportedWorking = reportedWorking
+        self.capabilities = capabilities
+    }
+
     var id: String { "\(kind.rawValue):\(threadID)" }
-    var isActive: Bool { activeInstanceToken != nil }
+    var isActive: Bool {
+        activityState == .relayActive || activityState == .externalActive
+    }
+    var isAttachable: Bool {
+        activityState == .relayActive && activeInstanceToken != nil
+    }
 }
 
 struct WorkerThreadResponse: Equatable {
@@ -48,20 +87,22 @@ struct WorkerThreadResponse: Equatable {
     func merging(liveSessions: [WorkerSessionSnapshot]) -> WorkerThreadResponse {
         var merged: [String: WorkerThreadSnapshot] = [:]
         for thread in threads {
-            if thread.kind == .claude, thread.isActive {
-                continue
+            if thread.activityState == .relayActive {
+                merged[thread.id] = WorkerThreadSnapshot(
+                    kind: thread.kind,
+                    repositoryName: thread.repositoryName,
+                    threadID: thread.threadID,
+                    title: thread.title,
+                    updatedAt: thread.updatedAt,
+                    isArchived: thread.isArchived,
+                    activityState: .inactive,
+                    activeInstanceToken: nil,
+                    reportedWorking: nil,
+                    capabilities: thread.isArchived ? .archived : .dormant
+                )
+            } else {
+                merged[thread.id] = thread
             }
-            merged[thread.id] = WorkerThreadSnapshot(
-                kind: thread.kind,
-                repositoryName: thread.repositoryName,
-                threadID: thread.threadID,
-                title: thread.title,
-                updatedAt: thread.updatedAt,
-                isArchived: thread.isArchived,
-                activeInstanceToken: nil,
-                reportedWorking: nil,
-                capabilities: thread.isArchived ? .archivedCodex : .dormantCodex
-            )
         }
         for session in liveSessions {
             guard let threadID = session.threadID else { continue }
@@ -73,6 +114,7 @@ struct WorkerThreadResponse: Equatable {
                 title: session.title ?? merged[id]?.title,
                 updatedAt: session.lastActivityAt ?? merged[id]?.updatedAt ?? 0,
                 isArchived: false,
+                activityState: .relayActive,
                 activeInstanceToken: session.instanceToken,
                 reportedWorking: session.reportedWorking,
                 capabilities: .active
@@ -110,7 +152,8 @@ enum WorkerThreadProtocolError: LocalizedError, Equatable {
 }
 
 enum WorkerThreadProtocol {
-    static let marker = "__TERMINAL_RELAY_THREADS_V1__"
+    static let marker = "__TERMINAL_RELAY_THREADS_V2__"
+    static let legacyMarker = "__TERMINAL_RELAY_THREADS_V1__"
 
     private struct WireResponse: Decodable {
         let threads: [WireThread]
@@ -123,6 +166,7 @@ enum WorkerThreadProtocol {
         let title: String?
         let updatedAt: Int
         let archived: Bool
+        let activityState: WorkerThreadActivityState?
         let activeInstanceToken: String?
         let isWorking: Bool?
         let capabilities: WorkerThreadCapabilities
@@ -143,7 +187,8 @@ enum WorkerThreadProtocol {
             throw WorkerThreadProtocolError.invalidResponse
         }
         let lines = output.split(whereSeparator: \.isNewline).map(String.init)
-        guard let markerIndex = lines.firstIndex(of: marker) else {
+        let isV2 = lines.contains(marker)
+        guard let markerIndex = lines.firstIndex(of: isV2 ? marker : legacyMarker) else {
             throw WorkerThreadProtocolError.missingMarker
         }
         guard lines.indices.contains(markerIndex + 1),
@@ -166,19 +211,26 @@ enum WorkerThreadProtocol {
                   seenIDs.insert("\(kind.rawValue):\(thread.threadID)").inserted else {
                 throw WorkerThreadProtocolError.invalidResponse
             }
-            let isActive = thread.activeInstanceToken != nil
+            let activityState: WorkerThreadActivityState
+            if isV2 {
+                guard let reportedActivity = thread.activityState else {
+                    throw WorkerThreadProtocolError.invalidResponse
+                }
+                activityState = reportedActivity
+            } else {
+                activityState = thread.activeInstanceToken == nil ? .inactive : .relayActive
+            }
             let expectedCapabilities: WorkerThreadCapabilities
-            if isActive {
+            if activityState != .inactive {
                 expectedCapabilities = .active
             } else if thread.archived {
-                expectedCapabilities = .archivedCodex
+                expectedCapabilities = .archived
             } else {
-                expectedCapabilities = .dormantCodex
+                expectedCapabilities = .dormant
             }
             guard thread.capabilities == expectedCapabilities,
-                  !thread.archived || !isActive,
-                  isActive || thread.isWorking == nil,
-                  kind != .claude || isActive else {
+                  activityState == .relayActive || thread.isWorking == nil,
+                  (activityState == .relayActive) == (thread.activeInstanceToken != nil) else {
                 throw WorkerThreadProtocolError.invalidResponse
             }
             return WorkerThreadSnapshot(
@@ -188,6 +240,7 @@ enum WorkerThreadProtocol {
                 title: thread.title,
                 updatedAt: thread.updatedAt,
                 isArchived: thread.archived,
+                activityState: activityState,
                 activeInstanceToken:
                     thread.activeInstanceToken,
                 reportedWorking: thread.isWorking,

@@ -412,8 +412,7 @@ final class WorkerSessionModel: ObservableObject {
     }
 
     func resumeThread(workerID: UUID, thread: WorkerThreadSnapshot) async {
-        guard thread.kind == .codex,
-              !thread.isActive,
+        guard thread.activityState == .inactive,
               thread.capabilities.resume else {
             return
         }
@@ -428,14 +427,16 @@ final class WorkerSessionModel: ObservableObject {
         guard let worker = profiles.first(where: { $0.id == workerID }) else { return }
         do {
             let command = try WorkerRemoteCommand.resumeThread(
+                kind: thread.kind,
                 repositoryName: thread.repositoryName,
                 threadID: thread.threadID,
-                launchArguments: AgentLaunchDefaults.standard.arguments(for: .codex)
+                launchArguments: AgentLaunchDefaults.standard.arguments(for: thread.kind)
             )
             let data = try await workerClient.execute(command, on: worker)
             let response = try WorkerSessionProtocol.parse(data)
             guard response.sessions.count == 1,
                   let snapshot = response.sessions.first,
+                  snapshot.kind == thread.kind,
                   snapshot.threadID == thread.threadID else {
                 throw WorkerThreadProtocolError.invalidResponse
             }
@@ -481,6 +482,7 @@ final class WorkerSessionModel: ObservableObject {
             thread: thread,
             command: {
                 try WorkerRemoteCommand.renameThread(
+                    kind: thread.kind,
                     repositoryName: thread.repositoryName,
                     threadID: thread.threadID,
                     name: name
@@ -499,6 +501,7 @@ final class WorkerSessionModel: ObservableObject {
             thread: thread,
             command: {
                 try WorkerRemoteCommand.archiveThread(
+                    kind: thread.kind,
                     repositoryName: thread.repositoryName,
                     threadID: thread.threadID,
                     unarchive: !archived
@@ -915,24 +918,34 @@ final class WorkerSessionModel: ObservableObject {
         archived: Bool
     ) async -> WorkerThreadResponse? {
         do {
-            var cursor: String?
-            var pages = 0
+            var remainingCursor: String?
             var threads: [WorkerThreadSnapshot] = []
-            repeat {
-                let command = try WorkerRemoteCommand.threads(
-                    repositoryName: repositoryName,
-                    archived: archived,
-                    cursor: cursor
-                )
-                let data = try await workerClient.execute(command, on: worker)
-                let response = try WorkerThreadProtocol.parse(
-                    data,
-                    repositoryName: repositoryName
-                )
-                threads.append(contentsOf: response.threads)
-                cursor = response.nextCursor
-                pages += 1
-            } while cursor != nil && pages < 20
+            for kind in AgentKind.allCases {
+                var cursor: String?
+                var pages = 0
+                repeat {
+                    let command = try WorkerRemoteCommand.threads(
+                        kind: kind,
+                        repositoryName: repositoryName,
+                        archived: archived,
+                        cursor: cursor
+                    )
+                    let data = try await workerClient.execute(command, on: worker)
+                    let response = try WorkerThreadProtocol.parse(
+                        data,
+                        repositoryName: repositoryName
+                    )
+                    guard response.threads.allSatisfy({ $0.kind == kind }) else {
+                        throw WorkerThreadProtocolError.invalidResponse
+                    }
+                    threads.append(contentsOf: response.threads)
+                    cursor = response.nextCursor
+                    pages += 1
+                } while cursor != nil && pages < 20
+                if cursor != nil {
+                    remainingCursor = cursor
+                }
+            }
             var threadsByID: [String: WorkerThreadSnapshot] = [:]
             for thread in threads {
                 threadsByID[thread.id] = thread
@@ -942,7 +955,7 @@ final class WorkerSessionModel: ObservableObject {
                     if $0.updatedAt != $1.updatedAt { return $0.updatedAt > $1.updatedAt }
                     return $0.threadID < $1.threadID
                 },
-                nextCursor: cursor
+                nextCursor: remainingCursor
             )
             if !archived {
                 response = response.merging(

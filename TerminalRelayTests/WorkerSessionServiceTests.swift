@@ -470,12 +470,17 @@ final class WorkerSessionServiceTests: XCTestCase {
                 ),
                 threadResult(
                     """
-                    {"threads":[{"provider":"codex","threadID":"\(threadID)","title":"Older","updatedAt":10,"archived":false,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":"page-2"}
+                    {"threads":[{"provider":"codex","threadID":"\(threadID)","title":"Older","updatedAt":10,"archived":false,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":"page-2"}
                     """
                 ),
                 threadResult(
                     """
-                    {"threads":[{"provider":"codex","threadID":"\(threadID)","title":"Newer","updatedAt":20,"archived":false,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}},{"provider":"codex","threadID":"\(otherThreadID)","title":"Other","updatedAt":15,"archived":false,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":null}
+                    {"threads":[{"provider":"codex","threadID":"\(threadID)","title":"Newer","updatedAt":20,"archived":false,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}},{"provider":"codex","threadID":"\(otherThreadID)","title":"Other","updatedAt":15,"archived":false,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":null}
+                    """
+                ),
+                threadResult(
+                    """
+                    {"threads":[],"nextCursor":null}
                     """
                 ),
                 WorkerSessionCommandResult(
@@ -511,18 +516,26 @@ final class WorkerSessionServiceTests: XCTestCase {
         XCTAssertEqual(response?.threads.first?.activeInstanceToken, instanceID)
         XCTAssertTrue(response?.threads.first?.reportedWorking == true)
         XCTAssertEqual(
-            recorder.configurations.suffix(2),
+            recorder.configurations.suffix(3),
             [
                 SSHCommandBuilder.workerThreadListConfiguration(
                     for: worker,
+                    kind: .codex,
                     repositoryName: "terminal-relay",
                     archived: false
                 ),
                 SSHCommandBuilder.workerThreadListConfiguration(
                     for: worker,
+                    kind: .codex,
                     repositoryName: "terminal-relay",
                     archived: false,
                     cursor: "page-2"
+                ),
+                SSHCommandBuilder.workerThreadListConfiguration(
+                    for: worker,
+                    kind: .claude,
+                    repositoryName: "terminal-relay",
+                    archived: false
                 )
             ]
         )
@@ -583,7 +596,12 @@ final class WorkerSessionServiceTests: XCTestCase {
                 ),
                 threadResult(
                     """
-                    {"threads":[{"provider":"codex","threadID":"\(threadID)","title":"Exact thread","updatedAt":200,"archived":false,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":null}
+                    {"threads":[{"provider":"codex","threadID":"\(threadID)","title":"Exact thread","updatedAt":200,"archived":false,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":null}
+                    """
+                ),
+                threadResult(
+                    """
+                    {"threads":[],"nextCursor":null}
                     """
                 )
             ]
@@ -593,6 +611,7 @@ final class WorkerSessionServiceTests: XCTestCase {
         }
 
         let snapshot = await service.resumeThread(
+            kind: .codex,
             repositoryName: "terminal-relay",
             threadID: threadID,
             launchDefaults: .standard,
@@ -606,6 +625,7 @@ final class WorkerSessionServiceTests: XCTestCase {
             recorder.configurations.first,
             SSHCommandBuilder.workerThreadResumeConfiguration(
                 for: worker,
+                kind: .codex,
                 repositoryName: "terminal-relay",
                 threadID: threadID,
                 launchDefaults: .standard

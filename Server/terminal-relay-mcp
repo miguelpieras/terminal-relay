@@ -13,8 +13,18 @@ INSTALLED_PATH = "/usr/local/bin/terminal-relay-mcp"
 INSTALLED_HELPER = "/usr/local/bin/terminal-relay-session"
 SESSION_MARKER = "__TERMINAL_RELAY_SESSION_V1__"
 THREAD_MARKER = "__TERMINAL_RELAY_THREADS_V1__"
+THREAD_MARKER_V2 = "__TERMINAL_RELAY_THREADS_V2__"
 MAXIMUM_MESSAGE_BYTES = 1024 * 1024
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
+PROVIDERS = ("codex", "claude")
+CLAUDE_RESUME_ARGUMENTS = (
+    "--settings",
+    '{"terminalProgressBarEnabled":true}',
+    "--mcp-config",
+    '{"mcpServers":{"terminal_relay":{"command":"/usr/local/bin/terminal-relay-mcp"}}}',
+    "--strict-mcp-config",
+    "--dangerously-skip-permissions",
+)
 
 
 def helper_path():
@@ -60,6 +70,13 @@ def require_thread_id(value):
     if canonical != value:
         raise ValueError("thread_id must be a canonical UUID")
     return canonical
+
+
+def require_provider(value, allow_all=False):
+    allowed = (*PROVIDERS, "all") if allow_all else PROVIDERS
+    if not isinstance(value, str) or value not in allowed:
+        raise ValueError(f"provider must be one of: {', '.join(allowed)}")
+    return value
 
 
 def require_name(value):
@@ -118,10 +135,11 @@ def parse_projects(output):
     return sorted(set(projects))
 
 
-def parse_thread_catalog(output, repository):
+def parse_thread_catalog(output, repository, expected_provider="codex"):
     lines = output.splitlines()
     try:
-        marker_index = lines.index(THREAD_MARKER)
+        marker = THREAD_MARKER_V2 if THREAD_MARKER_V2 in lines else THREAD_MARKER
+        marker_index = lines.index(marker)
         value = json.loads(lines[marker_index + 1])
     except (ValueError, IndexError, json.JSONDecodeError) as error:
         raise RuntimeError("The worker returned an invalid thread catalog.") from error
@@ -132,7 +150,8 @@ def parse_thread_catalog(output, repository):
     for thread in value["threads"]:
         if not isinstance(thread, dict):
             raise RuntimeError("The worker returned an invalid thread catalog.")
-        if thread.get("provider") != "codex":
+        provider = thread.get("provider")
+        if provider != expected_provider or provider not in PROVIDERS:
             raise RuntimeError("The worker returned an invalid thread provider.")
         thread_id = require_thread_id(thread.get("threadID"))
         if thread_id in seen_thread_ids:
@@ -149,22 +168,63 @@ def parse_thread_catalog(output, repository):
         if not isinstance(thread.get("archived"), bool):
             raise RuntimeError("The worker returned an invalid archive state.")
         archived = thread["archived"]
+        activity_state = thread.get("activityState", "inactive")
+        if activity_state not in (
+            "inactive",
+            "relay-active",
+            "external-active",
+            "unknown",
+        ):
+            raise RuntimeError("The worker returned an invalid activity state.")
+        active_instance = thread.get("activeInstanceToken")
+        if active_instance is not None:
+            active_instance = require_thread_id(active_instance)
+        working = thread.get("isWorking")
+        if working is not None and not isinstance(working, bool):
+            raise RuntimeError("The worker returned an invalid working state.")
+        capabilities = thread.get("capabilities")
+        if not isinstance(capabilities, dict) or set(capabilities) != {
+            "resume",
+            "rename",
+            "archive",
+            "unarchive",
+        }:
+            raise RuntimeError("The worker returned invalid thread capabilities.")
+        if not all(isinstance(value, bool) for value in capabilities.values()):
+            raise RuntimeError("The worker returned invalid thread capabilities.")
+        expected_capabilities = (
+            {
+                "resume": False,
+                "rename": False,
+                "archive": False,
+                "unarchive": False,
+            }
+            if activity_state != "inactive"
+            else {
+                "resume": not archived,
+                "rename": not archived,
+                "archive": not archived,
+                "unarchive": archived,
+            }
+        )
+        if (
+            capabilities != expected_capabilities
+            or (activity_state == "relay-active") != (active_instance is not None)
+            or (activity_state != "relay-active" and working is not None)
+        ):
+            raise RuntimeError("The worker returned inconsistent thread metadata.")
         normalized.append(
             {
-                "provider": "codex",
+                "provider": provider,
                 "repositoryName": repository,
                 "threadID": thread_id,
                 "title": title,
                 "updatedAt": updated_at,
                 "archived": archived,
-                "activeInstanceToken": None,
-                "isWorking": None,
-                "capabilities": {
-                    "resume": not archived,
-                    "rename": not archived,
-                    "archive": not archived,
-                    "unarchive": archived,
-                },
+                "activityState": activity_state,
+                "activeInstanceToken": active_instance,
+                "isWorking": working,
+                "capabilities": capabilities,
             }
         )
     next_cursor = value.get("nextCursor")
@@ -201,6 +261,14 @@ def parse_live_sessions(output, repository):
             thread_id = require_thread_id(fields[8])
         if thread_id is None:
             continue
+        updated_at = 0
+        if len(fields) >= 7:
+            try:
+                updated_at = int(fields[5])
+            except ValueError as error:
+                raise RuntimeError("The worker returned an invalid activity time.") from error
+            if updated_at < 0:
+                raise RuntimeError("The worker returned an invalid activity time.")
         title = None
         if len(fields) >= 7 and fields[6]:
             try:
@@ -218,8 +286,9 @@ def parse_live_sessions(output, repository):
                 "repositoryName": repository,
                 "threadID": thread_id,
                 "title": title,
-                "updatedAt": int(fields[5]) if len(fields) >= 7 else 0,
+                "updatedAt": updated_at,
                 "archived": False,
+                "activityState": "relay-active",
                 "activeInstanceToken": instance_id,
                 "isWorking": working,
                 "capabilities": {
@@ -235,6 +304,7 @@ def parse_live_sessions(output, repository):
 
 def list_threads(arguments):
     repository = require_repository(arguments.get("repository"))
+    requested_provider = require_provider(arguments.get("provider", "all"), allow_all=True)
     archived = arguments.get("archived", False)
     if not isinstance(archived, bool):
         raise ValueError("archived must be a boolean")
@@ -245,24 +315,58 @@ def list_threads(arguments):
         or "\n" in cursor
     ):
         raise ValueError("cursor is invalid")
-    helper_arguments = ["threads", repository, "archived" if archived else "active"]
-    if cursor:
-        helper_arguments.append(cursor)
-    catalog = parse_thread_catalog(run_helper(*helper_arguments), repository)
+    if requested_provider == "all" and cursor:
+        raise ValueError("cursor requires an explicit provider")
+    providers = PROVIDERS if requested_provider == "all" else (requested_provider,)
+    threads = []
+    next_cursors = {}
+    for provider in providers:
+        helper_arguments = [
+            "threads-v2",
+            provider,
+            repository,
+            "archived" if archived else "open",
+        ]
+        if cursor:
+            helper_arguments.append(cursor)
+        catalog = parse_thread_catalog(
+            run_helper(*helper_arguments),
+            repository,
+            provider,
+        )
+        threads.extend(catalog["threads"])
+        next_cursors[provider] = catalog["nextCursor"]
+    result = {
+        "threads": threads,
+        "nextCursor": (
+            next_cursors[requested_provider]
+            if requested_provider != "all"
+            else None
+        ),
+    }
+    if requested_provider == "all":
+        result["nextCursors"] = next_cursors
     if archived:
-        return catalog
+        result["threads"].sort(
+            key=lambda thread: (-thread["updatedAt"], thread["threadID"])
+        )
+        return result
     live = parse_live_sessions(run_helper("status"), repository)
+    if requested_provider != "all":
+        live = [
+            thread for thread in live if thread["provider"] == requested_provider
+        ]
     by_identity = {
         (thread["provider"], thread["threadID"]): thread
-        for thread in catalog["threads"]
+        for thread in result["threads"]
     }
     for thread in live:
         by_identity[(thread["provider"], thread["threadID"])] = thread
-    catalog["threads"] = sorted(
+    result["threads"] = sorted(
         by_identity.values(),
         key=lambda thread: (-thread["updatedAt"], thread["threadID"]),
     )
-    return catalog
+    return result
 
 
 def tool_result(value):
@@ -279,7 +383,8 @@ SERVER_INSTRUCTIONS = (
     "on this worker. For a broad request without a repository, such as "
     "'tell me about my open threads', call list_projects first and then call "
     "list_threads for each project. Treat open threads as unarchived threads, "
-    "including both live terminals and paused Codex threads. Do not mutate a "
+    "including live terminals plus inactive Codex and Claude conversations. "
+    "Do not mutate a "
     "thread unless the user directly asks for that change."
 )
 
@@ -300,13 +405,19 @@ TOOLS = [
         "description": (
             "List threads for one project on this worker. With archived=false, "
             "this returns the user's open threads: live terminals plus paused "
-            "Codex threads. Use archived=true only when archived history is "
-            "requested."
+            "Codex and Claude conversations. Use archived=true only when "
+            "archived history is requested. Set provider when following a "
+            "provider-specific pagination cursor."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "repository": {"type": "string"},
+                "provider": {
+                    "type": "string",
+                    "enum": ["all", "codex", "claude"],
+                    "default": "all",
+                },
                 "archived": {"type": "boolean", "default": False},
                 "cursor": {"type": "string"},
             },
@@ -328,11 +439,16 @@ TOOLS = [
     },
     {
         "name": "resume_thread",
-        "description": "Resume one dormant Codex thread in a persistent worker terminal.",
+        "description": "Resume one inactive Codex or Claude conversation in a persistent worker terminal.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "repository": {"type": "string"},
+                "provider": {
+                    "type": "string",
+                    "enum": ["codex", "claude"],
+                    "default": "codex",
+                },
                 "thread_id": {"type": "string", "format": "uuid"},
             },
             "required": ["repository", "thread_id"],
@@ -342,11 +458,16 @@ TOOLS = [
     },
     {
         "name": "rename_thread",
-        "description": "Rename one dormant Codex thread.",
+        "description": "Rename one inactive Codex or Claude conversation.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "repository": {"type": "string"},
+                "provider": {
+                    "type": "string",
+                    "enum": ["codex", "claude"],
+                    "default": "codex",
+                },
                 "thread_id": {"type": "string", "format": "uuid"},
                 "name": {"type": "string", "minLength": 1, "maxLength": 200},
             },
@@ -361,11 +482,16 @@ TOOLS = [
     },
     {
         "name": "archive_thread",
-        "description": "Archive one dormant Codex thread.",
+        "description": "Archive one inactive Codex or Claude conversation.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "repository": {"type": "string"},
+                "provider": {
+                    "type": "string",
+                    "enum": ["codex", "claude"],
+                    "default": "codex",
+                },
                 "thread_id": {"type": "string", "format": "uuid"},
             },
             "required": ["repository", "thread_id"],
@@ -379,11 +505,16 @@ TOOLS = [
     },
     {
         "name": "unarchive_thread",
-        "description": "Restore one archived Codex thread to its project.",
+        "description": "Restore one archived Codex or Claude conversation to its project.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "repository": {"type": "string"},
+                "provider": {
+                    "type": "string",
+                    "enum": ["codex", "claude"],
+                    "default": "codex",
+                },
                 "thread_id": {"type": "string", "format": "uuid"},
             },
             "required": ["repository", "thread_id"],
@@ -399,12 +530,12 @@ TOOLS = [
 
 TOOL_ARGUMENT_KEYS = {
     "list_projects": set(),
-    "list_threads": {"repository", "archived", "cursor"},
+    "list_threads": {"repository", "provider", "archived", "cursor"},
     "start_thread": {"repository"},
-    "resume_thread": {"repository", "thread_id"},
-    "rename_thread": {"repository", "thread_id", "name"},
-    "archive_thread": {"repository", "thread_id"},
-    "unarchive_thread": {"repository", "thread_id"},
+    "resume_thread": {"repository", "provider", "thread_id"},
+    "rename_thread": {"repository", "provider", "thread_id", "name"},
+    "archive_thread": {"repository", "provider", "thread_id"},
+    "unarchive_thread": {"repository", "provider", "thread_id"},
 }
 
 
@@ -423,24 +554,49 @@ def call_tool(name, arguments):
     repository = require_repository(arguments.get("repository"))
     if name == "start_thread":
         return parse_thread_catalog(run_helper("thread-create", repository), repository)
+    provider = require_provider(arguments.get("provider", "codex"))
     thread_id = require_thread_id(arguments.get("thread_id"))
     if name == "resume_thread":
-        output = run_helper("thread-resume", repository, thread_id)
+        helper_arguments = [
+            "thread-resume-v2",
+            provider,
+            repository,
+            thread_id,
+        ]
+        if provider == "claude":
+            helper_arguments.extend(CLAUDE_RESUME_ARGUMENTS)
+        output = run_helper(*helper_arguments)
         live = parse_live_sessions(output, repository)
-        if len(live) != 1 or live[0]["threadID"] != thread_id:
+        if (
+            len(live) != 1
+            or live[0]["provider"] != provider
+            or live[0]["threadID"] != thread_id
+        ):
             raise RuntimeError("The worker did not resume the requested thread.")
         return {"threads": live, "nextCursor": None}
     if name == "rename_thread":
         name_value = require_name(arguments.get("name"))
         return parse_thread_catalog(
-            run_helper("thread-rename", repository, thread_id, name_value),
+            run_helper(
+                "thread-rename-v2",
+                provider,
+                repository,
+                thread_id,
+                name_value,
+            ),
             repository,
+            provider,
         )
     if name in ("archive_thread", "unarchive_thread"):
-        command = "thread-archive" if name == "archive_thread" else "thread-unarchive"
+        command = (
+            "thread-archive-v2"
+            if name == "archive_thread"
+            else "thread-unarchive-v2"
+        )
         return parse_thread_catalog(
-            run_helper(command, repository, thread_id),
+            run_helper(command, provider, repository, thread_id),
             repository,
+            provider,
         )
     raise ValueError("unknown tool")
 

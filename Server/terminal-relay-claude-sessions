@@ -1,0 +1,496 @@
+#!/usr/bin/python3
+"""Bounded Claude Code session metadata adapter for Terminal Relay."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+from typing import Any
+
+
+INSTALLED_PATH = "/usr/local/bin/terminal-relay-claude-sessions"
+DEFAULT_CLAUDE_PATH = "/usr/bin/claude"
+MAXIMUM_OUTPUT_BYTES = 1024 * 1024
+PAGE_SIZE = 100
+MAXIMUM_OFFSET = 2000
+MAXIMUM_TITLE_BYTES = 200
+ARCHIVE_MARKER_CONTENT = "version|1\n"
+GIT_PATH = "/usr/bin/git"
+
+
+class AdapterError(Exception):
+    def __init__(self, message: str, exit_code: int = 70):
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+def test_mode_enabled() -> bool:
+    current_path = os.path.realpath(__file__)
+    test_environment = any(
+        key.startswith("TERMINAL_RELAY_CLAUDE_SESSIONS_TEST_")
+        for key in os.environ
+    )
+    if current_path == INSTALLED_PATH:
+        if test_environment:
+            raise AdapterError("The installed Claude session adapter refuses test overrides.", 78)
+        return False
+    if os.environ.get("TERMINAL_RELAY_CLAUDE_SESSIONS_TEST_MODE") == "1":
+        return True
+    if test_environment:
+        raise AdapterError(
+            "Claude session adapter test overrides require explicit test mode.",
+            78,
+        )
+    return False
+
+
+def claude_path(test_mode: bool) -> str:
+    value = DEFAULT_CLAUDE_PATH
+    if test_mode:
+        value = os.environ.get(
+            "TERMINAL_RELAY_CLAUDE_SESSIONS_TEST_CLAUDE_PATH",
+            value,
+        )
+    if not os.path.isabs(value) or "\n" in value:
+        raise AdapterError("The Claude session activity interface is unavailable.", 69)
+    return value
+
+
+def canonical_session_id(value: Any) -> str:
+    if not isinstance(value, str):
+        raise AdapterError("The Claude session metadata is invalid.")
+    try:
+        canonical = str(uuid.UUID(value))
+    except ValueError as error:
+        raise AdapterError("The Claude session metadata is invalid.") from error
+    if canonical != value:
+        raise AdapterError("The Claude session metadata is invalid.")
+    return canonical
+
+
+def canonical_directory(value: str, label: str, must_exist: bool = True) -> str:
+    if not os.path.isabs(value) or value == "/" or "\n" in value:
+        raise AdapterError(f"The {label} is invalid.", 64)
+    path = Path(value)
+    if must_exist and (not path.is_dir() or path.is_symlink()):
+        raise AdapterError(f"The {label} is unavailable.", 66)
+    resolved = os.path.realpath(value)
+    if resolved != value:
+        raise AdapterError(f"The {label} is invalid.", 64)
+    return value
+
+
+def parse_cursor(value: str | None) -> int:
+    if value is None or value == "":
+        return 0
+    if not re.fullmatch(r"(0|[1-9][0-9]{0,3})", value):
+        raise AdapterError("The Claude session cursor is invalid.", 64)
+    offset = int(value)
+    if offset > MAXIMUM_OFFSET:
+        raise AdapterError("The Claude session cursor is invalid.", 64)
+    return offset
+
+
+def bounded_title(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = re.sub(
+        r"\s+",
+        " ",
+        "".join(character if character.isprintable() else " " for character in value),
+    ).strip()
+    if not normalized:
+        return None
+    encoded = normalized.encode("utf-8")[:MAXIMUM_TITLE_BYTES]
+    return encoded.decode("utf-8", errors="ignore") or None
+
+
+def archive_marker_path(archive_directory: str, session_id: str) -> Path:
+    return Path(archive_directory) / canonical_session_id(session_id)
+
+
+def session_is_archived(archive_directory: str, session_id: str) -> bool:
+    marker = archive_marker_path(archive_directory, session_id)
+    if not os.path.lexists(marker):
+        return False
+    if marker.is_symlink() or not marker.is_file():
+        raise AdapterError("The Claude archive state is invalid.")
+    try:
+        content = marker.read_text(encoding="utf-8")
+    except OSError as error:
+        raise AdapterError("The Claude archive state is unavailable.") from error
+    if content != ARCHIVE_MARKER_CONTENT:
+        raise AdapterError("The Claude archive state is invalid.")
+    return True
+
+
+def process_matches_claude(pid: int, test_mode: bool) -> bool:
+    if test_mode:
+        return pid > 0
+    if pid <= 0:
+        return False
+    process_directory = Path("/proc") / str(pid)
+    try:
+        status = (process_directory / "status").read_text(encoding="utf-8")
+        uid_line = next(line for line in status.splitlines() if line.startswith("Uid:"))
+        uid_fields = uid_line.split()
+        if len(uid_fields) < 2 or int(uid_fields[1]) != os.getuid():
+            return False
+        command = (process_directory / "cmdline").read_bytes().split(b"\0", 1)[0]
+        command_name = os.path.basename(command.decode("utf-8", errors="ignore"))
+        return command_name in {"claude", "claude-code"}
+    except (OSError, StopIteration, ValueError):
+        return False
+
+
+def provider_active_session_ids(project_directory: str, test_mode: bool) -> set[str] | None:
+    executable = claude_path(test_mode)
+    environment = {
+        "HOME": os.environ.get("HOME", ""),
+        "LOGNAME": os.environ.get("LOGNAME", ""),
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "USER": os.environ.get("USER", ""),
+    }
+    if "CLAUDE_CONFIG_DIR" in os.environ:
+        environment["CLAUDE_CONFIG_DIR"] = os.environ["CLAUDE_CONFIG_DIR"]
+    try:
+        result = subprocess.run(
+            [executable, "agents", "--json", "--cwd", project_directory],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+            check=False,
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0 or len(result.stdout) > MAXIMUM_OUTPUT_BYTES:
+        return None
+    try:
+        value = json.loads(result.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, list):
+        return None
+    active_ids: set[str] = set()
+    for record in value:
+        if not isinstance(record, dict):
+            return None
+        session_id = record.get("sessionId")
+        pid = record.get("pid")
+        if not isinstance(session_id, str) or not isinstance(pid, int):
+            return None
+        try:
+            canonical = canonical_session_id(session_id)
+        except AdapterError:
+            return None
+        if process_matches_claude(pid, test_mode):
+            active_ids.add(canonical)
+    return active_ids
+
+
+def load_sdk():
+    try:
+        from claude_agent_sdk import get_session_info, list_sessions, rename_session
+    except (ImportError, OSError) as error:
+        raise AdapterError("Claude session history is unavailable.", 69) from error
+    return get_session_info, list_sessions, rename_session
+
+
+def version_command(arguments: list[str]) -> None:
+    if arguments:
+        raise AdapterError("Invalid Claude session version request.", 64)
+    try:
+        from claude_agent_sdk import __version__
+    except (ImportError, OSError) as error:
+        raise AdapterError("Claude session history is unavailable.", 69) from error
+    if not isinstance(__version__, str) or not re.fullmatch(
+        r"[0-9]+\.[0-9]+\.[0-9]+",
+        __version__,
+    ):
+        raise AdapterError("Claude session history is unavailable.", 69)
+    print(__version__)
+
+
+def git_common_directory(directory: str) -> str | None:
+    try:
+        result = subprocess.run(
+            [GIT_PATH, "-C", directory, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=4,
+            check=False,
+            text=True,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = result.stdout.strip()
+    if result.returncode != 0 or not value or "\n" in value or not os.path.isabs(value):
+        return None
+    resolved = os.path.realpath(value)
+    if resolved != value:
+        return None
+    return value
+
+
+def session_directory_is_in_scope(project_directory: str, session_directory: str) -> bool:
+    try:
+        session_directory = canonical_directory(session_directory, "session directory")
+    except AdapterError:
+        return False
+    if session_directory == project_directory or session_directory.startswith(
+        project_directory + os.sep
+    ):
+        return True
+    project_git_directory = git_common_directory(project_directory)
+    session_git_directory = git_common_directory(session_directory)
+    return (
+        project_git_directory is not None
+        and session_git_directory is not None
+        and project_git_directory == session_git_directory
+    )
+
+
+def validate_session_info(
+    info: Any,
+    project_directory: str,
+) -> tuple[str, str | None, int]:
+    if info is None:
+        raise AdapterError("The requested Claude session was not found.", 66)
+    session_id = canonical_session_id(getattr(info, "session_id", None))
+    last_modified = getattr(info, "last_modified", None)
+    if not isinstance(last_modified, int) or last_modified < 0:
+        raise AdapterError("The Claude session metadata is invalid.")
+    cwd = getattr(info, "cwd", None)
+    if (
+        not isinstance(cwd, str)
+        or not os.path.isabs(cwd)
+        or "\n" in cwd
+        or not session_directory_is_in_scope(project_directory, cwd)
+    ):
+        raise AdapterError("The Claude session metadata is invalid.")
+    title = bounded_title(
+        getattr(info, "custom_title", None) or getattr(info, "summary", None)
+    )
+    return session_id, title, last_modified // 1000
+
+
+def row_for_session(
+    info: Any,
+    project_directory: str,
+    archive_directory: str,
+    active_ids: set[str] | None,
+) -> dict[str, Any]:
+    session_id, title, updated_at = validate_session_info(info, project_directory)
+    archived = session_is_archived(archive_directory, session_id)
+    if active_ids is None:
+        activity = "unknown"
+    elif session_id in active_ids:
+        activity = "external-active"
+    else:
+        activity = "inactive"
+    mutable = activity == "inactive"
+    return {
+        "provider": "claude",
+        "threadID": session_id,
+        "title": title,
+        "updatedAt": updated_at,
+        "archived": archived,
+        "activityState": activity,
+        "activeInstanceToken": None,
+        "isWorking": None,
+        "capabilities": {
+            "resume": mutable and not archived,
+            "rename": mutable and not archived,
+            "archive": mutable and not archived,
+            "unarchive": mutable and archived,
+        },
+    }
+
+
+def print_catalog(rows: list[dict[str, Any]], next_cursor: str | None = None) -> None:
+    value = {"threads": rows, "nextCursor": next_cursor}
+    encoded = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    if len(encoded.encode("utf-8")) > MAXIMUM_OUTPUT_BYTES:
+        raise AdapterError("The Claude session catalog is too large.")
+    print(encoded)
+
+
+def list_command(arguments: list[str], test_mode: bool) -> None:
+    if len(arguments) not in (3, 4):
+        raise AdapterError("Invalid Claude session list request.", 64)
+    project_directory = canonical_directory(arguments[0], "project directory")
+    archive_directory = canonical_directory(
+        arguments[1],
+        "archive directory",
+        must_exist=False,
+    )
+    archive_filter = arguments[2]
+    if archive_filter not in {"open", "archived"}:
+        raise AdapterError("Invalid Claude archive filter.", 64)
+    offset = parse_cursor(arguments[3] if len(arguments) == 4 else None)
+    _, list_sessions, _ = load_sdk()
+    try:
+        sessions = list_sessions(
+            directory=project_directory,
+            limit=PAGE_SIZE + 1,
+            offset=offset,
+            include_worktrees=True,
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        raise AdapterError("Claude session history is unavailable.") from error
+    if not isinstance(sessions, list):
+        raise AdapterError("The Claude session metadata is invalid.")
+    active_ids = provider_active_session_ids(project_directory, test_mode)
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for info in sessions[:PAGE_SIZE]:
+        try:
+            row = row_for_session(
+                info,
+                project_directory,
+                archive_directory,
+                active_ids,
+            )
+        except AdapterError:
+            continue
+        identity = row["threadID"]
+        if identity in seen:
+            raise AdapterError("The Claude session metadata is invalid.")
+        seen.add(identity)
+        if row["archived"] == (archive_filter == "archived"):
+            rows.append(row)
+    next_offset = offset + PAGE_SIZE
+    next_cursor = (
+        str(next_offset)
+        if len(sessions) > PAGE_SIZE and next_offset <= MAXIMUM_OFFSET
+        else None
+    )
+    print_catalog(rows, next_cursor)
+
+
+def read_info(project_directory: str, session_id: str):
+    get_session_info, _, _ = load_sdk()
+    try:
+        info = get_session_info(session_id, directory=project_directory)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise AdapterError("Claude session history is unavailable.") from error
+    validate_session_info(info, project_directory)
+    return info
+
+
+def read_command(arguments: list[str], test_mode: bool) -> None:
+    if len(arguments) != 3:
+        raise AdapterError("Invalid Claude session read request.", 64)
+    project_directory = canonical_directory(arguments[0], "project directory")
+    archive_directory = canonical_directory(
+        arguments[1],
+        "archive directory",
+        must_exist=False,
+    )
+    session_id = canonical_session_id(arguments[2])
+    info = read_info(project_directory, session_id)
+    active_ids = provider_active_session_ids(project_directory, test_mode)
+    print_catalog(
+        [row_for_session(info, project_directory, archive_directory, active_ids)]
+    )
+
+
+def title_command(arguments: list[str]) -> None:
+    if len(arguments) != 2:
+        raise AdapterError("Invalid Claude session title request.", 64)
+    project_directory = canonical_directory(arguments[0], "project directory")
+    session_id = canonical_session_id(arguments[1])
+    info = read_info(project_directory, session_id)
+    _, title, _ = validate_session_info(info, project_directory)
+    print(title or "")
+
+
+def activity_command(arguments: list[str], test_mode: bool) -> None:
+    if len(arguments) != 2:
+        raise AdapterError("Invalid Claude session activity request.", 64)
+    project_directory = canonical_directory(arguments[0], "project directory")
+    session_id = canonical_session_id(arguments[1])
+    read_info(project_directory, session_id)
+    active_ids = provider_active_session_ids(project_directory, test_mode)
+    if active_ids is None:
+        raise AdapterError("Claude session activity is unavailable.", 70)
+    if session_id in active_ids:
+        raise AdapterError("The requested Claude session is already active.", 75)
+
+
+def rename_command(arguments: list[str], test_mode: bool) -> None:
+    if len(arguments) != 4:
+        raise AdapterError("Invalid Claude session rename request.", 64)
+    project_directory = canonical_directory(arguments[0], "project directory")
+    archive_directory = canonical_directory(
+        arguments[1],
+        "archive directory",
+        must_exist=False,
+    )
+    session_id = canonical_session_id(arguments[2])
+    title = bounded_title(arguments[3])
+    if title is None or title != arguments[3].strip():
+        raise AdapterError("The Claude session title is invalid.", 64)
+    info = read_info(project_directory, session_id)
+    if session_is_archived(archive_directory, session_id):
+        raise AdapterError("Archived Claude sessions must be restored before renaming.", 75)
+    active_ids = provider_active_session_ids(project_directory, test_mode)
+    if active_ids is None:
+        raise AdapterError("Claude session activity is unavailable.", 70)
+    if session_id in active_ids:
+        raise AdapterError("Active Claude sessions cannot be renamed.", 75)
+    _, _, rename_session = load_sdk()
+    try:
+        rename_session(session_id, title, directory=project_directory)
+    except FileNotFoundError as error:
+        raise AdapterError("The requested Claude session was not found.", 66) from error
+    except (OSError, RuntimeError, ValueError) as error:
+        raise AdapterError("The Claude session could not be renamed.") from error
+    updated = read_info(project_directory, session_id)
+    _, updated_title, _ = validate_session_info(updated, project_directory)
+    if updated_title != title:
+        raise AdapterError("The Claude session rename could not be verified.")
+    print_catalog(
+        [row_for_session(updated, project_directory, archive_directory, active_ids)]
+    )
+
+
+def main() -> None:
+    test_mode = test_mode_enabled()
+    if len(sys.argv) < 2:
+        raise AdapterError("A Claude session operation is required.", 64)
+    operation, *arguments = sys.argv[1:]
+    if operation == "version":
+        version_command(arguments)
+    elif operation == "list":
+        list_command(arguments, test_mode)
+    elif operation == "read":
+        read_command(arguments, test_mode)
+    elif operation == "title":
+        title_command(arguments)
+    elif operation == "activity":
+        activity_command(arguments, test_mode)
+    elif operation == "rename":
+        rename_command(arguments, test_mode)
+    else:
+        raise AdapterError("The Claude session operation is unsupported.", 64)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except AdapterError as error:
+        print(str(error), file=sys.stderr)
+        raise SystemExit(error.exit_code)
+    except Exception:
+        print("Claude session history is unavailable.", file=sys.stderr)
+        raise SystemExit(70)

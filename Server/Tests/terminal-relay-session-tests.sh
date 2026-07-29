@@ -25,6 +25,8 @@ agent_update_status_file="$test_root/agent-update-status"
 stub_agent="$test_root/stub-agent"
 stub_codex="$test_root/stub-codex"
 stub_codex_app_server="$test_root/stub-codex-app-server"
+stub_claude_sessions="$test_root/stub-claude-sessions"
+claude_sessions_state="$test_root/claude-sessions.json"
 flock_adapter="$test_root/flock"
 signal_adapter="$test_root/signal"
 tmux_socket="terminal-relay-test-$(/usr/bin/id -u)-$$-$RANDOM"
@@ -763,12 +765,117 @@ PYTHON_CODEX_APP_SERVER
     printf 'exec %q "$@"\n' "$stub_agent"
 } > "$stub_codex"
 
+{
+    printf '#!%s\n' "$python_path"
+    cat <<'PYTHON_CLAUDE_SESSIONS'
+import json
+import os
+import pathlib
+import sys
+import uuid
+
+state_path = pathlib.Path(os.environ["TERMINAL_RELAY_TEST_CLAUDE_SESSIONS_STATE"])
+
+
+def load():
+    with state_path.open(encoding="utf-8") as state_file:
+        return json.load(state_file)
+
+
+def save(value):
+    temporary = state_path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, separators=(",", ":")), encoding="utf-8")
+    temporary.replace(state_path)
+
+
+def canonical(value):
+    result = str(uuid.UUID(value))
+    if result != value:
+        raise ValueError
+    return result
+
+
+def row(session_id, record, archive_directory):
+    marker = pathlib.Path(archive_directory) / session_id
+    archived = marker.is_file() and not marker.is_symlink()
+    activity = record.get("activity", "inactive")
+    mutable = activity == "inactive"
+    return {
+        "provider": "claude",
+        "threadID": session_id,
+        "title": record.get("title"),
+        "updatedAt": record.get("updatedAt", 1),
+        "archived": archived,
+        "activityState": activity,
+        "activeInstanceToken": None,
+        "isWorking": None,
+        "capabilities": {
+            "resume": mutable and not archived,
+            "rename": mutable and not archived,
+            "archive": mutable and not archived,
+            "unarchive": mutable and archived,
+        },
+    }
+
+
+operation, *arguments = sys.argv[1:]
+state = load()
+if operation == "list":
+    _project, archive_directory, archive_filter, *cursor = arguments
+    offset = int(cursor[0]) if cursor else 0
+    rows = [
+        row(session_id, record, archive_directory)
+        for session_id, record in state.items()
+    ]
+    rows.sort(key=lambda value: (-value["updatedAt"], value["threadID"]))
+    rows = [
+        value
+        for value in rows
+        if value["archived"] == (archive_filter == "archived")
+    ]
+    page = rows[offset : offset + 100]
+    next_cursor = str(offset + 100) if len(rows) > offset + 100 else None
+    print(json.dumps({"threads": page, "nextCursor": next_cursor}, separators=(",", ":")))
+elif operation in {"read", "title", "activity", "rename"}:
+    project = arguments[0]
+    del project
+    if operation in {"read", "rename"}:
+        archive_directory = arguments[1]
+        session_id = canonical(arguments[2])
+    else:
+        session_id = canonical(arguments[1])
+        archive_directory = ""
+    record = state.get(session_id)
+    if not isinstance(record, dict):
+        print("The requested Claude session was not found.", file=sys.stderr)
+        raise SystemExit(66)
+    if operation == "title":
+        print(record.get("title") or "")
+    elif operation == "activity":
+        activity = record.get("activity", "inactive")
+        if activity == "external-active":
+            raise SystemExit(75)
+        if activity != "inactive":
+            raise SystemExit(70)
+    elif operation == "rename":
+        record["title"] = arguments[3]
+        save(state)
+        print(json.dumps({"threads": [row(session_id, record, archive_directory)], "nextCursor": None}, separators=(",", ":")))
+    else:
+        print(json.dumps({"threads": [row(session_id, record, archive_directory)], "nextCursor": None}, separators=(",", ":")))
+else:
+    raise SystemExit(64)
+PYTHON_CLAUDE_SESSIONS
+} > "$stub_claude_sessions"
+printf '{}\n' > "$claude_sessions_state"
+
 /bin/chmod 700 \
     "$flock_adapter" \
     "$signal_adapter" \
     "$stub_agent" \
     "$stub_codex" \
-    "$stub_codex_app_server"
+    "$stub_codex_app_server" \
+    "$stub_claude_sessions"
 
 echo "1/18 test overrides require explicit non-installed test mode; projects are sorted"
 set +e
@@ -785,6 +892,9 @@ export TERMINAL_RELAY_TEST_WORKSPACE_ROOT="$workspace_root"
 export TERMINAL_RELAY_TEST_RUNTIME_ROOT="$runtime_root"
 export TERMINAL_RELAY_TEST_CODEX_PATH="$stub_agent"
 export TERMINAL_RELAY_TEST_CLAUDE_PATH="$stub_agent"
+export TERMINAL_RELAY_TEST_CLAUDE_SESSIONS_PYTHON_PATH="$python_path"
+export TERMINAL_RELAY_TEST_CLAUDE_SESSIONS_ADAPTER_PATH="$stub_claude_sessions"
+export TERMINAL_RELAY_TEST_CLAUDE_SESSIONS_STATE="$claude_sessions_state"
 export TERMINAL_RELAY_TEST_FLOCK_PATH="$flock_adapter"
 export TERMINAL_RELAY_TEST_AGENT_LOG="$agent_log"
 export TERMINAL_RELAY_TEST_SIGNAL_PATH="$signal_adapter"
@@ -1143,32 +1253,57 @@ printf '%s\n' '33333333-3333-4333-8333-333333333333' > "$boot_id_file"
 assert_equal "8" "$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")" "stopped Codex restore count"
 
 echo "15/18 Claude resumes the UUID-bound provider conversation after reboot"
-claude_reboot_output="$(/bin/bash "$helper" start claude beta --reboot-claude)"
+claude_reboot_output="$(/bin/bash "$helper" start claude beta \
+    --model fable \
+    --effort max \
+    --settings worker-settings.json \
+    --reboot-claude)"
 claude_reboot_instance="$(printf '%s\n' "$claude_reboot_output" \
     | /usr/bin/awk -F'|' '$1 == "session" { print $5; exit }')"
+claude_provider_thread_id="$(printf '%s\n' "$claude_reboot_output" \
+    | /usr/bin/awk -F'|' '$1 == "session" { print $9; exit }')"
+[[ "$claude_reboot_instance" != "$claude_provider_thread_id" ]] \
+    || fail "Claude relay and provider identifiers were not separated"
 wait_for_log_lines 9
 claude_initial_log="$(/usr/bin/sed -n '9p' "$agent_log")"
 assert_contains "$claude_initial_log" \
-    "|--session-id|$claude_reboot_instance|--reboot-claude" "Claude initial session id"
-claude_history_directory="$test_home/.claude/projects/test-project"
-claude_history_file="$claude_history_directory/$claude_reboot_instance.jsonl"
-mkdir -p "$claude_history_directory"
-printf '%s\n' \
-    '{"type":"user","message":{"content":"This is the raw user message"}}' \
-    '{"type":"ai-title","aiTitle":"Generated Claude title"}' \
-    > "$claude_history_file"
+    "|--session-id|$claude_provider_thread_id|--model|fable|--effort|max|--settings|worker-settings.json|--reboot-claude" \
+    "Claude initial provider session id"
+"$python_path" - "$claude_sessions_state" "$claude_provider_thread_id" <<'PYTHON_CLAUDE_TITLE'
+import json
+import sys
+
+path, session_id = sys.argv[1:]
+with open(path, encoding="utf-8") as state_file:
+    state = json.load(state_file)
+state[session_id] = {
+    "title": "Generated Claude title",
+    "updatedAt": 200,
+    "activity": "inactive",
+}
+with open(path, "w", encoding="utf-8") as state_file:
+    json.dump(state, state_file, separators=(",", ":"))
+PYTHON_CLAUDE_TITLE
 claude_generated_title_status="$(wait_for_session claude beta 0)"
 assert_equal \
     "$(encode_title "Generated Claude title")" \
     "$(title_hex_from_line "$claude_generated_title_status")" \
     "Claude generated title"
 assert_equal \
-    "$claude_reboot_instance" \
+    "$claude_provider_thread_id" \
     "$(thread_id_from_line "$claude_generated_title_status")" \
     "Claude thread id"
-printf '%s\n' \
-    '{"type":"custom-title","customTitle":"Renamed Claude title"}' \
-    >> "$claude_history_file"
+"$python_path" - "$claude_sessions_state" "$claude_provider_thread_id" <<'PYTHON_CLAUDE_RENAME'
+import json
+import sys
+
+path, session_id = sys.argv[1:]
+with open(path, encoding="utf-8") as state_file:
+    state = json.load(state_file)
+state[session_id]["title"] = "Renamed Claude title"
+with open(path, "w", encoding="utf-8") as state_file:
+    json.dump(state, state_file, separators=(",", ":"))
+PYTHON_CLAUDE_RENAME
 claude_custom_title_status="$(wait_for_session claude beta 0)"
 assert_equal \
     "$(encode_title "Renamed Claude title")" \
@@ -1183,27 +1318,127 @@ assert_equal "$claude_reboot_instance" "$(instance_from_line "$restored_claude_s
 wait_for_log_lines 10
 claude_resume_log="$(/usr/bin/sed -n '10p' "$agent_log")"
 assert_contains "$claude_resume_log" \
-    "|--resume|$claude_reboot_instance|--reboot-claude" "Claude resume arguments"
+    "|--resume|$claude_provider_thread_id|--settings|worker-settings.json|--reboot-claude" \
+    "Claude exact resume arguments"
+[[ "$claude_resume_log" != *"|--model|"* \
+    && "$claude_resume_log" != *"|--effort|"* ]] \
+    || fail "Claude resume overrode provider-restored model state"
 /bin/bash "$helper" stop claude beta "$claude_reboot_instance"
 wait_for_no_session claude
 printf '%s\n' '55555555-5555-4555-8555-555555555555' > "$boot_id_file"
 /bin/bash "$helper" restore
 assert_equal "10" "$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")" "stopped Claude restore count"
 
+claude_rename_output="$(/bin/bash "$helper" \
+    thread-rename-v2 claude beta "$claude_provider_thread_id" "Managed Claude title")"
+assert_equal "__TERMINAL_RELAY_THREADS_V2__" \
+    "$(printf '%s\n' "$claude_rename_output" | /usr/bin/sed -n '1p')" \
+    "Claude V2 rename marker"
+assert_contains "$claude_rename_output" '"title":"Managed Claude title"' \
+    "Claude V2 rename result"
+claude_archive_output="$(/bin/bash "$helper" \
+    thread-archive-v2 claude beta "$claude_provider_thread_id")"
+assert_contains "$claude_archive_output" '"archived":true' "Claude archive result"
+claude_archive_marker="$runtime_root/claude-archives/beta/$claude_provider_thread_id"
+assert_equal "version|1" "$(< "$claude_archive_marker")" "Claude archive marker"
+assert_equal "600" "$(path_mode "$claude_archive_marker")" "Claude archive marker mode"
+printf '%s\n' '55666666-6666-4666-8666-666666666666' > "$boot_id_file"
+/bin/bash "$helper" restore
+claude_archived_catalog="$(/bin/bash "$helper" threads-v2 claude beta archived)"
+assert_contains "$claude_archived_catalog" "\"threadID\":\"$claude_provider_thread_id\"" \
+    "Claude archive persistence"
+/bin/bash "$helper" \
+    thread-unarchive-v2 claude beta "$claude_provider_thread_id" >/dev/null
+[[ ! -e "$claude_archive_marker" ]] || fail "Claude unarchive retained its marker"
+
+external_claude_id="eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+unknown_claude_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+"$python_path" - \
+    "$claude_sessions_state" "$external_claude_id" "$unknown_claude_id" <<'PYTHON_CLAUDE_ACTIVITY'
+import json
+import sys
+
+path, external_id, unknown_id = sys.argv[1:]
+with open(path, encoding="utf-8") as state_file:
+    state = json.load(state_file)
+state[external_id] = {
+    "title": "External Claude session",
+    "updatedAt": 150,
+    "activity": "external-active",
+}
+state[unknown_id] = {
+    "title": "Unknown Claude session",
+    "updatedAt": 140,
+    "activity": "unknown",
+}
+with open(path, "w", encoding="utf-8") as state_file:
+    json.dump(state, state_file, separators=(",", ":"))
+PYTHON_CLAUDE_ACTIVITY
+claude_open_catalog="$(/bin/bash "$helper" threads-v2 claude beta open)"
+printf '%s\n' "$claude_open_catalog" | "$python_path" -c '
+import json
+import sys
+
+lines = sys.stdin.read().splitlines()
+assert lines[0] == "__TERMINAL_RELAY_THREADS_V2__"
+rows = {row["threadID"]: row for row in json.loads(lines[1])["threads"]}
+assert rows[sys.argv[1]]["activityState"] == "external-active"
+assert rows[sys.argv[1]]["capabilities"]["resume"] is False
+assert rows[sys.argv[2]]["activityState"] == "unknown"
+assert rows[sys.argv[2]]["capabilities"]["archive"] is False
+' "$external_claude_id" "$unknown_claude_id"
+
+set +e
+/bin/bash "$helper" thread-resume-v2 claude beta "$claude_provider_thread_id" \
+    --model opus --effort high --settings worker-settings.json \
+    > "$test_root/claude-resume-one.out" 2>&1 &
+claude_resume_one_pid=$!
+/bin/bash "$helper" thread-resume-v2 claude beta "$claude_provider_thread_id" \
+    --model opus --effort high --settings worker-settings.json \
+    > "$test_root/claude-resume-two.out" 2>&1 &
+claude_resume_two_pid=$!
+wait "$claude_resume_one_pid"
+claude_resume_one_status=$?
+wait "$claude_resume_two_pid"
+claude_resume_two_status=$?
+set -e
+if [[ "$claude_resume_one_status" == "0" && "$claude_resume_two_status" == "75" ]]; then
+    claude_concurrent_output="$test_root/claude-resume-one.out"
+elif [[ "$claude_resume_one_status" == "75" && "$claude_resume_two_status" == "0" ]]; then
+    claude_concurrent_output="$test_root/claude-resume-two.out"
+else
+    fail "concurrent Claude resume returned $claude_resume_one_status and $claude_resume_two_status"
+fi
+claude_concurrent_instance="$(/usr/bin/awk -F'|' \
+    '$1 == "session" { print $5; exit }' "$claude_concurrent_output")"
+[[ -n "$claude_concurrent_instance" \
+    && "$claude_concurrent_instance" != "$claude_provider_thread_id" ]] \
+    || fail "concurrent Claude resume did not return a distinct relay token"
+wait_for_log_lines 11
+claude_v2_resume_log="$(/usr/bin/sed -n '11p' "$agent_log")"
+assert_contains "$claude_v2_resume_log" \
+    "|--resume|$claude_provider_thread_id|--settings|worker-settings.json" \
+    "Claude V2 exact resume"
+[[ "$claude_v2_resume_log" != *"|--model|"* \
+    && "$claude_v2_resume_log" != *"|--effort|"* ]] \
+    || fail "Claude V2 resume overrode provider-restored model state"
+/bin/bash "$helper" stop claude beta "$claude_concurrent_instance"
+wait_for_no_session claude
+
 echo "16/18 a same-boot death is not resurrected now or on a later reboot"
 same_boot_output="$(/bin/bash "$helper" start codex zeta --same-boot-death)"
 same_boot_instance="$(printf '%s\n' "$same_boot_output" \
     | /usr/bin/awk -F'|' '$1 == "session" { print $5; exit }')"
 [[ -n "$same_boot_instance" ]] || fail "same-boot launch did not return an instance"
-wait_for_log_lines 11
+wait_for_log_lines 12
 "$tmux_path" -f /dev/null -L "$tmux_socket" kill-server
 wait_for_agent_lock_free "$same_boot_instance"
 /bin/bash "$helper" restore
-assert_equal "11" "$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")" "same-boot restore count"
+assert_equal "12" "$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")" "same-boot restore count"
 assert_equal "__TERMINAL_RELAY_SESSION_V1__" "$(session_status)" "same-boot dead status"
 printf '%s\n' '66666666-6666-4666-8666-666666666666' > "$boot_id_file"
 /bin/bash "$helper" restore
-assert_equal "11" "$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")" "later restore after same-boot cleanup"
+assert_equal "12" "$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")" "later restore after same-boot cleanup"
 
 echo "17/18 corrupt persistent state fails closed without launching an agent"
 corrupt_instance="99999999-9999-4999-8999-999999999999"
@@ -1216,7 +1451,7 @@ corrupt_status=$?
 set -e
 assert_equal "70" "$corrupt_status" "corrupt restore status"
 assert_contains "$corrupt_output" "restart intent for" "corrupt restore diagnostic"
-assert_equal "11" "$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")" "corrupt restore launch count"
+assert_equal "12" "$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")" "corrupt restore launch count"
 /bin/rm -f -- "$runtime_root/$corrupt_instance.intent"
 
 echo "18/18 shared Codex launches leave MCP configuration on the app server"
@@ -1244,8 +1479,8 @@ TERMINAL_RELAY_TEST_CODEX_SHARED_ACCOUNT=1 \
     start_client shared-codex "$workspace_root/alpha" \
         __run-agent codex alpha "$shared_instance" initial --exit-cleanly
 wait_for_harness_exit shared-codex
-wait_for_log_lines 12
-shared_codex_log="$(/usr/bin/sed -n '12p' "$agent_log")"
+wait_for_log_lines 13
+shared_codex_log="$(/usr/bin/sed -n '13p' "$agent_log")"
 assert_contains "$shared_codex_log" \
     "--remote|unix://$shared_codex_socket" "shared Codex remote arguments"
 if [[ "$shared_codex_log" == *"mcp_servers.test_server"* ]]; then

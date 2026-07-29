@@ -3,6 +3,7 @@ set -euo pipefail
 
 readonly protocol_marker="__TERMINAL_RELAY_SESSION_V1__"
 readonly thread_protocol_marker="__TERMINAL_RELAY_THREADS_V1__"
+readonly thread_protocol_marker_v2="__TERMINAL_RELAY_THREADS_V2__"
 readonly agent_update_protocol_marker="__TERMINAL_RELAY_AGENT_UPDATE_V1__"
 readonly installed_helper_path="/usr/local/bin/terminal-relay-session"
 readonly default_agent_update_status_path="/var/lib/terminal-relay/agent-update-status"
@@ -11,6 +12,8 @@ readonly default_tmux_socket="terminal-relay"
 readonly default_workspace_root="/workspace"
 readonly default_codex_path="/usr/bin/codex"
 readonly default_claude_path="/usr/bin/claude"
+readonly default_claude_sessions_python_path="/opt/terminal-relay/claude-session-sdk/current/bin/python3"
+readonly default_claude_sessions_adapter_path="/usr/local/bin/terminal-relay-claude-sessions"
 readonly default_flock_path="/usr/bin/flock"
 readonly default_python_path="/usr/bin/python3"
 readonly default_getent_path="/usr/bin/getent"
@@ -71,6 +74,8 @@ if [[ $test_mode -eq 1 ]]; then
     runtime_directory="${TERMINAL_RELAY_TEST_RUNTIME_ROOT:-/run/user/$user_id/terminal-relay}"
     codex_path="${TERMINAL_RELAY_TEST_CODEX_PATH:-$default_codex_path}"
     claude_path="${TERMINAL_RELAY_TEST_CLAUDE_PATH:-$default_claude_path}"
+    claude_sessions_python_path="${TERMINAL_RELAY_TEST_CLAUDE_SESSIONS_PYTHON_PATH:-$default_python_path}"
+    claude_sessions_adapter_path="${TERMINAL_RELAY_TEST_CLAUDE_SESSIONS_ADAPTER_PATH:-$default_claude_sessions_adapter_path}"
     flock_path="${TERMINAL_RELAY_TEST_FLOCK_PATH:-$default_flock_path}"
     signal_path="${TERMINAL_RELAY_TEST_SIGNAL_PATH:-}"
     boot_id_path="${TERMINAL_RELAY_TEST_BOOT_ID_PATH:-$default_boot_id_path}"
@@ -98,6 +103,8 @@ else
     runtime_directory="$runtime_home/.local/state/terminal-relay"
     codex_path="$default_codex_path"
     claude_path="$default_claude_path"
+    claude_sessions_python_path="$default_claude_sessions_python_path"
+    claude_sessions_adapter_path="$default_claude_sessions_adapter_path"
     flock_path="$default_flock_path"
     signal_path=""
     boot_id_path="$default_boot_id_path"
@@ -118,12 +125,18 @@ usage:
   terminal-relay-session update-status
   terminal-relay-session restore
   terminal-relay-session threads <repository> <active|archived> [cursor]
+  terminal-relay-session threads-v2 <codex|claude> <repository> <open|archived> [cursor]
   terminal-relay-session thread-read <repository> <thread-id>
   terminal-relay-session thread-create <repository>
   terminal-relay-session thread-resume <repository> <thread-id> [agent arguments...]
   terminal-relay-session thread-rename <repository> <thread-id> <name>
   terminal-relay-session thread-archive <repository> <thread-id>
   terminal-relay-session thread-unarchive <repository> <thread-id>
+  terminal-relay-session thread-read-v2 <codex|claude> <repository> <thread-id>
+  terminal-relay-session thread-resume-v2 <codex|claude> <repository> <thread-id> [agent arguments...]
+  terminal-relay-session thread-rename-v2 <codex|claude> <repository> <thread-id> <name>
+  terminal-relay-session thread-archive-v2 <codex|claude> <repository> <thread-id>
+  terminal-relay-session thread-unarchive-v2 <codex|claude> <repository> <thread-id>
   terminal-relay-session start <codex|claude> <repository> [agent arguments...]
   terminal-relay-session attach <codex|claude> <repository> [agent arguments...]
   terminal-relay-session reattach <codex|claude> <repository> <instance>
@@ -157,6 +170,8 @@ validate_absolute_path "workspace root" "$workspace_root"
 validate_absolute_path "runtime root" "$runtime_directory"
 validate_absolute_path "Codex executable" "$codex_path"
 validate_absolute_path "Claude executable" "$claude_path"
+validate_absolute_path "Claude session Python executable" "$claude_sessions_python_path"
+validate_absolute_path "Claude session adapter" "$claude_sessions_adapter_path"
 validate_absolute_path "flock executable" "$flock_path"
 validate_absolute_path "boot id" "$boot_id_path"
 validate_absolute_path "Codex app-server socket" "$codex_app_server_socket"
@@ -1359,11 +1374,71 @@ stopping_intent_file_for() {
     printf '%s/%s.intent.stopping\n' "$runtime_directory" "$1"
 }
 
+provider_session_lock_file_for() {
+    printf '%s/provider-%s-%s.lock\n' "$runtime_directory" "$1" "$2"
+}
+
+claude_archive_directory_for() {
+    local repository="$1"
+    local archive_root="$runtime_directory/claude-archives"
+    local archive_directory="$archive_root/$repository"
+
+    is_valid_repository_name "$repository" || return 64
+    if [[ -L "$archive_root" ]] \
+        || { [[ -e "$archive_root" ]] && [[ ! -d "$archive_root" ]]; }; then
+        echo "The Claude archive state root is invalid." >&2
+        return 70
+    fi
+    /usr/bin/install -d -m 700 "$archive_root"
+    if [[ -L "$archive_directory" ]] \
+        || { [[ -e "$archive_directory" ]] && [[ ! -d "$archive_directory" ]]; }; then
+        echo "The Claude archive state is invalid." >&2
+        return 70
+    fi
+    /usr/bin/install -d -m 700 "$archive_directory"
+    printf '%s\n' "$archive_directory"
+}
+
+run_claude_sessions_adapter() {
+    if [[ ! -x "$claude_sessions_python_path" \
+        || ! -f "$claude_sessions_adapter_path" \
+        || -L "$claude_sessions_adapter_path" ]]; then
+        echo "Claude session history is unavailable." >&2
+        return 69
+    fi
+    "$claude_sessions_python_path" "$claude_sessions_adapter_path" "$@"
+}
+
 require_flock() {
     if [[ ! -x "$flock_path" ]]; then
         echo "Required flock executable is unavailable: $flock_path" >&2
         exit 69
     fi
+}
+
+lock_provider_session() {
+    local provider="$1"
+    local thread_id="$2"
+    local lock_file
+
+    validate_tool "$provider"
+    is_valid_instance "$thread_id" || return 64
+    require_flock
+    lock_file="$(provider_session_lock_file_for "$provider" "$thread_id")"
+    if [[ -L "$lock_file" ]]; then
+        echo "The provider session lock is invalid." >&2
+        return 70
+    fi
+    exec 5>"$lock_file"
+    if ! "$flock_path" --nonblock 5; then
+        exec 5>&-
+        echo "The requested provider session is already being managed." >&2
+        return 75
+    fi
+}
+
+unlock_provider_session() {
+    exec 5>&-
 }
 
 lock_tool_control() {
@@ -1565,6 +1640,34 @@ validate_launch_arguments() {
                 ;;
         esac
     done
+}
+
+build_claude_resume_arguments() {
+    local argument
+    local skip_value=0
+
+    claude_resume_arguments_result=()
+    for argument in "$@"; do
+        if [[ $skip_value -eq 1 ]]; then
+            skip_value=0
+            continue
+        fi
+        case "$argument" in
+            --model|--effort)
+                skip_value=1
+                ;;
+            --model=*|--effort=*)
+                ;;
+            *)
+                claude_resume_arguments_result+=("$argument")
+                ;;
+        esac
+    done
+    if [[ ${#claude_resume_arguments_result[@]} -gt 0 ]]; then
+        validate_launch_arguments claude "${claude_resume_arguments_result[@]}"
+    else
+        validate_launch_arguments claude
+    fi
 }
 
 encode_argument_hex() {
@@ -2156,7 +2259,8 @@ validate_thread_name() {
 }
 
 thread_is_active() {
-    local requested_thread_id="$1"
+    local requested_provider="$1"
+    local requested_thread_id="$2"
     local metadata_file
     local instance
     local tool
@@ -2167,7 +2271,7 @@ thread_is_active() {
         instance="${instance%.session}"
         is_valid_instance "$instance" || continue
         tool="$(/usr/bin/sed -n 's/^tool|//p' "$metadata_file")"
-        [[ "$tool" == "codex" || "$tool" == "claude" ]] || continue
+        [[ "$tool" == "$requested_provider" ]] || continue
         lock_tool_metadata "$instance"
         if load_metadata_unlocked "$tool" "$instance" \
             && [[ "$metadata_thread_id" == "$requested_thread_id" ]] \
@@ -2246,13 +2350,362 @@ codex_thread_mutate() {
     local project_directory
 
     validate_thread_id "$thread_id"
-    thread_is_active "$thread_id" && {
+    thread_is_active codex "$thread_id" && {
         echo "Active threads cannot be renamed or archived." >&2
         return 75
     }
     project_directory="$(project_directory_for "$repository")" || return $?
     run_codex_rpc_with_app_server_lock "$operation" \
         "$project_directory" "$thread_id" "$@"
+}
+
+provider_active_bindings() {
+    local requested_provider="$1"
+    local requested_repository="$2"
+    local metadata_file
+    local instance
+    local tool
+
+    shopt -s nullglob
+    for metadata_file in "$runtime_directory"/*.session; do
+        instance="${metadata_file##*/}"
+        instance="${instance%.session}"
+        is_valid_instance "$instance" || continue
+        tool="$(/usr/bin/sed -n 's/^tool|//p' "$metadata_file")"
+        [[ "$tool" == "$requested_provider" ]] || continue
+        lock_tool_metadata "$instance"
+        if load_metadata_unlocked "$tool" "$instance" \
+            && [[ "$metadata_repository" == "$requested_repository" ]] \
+            && is_valid_instance "$metadata_thread_id" \
+            && { session_exists "$tool" "$instance" \
+                || metadata_launch_is_running "$instance"; }; then
+            printf '%s|%s\n' "$metadata_thread_id" "$instance"
+        fi
+        unlock_tool_metadata
+    done
+    shopt -u nullglob
+}
+
+emit_thread_catalog_v2() {
+    local provider="$1"
+    local repository="$2"
+    local catalog="$3"
+    local binding
+    local -a python_arguments=("$provider")
+
+    while IFS= read -r binding; do
+        [[ -n "$binding" ]] && python_arguments+=("$binding")
+    done < <(provider_active_bindings "$provider" "$repository")
+
+    printf '%s\n' "$catalog" | "$default_python_path" -c '
+import json
+import sys
+
+provider, *bindings = sys.argv[1:]
+maximum = 1024 * 1024
+raw = sys.stdin.buffer.read(maximum + 1)
+if len(raw) > maximum:
+    raise SystemExit(70)
+text = raw.decode("utf-8")
+lines = text.splitlines()
+if lines and lines[0] == "__TERMINAL_RELAY_THREADS_V1__":
+    lines = lines[1:]
+if len(lines) != 1:
+    raise SystemExit(70)
+value = json.loads(lines[0])
+if not isinstance(value, dict) or not isinstance(value.get("threads"), list):
+    raise SystemExit(70)
+active = {}
+for binding in bindings:
+    fields = binding.split("|")
+    if len(fields) != 2:
+        raise SystemExit(70)
+    active[fields[0]] = fields[1]
+for row in value["threads"]:
+    if not isinstance(row, dict) or row.get("provider") != provider:
+        raise SystemExit(70)
+    thread_id = row.get("threadID")
+    archived = row.get("archived")
+    if not isinstance(thread_id, str) or not isinstance(archived, bool):
+        raise SystemExit(70)
+    activity = row.get("activityState", "inactive")
+    if activity not in ("inactive", "relay-active", "external-active", "unknown"):
+        raise SystemExit(70)
+    if thread_id in active:
+        activity = "relay-active"
+        row["activeInstanceToken"] = active[thread_id]
+    else:
+        row["activeInstanceToken"] = None
+    row["activityState"] = activity
+    row["isWorking"] = row.get("isWorking")
+    mutable = activity == "inactive"
+    row["capabilities"] = {
+        "resume": mutable and not archived,
+        "rename": mutable and not archived,
+        "archive": mutable and not archived,
+        "unarchive": mutable and archived,
+    }
+encoded = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+if len(encoded.encode("utf-8")) > maximum:
+    raise SystemExit(70)
+print("__TERMINAL_RELAY_THREADS_V2__")
+print(encoded)
+' "${python_arguments[@]}" || {
+        echo "The provider session catalog is unavailable." >&2
+        return 70
+    }
+}
+
+threads_v2() {
+    local provider="$1"
+    local repository="$2"
+    local archive_filter="$3"
+    local cursor="${4:-}"
+    local archive_directory
+    local catalog
+    local legacy_filter
+    local project_directory
+
+    validate_tool "$provider"
+    case "$archive_filter" in
+        open) legacy_filter=active ;;
+        archived) legacy_filter=archived ;;
+        *) fail_usage "threads-v2 requires an open or archived filter." ;;
+    esac
+    case "$provider" in
+        codex)
+            catalog="$(codex_threads \
+                "$repository" "$legacy_filter" "$cursor")" || return $?
+            ;;
+        claude)
+            project_directory="$(project_directory_for "$repository")" || return $?
+            archive_directory="$(claude_archive_directory_for "$repository")" \
+                || return $?
+            if [[ -n "$cursor" ]]; then
+                catalog="$(run_claude_sessions_adapter \
+                    list "$project_directory" "$archive_directory" \
+                    "$archive_filter" "$cursor")" || return $?
+            else
+                catalog="$(run_claude_sessions_adapter \
+                    list "$project_directory" "$archive_directory" \
+                    "$archive_filter")" || return $?
+            fi
+            ;;
+    esac
+    emit_thread_catalog_v2 "$provider" "$repository" "$catalog"
+}
+
+provider_thread_read_v2() {
+    local provider="$1"
+    local repository="$2"
+    local thread_id="$3"
+    local archive_directory
+    local catalog
+    local project_directory
+
+    validate_tool "$provider"
+    validate_thread_id "$thread_id"
+    project_directory="$(project_directory_for "$repository")" || return $?
+    case "$provider" in
+        codex)
+            catalog="$(run_codex_rpc_with_app_server_lock \
+                thread-read "$project_directory" "$thread_id")" || return $?
+            ;;
+        claude)
+            archive_directory="$(claude_archive_directory_for "$repository")" \
+                || return $?
+            catalog="$(run_claude_sessions_adapter \
+                read "$project_directory" "$archive_directory" "$thread_id")" \
+                || return $?
+            ;;
+    esac
+    emit_thread_catalog_v2 "$provider" "$repository" "$catalog"
+}
+
+read_claude_thread_snapshot() {
+    local project_directory="$1"
+    local archive_directory="$2"
+    local thread_id="$3"
+    local snapshot_fields
+
+    claude_thread_catalog="$(run_claude_sessions_adapter \
+        read "$project_directory" "$archive_directory" "$thread_id")" \
+        || return $?
+    snapshot_fields="$(printf '%s\n' "$claude_thread_catalog" \
+        | "$default_python_path" -c '
+import json
+import sys
+
+value = json.load(sys.stdin)
+rows = value.get("threads") if isinstance(value, dict) else None
+if not isinstance(rows, list) or len(rows) != 1:
+    raise SystemExit(70)
+row = rows[0]
+activity = row.get("activityState")
+archived = row.get("archived")
+if activity not in ("inactive", "external-active", "unknown") or not isinstance(archived, bool):
+    raise SystemExit(70)
+print(activity)
+print("1" if archived else "0")
+')" || {
+        echo "The Claude session metadata is invalid." >&2
+        return 70
+    }
+    claude_thread_activity="$(printf '%s\n' "$snapshot_fields" \
+        | /usr/bin/sed -n '1p')"
+    claude_thread_archived="$(printf '%s\n' "$snapshot_fields" \
+        | /usr/bin/sed -n '2p')"
+}
+
+require_inactive_claude_thread() {
+    local project_directory="$1"
+    local archive_directory="$2"
+    local thread_id="$3"
+
+    thread_is_active claude "$thread_id" && {
+        echo "The requested Claude session is already active in Terminal Relay." >&2
+        return 75
+    }
+    read_claude_thread_snapshot \
+        "$project_directory" "$archive_directory" "$thread_id" || return $?
+    case "$claude_thread_activity" in
+        inactive) ;;
+        external-active)
+            echo "The requested Claude session is active outside Terminal Relay." >&2
+            return 75
+            ;;
+        *)
+            echo "Claude session activity could not be verified." >&2
+            return 70
+            ;;
+    esac
+    run_claude_sessions_adapter \
+        activity "$project_directory" "$thread_id" >/dev/null
+}
+
+write_claude_archive_marker() {
+    local archive_directory="$1"
+    local thread_id="$2"
+    local marker="$archive_directory/$thread_id"
+    local temporary_marker="$archive_directory/.$thread_id.$$.$RANDOM.tmp"
+
+    if [[ -L "$marker" || -e "$marker" ]]; then
+        echo "The Claude session is already archived or its archive state is invalid." >&2
+        return 75
+    fi
+    if ! printf 'version|1\n' > "$temporary_marker" \
+        || ! /bin/chmod 600 "$temporary_marker" \
+        || ! /bin/mv -f "$temporary_marker" "$marker"; then
+        /bin/rm -f -- "$temporary_marker"
+        echo "The Claude archive state could not be written." >&2
+        return 70
+    fi
+}
+
+claude_thread_mutate_v2() {
+    local operation="$1"
+    local repository="$2"
+    local thread_id="$3"
+    shift 3
+    local archive_directory
+    local catalog
+    local marker
+    local project_directory
+
+    validate_thread_id "$thread_id"
+    project_directory="$(project_directory_for "$repository")" || return $?
+    archive_directory="$(claude_archive_directory_for "$repository")" || return $?
+    lock_provider_session claude "$thread_id" || return $?
+    require_inactive_claude_thread \
+        "$project_directory" "$archive_directory" "$thread_id" || {
+        local status=$?
+        unlock_provider_session
+        return "$status"
+    }
+    marker="$archive_directory/$thread_id"
+    case "$operation" in
+        thread-rename)
+            [[ "$claude_thread_archived" == "0" ]] || {
+                unlock_provider_session
+                echo "Archived Claude sessions must be restored before renaming." >&2
+                return 75
+            }
+            catalog="$(run_claude_sessions_adapter \
+                rename "$project_directory" "$archive_directory" \
+                "$thread_id" "$1")" || {
+                local status=$?
+                unlock_provider_session
+                return "$status"
+            }
+            ;;
+        thread-archive)
+            [[ "$claude_thread_archived" == "0" ]] || {
+                unlock_provider_session
+                echo "The Claude session is already archived." >&2
+                return 75
+            }
+            write_claude_archive_marker "$archive_directory" "$thread_id" || {
+                local status=$?
+                unlock_provider_session
+                return "$status"
+            }
+            catalog="$(run_claude_sessions_adapter \
+                read "$project_directory" "$archive_directory" "$thread_id")" \
+                || {
+                local status=$?
+                unlock_provider_session
+                return "$status"
+            }
+            ;;
+        thread-unarchive)
+            [[ "$claude_thread_archived" == "1" \
+                && -f "$marker" && ! -L "$marker" ]] || {
+                unlock_provider_session
+                echo "The Claude session is not archived or its archive state is invalid." >&2
+                return 75
+            }
+            /bin/rm -f -- "$marker"
+            catalog="$(run_claude_sessions_adapter \
+                read "$project_directory" "$archive_directory" "$thread_id")" \
+                || {
+                local status=$?
+                unlock_provider_session
+                return "$status"
+            }
+            ;;
+        *)
+            unlock_provider_session
+            return 64
+            ;;
+    esac
+    unlock_provider_session
+    emit_thread_catalog_v2 claude "$repository" "$catalog"
+}
+
+provider_thread_mutate_v2() {
+    local operation="$1"
+    local provider="$2"
+    local repository="$3"
+    local thread_id="$4"
+    shift 4
+    local catalog
+
+    validate_tool "$provider"
+    validate_thread_id "$thread_id"
+    if [[ "$provider" == "claude" ]]; then
+        claude_thread_mutate_v2 \
+            "$operation" "$repository" "$thread_id" "$@"
+        return
+    fi
+    lock_provider_session codex "$thread_id" || return $?
+    catalog="$(codex_thread_mutate \
+        "$operation" "$repository" "$thread_id" "$@")" || {
+        local status=$?
+        unlock_provider_session
+        return "$status"
+    }
+    unlock_provider_session
+    emit_thread_catalog_v2 codex "$repository" "$catalog"
 }
 
 system_resources() {
@@ -2402,12 +2855,30 @@ resolve_session_title() {
     local tool="$1"
     local instance="$2"
     local pane_title="$3"
+    local repository="${4:-}"
+    local provider_thread_id="${5:-}"
     local home_directory="${runtime_home:-${HOME:-}}"
     local fallback_title
+    local project_directory
+    local claude_title
+
+    if [[ "$tool" == "claude" && -n "$repository" && -n "$provider_thread_id" ]]; then
+        if project_directory="$(project_directory_for "$repository" 2>/dev/null)" \
+            && claude_title="$(run_claude_sessions_adapter \
+                title "$project_directory" "$provider_thread_id" 2>/dev/null)"; then
+            claude_title="$(printf '%s\n' "$claude_title" \
+                | /usr/bin/tr '\r\n' '  ' \
+                | /usr/bin/sed 's/[[:space:]]*$//' \
+                | /usr/bin/cut -c1-200)"
+            printf '%s\n0\n%s\n' "$claude_title" "$provider_thread_id"
+            return
+        fi
+        printf '\n0\n%s\n' "$provider_thread_id"
+        return
+    fi
 
     if [[ -x "$default_python_path" ]]; then
         "$default_python_path" - "$tool" "$instance" "$pane_title" "$home_directory" <<'PYTHON_TITLE'
-import glob
 import json
 import os
 import re
@@ -2544,33 +3015,6 @@ if tool == "codex":
         title = persisted_names.get(resolved_thread_id, "") or display_title
     else:
         title = display_title
-elif tool == "claude":
-    custom_title = ""
-    ai_title = ""
-    candidates = glob.glob(
-        os.path.join(home, ".claude", "projects", "**", f"{instance}.jsonl"),
-        recursive=True,
-    )
-    if candidates:
-        try:
-            with open(candidates[0], encoding="utf-8") as history:
-                for line in history:
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if record.get("type") == "custom-title":
-                        custom = record.get("customTitle")
-                        if isinstance(custom, str) and custom.strip():
-                            custom_title = custom
-                    elif record.get("type") == "ai-title":
-                        generated = record.get("aiTitle")
-                        if isinstance(generated, str) and generated.strip():
-                            ai_title = generated
-                title = custom_title or ai_title
-        except OSError:
-            pass
-
 title = "".join(character if character.isprintable() else " " for character in title)
 title = re.sub(r"\s+", " ", title).strip()
 print(title[:200])
@@ -2588,6 +3032,8 @@ PYTHON_TITLE
 session_display_fields() {
     local tool="$1"
     local instance="$2"
+    local repository="${3:-}"
+    local provider_thread_id="${4:-}"
     local session_name
     local display
     local pane_title
@@ -2618,10 +3064,11 @@ session_display_fields() {
                 session_working=1
                 ;;
         esac
-    else
-        session_thread_id="$instance"
+    elif is_valid_instance "$provider_thread_id"; then
+        session_thread_id="$provider_thread_id"
     fi
-    resolved_title_fields="$(resolve_session_title "$tool" "$instance" "$pane_title")"
+    resolved_title_fields="$(resolve_session_title \
+        "$tool" "$instance" "$pane_title" "$repository" "$provider_thread_id")"
     resolved_title="$(printf '%s\n' "$resolved_title_fields" | /usr/bin/sed -n '1p')"
     resolved_generation="$(printf '%s\n' "$resolved_title_fields" | /usr/bin/sed -n '2p')"
     resolved_thread_id="$(printf '%s\n' "$resolved_title_fields" | /usr/bin/sed -n '3p')"
@@ -2704,7 +3151,8 @@ status_sessions() {
             echo "tmux returned an invalid attached-client count for $tool." >&2
             return 70
         }
-        if ! session_display_fields "$tool" "$instance"; then
+        if ! session_display_fields \
+            "$tool" "$instance" "$repository" "$bound_thread_id"; then
             session_activity=0
             session_title_hex=""
             session_working=""
@@ -2859,6 +3307,7 @@ restore_sessions() {
     local session_name
     local overall_status=0
     local codex_app_server_reserved=0
+    local provider_lock_acquired=0
 
     [[ -x "$tmux_path" ]] || {
         echo "Required tmux executable is unavailable: $tmux_path" >&2
@@ -2893,6 +3342,7 @@ restore_sessions() {
 
     for intent_file in "$runtime_directory"/*.intent; do
         codex_app_server_reserved=0
+        provider_lock_acquired=0
         instance="${intent_file##*/}"
         instance="${instance%.intent}"
         is_valid_instance "$instance" || continue
@@ -2927,6 +3377,24 @@ restore_sessions() {
             continue
         fi
         if [[ "$tool" == "claude" ]]; then
+            if ! is_valid_instance "$intent_thread_id"; then
+                unlock_tool_metadata
+                unlock_tool_control
+                echo "The saved Claude provider session identifier is invalid." >&2
+                overall_status=70
+                continue
+            fi
+            build_claude_resume_arguments "${intent_arguments[@]}" || {
+                unlock_tool_metadata
+                unlock_tool_control
+                overall_status=70
+                continue
+            }
+            if [[ ${#claude_resume_arguments_result[@]} -gt 0 ]]; then
+                intent_arguments=("${claude_resume_arguments_result[@]}")
+            else
+                intent_arguments=()
+            fi
             set +e
             prepare_claude_onboarding
             load_status=$?
@@ -2956,12 +3424,28 @@ restore_sessions() {
                 continue
             fi
         fi
+        if [[ -n "$intent_thread_id" ]]; then
+            lock_provider_session "$tool" "$intent_thread_id" || {
+                load_status=$?
+                if [[ $codex_app_server_reserved -eq 1 ]]; then
+                    unlock_codex_app_server
+                fi
+                unlock_tool_metadata
+                unlock_tool_control
+                overall_status="$load_status"
+                continue
+            }
+            provider_lock_acquired=1
+        fi
         if session_exists "$tool" "$instance" || {
             load_metadata_unlocked "$tool" "$instance" \
                 && metadata_launch_is_running "$instance";
         }; then
             if [[ $codex_app_server_reserved -eq 1 ]]; then
                 unlock_codex_app_server
+            fi
+            if [[ $provider_lock_acquired -eq 1 ]]; then
+                unlock_provider_session
             fi
             unlock_tool_metadata
             unlock_tool_control
@@ -2977,6 +3461,9 @@ restore_sessions() {
             unlock_tool_metadata
             if [[ $codex_app_server_reserved -eq 1 ]]; then
                 unlock_codex_app_server
+            fi
+            if [[ $provider_lock_acquired -eq 1 ]]; then
+                unlock_provider_session
             fi
             unlock_tool_control
             echo "Unable to advance the saved $tool restart intent." >&2
@@ -2999,6 +3486,9 @@ restore_sessions() {
             if [[ $codex_app_server_reserved -eq 1 ]]; then
                 unlock_codex_app_server
             fi
+            if [[ $provider_lock_acquired -eq 1 ]]; then
+                unlock_provider_session
+            fi
             unlock_tool_control
             echo "Unable to recreate the $tool tmux session during recovery." >&2
             overall_status=70
@@ -3006,6 +3496,9 @@ restore_sessions() {
         fi
         if [[ $codex_app_server_reserved -eq 1 ]]; then
             unlock_codex_app_server
+        fi
+        if [[ $provider_lock_acquired -eq 1 ]]; then
+            unlock_provider_session
         fi
         if ! configure_tmux || ! session_exists "$tool" "$instance"; then
             terminate_launch "$tool" "$repository" "$instance" || true
@@ -3506,6 +3999,7 @@ start_instance_session() {
     local boot_id
     local account_status=0
     local codex_app_server_reserved=0
+    local provider_session_lock_acquired=0
     local provider_thread_id="${requested_provider_thread_id:-}"
     local launch_mode="${requested_launch_mode:-initial}"
 
@@ -3529,8 +4023,18 @@ start_instance_session() {
         echo "Unable to generate a launch instance token." >&2
         exit 70
     }
-    if [[ "$tool" == "claude" ]]; then
-        provider_thread_id="$instance"
+    if [[ "$tool" == "claude" && -z "$provider_thread_id" ]]; then
+        provider_thread_id="$(generate_instance)" || {
+            echo "Unable to generate a Claude provider session identifier." >&2
+            exit 70
+        }
+    fi
+    if [[ "$tool" == "claude" \
+        && "${requested_provider_session_lock_held:-0}" != "1" ]]; then
+        lock_provider_session claude "$provider_thread_id" || exit $?
+        provider_session_lock_acquired=1
+    else
+        provider_session_lock_acquired=0
     fi
     session_name="$(session_name_for "$tool" "$instance")"
 
@@ -3601,7 +4105,8 @@ start_instance_session() {
     fi
     unlock_tool_control
 
-    if ! session_display_fields "$tool" "$instance"; then
+    if ! session_display_fields \
+        "$tool" "$instance" "$repository" "$provider_thread_id"; then
         session_activity=0
         session_title_hex=""
         session_working=""
@@ -3614,6 +4119,9 @@ start_instance_session() {
     printf 'session|%s|%s|%s|%s|%s|%s|%s|%s\n' \
         "$tool" "$repository" "$attached_client_count" "$instance" \
         "$session_activity" "$session_title_hex" "$session_working" "$session_thread_id"
+    if [[ $provider_session_lock_acquired -eq 1 ]]; then
+        unlock_provider_session
+    fi
 }
 
 resume_codex_thread() {
@@ -3622,7 +4130,7 @@ resume_codex_thread() {
     shift 2
 
     validate_thread_id "$thread_id"
-    thread_is_active "$thread_id" && {
+    thread_is_active codex "$thread_id" && {
         echo "The requested Codex thread is already active." >&2
         return 75
     }
@@ -3630,6 +4138,73 @@ resume_codex_thread() {
     requested_provider_thread_id="$thread_id"
     requested_launch_mode=resume
     start_instance_session codex "$repository" "$@"
+}
+
+resume_provider_thread_v2() {
+    local provider="$1"
+    local repository="$2"
+    local thread_id="$3"
+    shift 3
+    local archive_directory
+    local project_directory
+    local start_status
+
+    validate_tool "$provider"
+    validate_thread_id "$thread_id"
+    project_directory="$(project_directory_for "$repository")" || return $?
+    lock_provider_session "$provider" "$thread_id" || return $?
+    case "$provider" in
+        codex)
+            if thread_is_active codex "$thread_id"; then
+                unlock_provider_session
+                echo "The requested Codex thread is already active." >&2
+                return 75
+            fi
+            codex_thread_read "$repository" "$thread_id" >/dev/null || {
+                start_status=$?
+                unlock_provider_session
+                return "$start_status"
+            }
+            ;;
+        claude)
+            archive_directory="$(claude_archive_directory_for "$repository")" || {
+                start_status=$?
+                unlock_provider_session
+                return "$start_status"
+            }
+            require_inactive_claude_thread \
+                "$project_directory" "$archive_directory" "$thread_id" || {
+                start_status=$?
+                unlock_provider_session
+                return "$start_status"
+            }
+            if [[ "$claude_thread_archived" == "1" ]]; then
+                unlock_provider_session
+                echo "Archived Claude sessions must be restored before resuming." >&2
+                return 75
+            fi
+            build_claude_resume_arguments "$@" || {
+                start_status=$?
+                unlock_provider_session
+                return "$start_status"
+            }
+            if [[ ${#claude_resume_arguments_result[@]} -gt 0 ]]; then
+                set -- "${claude_resume_arguments_result[@]}"
+            else
+                set --
+            fi
+            ;;
+    esac
+    requested_provider_thread_id="$thread_id"
+    requested_launch_mode=resume
+    requested_provider_session_lock_held=1
+    if start_instance_session "$provider" "$repository" "$@"; then
+        start_status=0
+    else
+        start_status=$?
+    fi
+    unlock_provider_session
+    return "$start_status"
 }
 
 reattach_instance_session() {
@@ -3895,9 +4470,25 @@ run_agent_instance() {
         claude)
             executable="$claude_path"
             if [[ "$launch_mode" == "resume" ]]; then
-                agent_command=("$executable" --resume "$instance" "${agent_arguments[@]}")
+                is_valid_instance "$launch_thread_id" || {
+                    echo "The saved Claude provider session identifier is invalid." >&2
+                    exit 70
+                }
+                agent_command=(
+                    "$executable"
+                    --resume "$launch_thread_id"
+                    "${agent_arguments[@]}"
+                )
             else
-                agent_command=("$executable" --session-id "$instance" "${agent_arguments[@]}")
+                is_valid_instance "$launch_thread_id" || {
+                    echo "The new Claude provider session identifier is invalid." >&2
+                    exit 70
+                }
+                agent_command=(
+                    "$executable"
+                    --session-id "$launch_thread_id"
+                    "${agent_arguments[@]}"
+                )
             fi
             ;;
     esac
@@ -4242,6 +4833,11 @@ case "$command_name" in
             || fail_usage "threads requires a repository, filter, and optional cursor."
         codex_threads "$@"
         ;;
+    threads-v2)
+        [[ $# -ge 3 && $# -le 4 ]] \
+            || fail_usage "threads-v2 requires a provider, repository, filter, and optional cursor."
+        threads_v2 "$@"
+        ;;
     thread-read)
         [[ $# -eq 2 ]] || fail_usage "thread-read requires a repository and thread id."
         codex_thread_read "$1" "$2"
@@ -4266,6 +4862,32 @@ case "$command_name" in
     thread-unarchive)
         [[ $# -eq 2 ]] || fail_usage "thread-unarchive requires a repository and thread id."
         codex_thread_mutate thread-unarchive "$1" "$2"
+        ;;
+    thread-read-v2)
+        [[ $# -eq 3 ]] \
+            || fail_usage "thread-read-v2 requires a provider, repository, and thread id."
+        provider_thread_read_v2 "$1" "$2" "$3"
+        ;;
+    thread-resume-v2)
+        [[ $# -ge 3 ]] \
+            || fail_usage "thread-resume-v2 requires a provider, repository, and thread id."
+        resume_provider_thread_v2 "$@"
+        ;;
+    thread-rename-v2)
+        [[ $# -eq 4 ]] \
+            || fail_usage "thread-rename-v2 requires a provider, repository, thread id, and name."
+        validate_thread_name "$4"
+        provider_thread_mutate_v2 thread-rename "$1" "$2" "$3" "$4"
+        ;;
+    thread-archive-v2)
+        [[ $# -eq 3 ]] \
+            || fail_usage "thread-archive-v2 requires a provider, repository, and thread id."
+        provider_thread_mutate_v2 thread-archive "$1" "$2" "$3"
+        ;;
+    thread-unarchive-v2)
+        [[ $# -eq 3 ]] \
+            || fail_usage "thread-unarchive-v2 requires a provider, repository, and thread id."
+        provider_thread_mutate_v2 thread-unarchive "$1" "$2" "$3"
         ;;
     start)
         [[ $# -ge 2 ]] || fail_usage "start requires a tool and repository."

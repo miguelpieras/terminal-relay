@@ -174,6 +174,7 @@ enum WorkerRemoteCommand {
     }
 
     static func threads(
+        kind: AgentKind,
         repositoryName: String,
         archived: Bool,
         cursor: String? = nil
@@ -181,9 +182,10 @@ enum WorkerRemoteCommand {
         try validateRepository(repositoryName)
         var arguments = [
             WorkerSessionProtocol.helperPath,
-            "threads",
+            "threads-v2",
+            kind.rawValue,
             repositoryName,
-            archived ? "archived" : "active",
+            archived ? "archived" : "open",
         ]
         if let cursor {
             arguments.append(cursor)
@@ -201,6 +203,7 @@ enum WorkerRemoteCommand {
     }
 
     static func resumeThread(
+        kind: AgentKind,
         repositoryName: String,
         threadID: String,
         launchArguments: [String]
@@ -208,13 +211,15 @@ enum WorkerRemoteCommand {
         try validateThread(repositoryName: repositoryName, threadID: threadID)
         return ([
             WorkerSessionProtocol.helperPath,
-            "thread-resume",
+            "thread-resume-v2",
+            kind.rawValue,
             repositoryName,
             threadID,
         ] + launchArguments).map(shellQuote).joined(separator: " ")
     }
 
     static func renameThread(
+        kind: AgentKind,
         repositoryName: String,
         threadID: String,
         name: String
@@ -228,7 +233,8 @@ enum WorkerRemoteCommand {
         }
         return [
             WorkerSessionProtocol.helperPath,
-            "thread-rename",
+            "thread-rename-v2",
+            kind.rawValue,
             repositoryName,
             threadID,
             normalized,
@@ -236,6 +242,7 @@ enum WorkerRemoteCommand {
     }
 
     static func archiveThread(
+        kind: AgentKind,
         repositoryName: String,
         threadID: String,
         unarchive: Bool
@@ -243,7 +250,8 @@ enum WorkerRemoteCommand {
         try validateThread(repositoryName: repositoryName, threadID: threadID)
         return [
             WorkerSessionProtocol.helperPath,
-            unarchive ? "thread-unarchive" : "thread-archive",
+            unarchive ? "thread-unarchive-v2" : "thread-archive-v2",
+            kind.rawValue,
             repositoryName,
             threadID,
         ].map(shellQuote).joined(separator: " ")

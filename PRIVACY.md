@@ -11,7 +11,9 @@ locally. Thread catalog metadata is limited to the configured worker, project
 name, provider thread identifier, relay instance identifier, title, activity
 time, archive/run state, and supported actions. The universal iPhone and iPad
 app creates an SSH private key in the device Keychain. Terminal Relay does not
-upload that private key.
+upload that private key. Conversation titles can be provider-generated from
+prompt content and may therefore contain sensitive text; the apps cache the
+last received catalog locally for display.
 
 The iPhone and iPad app uses the camera only to scan a pairing code displayed
 by the Mac app. Camera frames are processed on the device and are not stored or
@@ -35,6 +37,33 @@ cannot access another worker. Codex cataloging reads only IDs, project paths,
 titles, activity times, archive flags, and source kinds from Codex's local
 metadata index when a new preview-empty thread is not yet returned by the app
 server; message and preview content are not selected.
+
+Claude cataloging uses a pinned official Claude Agent SDK environment on the
+worker. The SDK derives session ID, working directory, provider display title
+or summary, and last-modified time from Claude's local provider history; a
+summary or title can be derived from prompt text. Terminal Relay also asks
+Claude Code's local agent registry for session ID and process ID and validates
+the reported process before classifying activity. Terminal Relay does not call
+the SDK message-history API or parse, copy, index, transmit, or store Claude
+transcript items. Provider entries whose working directory is outside the
+selected repository or its Git worktrees are not returned. Renaming is a
+provider-native mutation: the SDK appends a custom-title entry to the provider
+transcript without rewriting it.
+
+Claude Code keeps its own conversation history in plaintext local provider
+storage on the worker under its own retention and cleanup policy. Terminal
+Relay does not change that retention and does not install a transcript
+`SessionStore`. Exact resume and reboot recovery work only while the provider
+history remains on the same worker. Multi-device handoff sends catalog metadata
+over SSH between your clients and that worker; Terminal Relay does not copy
+history to another worker or a maintainer-operated service.
+
+For Claude, archive state is a Terminal Relay-only visibility overlay. The
+worker stores one mode-`0600` version marker, named by the provider session UUID,
+inside a repository-scoped mode-`0700` relay state directory. The marker has no
+title, prompt, transcript, account, or terminal content. Archiving does not
+delete, retain, move, or modify the provider transcript and cannot prevent a
+direct provider resume outside Terminal Relay.
 
 Maintainer-signed macOS builds check a public GitHub Pages appcast once per day
 and download accepted updates from GitHub Releases. Sparkle system profiling is

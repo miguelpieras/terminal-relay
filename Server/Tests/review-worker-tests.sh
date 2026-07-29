@@ -123,7 +123,13 @@ for review_command in \
     "/usr/local/bin/terminal-relay-session thread-resume atlas aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa --model gpt-5.6-sol --config 'model_reasoning_effort=\"max\"' --config 'tui.terminal_title=[\"thread-title\",\"run-state\"]' --dangerously-bypass-approvals-and-sandbox" \
     "/usr/local/bin/terminal-relay-session thread-rename atlas aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa 'Review task'" \
     "/usr/local/bin/terminal-relay-session thread-archive atlas aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" \
-    "/usr/local/bin/terminal-relay-session thread-unarchive atlas aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    "/usr/local/bin/terminal-relay-session thread-unarchive atlas aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" \
+    "/usr/local/bin/terminal-relay-session threads-v2 claude atlas open" \
+    "/usr/local/bin/terminal-relay-session threads-v2 codex atlas archived next-page" \
+    "/usr/local/bin/terminal-relay-session thread-resume-v2 claude atlas aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa --model fable --effort max --settings '{\"terminalProgressBarEnabled\":true}' --mcp-config '{\"mcpServers\":{\"terminal_relay\":{\"command\":\"/usr/local/bin/terminal-relay-mcp\"}}}' --strict-mcp-config --dangerously-skip-permissions" \
+    "/usr/local/bin/terminal-relay-session thread-rename-v2 claude atlas aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa 'Review task'" \
+    "/usr/local/bin/terminal-relay-session thread-archive-v2 claude atlas aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" \
+    "/usr/local/bin/terminal-relay-session thread-unarchive-v2 claude atlas aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 do
     TERMINAL_RELAY_REVIEW_GATEWAY_DRY_RUN=1 \
         SSH_ORIGINAL_COMMAND="$review_command" \
