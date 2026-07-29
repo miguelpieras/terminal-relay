@@ -34,7 +34,7 @@ jobs:
           [[ "${RELEASE_TAG#v}" == "$configured_version" ]]
 
       - name: Install build tools
-        run: brew install xcodegen tmux shellcheck
+        run: brew install xcodegen tmux shellcheck openssl@3
 
       - name: Install Metal toolchain
         run: xcodebuild -downloadComponent MetalToolchain
@@ -77,6 +77,23 @@ jobs:
           chmod 600 "$key_path"
           echo "path=$key_path" >> "$GITHUB_OUTPUT"
 
+      - name: Prepare worker runtime signing key
+        id: runtime-key
+        env:
+          WORKER_RUNTIME_SIGNING_KEY: ${{ secrets.WORKER_RUNTIME_SIGNING_KEY }}
+        run: |
+          key_path="$RUNNER_TEMP/worker-runtime-signing.pem"
+          printf '%s' "$WORKER_RUNTIME_SIGNING_KEY" > "$key_path"
+          chmod 600 "$key_path"
+          /opt/homebrew/opt/openssl@3/bin/openssl pkey \
+            -in "$key_path" \
+            -pubout \
+            -out "$RUNNER_TEMP/worker-runtime-public.pem"
+          cmp -s \
+            "$RUNNER_TEMP/worker-runtime-public.pem" \
+            Server/terminal-relay-runtime-update.pub
+          echo "path=$key_path" >> "$GITHUB_OUTPUT"
+
       - name: Generate release notes
         id: notes
         env:
@@ -111,9 +128,11 @@ jobs:
           FIRST_MACOS_RELEASE: ${{ steps.history.outputs.first }}
           RELEASE_NOTES_FILE: ${{ steps.notes.outputs.path }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          OPENSSL_BIN: /opt/homebrew/opt/openssl@3/bin/openssl
+          WORKER_RUNTIME_SIGNING_KEY_PATH: ${{ steps.runtime-key.outputs.path }}
         run: ./Scripts/release-macos.sh "${GITHUB_REF_NAME#v}"
 
-      - name: Publish GitHub release
+      - name: Create draft GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_NOTES_FILE: ${{ steps.notes.outputs.path }}
@@ -124,7 +143,11 @@ jobs:
             "build/macos-release/Terminal-Relay-${version}.zip" \
             "build/macos-release/Terminal-Relay-${version}.md" \
             "build/macos-release/appcast.xml" \
+            "build/macos-release/worker-runtime/manifest.json" \
+            "build/macos-release/worker-runtime/manifest.sig" \
+            "build/macos-release/worker-runtime/runtime.tar.gz" \
             --verify-tag \
+            --draft \
             --title "Terminal Relay ${version}" \
             --notes-file "$RELEASE_NOTES_FILE"
 
@@ -153,6 +176,7 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     permissions:
+      contents: write
       pages: write
       id-token: write
 
@@ -160,3 +184,9 @@ jobs:
       - name: Deploy signed update feed and archive
         id: deployment
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+
+      - name: Publish GitHub release after runtime feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false

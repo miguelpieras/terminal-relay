@@ -65,6 +65,47 @@ commands in `Server/README.md` for the underlying failure. Do not copy package
 manager output into a public issue until it has been checked for hostnames,
 repository details, account data, or credentials.
 
+Inspect the worker runtime and its sanitized updater state without privileged
+access:
+
+```bash
+ssh terminal-relay-worker-N \
+  '/usr/local/bin/terminal-relay-session runtime-info'
+ssh terminal-relay-worker-N \
+  '/usr/local/bin/terminal-relay-session runtime-update-status'
+```
+
+`runtime-info` must report one positive version, a protocol range that includes
+the client protocol, and sorted capabilities. `runtime-update-status` contains
+only a timestamp, state, installed/target versions, and safe code. `checking`
+normally clears after the bounded service run; `failure` leaves the previous
+runtime active and the timer retries. Safe codes distinguish unavailable feed
+or archive, invalid signature/manifest/archive, blocked rollback, SDK failure,
+install failure, and systemd failure.
+
+Request the same fixed stable-channel check used by clients:
+
+```bash
+ssh terminal-relay-worker-N \
+  '/usr/local/bin/terminal-relay-session runtime-update-request'
+```
+
+The request should return `accepted`; poll `runtime-update-status` rather than
+repeating requests. If it remains failed, inspect only the service state first:
+
+```bash
+ssh root@terminal-relay-worker-N \
+  'systemctl status terminal-relay-runtime-update.service'
+ssh root@terminal-relay-worker-N \
+  'systemctl list-timers terminal-relay-runtime-update.timer'
+ssh root@terminal-relay-worker-N \
+  'systemctl status terminal-relay-runtime-update.path'
+```
+
+Do not replace the feed URL, public key, manifest, or installed-version state
+manually. Reconcile the exact worker from the current `main` checkout if the
+updater or key is missing.
+
 Compare the installed helper with the repository source:
 
 ```bash
@@ -248,13 +289,14 @@ authorization URLs, or unredacted terminal captures into logs or issues.
 
 ## Current and future workers
 
-`Server/terminal-relay-session`, `Server/terminal-relay-mcp`, and
-`Server/terminal-relay-claude-sessions` are the canonical worker control
-executables. Fresh-worker bootstrap includes all three plus the pinned SDK
-requirements, and `Server/install-worker.sh` installs them at their fixed
-paths. Existing workers must be reconciled with
-`Scripts/install-worker-session-helper.sh` after any of them or the SDK lock
-changes.
+`Server/worker-runtime-files.txt` is the canonical list of worker control
+files, including `terminal-relay-session`, `terminal-relay-mcp`,
+`terminal-relay-chat`, the Claude adapter and pinned SDK requirements. Fresh
+bootstrap installs the signed-runtime updater and fixed stable-channel trigger.
+Workers predating it need one `Scripts/manage-worker.sh reconcile all` (or
+their original application-only bootstrap); later runtime changes are
+automatic. `Scripts/install-worker-session-helper.sh` remains the operator
+recovery path.
 
 For helper changes, run:
 
@@ -262,5 +304,6 @@ For helper changes, run:
 ./Server/Tests/terminal-relay-session-tests.sh
 ./Server/Tests/terminal-relay-mcp-tests.sh
 ./Server/Tests/terminal-relay-claude-sessions-tests.py
+./Server/Tests/worker-runtime-update-tests.sh
 ./Scripts/build-and-install.sh
 ```

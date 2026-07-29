@@ -85,7 +85,10 @@ account, managed path, or non-empty `/workspace`. It then:
   instance for `terminal-relay`; and installs the worker-wide guidance as the
   unprivileged account;
 - installs and enables the root-owned `terminal-relay-agent-update.timer`,
-  which updates only Claude Code and Codex after boot and four times daily.
+  which updates only Claude Code and Codex after boot and four times daily; and
+- installs the root-owned signed-runtime updater, stable release public key,
+  periodic timer, fixed request path, sanitized status file, and paired-mobile
+  forced-command gateway.
 
 After remote readiness checks, the local script reconnects as `terminal-relay`.
 It runs `codex login --device-auth` and `claude auth login` interactively only
@@ -142,6 +145,57 @@ update does not disable either agent: macOS and iOS show a dismissible warning
 with the installed versions the next time they refresh the worker, and the timer
 retries automatically. The response contains no package-manager output,
 repository details, credentials, host data, or terminal contents.
+
+## Automatic worker runtime updates
+
+`Server/worker-runtime-files.txt` is the single payload allowlist used by
+bootstrap, reconciliation, helper-only installation, App Review, verification,
+and release packaging. A runtime manifest names the exact destination, mode,
+SHA-256 digest, protocol range, and capabilities for every helper, adapter, SDK
+lock, unit, gateway, updater, and public key. Releases use the producing commit
+timestamp as a monotonically increasing runtime version.
+
+`terminal-relay-runtime-update.timer` checks the one stable HTTPS feed five
+minutes after boot and at 01:15, 07:15, 13:15, and 19:15 UTC, with a bounded
+random delay. A compatible macOS or paired-mobile client can also call the
+typed `runtime-update-request` helper operation. That operation only touches a
+root-owned path trigger; it cannot select a URL, version, file, systemd unit, or
+network command. `terminal-relay-runtime-update.path` converts the trigger into
+the same serialized root service.
+
+The root updater accepts no arguments. It downloads only the compiled-in feed,
+uses bounded HTTPS timeouts and retries, verifies the Ed25519 manifest
+signature, rejects non-monotonic versions or any payload outside the exact
+allowlist, then verifies the archive digest, entry type, ownership, mode, and
+per-file digest before installation. It prepares the pinned SDK without
+switching the live link, takes the deployment and agent-update locks, installs
+through atomic renames, and rolls back files, the installed manifest, and SDK
+link on failure. It does not read or write `/workspace`, provider credentials
+or histories, relay metadata, restart intents, or tmux processes. A shared
+Codex app-server restart is recorded and deferred until active Codex terminals
+drain.
+
+The unprivileged helper exposes only:
+
+```bash
+terminal-relay-session runtime-info
+terminal-relay-session runtime-update-status
+terminal-relay-session runtime-update-request
+```
+
+`runtime-info` reports the installed version, supported client-protocol range,
+and sorted capabilities. `runtime-update-status` reports only a timestamp,
+checking/success/failure, installed version, target version, and a safe failure
+code. Clients request one immediate check when a reported protocol or required
+capability is incompatible, poll with bounded backoff, refresh worker catalogs
+when compatible, and otherwise leave other workers and existing terminals
+available. The timer retries failures automatically.
+
+Workers created before this updater need one
+`./Scripts/manage-worker.sh reconcile all` (or their original application-only
+bootstrap command). Future stable runtime changes then arrive unattended. App
+binaries remain separate: Sparkle updates macOS and the App Store updates
+iPhone/iPad.
 
 ## Native structured chat
 

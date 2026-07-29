@@ -29,6 +29,8 @@ struct WorkerOverviewSnapshot: Equatable {
     let accountErrors: Set<AgentKind>
     let connectionError: String?
     let updateStatus: WorkerUpdateStatus?
+    var runtimeInfo: WorkerRuntimeInfo? = nil
+    var runtimeUpdateStatus: WorkerRuntimeUpdateStatus? = nil
 
     var isOnline: Bool {
         connectionError == nil

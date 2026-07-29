@@ -9,9 +9,12 @@ readonly SERVER_DIRECTORY="$REPOSITORY_ROOT/Server"
 readonly BASELINE_FILE="${TERMINAL_RELAY_BASELINE_FILE:-$SERVER_DIRECTORY/worker-baseline.local.env}"
 readonly HOST_INSTALLER="$SERVER_DIRECTORY/install-worker-host.sh"
 readonly SESSION_HELPER_SOURCE="$SERVER_DIRECTORY/terminal-relay-session"
+readonly CHAT_SOURCE="$SERVER_DIRECTORY/terminal-relay-chat"
 readonly MCP_SOURCE="$SERVER_DIRECTORY/terminal-relay-mcp"
 readonly CLAUDE_SESSIONS_SOURCE="$SERVER_DIRECTORY/terminal-relay-claude-sessions"
 readonly CLAUDE_REQUIREMENTS_SOURCE="$SERVER_DIRECTORY/claude-agent-sdk-requirements.txt"
+readonly RUNTIME_UPDATER_SOURCE="$SERVER_DIRECTORY/terminal-relay-runtime-update"
+readonly RUNTIME_PUBLIC_KEY_SOURCE="$SERVER_DIRECTORY/terminal-relay-runtime-update.pub"
 readonly NODE_EXPORTER_TEMPLATE="$SERVER_DIRECTORY/node-exporter.service.template"
 readonly BOOTSTRAP_SCRIPT="$SCRIPT_DIRECTORY/bootstrap-worker.sh"
 readonly SSH_CONFIG="$HOME/.ssh/config"
@@ -137,6 +140,8 @@ validate_local_prerequisites() {
         || die "worker lifecycle scripts must be executable"
     [[ -f "$SESSION_HELPER_SOURCE" && ! -L "$SESSION_HELPER_SOURCE" ]] \
         || die "worker session helper source is missing or unsafe"
+    [[ -f "$CHAT_SOURCE" && ! -L "$CHAT_SOURCE" ]] \
+        || die "structured chat broker source is missing or unsafe"
     [[ -f "$MCP_SOURCE" && ! -L "$MCP_SOURCE" ]] \
         || die "worker MCP source is missing or unsafe"
     [[ -f "$CLAUDE_SESSIONS_SOURCE" && ! -L "$CLAUDE_SESSIONS_SOURCE" ]] \
@@ -775,10 +780,14 @@ verify_application() {
     local number="$1"
     local alias
     local expected_helper_digest
+    local expected_chat_digest
     local expected_mcp_digest
     local expected_claude_sessions_digest
     local expected_claude_requirements_digest
     local expected_claude_sdk_version
+    local expected_runtime_updater_digest
+    local expected_runtime_public_key_digest
+    local expected_runtime_version
     local output
 
     alias="$(worker_name_for_number "$number")"
@@ -786,6 +795,10 @@ verify_application() {
         | /usr/bin/awk '{ print $1; exit }')"
     [[ "$expected_helper_digest" =~ ^[a-f0-9]{64}$ ]] \
         || die "could not fingerprint the worker session helper source"
+    expected_chat_digest="$(/usr/bin/shasum -a 256 "$CHAT_SOURCE" \
+        | /usr/bin/awk '{ print $1; exit }')"
+    [[ "$expected_chat_digest" =~ ^[a-f0-9]{64}$ ]] \
+        || die "could not fingerprint the structured chat broker source"
     expected_mcp_digest="$(/usr/bin/shasum -a 256 "$MCP_SOURCE" \
         | /usr/bin/awk '{ print $1; exit }')"
     [[ "$expected_mcp_digest" =~ ^[a-f0-9]{64}$ ]] \
@@ -802,20 +815,30 @@ verify_application() {
         's/^claude-agent-sdk==//p' "$CLAUDE_REQUIREMENTS_SOURCE")"
     [[ "$expected_claude_sdk_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
         || die "could not read the pinned Claude Agent SDK version"
+    expected_runtime_updater_digest="$(/usr/bin/shasum -a 256 "$RUNTIME_UPDATER_SOURCE" \
+        | /usr/bin/awk '{ print $1; exit }')"
+    expected_runtime_public_key_digest="$(/usr/bin/shasum -a 256 "$RUNTIME_PUBLIC_KEY_SOURCE" \
+        | /usr/bin/awk '{ print $1; exit }')"
+    expected_runtime_version="$(git -C "$REPOSITORY_ROOT" show -s --format=%ct HEAD)"
     output="$(/usr/bin/ssh \
         -o BatchMode=yes \
         -o ConnectTimeout=15 \
         -o StrictHostKeyChecking=yes \
         "$alias" \
-        "/bin/bash -s -- '$expected_helper_digest' '$expected_mcp_digest' '$expected_claude_sessions_digest' '$expected_claude_requirements_digest' '$expected_claude_sdk_version'" <<'REMOTE'
+        "/bin/bash -s -- '$expected_helper_digest' '$expected_chat_digest' '$expected_mcp_digest' '$expected_claude_sessions_digest' '$expected_claude_requirements_digest' '$expected_claude_sdk_version' '$expected_runtime_updater_digest' '$expected_runtime_public_key_digest' '$expected_runtime_version'" <<'REMOTE'
 set -euo pipefail
 expected_helper_digest="$1"
-expected_mcp_digest="$2"
-expected_claude_sessions_digest="$3"
-expected_claude_requirements_digest="$4"
-expected_claude_sdk_version="$5"
+expected_chat_digest="$2"
+expected_mcp_digest="$3"
+expected_claude_sessions_digest="$4"
+expected_claude_requirements_digest="$5"
+expected_claude_sdk_version="$6"
+expected_runtime_updater_digest="$7"
+expected_runtime_public_key_digest="$8"
+expected_runtime_version="$9"
 safe_path="/usr/local/bin:/usr/bin:/bin"
 session_helper="/usr/local/bin/terminal-relay-session"
+chat_broker="/usr/local/bin/terminal-relay-chat"
 mcp_server="/usr/local/bin/terminal-relay-mcp"
 claude_sessions="/usr/local/bin/terminal-relay-claude-sessions"
 claude_sdk="/opt/terminal-relay/claude-session-sdk/current"
@@ -827,10 +850,14 @@ test "$(id -un)" = terminal-relay
 test "$(id -gn)" = terminal-relay
 test "$(stat -c '%U:%G:%a' /workspace)" = terminal-relay:terminal-relay:750
 test "$(sha256sum "$session_helper" | awk '{ print $1; exit }')" = "$expected_helper_digest"
+test "$(sha256sum "$chat_broker" | awk '{ print $1; exit }')" = "$expected_chat_digest"
 test "$(sha256sum "$mcp_server" | awk '{ print $1; exit }')" = "$expected_mcp_digest"
 test "$(sha256sum "$claude_sessions" | awk '{ print $1; exit }')" = "$expected_claude_sessions_digest"
 test "$(sha256sum "$claude_sdk/requirements.txt" | awk '{ print $1; exit }')" = "$expected_claude_requirements_digest"
+test "$(sha256sum /usr/local/sbin/terminal-relay-runtime-update | awk '{ print $1; exit }')" = "$expected_runtime_updater_digest"
+test "$(sha256sum /etc/terminal-relay/runtime-update-public.pem | awk '{ print $1; exit }')" = "$expected_runtime_public_key_digest"
 test "$(stat -c '%U:%G:%a' "$claude_sessions")" = root:root:755
+test "$(stat -c '%U:%G:%a' "$chat_broker")" = root:root:755
 test -x "$claude_sdk/bin/python3"
 test "$("$claude_sdk/bin/python3" "$claude_sessions" version)" = "$expected_claude_sdk_version"
 test "$(command -v bwrap)" = /usr/bin/bwrap
@@ -879,7 +906,19 @@ systemctl is-enabled --quiet terminal-relay-session-restore@terminal-relay.servi
 systemctl is-active --quiet terminal-relay-session-restore@terminal-relay.service
 systemctl is-enabled --quiet terminal-relay-agent-update.timer
 systemctl is-active --quiet terminal-relay-agent-update.timer
+systemctl is-enabled --quiet terminal-relay-runtime-update.timer
+systemctl is-active --quiet terminal-relay-runtime-update.timer
+systemctl is-enabled --quiet terminal-relay-runtime-update.path
+systemctl is-active --quiet terminal-relay-runtime-update.path
 "$session_helper" status >/dev/null
+/usr/bin/python3 "$chat_broker" ready \
+    --provider codex \
+    --codex-socket /home/terminal-relay/.local/state/terminal-relay/codex.sock \
+    >/dev/null
+"$claude_sdk/bin/python3" "$chat_broker" ready --provider claude >/dev/null
+"$session_helper" runtime-info \
+    | grep -Eq "^runtime\\|$expected_runtime_version\\|1\\|2\\|agent-sessions,chat-v1,runtime-updates-v1,threads-v1,threads-v2$"
+"$session_helper" runtime-update-status >/dev/null
 printf 'application=ready\n'
 REMOTE
 )"

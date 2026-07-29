@@ -162,6 +162,23 @@ final class SSHCommandBuilderTests: XCTestCase {
         XCTAssertFalse(configuration.arguments.contains("-tt"))
     }
 
+    func testWorkerRuntimeCommandsUseFixedTypedHelperOperations() {
+        let server = makeServer(port: 2_222, identityFile: "~/Keys/agent key")
+        let info = SSHCommandBuilder.workerRuntimeInfoConfiguration(for: server)
+        let status = SSHCommandBuilder.workerRuntimeUpdateStatusConfiguration(for: server)
+        let request = SSHCommandBuilder.workerRuntimeUpdateRequestConfiguration(for: server)
+
+        XCTAssertEqual(info.arguments.last, "'/usr/local/bin/terminal-relay-session' 'runtime-info'")
+        XCTAssertEqual(
+            status.arguments.last,
+            "'/usr/local/bin/terminal-relay-session' 'runtime-update-status'"
+        )
+        XCTAssertEqual(
+            request.arguments.last,
+            "'/usr/local/bin/terminal-relay-session' 'runtime-update-request'"
+        )
+    }
+
     func testWorkerSessionStartPassesCodexDefaultsToFixedHelper() {
         let server = makeServer(codexCommand: "printf should-not-run")
         let defaults = AgentLaunchDefaults(

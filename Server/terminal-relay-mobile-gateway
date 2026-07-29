@@ -1,0 +1,9 @@
+#!/bin/bash
+set -euo pipefail
+
+readonly gateway="/usr/local/libexec/terminal-relay-command-gateway"
+[[ -x "$gateway" && ! -L "$gateway" ]] || {
+    echo "The Terminal Relay device command gateway is unavailable." >&2
+    exit 69
+}
+exec "$gateway"

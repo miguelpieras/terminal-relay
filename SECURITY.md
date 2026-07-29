@@ -47,6 +47,24 @@ Terminal Relay is a client for infrastructure controlled by its user:
   seven typed project/thread operations to the fixed helper path, validates
   project and UUID inputs, bounds runtime and output, and exposes no shell,
   terminal input, transcript access, deletion, listener, or cross-worker route.
+- Worker runtime releases are described by an Ed25519-signed manifest with an
+  exact file allowlist, destinations, modes, and SHA-256 digests. The root
+  updater has one compiled-in HTTPS feed, accepts no arguments, rejects
+  rollback versions, stages and verifies before taking deployment locks, and
+  restores the previous runtime on installation failure.
+- macOS and paired-mobile SSH gateways may invoke only typed helper operations.
+  Their runtime-update operation can create one fixed trigger for the
+  root-owned service; it cannot supply a URL, path, version, shell command,
+  systemd unit, or arbitrary network request. Existing paired-mobile keys are
+  migrated to this forced-command gateway during the one-time reconciliation.
+- Runtime installation never migrates or deletes `/workspace`, provider
+  credentials or history, relay metadata, restart intent, or tmux processes.
+  Runtime status is intentionally limited to versions, timestamp, result, and
+  a safe failure code.
+- App and worker diagnostics contain identifiers, state transitions, counts,
+  sizes, and sanitized error categories only. They must never include raw
+  structured records, terminal contents, provider objects, secret answers, or
+  fetched file content.
 
 Users are responsible for their worker operating systems, Tailscale policy,
 SSH authorization, agent accounts, repository permissions, backups, and

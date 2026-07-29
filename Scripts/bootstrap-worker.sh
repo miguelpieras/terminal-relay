@@ -10,16 +10,10 @@ REPOSITORY_ROOT="$(cd "$SCRIPT_DIRECTORY/.." && pwd -P)"
 readonly REPOSITORY_ROOT
 readonly SERVER_DIRECTORY="$REPOSITORY_ROOT/Server"
 readonly BASELINE_FILE="${TERMINAL_RELAY_BASELINE_FILE:-$SERVER_DIRECTORY/worker-baseline.local.env}"
-readonly -a WORKER_PAYLOAD_PATHS=(
+readonly RUNTIME_PAYLOAD_LIST="$SERVER_DIRECTORY/worker-runtime-files.txt"
+readonly -a INSTALLER_PAYLOAD_PATHS=(
     install-worker.sh
-    terminal-relay-session
-    terminal-relay-mcp
-    terminal-relay-claude-sessions
-    claude-agent-sdk-requirements.txt
-    terminal-relay-session-restore@.service
-    terminal-relay-agent-update
-    terminal-relay-agent-update.service
-    terminal-relay-agent-update.timer
+    worker-runtime-files.txt
     worker-config/install.sh
     worker-config/AGENTS.md
     worker-config/CLAUDE.md
@@ -221,7 +215,12 @@ fi
 if /usr/bin/grep -Eq '="REPLACE_ME"$' "$BASELINE_FILE"; then
     die "local worker baseline still contains REPLACE_ME values"
 fi
-for payload_path in "${WORKER_PAYLOAD_PATHS[@]}"; do
+runtime_payload_paths=()
+while IFS= read -r payload_path; do
+    runtime_payload_paths+=("$payload_path")
+done < <(/usr/bin/awk -F'|' '!/^#/ && NF { print $1 }' "$RUNTIME_PAYLOAD_LIST")
+[[ ${#runtime_payload_paths[@]} -gt 0 ]] || die "canonical worker runtime payload list is empty"
+for payload_path in "${INSTALLER_PAYLOAD_PATHS[@]}" "${runtime_payload_paths[@]}"; do
     [[ -f "$SERVER_DIRECTORY/$payload_path" && ! -L "$SERVER_DIRECTORY/$payload_path" ]] \
         || die "missing or unsafe bootstrap payload: Server/$payload_path"
 done
@@ -253,6 +252,11 @@ temporary_root="$(cd "$temporary_root" && pwd -P)"
 temporary_directory=$(/usr/bin/mktemp -d "$temporary_root/terminal-relay-bootstrap.XXXXXX")
 /bin/cp "$BASELINE_FILE" "$temporary_directory/worker-baseline.env"
 /bin/chmod 0600 "$temporary_directory/worker-baseline.env"
+runtime_version="$(git -C "$REPOSITORY_ROOT" show -s --format=%ct HEAD)"
+[[ "$runtime_version" =~ ^[1-9][0-9]*$ ]] || die "could not derive the worker runtime version"
+"$SCRIPT_DIRECTORY/write-installed-runtime-manifest.sh" \
+    "$runtime_version" \
+    "$temporary_directory/runtime-manifest.json"
 registration_token_file=""
 registration_handoff_dispatched=false
 cleanup() {
@@ -383,8 +387,8 @@ fi
 
 result_file="$temporary_directory/install-result"
 /usr/bin/tar --no-xattrs -cf - \
-    -C "$temporary_directory" worker-baseline.env \
-    -C "$SERVER_DIRECTORY" "${WORKER_PAYLOAD_PATHS[@]}" | \
+    -C "$temporary_directory" worker-baseline.env runtime-manifest.json \
+    -C "$SERVER_DIRECTORY" "${INSTALLER_PAYLOAD_PATHS[@]}" "${runtime_payload_paths[@]}" | \
     /usr/bin/ssh "${ssh_options[@]}" "$target" '
 set -eu
 worker_number='"$worker_number"'
@@ -454,19 +458,38 @@ test "$(id -un)" = terminal-relay
 test "$HOME" = /home/terminal-relay
 test -d /workspace && test -w /workspace
 test -x /usr/local/bin/terminal-relay-session
+test -x /usr/local/bin/terminal-relay-chat
 test -x /usr/local/bin/terminal-relay-mcp
 test -f /etc/systemd/system/terminal-relay-session-restore@.service
 test -x /usr/local/sbin/terminal-relay-agent-update
 test -f /etc/systemd/system/terminal-relay-agent-update.service
 test -f /etc/systemd/system/terminal-relay-agent-update.timer
+test -x /usr/local/sbin/terminal-relay-runtime-update
+test -f /etc/systemd/system/terminal-relay-runtime-update.service
+test -f /etc/systemd/system/terminal-relay-runtime-update.timer
+test -f /etc/systemd/system/terminal-relay-runtime-update.path
+test -f /etc/terminal-relay/runtime-update-public.pem
+test -f /etc/terminal-relay/runtime-manifest.json
+test -x /usr/local/bin/terminal-relay-mobile-gateway
 test -x /usr/bin/codex && test -x /usr/bin/claude
+/usr/bin/python3 /usr/local/bin/terminal-relay-chat ready \
+    --provider codex \
+    --codex-socket "$HOME/.local/state/terminal-relay/codex.sock" >/dev/null
+/opt/terminal-relay/claude-session-sdk/current/bin/python3 \
+    /usr/local/bin/terminal-relay-chat ready --provider claude >/dev/null
 test -r /proc/stat && test -r /proc/meminfo
 systemctl is-enabled --quiet terminal-relay-session-restore@terminal-relay.service
 systemctl is-active --quiet terminal-relay-session-restore@terminal-relay.service
 test "$(systemctl show -p User --value terminal-relay-session-restore@terminal-relay.service)" = terminal-relay
 systemctl is-enabled --quiet terminal-relay-agent-update.timer
 systemctl is-active --quiet terminal-relay-agent-update.timer
+systemctl is-enabled --quiet terminal-relay-runtime-update.timer
+systemctl is-active --quiet terminal-relay-runtime-update.timer
+systemctl is-enabled --quiet terminal-relay-runtime-update.path
+systemctl is-active --quiet terminal-relay-runtime-update.path
 /usr/local/bin/terminal-relay-session status >/dev/null
+/usr/local/bin/terminal-relay-session runtime-info >/dev/null
+/usr/local/bin/terminal-relay-session runtime-update-status >/dev/null
 '
 
 registration_proof=$(/usr/bin/openssl rand -hex 32) \

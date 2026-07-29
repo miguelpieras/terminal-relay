@@ -18,6 +18,7 @@ enum WorkerSessionServiceError: LocalizedError, Equatable {
     case startFailed
     case stopFailed
     case threadFailed
+    case runtimeUpdating
 
     var errorDescription: String? {
         switch self {
@@ -29,6 +30,8 @@ enum WorkerSessionServiceError: LocalizedError, Equatable {
             "The worker could not stop this agent."
         case .threadFailed:
             "The worker could not complete that thread action."
+        case .runtimeUpdating:
+            "This worker is updating to a compatible runtime. Existing terminals remain connected; try again shortly."
         }
     }
 }
@@ -51,31 +54,48 @@ final class WorkerSessionService: ObservableObject {
     @Published private(set) var errors: [UUID: String] = [:]
     @Published private(set) var updateStatuses: [UUID: WorkerUpdateStatus] = [:]
     @Published private(set) var updateWarnings: [UUID: String] = [:]
+    @Published private(set) var runtimeInfos: [UUID: WorkerRuntimeInfo] = [:]
+    @Published private(set) var runtimeUpdateStatuses: [UUID: WorkerRuntimeUpdateStatus] = [:]
+    @Published private(set) var runtimeMessages: [UUID: String] = [:]
     @Published private(set) var loadingWorkerIDs: Set<UUID> = []
     @Published private(set) var startingSlots: Set<SessionSlot> = []
     @Published private(set) var stoppingSlots: Set<SessionSlot> = []
     @Published private(set) var threadCatalogs: [WorkerThreadCatalogKey: WorkerThreadResponse] = [:]
 
     private let runCommand: CommandRunner
+    private let inspectsRuntimeOnRefresh: Bool
     private var refreshTasks: [UUID: Task<WorkerSessionResponse?, Never>] = [:]
     private var dismissedUpdateTimestamps: [UUID: Int] = [:]
+    private var runtimeUpdateTasks: [UUID: Task<Void, Never>] = [:]
 
     convenience init() {
-        self.init { configuration in
-            let result = try await Subprocess.run(
-                executable: URL(fileURLWithPath: configuration.executable),
-                arguments: configuration.arguments
-            )
-            return WorkerSessionCommandResult(
-                exitCode: result.exitCode,
-                standardOutput: result.standardOutput,
-                standardError: result.standardError
-            )
-        }
+        self.init(
+            runCommand: { configuration in
+                let result = try await Subprocess.run(
+                    executable: URL(fileURLWithPath: configuration.executable),
+                    arguments: configuration.arguments
+                )
+                return WorkerSessionCommandResult(
+                    exitCode: result.exitCode,
+                    standardOutput: result.standardOutput,
+                    standardError: result.standardError
+                )
+            },
+            inspectsRuntimeOnRefresh: true
+        )
     }
 
     init(runCommand: @escaping CommandRunner) {
         self.runCommand = runCommand
+        inspectsRuntimeOnRefresh = false
+    }
+
+    init(
+        runCommand: @escaping CommandRunner,
+        inspectsRuntimeOnRefresh: Bool
+    ) {
+        self.runCommand = runCommand
+        self.inspectsRuntimeOnRefresh = inspectsRuntimeOnRefresh
     }
 
     func response(for workerID: UUID) -> WorkerSessionResponse? {
@@ -105,7 +125,7 @@ final class WorkerSessionService: ObservableObject {
     }
 
     func updateWarning(for workerID: UUID) -> String? {
-        updateWarnings[workerID]
+        runtimeMessages[workerID] ?? updateWarnings[workerID]
     }
 
     func dismissUpdateWarning(for workerID: UUID) {
@@ -166,6 +186,9 @@ final class WorkerSessionService: ObservableObject {
             }
 
             let response = try WorkerSessionProtocol.parse(result.standardOutput)
+            if inspectsRuntimeOnRefresh {
+                await inspectRuntime(worker: worker)
+            }
             apply(await fetchUpdateStatus(worker: worker), to: worker.id)
             responses[worker.id] = response
             mergeLiveSessionsIntoThreadCatalogs(
@@ -178,6 +201,9 @@ final class WorkerSessionService: ObservableObject {
             )
             return response
         } catch {
+            if inspectsRuntimeOnRefresh {
+                await inspectRuntime(worker: worker)
+            }
             apply(await fetchUpdateStatus(worker: worker), to: worker.id)
             let message = message(for: error, fallback: .statusFailed)
             workerSessionLogger.error(
@@ -186,6 +212,99 @@ final class WorkerSessionService: ObservableObject {
             errors[worker.id] = message
             return nil
         }
+    }
+
+    private func inspectRuntime(worker: ServerProfile) async {
+        do {
+            let result = try await runCommand(
+                SSHCommandBuilder.workerRuntimeInfoConfiguration(for: worker)
+            )
+            guard result.exitCode == 0 else { return }
+            let info = try WorkerRuntimeInfoProtocol.parse(result.standardOutput)
+            runtimeInfos[worker.id] = info
+            if info.isClientProtocolCompatible {
+                runtimeMessages[worker.id] = nil
+            } else {
+                runtimeMessages[worker.id] =
+                    "This worker needs a runtime update for the current client. Updating automatically…"
+                beginRuntimeUpdate(worker: worker)
+            }
+            await refreshRuntimeUpdateStatus(worker: worker)
+        } catch {
+            runtimeInfos[worker.id] = nil
+        }
+    }
+
+    private func beginRuntimeUpdate(worker: ServerProfile) {
+        guard runtimeUpdateTasks[worker.id] == nil else { return }
+        runtimeUpdateTasks[worker.id] = Task { [weak self] in
+            guard let self else { return }
+            defer { runtimeUpdateTasks[worker.id] = nil }
+            do {
+                let request = try await runCommand(
+                    SSHCommandBuilder.workerRuntimeUpdateRequestConfiguration(for: worker)
+                )
+                let requestOutput = String(decoding: request.standardOutput, as: UTF8.self)
+                guard request.exitCode == 0,
+                      requestOutput.contains(WorkerRuntimeUpdateStatusProtocol.marker),
+                      requestOutput.contains("|accepted")
+                else { return }
+                runtimeMessages[worker.id] =
+                    "This worker needs a runtime update for the current client. Updating automatically…"
+                for delay in [1, 2, 4] {
+                    try? await Task.sleep(for: .seconds(delay))
+                    await refreshRuntimeUpdateStatus(worker: worker)
+                    let result = try await runCommand(
+                        SSHCommandBuilder.workerRuntimeInfoConfiguration(for: worker)
+                    )
+                    guard result.exitCode == 0,
+                          let info = try? WorkerRuntimeInfoProtocol.parse(result.standardOutput)
+                    else { continue }
+                    runtimeInfos[worker.id] = info
+                    if info.isClientProtocolCompatible {
+                        runtimeMessages[worker.id] = nil
+                        _ = await refresh(worker: worker)
+                        return
+                    }
+                }
+            } catch {
+                // The next normal refresh retries through the fixed worker trigger.
+            }
+        }
+    }
+
+    private func refreshRuntimeUpdateStatus(worker: ServerProfile) async {
+        do {
+            let result = try await runCommand(
+                SSHCommandBuilder.workerRuntimeUpdateStatusConfiguration(for: worker)
+            )
+            guard result.exitCode == 0,
+                  let status = try WorkerRuntimeUpdateStatusProtocol.parse(result.standardOutput)
+            else { return }
+            runtimeUpdateStatuses[worker.id] = status
+            if let message = status.message {
+                runtimeMessages[worker.id] = message
+            }
+        } catch {
+            return
+        }
+    }
+
+    private func requireCapability(
+        _ capability: String,
+        worker: ServerProfile
+    ) -> Bool {
+        if runtimeInfos[worker.id] == nil, runtimeMessages[worker.id] == nil {
+            return true
+        }
+        guard runtimeInfos[worker.id]?.supports(capability) == true else {
+            runtimeMessages[worker.id] =
+                "This worker is updating to add the required capability."
+            errors[worker.id] = WorkerSessionServiceError.runtimeUpdating.localizedDescription
+            beginRuntimeUpdate(worker: worker)
+            return false
+        }
+        return true
     }
 
     private func fetchUpdateStatus(worker: ServerProfile) async -> WorkerUpdateStatusFetchResult {
@@ -254,6 +373,7 @@ final class WorkerSessionService: ObservableObject {
         launchDefaults: AgentLaunchDefaults,
         on worker: ServerProfile
     ) async -> WorkerSessionSnapshot? {
+        guard requireCapability("agent-sessions", worker: worker) else { return nil }
         guard WorkerSessionProtocol.isValidRepositoryName(repositoryName) else {
             errors[worker.id] = WorkerSessionServiceError.startFailed.localizedDescription
             return nil
@@ -376,6 +496,7 @@ final class WorkerSessionService: ObservableObject {
         presentation: WorkerSessionPresentation = .terminal,
         on worker: ServerProfile
     ) async -> Bool {
+        guard requireCapability("agent-sessions", worker: worker) else { return false }
         guard WorkerSessionProtocol.isValidRepositoryName(repositoryName),
               let parsedInstanceToken = UUID(uuidString: instanceToken),
               parsedInstanceToken.uuidString.lowercased() == instanceToken else {
@@ -474,6 +595,7 @@ final class WorkerSessionService: ObservableObject {
         archived: Bool,
         on worker: ServerProfile
     ) async -> WorkerThreadResponse? {
+        guard requireCapability("threads-v2", worker: worker) else { return nil }
         guard WorkerSessionProtocol.isValidRepositoryName(repositoryName) else {
             errors[worker.id] = WorkerSessionServiceError.threadFailed.localizedDescription
             return nil
@@ -550,7 +672,8 @@ final class WorkerSessionService: ObservableObject {
         repositoryName: String,
         on worker: ServerProfile
     ) async -> WorkerThreadSnapshot? {
-        await mutateThreadCatalog(
+        guard requireCapability("threads-v2", worker: worker) else { return nil }
+        return await mutateThreadCatalog(
             configuration: SSHCommandBuilder.workerThreadCreateConfiguration(
                 for: worker,
                 repositoryName: repositoryName
@@ -568,6 +691,7 @@ final class WorkerSessionService: ObservableObject {
         preferredPresentation: WorkerSessionPresentation = .chat,
         on worker: ServerProfile
     ) async -> WorkerSessionSnapshot? {
+        guard requireCapability("threads-v2", worker: worker) else { return nil }
         guard Self.isCanonicalUUID(threadID) else {
             errors[worker.id] = WorkerSessionServiceError.threadFailed.localizedDescription
             return nil
@@ -679,6 +803,7 @@ final class WorkerSessionService: ObservableObject {
         name: String,
         on worker: ServerProfile
     ) async -> Bool {
+        guard requireCapability("threads-v2", worker: worker) else { return false }
         let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard Self.isCanonicalUUID(threadID), !normalized.isEmpty,
               !normalized.contains("\n"), normalized.utf8.count <= 200 else {
@@ -706,6 +831,7 @@ final class WorkerSessionService: ObservableObject {
         archived: Bool,
         on worker: ServerProfile
     ) async -> Bool {
+        guard requireCapability("threads-v2", worker: worker) else { return false }
         guard Self.isCanonicalUUID(threadID) else {
             errors[worker.id] = WorkerSessionServiceError.threadFailed.localizedDescription
             return false

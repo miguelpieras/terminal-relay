@@ -352,20 +352,26 @@ prepare_ssh() {
 
 install_review_worker() {
     local payload="$temporary_directory/payload"
+    local runtime_version
+    local payload_name
 
     /bin/mkdir -p "$payload"
     /bin/cp "$baseline_file" "$payload/worker-baseline.env"
     /bin/cp \
         "$server_directory/install-worker.sh" \
-        "$server_directory/terminal-relay-session" \
-        "$server_directory/terminal-relay-session-restore@.service" \
-        "$server_directory/terminal-relay-agent-update" \
-        "$server_directory/terminal-relay-agent-update.service" \
-        "$server_directory/terminal-relay-agent-update.timer" \
+        "$server_directory/worker-runtime-files.txt" \
         "$server_directory/terminal-relay-review-admin" \
         "$server_directory/terminal-relay-review-enroll" \
         "$server_directory/terminal-relay-review-gateway" \
         "$payload/"
+    while IFS= read -r payload_name; do
+        /bin/cp "$server_directory/$payload_name" "$payload/"
+    done < <(/usr/bin/awk -F'|' '!/^#/ && NF { print $1 }' \
+        "$server_directory/worker-runtime-files.txt")
+    runtime_version="$(git -C "$repository_root" show -s --format=%ct HEAD)"
+    "$script_directory/write-installed-runtime-manifest.sh" \
+        "$runtime_version" \
+        "$payload/runtime-manifest.json"
     /bin/cp -R "$server_directory/worker-config" "$payload/worker-config"
     /bin/chmod 0600 "$payload/worker-baseline.env"
 

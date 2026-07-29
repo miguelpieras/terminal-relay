@@ -135,6 +135,7 @@ enum MobilePairingService {
             echo "The Terminal Relay device key is invalid." >&2
             exit 64
         }
+        device_entry="restrict,command=\\"/usr/local/bin/terminal-relay-mobile-gateway\\" $device_key"
         printf '%s\n' "$device_key" | /usr/bin/awk '
             NF == 3 && $1 == "ssh-ed25519" \
                 && $2 ~ /^[A-Za-z0-9+\\/=]+$/ \
@@ -168,8 +169,8 @@ enum MobilePairingService {
             trap '/bin/rm -f -- "$temporary_file"' EXIT
             /usr/bin/awk -v marker="$marker" '$NF != marker { print }' \
                 "$authorized_keys" > "$temporary_file"
-            if ! /usr/bin/grep -Fqx -- "$device_key" "$temporary_file"; then
-                printf '%s\n' "$device_key" >> "$temporary_file"
+            if ! /usr/bin/grep -Fqx -- "$device_entry" "$temporary_file"; then
+                printf '%s\n' "$device_entry" >> "$temporary_file"
             fi
             /bin/chmod 600 "$temporary_file"
             /bin/mv -f -- "$temporary_file" "$authorized_keys"

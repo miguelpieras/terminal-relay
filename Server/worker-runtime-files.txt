@@ -1,0 +1,17 @@
+# source|destination|mode
+terminal-relay-session|/usr/local/bin/terminal-relay-session|0755
+terminal-relay-mcp|/usr/local/bin/terminal-relay-mcp|0755
+terminal-relay-chat|/usr/local/bin/terminal-relay-chat|0755
+terminal-relay-claude-sessions|/usr/local/bin/terminal-relay-claude-sessions|0755
+claude-agent-sdk-requirements.txt|/opt/terminal-relay/claude-session-sdk/runtime-requirements.txt|0644
+terminal-relay-session-restore@.service|/etc/systemd/system/terminal-relay-session-restore@.service|0644
+terminal-relay-agent-update|/usr/local/sbin/terminal-relay-agent-update|0755
+terminal-relay-agent-update.service|/etc/systemd/system/terminal-relay-agent-update.service|0644
+terminal-relay-agent-update.timer|/etc/systemd/system/terminal-relay-agent-update.timer|0644
+terminal-relay-runtime-update|/usr/local/sbin/terminal-relay-runtime-update|0755
+terminal-relay-runtime-update.service|/etc/systemd/system/terminal-relay-runtime-update.service|0644
+terminal-relay-runtime-update.timer|/etc/systemd/system/terminal-relay-runtime-update.timer|0644
+terminal-relay-runtime-update.path|/etc/systemd/system/terminal-relay-runtime-update.path|0644
+terminal-relay-runtime-update.pub|/etc/terminal-relay/runtime-update-public.pem|0644
+terminal-relay-review-gateway|/usr/local/libexec/terminal-relay-command-gateway|0755
+terminal-relay-mobile-gateway|/usr/local/bin/terminal-relay-mobile-gateway|0755

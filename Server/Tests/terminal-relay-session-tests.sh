@@ -22,6 +22,8 @@ codex_app_server_log="$test_root/codex-app-server.log"
 codex_app_server_control="$test_root/codex-app-server.control"
 boot_id_file="$test_root/boot-id"
 agent_update_status_file="$test_root/agent-update-status"
+runtime_manifest_file="$test_root/runtime-manifest.json"
+runtime_update_status_file="$test_root/runtime-update-status"
 stub_agent="$test_root/stub-agent"
 stub_codex="$test_root/stub-codex"
 stub_codex_app_server="$test_root/stub-codex-app-server"
@@ -903,6 +905,8 @@ export TERMINAL_RELAY_TEST_SIGNAL_LOG="$signal_log"
 export TERMINAL_RELAY_TEST_SIGNAL_TARGET_PATH="$stub_agent"
 export TERMINAL_RELAY_TEST_BOOT_ID_PATH="$boot_id_file"
 export TERMINAL_RELAY_TEST_AGENT_UPDATE_STATUS_PATH="$agent_update_status_file"
+export TERMINAL_RELAY_TEST_RUNTIME_MANIFEST_PATH="$runtime_manifest_file"
+export TERMINAL_RELAY_TEST_RUNTIME_UPDATE_STATUS_PATH="$runtime_update_status_file"
 export HOME="$test_home"
 
 list_output="$(/bin/bash "$helper" list-projects)"
@@ -943,6 +947,34 @@ set -e
 assert_equal "70" "$malformed_update_status" "malformed agent update status"
 assert_contains "$malformed_update_output" "malformed" "malformed agent update diagnostic"
 /bin/rm -f -- "$agent_update_status_file"
+printf '%s\n' \
+    '{"runtimeVersion":2000000000,"protocol":{"minimum":1,"maximum":2},"capabilities":["agent-sessions","chat-v1","runtime-updates-v1","threads-v1","threads-v2"]}' \
+    > "$runtime_manifest_file"
+/bin/chmod 644 "$runtime_manifest_file"
+assert_equal \
+    $'__TERMINAL_RELAY_RUNTIME_INFO_V1__\nruntime|2000000000|1|2|agent-sessions,chat-v1,runtime-updates-v1,threads-v1,threads-v2' \
+    "$(/bin/bash "$helper" runtime-info)" \
+    "worker runtime information"
+assert_equal \
+    "__TERMINAL_RELAY_RUNTIME_UPDATE_V1__" \
+    "$(/bin/bash "$helper" runtime-update-status)" \
+    "missing worker runtime update status"
+printf '%s\n' \
+    '__TERMINAL_RELAY_RUNTIME_UPDATE_V1__' \
+    'runtime-update|1785055400|checking|2000000000|2000000001|none' \
+    > "$runtime_update_status_file"
+/bin/chmod 644 "$runtime_update_status_file"
+assert_equal \
+    $'__TERMINAL_RELAY_RUNTIME_UPDATE_V1__\nruntime-update|1785055400|checking|2000000000|2000000001|none' \
+    "$(/bin/bash "$helper" runtime-update-status)" \
+    "worker runtime update progress"
+runtime_request_output="$(/bin/bash "$helper" runtime-update-request)"
+assert_contains "$runtime_request_output" \
+    "__TERMINAL_RELAY_RUNTIME_UPDATE_V1__" \
+    "worker runtime request marker"
+assert_contains "$runtime_request_output" "|accepted" "worker runtime request result"
+assert_equal "600" "$(path_mode "$runtime_root/runtime-update-request")" \
+    "worker runtime request mode"
 
 echo "2/18 concurrent starts create independent terminals with distinct tokens"
 start_one_output="$test_root/start-one.out"
@@ -1749,5 +1781,121 @@ assert_contains \
     "$claude_account_output" \
     "Current session: 12% used" \
     "Claude account usage output"
+
+echo "A signed-runtime-style helper replacement preserves attached sessions and provider metadata"
+current_runtime_helper="$helper"
+upgrade_helper="$test_root/terminal-relay-session.previous"
+/bin/cp "$current_runtime_helper" "$upgrade_helper"
+printf '\n# Simulated previous worker runtime.\n' >> "$upgrade_helper"
+/bin/chmod 755 "$upgrade_helper"
+helper="$upgrade_helper"
+
+upgrade_codex_output="$(/bin/bash "$helper" start codex alpha --runtime-upgrade)"
+upgrade_codex_instance="$(instance_from_line "$(printf '%s\n' "$upgrade_codex_output" \
+    | /usr/bin/awk -F'|' '$1 == "session" { print; exit }')")"
+upgrade_claude_output="$(/bin/bash "$helper" start claude beta --runtime-upgrade)"
+upgrade_claude_line="$(printf '%s\n' "$upgrade_claude_output" \
+    | /usr/bin/awk -F'|' '$1 == "session" { print; exit }')"
+upgrade_claude_instance="$(instance_from_line "$upgrade_claude_line")"
+upgrade_claude_thread_id="$(thread_id_from_line "$upgrade_claude_line")"
+upgrade_codex_thread_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+upgrade_dormant_codex_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+upgrade_archived_codex_id="eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+upgrade_archived_claude_id="ffffffff-ffff-4fff-8fff-ffffffffffff"
+
+wait_for_session codex alpha 0 >/dev/null
+wait_for_session claude beta 0 >/dev/null
+"$tmux_path" -f /dev/null -L "$tmux_socket" \
+    select-pane -t "terminal-relay-codex-$upgrade_codex_instance" \
+    -T "$upgrade_codex_thread_id | Ready"
+wait_for_session codex alpha 0 >/dev/null
+start_client runtime-upgrade-codex "$workspace_root/alpha" \
+    reattach codex alpha "$upgrade_codex_instance"
+start_client runtime-upgrade-claude "$workspace_root/beta" \
+    reattach claude beta "$upgrade_claude_instance"
+upgrade_codex_before="$(wait_for_session codex alpha 1)"
+upgrade_claude_before="$(wait_for_session claude beta 1)"
+upgrade_codex_pid="$("$tmux_path" -f /dev/null -L "$tmux_socket" \
+    display-message -p -t "terminal-relay-codex-$upgrade_codex_instance" '#{pane_pid}')"
+upgrade_claude_pid="$("$tmux_path" -f /dev/null -L "$tmux_socket" \
+    display-message -p -t "terminal-relay-claude-$upgrade_claude_instance" '#{pane_pid}')"
+
+mkdir -p \
+    "$test_home/.codex/sessions" \
+    "$test_home/.codex/archived_sessions" \
+    "$runtime_root/claude-archives/beta" \
+    "$test_root/other-worker-provider-state"
+printf '%s\n' "$upgrade_dormant_codex_id" \
+    > "$test_home/.codex/sessions/$upgrade_dormant_codex_id.json"
+printf '%s\n' "$upgrade_archived_codex_id" \
+    > "$test_home/.codex/archived_sessions/$upgrade_archived_codex_id.json"
+printf '%s\n' 'version|1' \
+    > "$runtime_root/claude-archives/beta/$upgrade_archived_claude_id"
+printf '%s\n' 'other-worker-state' \
+    > "$test_root/other-worker-provider-state/unchanged"
+provider_state_before="$(/usr/bin/shasum -a 256 \
+    "$test_home/.codex/sessions/$upgrade_dormant_codex_id.json" \
+    "$test_home/.codex/archived_sessions/$upgrade_archived_codex_id.json" \
+    "$runtime_root/claude-archives/beta/$upgrade_archived_claude_id")"
+other_worker_state_before="$(/usr/bin/shasum -a 256 \
+    "$test_root/other-worker-provider-state/unchanged")"
+
+/usr/bin/install -m 0755 "$current_runtime_helper" "$test_root/runtime-helper.next"
+/bin/mv -f "$test_root/runtime-helper.next" "$helper"
+
+upgrade_codex_after="$(wait_for_session codex alpha 1)"
+upgrade_claude_after="$(wait_for_session claude beta 1)"
+assert_equal "$upgrade_codex_before" "$upgrade_codex_after" \
+    "Codex session identity across runtime replacement"
+assert_equal "$upgrade_claude_before" "$upgrade_claude_after" \
+    "Claude session identity across runtime replacement"
+assert_equal "$upgrade_codex_pid" \
+    "$("$tmux_path" -f /dev/null -L "$tmux_socket" \
+        display-message -p -t "terminal-relay-codex-$upgrade_codex_instance" '#{pane_pid}')" \
+    "Codex process across runtime replacement"
+assert_equal "$upgrade_claude_pid" \
+    "$("$tmux_path" -f /dev/null -L "$tmux_socket" \
+        display-message -p -t "terminal-relay-claude-$upgrade_claude_instance" '#{pane_pid}')" \
+    "Claude process across runtime replacement"
+assert_equal "$upgrade_codex_thread_id" "$(thread_id_from_line "$upgrade_codex_after")" \
+    "Codex provider thread across runtime replacement"
+assert_equal "$upgrade_claude_thread_id" "$(thread_id_from_line "$upgrade_claude_after")" \
+    "Claude provider thread across runtime replacement"
+assert_equal "$provider_state_before" "$(/usr/bin/shasum -a 256 \
+    "$test_home/.codex/sessions/$upgrade_dormant_codex_id.json" \
+    "$test_home/.codex/archived_sessions/$upgrade_archived_codex_id.json" \
+    "$runtime_root/claude-archives/beta/$upgrade_archived_claude_id")" \
+    "dormant and archived provider metadata across runtime replacement"
+assert_equal "$other_worker_state_before" "$(/usr/bin/shasum -a 256 \
+    "$test_root/other-worker-provider-state/unchanged")" \
+    "other worker state across runtime replacement"
+assert_contains "$(/bin/bash "$helper" status)" "__TERMINAL_RELAY_SESSION_V1__" \
+    "legacy session protocol after runtime replacement"
+assert_contains "$(/bin/bash "$helper" threads-v2 claude beta open)" \
+    "__TERMINAL_RELAY_THREADS_V2__" \
+    "current thread protocol after runtime replacement"
+assert_contains "$(/bin/bash "$helper" runtime-info)" \
+    "__TERMINAL_RELAY_RUNTIME_INFO_V1__" \
+    "runtime information after runtime replacement"
+
+/bin/bash "$helper" __schedule-codex-app-server-restart
+[[ -f "$codex_restart_marker" ]] \
+    || fail "runtime replacement restart marker did not wait for an attached Codex terminal"
+"$tmux_path" -f /dev/null -L "$harness_socket" \
+    kill-session -t runtime-upgrade-codex
+"$tmux_path" -f /dev/null -L "$harness_socket" \
+    kill-session -t runtime-upgrade-claude
+wait_for_session codex alpha 0 >/dev/null
+wait_for_session claude beta 0 >/dev/null
+/bin/bash "$helper" stop codex alpha "$upgrade_codex_instance"
+/bin/bash "$helper" stop claude beta "$upgrade_claude_instance"
+wait_for_no_session codex
+wait_for_no_session claude
+TERMINAL_RELAY_TEST_CODEX_SHARED_ACCOUNT=1 \
+    /bin/bash "$helper" codex-account >/dev/null
+[[ ! -e "$codex_restart_marker" ]] \
+    || fail "runtime replacement restart marker remained after attached terminals drained"
+
+helper="$current_runtime_helper"
 
 echo "PASS: terminal-relay-session integration tests"

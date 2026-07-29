@@ -1,0 +1,571 @@
+#!/bin/bash
+set -uo pipefail
+
+readonly feed_root="https://miguelpieras.github.io/terminal-relay/worker-runtime"
+readonly manifest_url="$feed_root/manifest.json"
+readonly signature_url="$feed_root/manifest.sig"
+readonly public_key="/etc/terminal-relay/runtime-update-public.pem"
+readonly installed_manifest="/etc/terminal-relay/runtime-manifest.json"
+readonly status_directory="/var/lib/terminal-relay"
+readonly status_path="$status_directory/runtime-update-status"
+readonly request_path="/home/terminal-relay/.local/state/terminal-relay/runtime-update-request"
+readonly runtime_user="terminal-relay"
+readonly runtime_group="terminal-relay"
+readonly sdk_root="/opt/terminal-relay/claude-session-sdk"
+readonly sdk_current="$sdk_root/current"
+readonly sdk_version="0.2.125"
+readonly deployment_lock="/run/lock/terminal-relay-session-helper.lock"
+readonly update_lock="/run/lock/terminal-relay-runtime-update.lock"
+readonly launcher="/usr/local/bin/terminal-relay-session"
+readonly restart_marker="/home/terminal-relay/.local/state/terminal-relay/codex-app-server-restart-required"
+
+temporary_directory=""
+installed_version=0
+target_version=0
+prepared_sdk_environment_name=""
+previous_sdk_current_target=""
+sdk_current_changed=false
+
+log() {
+    printf '[terminal-relay-runtime-update] %s\n' "$*"
+}
+
+cleanup() {
+    local exit_code=$?
+    trap - EXIT
+    if [[ -n "$temporary_directory" && -d "$temporary_directory" ]]; then
+        case "$temporary_directory" in
+            /tmp/terminal-relay-runtime-update.*)
+                /bin/rm -rf -- "$temporary_directory"
+                ;;
+        esac
+    fi
+    exit "$exit_code"
+}
+trap cleanup EXIT
+
+safe_version_from_manifest() {
+    local path="$1"
+    [[ -f "$path" && ! -L "$path" ]] || {
+        printf '0\n'
+        return
+    }
+    /usr/bin/python3 - "$path" <<'PYTHON' 2>/dev/null || printf '0\n'
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8")).get("runtimeVersion")
+if isinstance(value, int) and 0 <= value <= 9_223_372_036_854_775_807:
+    print(value)
+else:
+    raise SystemExit(1)
+PYTHON
+}
+
+write_status() {
+    local result="$1"
+    local failure_code="$2"
+    local timestamp
+    local temporary_file
+
+    case "$result" in checking|success|failure) ;;
+        *) return 1 ;;
+    esac
+    case "$failure_code" in
+        none|current|feed-unavailable|signature-invalid|manifest-invalid|rollback-blocked|\
+        archive-unavailable|archive-invalid|sdk-failed|install-failed|systemd-failed)
+            ;;
+        *) failure_code=install-failed ;;
+    esac
+    [[ "$installed_version" =~ ^[0-9]+$ ]] || installed_version=0
+    [[ "$target_version" =~ ^[0-9]+$ ]] || target_version=0
+    timestamp="$(/bin/date -u +%s)" || return 1
+    [[ "$timestamp" =~ ^[1-9][0-9]*$ ]] || return 1
+    /usr/bin/install -d -o root -g root -m 0755 "$status_directory" || return 1
+    temporary_file="$(/usr/bin/mktemp "$status_directory/.runtime-update-status.XXXXXX")" \
+        || return 1
+    if ! printf '%s\nruntime-update|%s|%s|%s|%s|%s\n' \
+        '__TERMINAL_RELAY_RUNTIME_UPDATE_V1__' \
+        "$timestamp" \
+        "$result" \
+        "$installed_version" \
+        "$target_version" \
+        "$failure_code" > "$temporary_file" \
+        || ! /bin/chown root:root "$temporary_file" \
+        || ! /bin/chmod 0644 "$temporary_file" \
+        || ! /bin/mv -f -- "$temporary_file" "$status_path"; then
+        /bin/rm -f -- "$temporary_file"
+        return 1
+    fi
+}
+
+fail_update() {
+    local code="$1"
+    log "Update failed ($code)."
+    write_status failure "$code" || true
+    exit 1
+}
+
+download() {
+    /usr/bin/curl \
+        --proto '=https' \
+        --tlsv1.2 \
+        --fail \
+        --location \
+        --silent \
+        --show-error \
+        --connect-timeout 5 \
+        --max-time 20 \
+        --retry 2 \
+        --retry-delay 2 \
+        --retry-max-time 45 \
+        --output "$2" \
+        "$1"
+}
+
+validate_manifest() {
+    /usr/bin/python3 - "$1" "$2" "$installed_version" "$feed_root" <<'PYTHON'
+import json
+import re
+import sys
+
+manifest_path, output_path, installed_text, feed_root = sys.argv[1:]
+expected = {
+    "terminal-relay-session": ("/usr/local/bin/terminal-relay-session", "0755"),
+    "terminal-relay-mcp": ("/usr/local/bin/terminal-relay-mcp", "0755"),
+    "terminal-relay-chat": ("/usr/local/bin/terminal-relay-chat", "0755"),
+    "terminal-relay-claude-sessions": (
+        "/usr/local/bin/terminal-relay-claude-sessions",
+        "0755",
+    ),
+    "claude-agent-sdk-requirements.txt": (
+        "/opt/terminal-relay/claude-session-sdk/runtime-requirements.txt",
+        "0644",
+    ),
+    "terminal-relay-session-restore@.service": (
+        "/etc/systemd/system/terminal-relay-session-restore@.service",
+        "0644",
+    ),
+    "terminal-relay-agent-update": (
+        "/usr/local/sbin/terminal-relay-agent-update",
+        "0755",
+    ),
+    "terminal-relay-agent-update.service": (
+        "/etc/systemd/system/terminal-relay-agent-update.service",
+        "0644",
+    ),
+    "terminal-relay-agent-update.timer": (
+        "/etc/systemd/system/terminal-relay-agent-update.timer",
+        "0644",
+    ),
+    "terminal-relay-runtime-update": (
+        "/usr/local/sbin/terminal-relay-runtime-update",
+        "0755",
+    ),
+    "terminal-relay-runtime-update.service": (
+        "/etc/systemd/system/terminal-relay-runtime-update.service",
+        "0644",
+    ),
+    "terminal-relay-runtime-update.timer": (
+        "/etc/systemd/system/terminal-relay-runtime-update.timer",
+        "0644",
+    ),
+    "terminal-relay-runtime-update.path": (
+        "/etc/systemd/system/terminal-relay-runtime-update.path",
+        "0644",
+    ),
+    "terminal-relay-runtime-update.pub": (
+        "/etc/terminal-relay/runtime-update-public.pem",
+        "0644",
+    ),
+    "terminal-relay-review-gateway": (
+        "/usr/local/libexec/terminal-relay-command-gateway",
+        "0755",
+    ),
+    "terminal-relay-mobile-gateway": (
+        "/usr/local/bin/terminal-relay-mobile-gateway",
+        "0755",
+    ),
+}
+expected_capabilities = [
+    "agent-sessions",
+    "chat-v1",
+    "runtime-updates-v1",
+    "threads-v1",
+    "threads-v2",
+]
+digest = re.compile(r"^[a-f0-9]{64}$")
+
+try:
+    manifest = json.load(open(manifest_path, encoding="utf-8"))
+except (OSError, ValueError):
+    raise SystemExit(1)
+if set(manifest) != {
+    "schemaVersion",
+    "channel",
+    "runtimeVersion",
+    "releaseVersion",
+    "protocol",
+    "capabilities",
+    "archiveURL",
+    "archiveSHA256",
+    "files",
+}:
+    raise SystemExit(1)
+version = manifest["runtimeVersion"]
+if (
+    manifest["schemaVersion"] != 1
+    or manifest["channel"] != "stable"
+    or not isinstance(version, int)
+    or version <= 0
+    or version > 9_223_372_036_854_775_807
+    or not isinstance(manifest["releaseVersion"], str)
+    or not re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,2}", manifest["releaseVersion"])
+    or manifest["protocol"] != {"minimum": 1, "maximum": 2}
+    or manifest["capabilities"] != expected_capabilities
+    or manifest["archiveURL"] != f"{feed_root}/{version}/runtime.tar.gz"
+    or not isinstance(manifest["archiveSHA256"], str)
+    or not digest.fullmatch(manifest["archiveSHA256"])
+    or not isinstance(manifest["files"], list)
+    or len(manifest["files"]) != len(expected)
+):
+    raise SystemExit(1)
+
+seen = set()
+rows = []
+for item in manifest["files"]:
+    if not isinstance(item, dict) or set(item) != {
+        "source",
+        "destination",
+        "mode",
+        "sha256",
+    }:
+        raise SystemExit(1)
+    source = item["source"]
+    if source not in expected or source in seen:
+        raise SystemExit(1)
+    destination, mode = expected[source]
+    if (
+        item["destination"] != destination
+        or item["mode"] != mode
+        or not isinstance(item["sha256"], str)
+        or not digest.fullmatch(item["sha256"])
+    ):
+        raise SystemExit(1)
+    seen.add(source)
+    rows.append((source, destination, mode, item["sha256"]))
+if seen != set(expected):
+    raise SystemExit(1)
+
+with open(output_path, "w", encoding="utf-8") as output:
+    output.write(
+        f"{version}\t{manifest['archiveURL']}\t{manifest['archiveSHA256']}\n"
+    )
+    for row in rows:
+        output.write("\t".join(row) + "\n")
+PYTHON
+}
+
+validate_and_extract_archive() {
+    /usr/bin/python3 - "$1" "$2" "$3" <<'PYTHON'
+import hashlib
+import pathlib
+import sys
+import tarfile
+
+archive_path = pathlib.Path(sys.argv[1])
+validated_path = pathlib.Path(sys.argv[2])
+staging = pathlib.Path(sys.argv[3])
+rows = validated_path.read_text(encoding="utf-8").splitlines()[1:]
+expected = {}
+for row in rows:
+    source, destination, mode, digest = row.split("\t")
+    expected[source] = (destination, int(mode, 8), digest)
+
+with tarfile.open(archive_path, mode="r:gz") as archive:
+    members = archive.getmembers()
+    if len(members) != len(expected):
+        raise SystemExit(1)
+    seen = set()
+    for member in members:
+        if (
+            member.name not in expected
+            or member.name in seen
+            or not member.isreg()
+            or member.uid != 0
+            or member.gid != 0
+        ):
+            raise SystemExit(1)
+        _, expected_mode, expected_digest = expected[member.name]
+        if member.mode != expected_mode:
+            raise SystemExit(1)
+        source = archive.extractfile(member)
+        if source is None:
+            raise SystemExit(1)
+        contents = source.read()
+        if hashlib.sha256(contents).hexdigest() != expected_digest:
+            raise SystemExit(1)
+        destination = staging / member.name
+        destination.write_bytes(contents)
+        destination.chmod(expected_mode)
+        seen.add(member.name)
+    if seen != set(expected):
+        raise SystemExit(1)
+PYTHON
+}
+
+install_sdk() {
+    local requirements="$1"
+    local requirements_digest
+    local environment_name
+    local environment_directory
+    local staging_directory
+
+    requirements_digest="$(/usr/bin/sha256sum "$requirements" | /usr/bin/awk '{ print $1 }')" \
+        || return 1
+    [[ "$requirements_digest" =~ ^[a-f0-9]{64}$ ]] || return 1
+    environment_name="sdk-$sdk_version-${requirements_digest:0:16}"
+    environment_directory="$sdk_root/$environment_name"
+    /usr/bin/install -d -o root -g root -m 0755 "$sdk_root" || return 1
+    if [[ ! -d "$environment_directory" ]]; then
+        staging_directory="$(/usr/bin/mktemp -d \
+            "$sdk_root/.terminal-relay-claude-sdk.install.XXXXXX")" || return 1
+        if ! /usr/bin/python3 -m venv "$staging_directory" \
+            || ! "$staging_directory/bin/python3" -m pip install \
+                --disable-pip-version-check \
+                --no-cache-dir \
+                --requirement "$requirements" \
+            || [[ "$("$staging_directory/bin/python3" -c \
+                'import claude_agent_sdk; print(claude_agent_sdk.__version__)' 2>/dev/null)" \
+                != "$sdk_version" ]] \
+            || ! /usr/bin/install -o root -g root -m 0644 \
+                "$requirements" "$staging_directory/requirements.txt"; then
+            /bin/rm -rf -- "$staging_directory"
+            return 1
+        fi
+        /bin/chown -R root:root "$staging_directory" || return 1
+        /bin/chmod -R a+rX,u+w,go-w "$staging_directory" || return 1
+        /bin/mv -T "$staging_directory" "$environment_directory" || return 1
+    fi
+    [[ -x "$environment_directory/bin/python3" ]] || return 1
+    prepared_sdk_environment_name="$environment_name"
+}
+
+activate_sdk() {
+    local temporary_link
+
+    [[ "$prepared_sdk_environment_name" =~ ^sdk-[0-9.]+-[a-f0-9]{16}$ ]] || return 1
+    if [[ -L "$sdk_current" ]]; then
+        previous_sdk_current_target="$(/bin/readlink "$sdk_current")" || return 1
+        [[ "$previous_sdk_current_target" =~ ^sdk-[0-9.]+-[a-f0-9]{16}$ ]] \
+            || return 1
+    elif [[ -e "$sdk_current" ]]; then
+        return 1
+    fi
+    temporary_link="$sdk_root/.current.$$.$RANDOM"
+    /bin/ln -s "$prepared_sdk_environment_name" "$temporary_link" || return 1
+    /bin/mv -Tf "$temporary_link" "$sdk_current" || return 1
+    sdk_current_changed=true
+    [[ -x "$sdk_current/bin/python3" ]]
+}
+
+install_runtime() {
+    local validated="$1"
+    local staging="$2"
+    local manifest="$3"
+    local rollback="$temporary_directory/rollback"
+    local installed="$temporary_directory/installed"
+    local source
+    local destination
+    local mode
+    local index=0
+    local temporary_file
+
+    /usr/bin/install -d -o root -g root -m 0700 "$rollback" || return 1
+    : > "$installed"
+    while IFS=$'\t' read -r source destination mode _digest; do
+        [[ -n "$source" ]] || continue
+        index=$((index + 1))
+        if [[ -e "$destination" || -L "$destination" ]]; then
+            [[ -f "$destination" && ! -L "$destination" ]] || return 1
+            /bin/cp -a -- "$destination" "$rollback/$index" || return 1
+            printf '%s\t%s\tpresent\n' "$index" "$destination" >> "$installed"
+        else
+            printf '%s\t%s\tabsent\n' "$index" "$destination" >> "$installed"
+        fi
+        /usr/bin/install -d -o root -g root -m 0755 "$(dirname "$destination")" \
+            || return 1
+        temporary_file="$(/usr/bin/mktemp "$(dirname "$destination")/.runtime.XXXXXX")" \
+            || return 1
+        if ! /usr/bin/install -o root -g root -m "$mode" \
+            "$staging/$source" "$temporary_file" \
+            || ! /bin/mv -f -- "$temporary_file" "$destination"; then
+            /bin/rm -f -- "$temporary_file"
+            return 1
+        fi
+    done < <(/usr/bin/tail -n +2 "$validated")
+
+    index=$((index + 1))
+    if [[ -e "$installed_manifest" || -L "$installed_manifest" ]]; then
+        [[ -f "$installed_manifest" && ! -L "$installed_manifest" ]] || return 1
+        /bin/cp -a -- "$installed_manifest" "$rollback/$index" || return 1
+        printf '%s\t%s\tpresent\n' "$index" "$installed_manifest" >> "$installed"
+    else
+        printf '%s\t%s\tabsent\n' "$index" "$installed_manifest" >> "$installed"
+    fi
+    temporary_file="$(/usr/bin/mktemp /etc/terminal-relay/.runtime-manifest.XXXXXX)" \
+        || return 1
+    /usr/bin/install -o root -g root -m 0644 "$manifest" "$temporary_file" \
+        || return 1
+    /bin/mv -f -- "$temporary_file" "$installed_manifest" || return 1
+    activate_sdk
+}
+
+rollback_runtime() {
+    local installed="$temporary_directory/installed"
+    local rollback="$temporary_directory/rollback"
+    local index
+    local destination
+    local state
+    [[ -f "$installed" ]] || return
+    /usr/bin/tac "$installed" | while IFS=$'\t' read -r index destination state; do
+        if [[ "$state" == present && -f "$rollback/$index" ]]; then
+            /bin/cp -a -- "$rollback/$index" "$destination"
+        elif [[ "$state" == absent ]]; then
+            /bin/rm -f -- "$destination"
+        fi
+    done
+    if [[ "$sdk_current_changed" == true ]]; then
+        if [[ -n "$previous_sdk_current_target" ]]; then
+            local temporary_link="$sdk_root/.current.rollback.$$.$RANDOM"
+            /bin/ln -s "$previous_sdk_current_target" "$temporary_link" \
+                && /bin/mv -Tf "$temporary_link" "$sdk_current"
+        else
+            /bin/rm -f -- "$sdk_current"
+        fi
+        sdk_current_changed=false
+    fi
+}
+
+schedule_app_server_restart() {
+    /usr/sbin/runuser -u "$runtime_user" -- \
+        /usr/bin/env \
+            HOME="/home/$runtime_user" \
+            USER="$runtime_user" \
+            LOGNAME="$runtime_user" \
+            SHELL=/bin/bash \
+            PATH=/usr/local/bin:/usr/bin:/bin \
+            "$launcher" __schedule-codex-app-server-restart \
+        && [[ "$(/usr/bin/stat -c '%U:%G:%a' "$restart_marker")" \
+            == "$runtime_user:$runtime_group:600" ]]
+}
+
+main() {
+    local manifest
+    local signature
+    local validated
+    local archive
+    local staging
+    local archive_url
+    local expected_archive_digest
+    local actual_archive_digest
+
+    [[ "$EUID" -eq 0 ]] || {
+        log "Run as root."
+        exit 1
+    }
+    exec 8>"$update_lock"
+    if ! /usr/bin/flock -n 8; then
+        log "Another runtime update is already running."
+        exit 0
+    fi
+    installed_version="$(safe_version_from_manifest "$installed_manifest")"
+    [[ "$installed_version" =~ ^[0-9]+$ ]] || installed_version=0
+    target_version="$installed_version"
+    write_status checking none || exit 1
+
+    temporary_directory="$(/usr/bin/mktemp -d /tmp/terminal-relay-runtime-update.XXXXXX)" \
+        || fail_update install-failed
+    manifest="$temporary_directory/manifest.json"
+    signature="$temporary_directory/manifest.sig"
+    validated="$temporary_directory/validated.tsv"
+    archive="$temporary_directory/runtime.tar.gz"
+    staging="$temporary_directory/staging"
+    /usr/bin/install -d -o root -g root -m 0700 "$staging" \
+        || fail_update install-failed
+
+    download "$manifest_url" "$manifest" || fail_update feed-unavailable
+    download "$signature_url" "$signature" || fail_update feed-unavailable
+    [[ -f "$public_key" && ! -L "$public_key" \
+        && "$(/usr/bin/stat -c '%U:%G:%a' "$public_key")" == root:root:644 ]] \
+        || fail_update signature-invalid
+    /usr/bin/openssl pkeyutl \
+        -verify \
+        -pubin \
+        -inkey "$public_key" \
+        -rawin \
+        -in "$manifest" \
+        -sigfile "$signature" >/dev/null 2>&1 \
+        || fail_update signature-invalid
+    validate_manifest "$manifest" "$validated" "$installed_version" "$feed_root" \
+        || fail_update manifest-invalid
+    IFS=$'\t' read -r target_version archive_url expected_archive_digest < "$validated"
+    [[ "$target_version" =~ ^[1-9][0-9]*$ ]] || fail_update manifest-invalid
+    if ((target_version < installed_version)); then
+        fail_update rollback-blocked
+    fi
+    if ((target_version == installed_version)); then
+        /bin/rm -f -- "$request_path"
+        write_status success current || exit 1
+        log "Runtime $installed_version is current."
+        exit 0
+    fi
+
+    write_status checking none || exit 1
+    download "$archive_url" "$archive" || fail_update archive-unavailable
+    actual_archive_digest="$(/usr/bin/sha256sum "$archive" | /usr/bin/awk '{ print $1 }')" \
+        || fail_update archive-invalid
+    [[ "$actual_archive_digest" == "$expected_archive_digest" ]] \
+        || fail_update archive-invalid
+    validate_and_extract_archive "$archive" "$validated" "$staging" \
+        || fail_update archive-invalid
+    install_sdk "$staging/claude-agent-sdk-requirements.txt" \
+        || fail_update sdk-failed
+
+    exec 9>"$deployment_lock"
+    /usr/bin/flock 9 || fail_update install-failed
+    exec 7>/run/lock/terminal-relay-agent-update.lock
+    /usr/bin/flock 7 || fail_update install-failed
+    if ! install_runtime "$validated" "$staging" "$manifest"; then
+        rollback_runtime
+        fail_update install-failed
+    fi
+    if ! /usr/bin/systemctl daemon-reload \
+        || ! /usr/bin/systemd-analyze verify \
+            /etc/systemd/system/terminal-relay-session-restore@.service \
+            /etc/systemd/system/terminal-relay-agent-update.service \
+            /etc/systemd/system/terminal-relay-agent-update.timer \
+            /etc/systemd/system/terminal-relay-runtime-update.service \
+            /etc/systemd/system/terminal-relay-runtime-update.timer \
+            /etc/systemd/system/terminal-relay-runtime-update.path \
+        || ! /usr/bin/systemctl enable --now \
+            terminal-relay-session-restore@terminal-relay.service \
+            terminal-relay-agent-update.timer \
+            terminal-relay-runtime-update.timer \
+            terminal-relay-runtime-update.path; then
+        rollback_runtime
+        /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
+        fail_update systemd-failed
+    fi
+    schedule_app_server_restart || {
+        rollback_runtime
+        /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
+        fail_update install-failed
+    }
+    installed_version="$target_version"
+    /bin/rm -f -- "$request_path"
+    write_status success none || exit 1
+    log "Installed worker runtime $installed_version."
+}
+
+main "$@"

@@ -76,6 +76,7 @@ final class WorkerSessionModel: ObservableObject {
     private let readStateDefaults: UserDefaults
     private var readActivityBySession: [String: Int]
     private var lastOpenedTerminalRoute: TerminalRoute?
+    private var runtimeUpdateTasks: [UUID: Task<Void, Never>] = [:]
     private var refreshToken = UUID()
     private static let readStateKey = "workerSessionReadActivity.v1"
 
@@ -261,6 +262,13 @@ final class WorkerSessionModel: ObservableObject {
     }
 
     func updateWarning(for profileID: UUID) -> String? {
+        if let message = workerOverviews[profileID]?.runtimeUpdateStatus?.message {
+            return message
+        }
+        if let info = workerOverviews[profileID]?.runtimeInfo,
+           !info.isClientProtocolCompatible {
+            return "This worker is updating to support the current app."
+        }
         guard let status = workerOverviews[profileID]?.updateStatus,
               dismissedUpdateTimestamps[profileID] != status.timestamp else {
             return nil
@@ -295,8 +303,28 @@ final class WorkerSessionModel: ObservableObject {
                 profile: profile,
                 workerClient: workerClient
             )
-            let (projectsOutput, statusOutput) = try await (projectData, statusData)
+            async let runtimeInfoResult = Self.commandResult(
+                WorkerRemoteCommand.runtimeInfo,
+                profile: profile,
+                workerClient: workerClient
+            )
+            async let runtimeStatusResult = Self.commandResult(
+                WorkerRemoteCommand.runtimeUpdateStatus,
+                profile: profile,
+                workerClient: workerClient
+            )
+            let (projectsOutput, statusOutput, runtimeInfoOutput, runtimeStatusOutput) =
+                try await (
+                    projectData,
+                    statusData,
+                    runtimeInfoResult,
+                    runtimeStatusResult
+                )
             let updateStatus = Self.parseUpdateStatus(await updateResult)
+            let runtimeInfo = try? WorkerRuntimeInfoProtocol.parse(runtimeInfoOutput.get())
+            let runtimeUpdateStatus = try? WorkerRuntimeUpdateStatusProtocol.parse(
+                runtimeStatusOutput.get()
+            )
             let projectResponse = try WorkerSessionProtocol.parse(projectsOutput)
             let statusResponse = try WorkerSessionProtocol.parse(statusOutput)
 
@@ -318,8 +346,13 @@ final class WorkerSessionModel: ObservableObject {
                 accounts: currentOverview?.accounts ?? [:],
                 accountErrors: currentOverview?.accountErrors ?? [],
                 connectionError: nil,
-                updateStatus: updateStatus ?? currentOverview?.updateStatus
+                updateStatus: updateStatus ?? currentOverview?.updateStatus,
+                runtimeInfo: runtimeInfo ?? currentOverview?.runtimeInfo,
+                runtimeUpdateStatus: runtimeUpdateStatus ?? currentOverview?.runtimeUpdateStatus
             )
+            if let runtimeInfo, !runtimeInfo.isClientProtocolCompatible {
+                beginRuntimeUpdate(profile: profile)
+            }
             mergeLiveSessionsIntoThreadCatalogs(
                 workerID: profile.id,
                 sessions: visibleSessions
@@ -331,7 +364,70 @@ final class WorkerSessionModel: ObservableObject {
         }
     }
 
+    private func beginRuntimeUpdate(profile: WorkerProfile) {
+        guard runtimeUpdateTasks[profile.id] == nil else { return }
+        runtimeUpdateTasks[profile.id] = Task { [weak self] in
+            guard let self else { return }
+            defer { runtimeUpdateTasks[profile.id] = nil }
+            do {
+                let request = try await workerClient.execute(
+                    WorkerRemoteCommand.runtimeUpdateRequest,
+                    on: profile
+                )
+                let requestOutput = String(decoding: request, as: UTF8.self)
+                guard requestOutput.contains(WorkerRuntimeUpdateStatusProtocol.marker),
+                      requestOutput.contains("|accepted") else {
+                    return
+                }
+                for delay in [1, 2, 4] {
+                    try? await Task.sleep(for: .seconds(delay))
+                    let infoData = try await workerClient.execute(
+                        WorkerRemoteCommand.runtimeInfo,
+                        on: profile
+                    )
+                    guard let info = try? WorkerRuntimeInfoProtocol.parse(infoData) else {
+                        continue
+                    }
+                    if var overview = workerOverviews[profile.id] {
+                        overview.runtimeInfo = info
+                        if let statusData = try? await workerClient.execute(
+                            WorkerRemoteCommand.runtimeUpdateStatus,
+                            on: profile
+                        ) {
+                            overview.runtimeUpdateStatus =
+                                try? WorkerRuntimeUpdateStatusProtocol.parse(statusData)
+                        }
+                        workerOverviews[profile.id] = overview
+                    }
+                    if info.isClientProtocolCompatible {
+                        await refreshProjectCatalogs()
+                        await refreshAllThreads()
+                        return
+                    }
+                }
+            } catch {
+                return
+            }
+        }
+    }
+
+    private func requireCapability(_ capability: String, on worker: WorkerProfile) -> Bool {
+        guard let info = workerOverviews[worker.id]?.runtimeInfo else {
+            return true
+        }
+        guard info.supports(capability) else {
+            errorMessage =
+                "This worker is updating to add the required capability. Existing terminals are unchanged."
+            beginRuntimeUpdate(profile: worker)
+            return false
+        }
+        return true
+    }
+
     func startTerminal(kind: AgentKind, repositoryName: String) {
+        if let profile, !requireCapability("agent-sessions", on: profile) {
+            return
+        }
         guard WorkerSessionProtocol.isValidRepositoryName(repositoryName) else {
             errorMessage = WorkerRemoteCommandError.invalidRepositoryName.localizedDescription
             return
@@ -361,7 +457,8 @@ final class WorkerSessionModel: ObservableObject {
 
     func refreshThreads(workerID: UUID, repositoryName: String) async {
         guard !isDemoMode,
-              let worker = profiles.first(where: { $0.id == workerID }) else {
+              let worker = profiles.first(where: { $0.id == workerID }),
+              requireCapability("threads-v2", on: worker) else {
             return
         }
         async let active = loadThreads(
@@ -413,7 +510,8 @@ final class WorkerSessionModel: ObservableObject {
 
     func createThread(workerID: UUID, repositoryName: String) async {
         guard !isDemoMode,
-              let worker = profiles.first(where: { $0.id == workerID }) else {
+              let worker = profiles.first(where: { $0.id == workerID }),
+              requireCapability("threads-v2", on: worker) else {
             return
         }
         do {
@@ -443,7 +541,8 @@ final class WorkerSessionModel: ObservableObject {
             terminalRoute = route
             return
         }
-        guard let worker = profiles.first(where: { $0.id == workerID }) else { return }
+        guard let worker = profiles.first(where: { $0.id == workerID }),
+              requireCapability("threads-v2", on: worker) else { return }
         if profile?.id != workerID {
             selectProfile(id: workerID)
         }
@@ -517,7 +616,7 @@ final class WorkerSessionModel: ObservableObject {
             terminalRoute = nil
             return
         }
-        guard let profile else { return }
+        guard let profile, requireCapability("agent-sessions", on: profile) else { return }
         do {
             let statusData = try await workerClient.execute(WorkerRemoteCommand.status, on: profile)
             let response = try WorkerSessionProtocol.parse(statusData)
@@ -600,6 +699,12 @@ final class WorkerSessionModel: ObservableObject {
 
             for await (profileID, overview) in group {
                 workerOverviews[profileID] = overview
+                if overview.connectionError == nil,
+                   let runtimeInfo = overview.runtimeInfo,
+                   !runtimeInfo.isClientProtocolCompatible,
+                   let profile = profiles.first(where: { $0.id == profileID }) {
+                    beginRuntimeUpdate(profile: profile)
+                }
                 mergeLiveSessionsIntoThreadCatalogs(
                     workerID: profileID,
                     sessions: overview.sessions
@@ -677,7 +782,9 @@ final class WorkerSessionModel: ObservableObject {
                     accounts: currentOverview.accounts,
                     accountErrors: currentOverview.accountErrors,
                     connectionError: nil,
-                    updateStatus: currentOverview.updateStatus
+                    updateStatus: currentOverview.updateStatus,
+                    runtimeInfo: currentOverview.runtimeInfo,
+                    runtimeUpdateStatus: currentOverview.runtimeUpdateStatus
                 )
                 mergeLiveSessionsIntoThreadCatalogs(
                     workerID: profileID,
@@ -710,18 +817,40 @@ final class WorkerSessionModel: ObservableObject {
             profile: profile,
             workerClient: workerClient
         )
+        async let runtimeInfoResult = commandResult(
+            WorkerRemoteCommand.runtimeInfo,
+            profile: profile,
+            workerClient: workerClient
+        )
+        async let runtimeStatusResult = commandResult(
+            WorkerRemoteCommand.runtimeUpdateStatus,
+            profile: profile,
+            workerClient: workerClient
+        )
 
         do {
-            let (projectData, sessionData, updateStatusResult) = await (
+            let (
+                projectData,
+                sessionData,
+                updateStatusOutput,
+                runtimeInfoOutput,
+                runtimeStatusOutput
+            ) = await (
                 projectsResult,
                 sessionsResult,
-                updateResult
+                updateResult,
+                runtimeInfoResult,
+                runtimeStatusResult
             )
             let (projectOutput, sessionOutput) = try (
                 projectData.get(),
                 sessionData.get()
             )
-            let updateStatus = parseUpdateStatus(updateStatusResult)
+            let updateStatus = parseUpdateStatus(updateStatusOutput)
+            let runtimeInfo = try? WorkerRuntimeInfoProtocol.parse(runtimeInfoOutput.get())
+            let runtimeUpdateStatus = try? WorkerRuntimeUpdateStatusProtocol.parse(
+                runtimeStatusOutput.get()
+            )
             let projectResponse = try WorkerSessionProtocol.parse(projectOutput)
             let sessionResponse = try WorkerSessionProtocol.parse(sessionOutput)
             let projects = WorkerProjectCatalog.visibleProjectNames(
@@ -738,7 +867,9 @@ final class WorkerSessionModel: ObservableObject {
                 accounts: currentOverview?.accounts ?? [:],
                 accountErrors: currentOverview?.accountErrors ?? [],
                 connectionError: nil,
-                updateStatus: updateStatus ?? currentOverview?.updateStatus
+                updateStatus: updateStatus ?? currentOverview?.updateStatus,
+                runtimeInfo: runtimeInfo ?? currentOverview?.runtimeInfo,
+                runtimeUpdateStatus: runtimeUpdateStatus ?? currentOverview?.runtimeUpdateStatus
             )
         } catch {
             return WorkerOverviewSnapshot(
@@ -748,7 +879,9 @@ final class WorkerSessionModel: ObservableObject {
                 accounts: currentOverview?.accounts ?? [:],
                 accountErrors: currentOverview?.accountErrors ?? [],
                 connectionError: error.localizedDescription,
-                updateStatus: currentOverview?.updateStatus
+                updateStatus: currentOverview?.updateStatus,
+                runtimeInfo: currentOverview?.runtimeInfo,
+                runtimeUpdateStatus: currentOverview?.runtimeUpdateStatus
             )
         }
     }
@@ -790,6 +923,16 @@ final class WorkerSessionModel: ObservableObject {
             profile: profile,
             workerClient: workerClient
         )
+        async let runtimeInfoResult = commandResult(
+            WorkerRemoteCommand.runtimeInfo,
+            profile: profile,
+            workerClient: workerClient
+        )
+        async let runtimeStatusResult = commandResult(
+            WorkerRemoteCommand.runtimeUpdateStatus,
+            profile: profile,
+            workerClient: workerClient
+        )
 
         let results = await (
             projectsResult,
@@ -797,7 +940,9 @@ final class WorkerSessionModel: ObservableObject {
             resourcesResult,
             codexResult,
             claudeResult,
-            updateResult
+            updateResult,
+            runtimeInfoResult,
+            runtimeStatusResult
         )
 
         let projectResponse: WorkerSessionResponse
@@ -813,7 +958,11 @@ final class WorkerSessionModel: ObservableObject {
                 accounts: [:],
                 accountErrors: Set(AgentKind.allCases),
                 connectionError: error.localizedDescription,
-                updateStatus: parseUpdateStatus(results.5)
+                updateStatus: parseUpdateStatus(results.5),
+                runtimeInfo: try? WorkerRuntimeInfoProtocol.parse(results.6.get()),
+                runtimeUpdateStatus: try? WorkerRuntimeUpdateStatusProtocol.parse(
+                    results.7.get()
+                )
             )
         }
 
@@ -827,6 +976,10 @@ final class WorkerSessionModel: ObservableObject {
         }
         let resources = try? WorkerOverviewParser.resources(results.2.get())
         let updateStatus = parseUpdateStatus(results.5)
+        let runtimeInfo = try? WorkerRuntimeInfoProtocol.parse(results.6.get())
+        let runtimeUpdateStatus = try? WorkerRuntimeUpdateStatusProtocol.parse(
+            results.7.get()
+        )
 
         var accounts: [AgentKind: WorkerAccountSnapshot] = [:]
         var accountErrors: Set<AgentKind> = []
@@ -852,7 +1005,9 @@ final class WorkerSessionModel: ObservableObject {
             accounts: accounts,
             accountErrors: accountErrors,
             connectionError: nil,
-            updateStatus: updateStatus
+            updateStatus: updateStatus,
+            runtimeInfo: runtimeInfo,
+            runtimeUpdateStatus: runtimeUpdateStatus
         )
     }
 
@@ -963,7 +1118,8 @@ final class WorkerSessionModel: ObservableObject {
         command: () throws -> String
     ) async {
         guard !isDemoMode,
-              let worker = profiles.first(where: { $0.id == workerID }) else {
+              let worker = profiles.first(where: { $0.id == workerID }),
+              requireCapability("threads-v2", on: worker) else {
             return
         }
         do {

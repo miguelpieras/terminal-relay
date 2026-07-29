@@ -4,6 +4,7 @@ set -euo pipefail
 script_directory="$(cd "$(dirname "$0")" && pwd -P)"
 repository_root="$(cd "$script_directory/.." && pwd -P)"
 source_helper="$repository_root/Server/terminal-relay-session"
+source_chat="$repository_root/Server/terminal-relay-chat"
 source_mcp="$repository_root/Server/terminal-relay-mcp"
 source_claude_sessions="$repository_root/Server/terminal-relay-claude-sessions"
 source_claude_requirements="$repository_root/Server/claude-agent-sdk-requirements.txt"
@@ -108,6 +109,12 @@ validate_ssh_target "admin" "$admin_target"
     || { echo "Missing regular restore unit source: $source_restore_unit" >&2; exit 66; }
 /bin/bash -n "$source_helper" \
     || { echo "Worker helper source failed Bash syntax validation." >&2; exit 65; }
+[[ -f "$source_chat" && ! -L "$source_chat" ]] \
+    || { echo "Missing regular structured chat broker source: $source_chat" >&2; exit 66; }
+/usr/bin/python3 -c \
+    'import pathlib, sys; compile(pathlib.Path(sys.argv[1]).read_text(), sys.argv[1], "exec")' \
+    "$source_chat" \
+    || { echo "Structured chat broker failed Python syntax validation." >&2; exit 65; }
 [[ -f "$source_mcp" && ! -L "$source_mcp" ]] \
     || { echo "Missing regular worker MCP source: $source_mcp" >&2; exit 66; }
 [[ -f "$source_claude_sessions" && ! -L "$source_claude_sessions" ]] \
@@ -302,6 +309,7 @@ privileged() {
 privileged /usr/bin/true
 
 helper_target=/usr/local/bin/terminal-relay-session
+chat_target=/usr/local/bin/terminal-relay-chat
 mcp_target=/usr/local/bin/terminal-relay-mcp
 claude_sessions_target=/usr/local/bin/terminal-relay-claude-sessions
 claude_sdk_root=/opt/terminal-relay/claude-session-sdk
@@ -311,11 +319,13 @@ unit_target=/etc/systemd/system/terminal-relay-session-restore@.service
 service="terminal-relay-session-restore@$application_user.service"
 temporary_directory=""
 temporary_helper=""
+temporary_chat=""
 temporary_mcp=""
 temporary_claude_sessions=""
 temporary_claude_requirements=""
 temporary_unit=""
 helper_staged=""
+chat_staged=""
 mcp_staged=""
 claude_sessions_staged=""
 claude_sdk_staged=""
@@ -333,6 +343,7 @@ helper_installed_digest=""
 unit_installed_digest=""
 helper_installed_state=""
 mcp_changed=0
+chat_changed=0
 unit_installed_state=""
 service_initial_enabled=false
 service_initial_active=false
@@ -447,6 +458,14 @@ cleanup() {
             *) echo "Refusing to clean unexpected MCP stage: $mcp_staged" >&2 ;;
         esac
     fi
+    if [ -n "$chat_staged" ]; then
+        case "$chat_staged" in
+            /usr/local/bin/.terminal-relay-chat.install.*)
+                privileged /bin/rm -f -- "$chat_staged" || true
+                ;;
+            *) echo "Refusing to clean unexpected chat broker stage: $chat_staged" >&2 ;;
+        esac
+    fi
     if [ -n "$claude_sessions_staged" ]; then
         case "$claude_sessions_staged" in
             /usr/local/bin/.terminal-relay-claude-sessions.install.*)
@@ -493,6 +512,7 @@ cleanup() {
 temporary_directory=$(mktemp -d /tmp/terminal-relay-session.install.XXXXXX)
 trap cleanup EXIT
 temporary_helper="$temporary_directory/terminal-relay-session"
+temporary_chat="$temporary_directory/terminal-relay-chat"
 temporary_mcp="$temporary_directory/terminal-relay-mcp"
 temporary_claude_sessions="$temporary_directory/terminal-relay-claude-sessions"
 temporary_claude_requirements="$temporary_directory/claude-agent-sdk-requirements.txt"
@@ -500,6 +520,7 @@ temporary_unit="$temporary_directory/terminal-relay-session-restore@.service"
 /usr/bin/tar -xf - -C "$temporary_directory"
 /bin/chmod 600 \
     "$temporary_helper" \
+    "$temporary_chat" \
     "$temporary_mcp" \
     "$temporary_claude_sessions" \
     "$temporary_claude_requirements" \
@@ -507,10 +528,15 @@ temporary_unit="$temporary_directory/terminal-relay-session-restore@.service"
 /bin/bash -n "$temporary_helper"
 /usr/bin/python3 -c \
     'import pathlib, sys; compile(pathlib.Path(sys.argv[1]).read_text(), sys.argv[1], "exec")' \
+    "$temporary_chat"
+/usr/bin/python3 -c \
+    'import pathlib, sys; compile(pathlib.Path(sys.argv[1]).read_text(), sys.argv[1], "exec")' \
     "$temporary_claude_sessions"
 privileged /usr/bin/systemd-analyze verify "$temporary_unit"
 helper_source_digest=$(/usr/bin/sha256sum "$temporary_helper")
 helper_source_digest=${helper_source_digest%% *}
+chat_source_digest=$(/usr/bin/sha256sum "$temporary_chat")
+chat_source_digest=${chat_source_digest%% *}
 unit_source_digest=$(/usr/bin/sha256sum "$temporary_unit")
 unit_source_digest=${unit_source_digest%% *}
 mcp_source_digest=$(/usr/bin/sha256sum "$temporary_mcp")
@@ -653,6 +679,31 @@ fi
     = "$mcp_source_digest" ]
 [ "$(privileged /usr/bin/stat -c "%u:%g:%a" "$mcp_target")" = "0:0:755" ]
 
+if privileged /usr/bin/test -L "$chat_target"; then
+    echo "Refusing to replace a symlinked structured chat broker: $chat_target" >&2
+    exit 1
+fi
+if privileged /usr/bin/test -e "$chat_target"; then
+    privileged /usr/bin/test -f "$chat_target" \
+        || { echo "Refusing to replace a non-regular structured chat broker: $chat_target" >&2; exit 1; }
+fi
+if ! privileged /usr/bin/test -f "$chat_target" \
+    || ! privileged /usr/bin/cmp -s "$temporary_chat" "$chat_target" \
+    || [ "$(privileged /usr/bin/stat -c "%u:%g:%a" \
+        "$chat_target" 2>/dev/null || true)" != "0:0:755" ]; then
+    chat_staged=$(privileged /usr/bin/mktemp \
+        /usr/local/bin/.terminal-relay-chat.install.XXXXXX)
+    privileged /usr/bin/install -o root -g root -m 0755 \
+        "$temporary_chat" "$chat_staged"
+    privileged /usr/bin/cmp -s "$temporary_chat" "$chat_staged"
+    privileged /bin/mv -fT -- "$chat_staged" "$chat_target"
+    chat_staged=""
+    chat_changed=1
+fi
+[ "$(privileged /usr/bin/sha256sum "$chat_target" \
+    | /usr/bin/awk '{ print $1; exit }')" = "$chat_source_digest" ]
+[ "$(privileged /usr/bin/stat -c "%u:%g:%a" "$chat_target")" = "0:0:755" ]
+
 if ! privileged /usr/bin/dpkg-query -W -f='${Status}' python3-venv 2>/dev/null \
     | /bin/grep -q '^install ok installed$'; then
     privileged /usr/bin/apt-get update
@@ -739,7 +790,8 @@ fi
         "$claude_sdk_current/bin/python3" \
         "$claude_sessions_target" version)" = "$claude_sdk_version" ]
 
-if [ "$helper_result" != unchanged ] || [ "$mcp_changed" -eq 1 ]; then
+if [ "$helper_result" != unchanged ] || [ "$mcp_changed" -eq 1 ] \
+    || [ "$chat_changed" -eq 1 ]; then
     restart_marker="$application_home/.local/state/terminal-relay/codex-app-server-restart-required"
     privileged /usr/sbin/runuser -u "$application_user" -- \
         /usr/bin/env \
@@ -890,6 +942,7 @@ fi
 # shellcheck disable=SC2029
 install_output="$(/usr/bin/tar --no-xattrs -C "$repository_root/Server" -cf - \
     terminal-relay-session \
+    terminal-relay-chat \
     terminal-relay-mcp \
     terminal-relay-claude-sessions \
     claude-agent-sdk-requirements.txt \
@@ -934,7 +987,105 @@ case "$unit_result" in
     *) echo "Remote installer returned an invalid unit result: $unit_result" >&2; exit 70 ;;
 esac
 
-echo "Installed helper and restore unit with verified systemd service state."
+runtime_manifest_directory="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/terminal-relay-runtime-manifest.XXXXXX")"
+runtime_manifest_file="$runtime_manifest_directory/runtime-manifest.json"
+runtime_version="$(git -C "$repository_root" show -s --format=%ct HEAD)"
+"$script_directory/write-installed-runtime-manifest.sh" \
+    "$runtime_version" \
+    "$runtime_manifest_file"
+runtime_control_script="$(/bin/cat <<'REMOTE_RUNTIME_CONTROLS'
+set -euo pipefail
+temporary_directory="$(/usr/bin/mktemp -d /tmp/terminal-relay-runtime-controls.XXXXXX)"
+cleanup() {
+    exit_code=$?
+    trap - EXIT
+    case "$temporary_directory" in
+        /tmp/terminal-relay-runtime-controls.*)
+            /bin/rm -rf -- "$temporary_directory"
+            ;;
+        *) exit_code=1 ;;
+    esac
+    exit "$exit_code"
+}
+trap cleanup EXIT
+/usr/bin/tar --no-same-owner --no-same-permissions -xf - -C "$temporary_directory"
+/usr/bin/install -d -o root -g root -m 0755 \
+    /etc/terminal-relay \
+    /opt/terminal-relay/claude-session-sdk \
+    /usr/local/libexec
+/usr/bin/install -o root -g root -m 0644 \
+    "$temporary_directory/runtime-manifest.json" \
+    /etc/terminal-relay/runtime-manifest.json
+/usr/bin/install -o root -g root -m 0644 \
+    "$temporary_directory/terminal-relay-runtime-update.pub" \
+    /etc/terminal-relay/runtime-update-public.pem
+/usr/bin/install -o root -g root -m 0644 \
+    "$temporary_directory/claude-agent-sdk-requirements.txt" \
+    /opt/terminal-relay/claude-session-sdk/runtime-requirements.txt
+/usr/bin/install -o root -g root -m 0755 \
+    "$temporary_directory/terminal-relay-agent-update" \
+    /usr/local/sbin/terminal-relay-agent-update
+/usr/bin/install -o root -g root -m 0755 \
+    "$temporary_directory/terminal-relay-runtime-update" \
+    /usr/local/sbin/terminal-relay-runtime-update
+/usr/bin/install -o root -g root -m 0755 \
+    "$temporary_directory/terminal-relay-review-gateway" \
+    /usr/local/libexec/terminal-relay-command-gateway
+/usr/bin/install -o root -g root -m 0755 \
+    "$temporary_directory/terminal-relay-mobile-gateway" \
+    /usr/local/bin/terminal-relay-mobile-gateway
+for unit in \
+    terminal-relay-agent-update.service \
+    terminal-relay-agent-update.timer \
+    terminal-relay-runtime-update.service \
+    terminal-relay-runtime-update.timer \
+    terminal-relay-runtime-update.path; do
+    /usr/bin/install -o root -g root -m 0644 \
+        "$temporary_directory/$unit" \
+        "/etc/systemd/system/$unit"
+done
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemd-analyze verify \
+    /etc/systemd/system/terminal-relay-agent-update.service \
+    /etc/systemd/system/terminal-relay-agent-update.timer \
+    /etc/systemd/system/terminal-relay-runtime-update.service \
+    /etc/systemd/system/terminal-relay-runtime-update.timer \
+    /etc/systemd/system/terminal-relay-runtime-update.path
+/usr/bin/systemctl enable --now \
+    terminal-relay-agent-update.timer \
+    terminal-relay-runtime-update.timer \
+    terminal-relay-runtime-update.path
+REMOTE_RUNTIME_CONTROLS
+)"
+runtime_control_command="$(build_locked_remote_command \
+    "$admin_uid" "$runtime_control_script" terminal-relay-runtime-controls)"
+set +e
+# shellcheck disable=SC2029 # The audited fixed command is intentionally expanded locally.
+/usr/bin/tar --no-xattrs -cf - \
+    -C "$runtime_manifest_directory" runtime-manifest.json \
+    -C "$repository_root/Server" \
+        claude-agent-sdk-requirements.txt \
+        terminal-relay-agent-update \
+        terminal-relay-agent-update.service \
+        terminal-relay-agent-update.timer \
+        terminal-relay-runtime-update \
+        terminal-relay-runtime-update.service \
+        terminal-relay-runtime-update.timer \
+        terminal-relay-runtime-update.path \
+        terminal-relay-runtime-update.pub \
+        terminal-relay-review-gateway \
+        terminal-relay-mobile-gateway \
+    | /usr/bin/ssh "$admin_target" "$runtime_control_command"
+runtime_control_status="${PIPESTATUS[1]}"
+set -e
+/bin/unlink "$runtime_manifest_file"
+/bin/rmdir "$runtime_manifest_directory"
+[[ "$runtime_control_status" -eq 0 ]] || {
+    echo "Installing the worker runtime update controls failed." >&2
+    exit "$runtime_control_status"
+}
+
+echo "Installed helper, restore unit, and automatic runtime update controls."
 [[ "$helper_result" != replaced ]] || echo "Helper backup retained at $helper_backup"
 [[ "$unit_result" != replaced ]] || echo "Unit backup retained at $unit_backup"
 

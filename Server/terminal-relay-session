@@ -5,9 +5,13 @@ readonly protocol_marker="__TERMINAL_RELAY_SESSION_V1__"
 readonly thread_protocol_marker="__TERMINAL_RELAY_THREADS_V1__"
 readonly thread_protocol_marker_v2="__TERMINAL_RELAY_THREADS_V2__"
 readonly agent_update_protocol_marker="__TERMINAL_RELAY_AGENT_UPDATE_V1__"
+readonly runtime_info_protocol_marker="__TERMINAL_RELAY_RUNTIME_INFO_V1__"
+readonly runtime_update_protocol_marker="__TERMINAL_RELAY_RUNTIME_UPDATE_V1__"
 readonly chat_protocol_marker="__TERMINAL_RELAY_CHAT_V1__"
 readonly installed_helper_path="/usr/local/bin/terminal-relay-session"
 readonly default_agent_update_status_path="/var/lib/terminal-relay/agent-update-status"
+readonly default_runtime_manifest_path="/etc/terminal-relay/runtime-manifest.json"
+readonly default_runtime_update_status_path="/var/lib/terminal-relay/runtime-update-status"
 readonly default_tmux_path="/usr/bin/tmux"
 readonly default_tmux_socket="terminal-relay"
 readonly default_workspace_root="/workspace"
@@ -86,6 +90,8 @@ if [[ $test_mode -eq 1 ]]; then
     codex_title_generation_enabled="${TERMINAL_RELAY_TEST_CODEX_TITLE_GENERATION:-0}"
     codex_app_server_socket="${TERMINAL_RELAY_TEST_CODEX_APP_SERVER_SOCKET:-$runtime_directory/codex.sock}"
     agent_update_status_path="${TERMINAL_RELAY_TEST_AGENT_UPDATE_STATUS_PATH:-$default_agent_update_status_path}"
+    runtime_manifest_path="${TERMINAL_RELAY_TEST_RUNTIME_MANIFEST_PATH:-$default_runtime_manifest_path}"
+    runtime_update_status_path="${TERMINAL_RELAY_TEST_RUNTIME_UPDATE_STATUS_PATH:-$default_runtime_update_status_path}"
 else
     if [[ ! -x "$default_getent_path" ]]; then
         echo "Required account database command is unavailable: $default_getent_path" >&2
@@ -116,7 +122,10 @@ else
     codex_title_generation_enabled=1
     codex_app_server_socket="$runtime_directory/codex.sock"
     agent_update_status_path="$default_agent_update_status_path"
+    runtime_manifest_path="$default_runtime_manifest_path"
+    runtime_update_status_path="$default_runtime_update_status_path"
 fi
+runtime_update_request_path="$runtime_directory/runtime-update-request"
 readonly codex_app_server_session="terminal-relay-account-server"
 readonly codex_title_generator_session="terminal-relay-title-generator"
 
@@ -127,6 +136,9 @@ usage:
   terminal-relay-session status
   terminal-relay-session resources
   terminal-relay-session update-status
+  terminal-relay-session runtime-info
+  terminal-relay-session runtime-update-status
+  terminal-relay-session runtime-update-request
   terminal-relay-session chat-capabilities-v1 <codex|claude> <repository>
   terminal-relay-session chat-start-v1 <codex|claude> <repository> [provider-thread-id] [agent arguments...]
   terminal-relay-session chat-attach-v1 <codex|claude> <repository> <relay-id>
@@ -185,6 +197,9 @@ validate_absolute_path "flock executable" "$flock_path"
 validate_absolute_path "boot id" "$boot_id_path"
 validate_absolute_path "Codex app-server socket" "$codex_app_server_socket"
 validate_absolute_path "agent update status" "$agent_update_status_path"
+validate_absolute_path "runtime manifest" "$runtime_manifest_path"
+validate_absolute_path "runtime update status" "$runtime_update_status_path"
+validate_absolute_path "runtime update request" "$runtime_update_request_path"
 
 if [[ "$codex_shared_account_enabled" == "1" ]]; then
     codex_socket_bytes="$(printf '%s' "$codex_app_server_socket" | /usr/bin/wc -c | /usr/bin/tr -d '[:space:]')"
@@ -3386,6 +3401,131 @@ agent_update_status() {
     printf '%s\n' "${lines[1]}"
 }
 
+validate_root_protocol_file() {
+    local label="$1"
+    local path="$2"
+    local expected_mode="$3"
+    local expected_owner=0
+    local identity
+
+    [[ -f "$path" && ! -L "$path" ]] || {
+        echo "The $label is not a regular file." >&2
+        return 70
+    }
+    [[ $test_mode -eq 0 ]] || expected_owner="$user_id"
+    identity="$(path_uid_mode "$path")" || {
+        echo "The $label cannot be inspected." >&2
+        return 70
+    }
+    [[ "$identity" == "$expected_owner:$expected_mode" ]] || {
+        echo "The $label has unsafe ownership or permissions." >&2
+        return 70
+    }
+}
+
+runtime_info() {
+    validate_root_protocol_file "worker runtime manifest" "$runtime_manifest_path" 644 \
+        || return $?
+    printf '%s\n' "$runtime_info_protocol_marker"
+    "$default_python_path" - "$runtime_manifest_path" <<'PYTHON_RUNTIME_INFO'
+import json
+import re
+import sys
+
+try:
+    manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, ValueError):
+    raise SystemExit(70)
+version = manifest.get("runtimeVersion")
+protocol = manifest.get("protocol")
+capabilities = manifest.get("capabilities")
+if (
+    not isinstance(version, int)
+    or version < 1
+    or not isinstance(protocol, dict)
+    or set(protocol) != {"minimum", "maximum"}
+    or not isinstance(protocol["minimum"], int)
+    or not isinstance(protocol["maximum"], int)
+    or protocol["minimum"] < 1
+    or protocol["maximum"] < protocol["minimum"]
+    or not isinstance(capabilities, list)
+    or not capabilities
+    or capabilities != sorted(set(capabilities))
+    or any(not isinstance(item, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", item)
+           for item in capabilities)
+):
+    raise SystemExit(70)
+print(
+    "runtime|{}|{}|{}|{}".format(
+        version,
+        protocol["minimum"],
+        protocol["maximum"],
+        ",".join(capabilities),
+    )
+)
+PYTHON_RUNTIME_INFO
+}
+
+runtime_update_status() {
+    local -a lines=()
+    local line
+    local record_type
+    local timestamp
+    local result
+    local installed
+    local target
+    local failure_code
+    local extra
+
+    printf '%s\n' "$runtime_update_protocol_marker"
+    [[ -e "$runtime_update_status_path" || -L "$runtime_update_status_path" ]] || return 0
+    validate_root_protocol_file "worker runtime update status" "$runtime_update_status_path" 644 \
+        || return $?
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lines+=("$line")
+    done < "$runtime_update_status_path"
+    [[ ${#lines[@]} -eq 2 && "${lines[0]}" == "$runtime_update_protocol_marker" ]] || {
+        echo "The worker runtime update status is malformed." >&2
+        return 70
+    }
+    IFS='|' read -r record_type timestamp result installed target failure_code extra \
+        <<< "${lines[1]}"
+    [[ "$record_type" == runtime-update \
+        && "$timestamp" =~ ^[1-9][0-9]*$ \
+        && "$result" =~ ^(checking|success|failure)$ \
+        && "$installed" =~ ^[0-9]+$ \
+        && "$target" =~ ^[0-9]+$ \
+        && "$failure_code" =~ ^(none|current|feed-unavailable|signature-invalid|manifest-invalid|rollback-blocked|archive-unavailable|archive-invalid|sdk-failed|install-failed|systemd-failed)$ \
+        && -z "${extra:-}" ]] || {
+        echo "The worker runtime update status is malformed." >&2
+        return 70
+    }
+    printf '%s\n' "${lines[1]}"
+}
+
+runtime_update_request() {
+    local timestamp
+    local temporary_file
+
+    timestamp="$(/bin/date -u +%s)"
+    [[ "$timestamp" =~ ^[1-9][0-9]*$ ]] || return 70
+    if [[ -e "$runtime_update_request_path" || -L "$runtime_update_request_path" ]]; then
+        [[ -f "$runtime_update_request_path" && ! -L "$runtime_update_request_path" \
+            && "$(path_uid_mode "$runtime_update_request_path")" == "$user_id:600" ]] || {
+            echo "The worker runtime update request path is unsafe." >&2
+            return 70
+        }
+    fi
+    temporary_file="$(/usr/bin/mktemp "$runtime_directory/.runtime-update-request.XXXXXX")"
+    if ! printf '%s\n' "$timestamp" > "$temporary_file" \
+        || ! /bin/chmod 0600 "$temporary_file" \
+        || ! /bin/mv -f -- "$temporary_file" "$runtime_update_request_path"; then
+        /bin/rm -f -- "$temporary_file"
+        return 70
+    fi
+    printf '%s\nrequest|%s|accepted\n' "$runtime_update_protocol_marker" "$timestamp"
+}
+
 resolve_session_title() {
     local tool="$1"
     local instance="$2"
@@ -5464,6 +5604,18 @@ case "$command_name" in
     update-status)
         [[ $# -eq 0 ]] || fail_usage "update-status does not accept arguments."
         agent_update_status
+        ;;
+    runtime-info)
+        [[ $# -eq 0 ]] || fail_usage "runtime-info does not accept arguments."
+        runtime_info
+        ;;
+    runtime-update-status)
+        [[ $# -eq 0 ]] || fail_usage "runtime-update-status does not accept arguments."
+        runtime_update_status
+        ;;
+    runtime-update-request)
+        [[ $# -eq 0 ]] || fail_usage "runtime-update-request does not accept arguments."
+        runtime_update_request
         ;;
     chat-capabilities-v1)
         [[ $# -eq 2 ]] \

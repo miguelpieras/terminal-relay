@@ -21,6 +21,8 @@ update_archive="$release_root/Terminal-Relay-${version}.zip"
 release_notes_asset="$release_root/Terminal-Relay-${version}.md"
 appcast_path="$release_root/appcast.xml"
 pages_directory="$release_root/pages"
+worker_runtime_directory="$release_root/worker-runtime"
+worker_runtime_signing_key="${WORKER_RUNTIME_SIGNING_KEY_PATH:-}"
 temporary_directory="$(mktemp -d)"
 
 cleanup() {
@@ -50,6 +52,12 @@ usage() {
 }
 [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" ]] || {
     echo "release-macos: APPLE_API_KEY_ID and APPLE_API_ISSUER_ID are required" >&2
+    exit 64
+}
+[[ -n "$worker_runtime_signing_key" \
+    && -f "$worker_runtime_signing_key" \
+    && ! -L "$worker_runtime_signing_key" ]] || {
+    echo "release-macos: WORKER_RUNTIME_SIGNING_KEY_PATH must name the worker-runtime signing key" >&2
     exit 64
 }
 
@@ -116,6 +124,7 @@ fi
 "$repository_root/Server/Tests/terminal-relay-mcp-tests.sh"
 "$repository_root/Server/Tests/install-worker-session-helper-generation-tests.sh"
 "$repository_root/Server/Tests/worker-lifecycle-tests.sh"
+"$repository_root/Server/Tests/worker-runtime-update-tests.sh"
 
 cd "$repository_root"
 xcodegen generate
@@ -134,6 +143,10 @@ case "$release_root" in
 esac
 /bin/rm -rf "$release_root"
 /bin/mkdir -p "$release_root"
+"$script_directory/build-worker-runtime.sh" \
+    "$bundle_version" \
+    "$version" \
+    "$worker_runtime_directory"
 if [[ -s "$downloaded_appcast" ]]; then
     /bin/cp "$downloaded_appcast" "$appcast_path"
 fi
@@ -270,6 +283,13 @@ fi
     exit 1
 }
 /bin/mkdir -p "$pages_directory"
+/bin/mkdir -p "$pages_directory/worker-runtime/$bundle_version"
+/bin/cp "$worker_runtime_directory/manifest.json" \
+    "$pages_directory/worker-runtime/manifest.json"
+/bin/cp "$worker_runtime_directory/manifest.sig" \
+    "$pages_directory/worker-runtime/manifest.sig"
+/bin/cp "$worker_runtime_directory/runtime.tar.gz" \
+    "$pages_directory/worker-runtime/$bundle_version/runtime.tar.gz"
 /bin/cp "$appcast_path" "$pages_directory/appcast.xml"
 /bin/cp "$update_archive" "$pages_directory/Terminal-Relay-${version}.zip"
 
@@ -277,3 +297,6 @@ echo "Created notarized macOS release artifacts:"
 echo "  $update_archive"
 echo "  $release_notes_asset"
 echo "  $appcast_path"
+echo "  $worker_runtime_directory/manifest.json"
+echo "  $worker_runtime_directory/manifest.sig"
+echo "  $worker_runtime_directory/runtime.tar.gz"

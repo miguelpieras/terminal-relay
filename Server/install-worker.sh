@@ -21,19 +21,31 @@ readonly version_file="$state_directory/installer-version"
 readonly worker_id_file="$state_directory/worker-id"
 readonly display_name_file="$state_directory/display-name"
 readonly ssh_keys_marker="$state_directory/authorized-keys-installed"
+readonly runtime_manifest_destination="$state_directory/runtime-manifest.json"
+readonly runtime_update_public_key_destination="$state_directory/runtime-update-public.pem"
 readonly workspace_directory="/workspace"
 readonly launcher_destination="/usr/local/bin/terminal-relay-session"
+readonly chat_destination="/usr/local/bin/terminal-relay-chat"
 readonly mcp_destination="/usr/local/bin/terminal-relay-mcp"
 readonly claude_sessions_adapter_destination="/usr/local/bin/terminal-relay-claude-sessions"
 readonly claude_sessions_sdk_root="/opt/terminal-relay/claude-session-sdk"
 readonly claude_sessions_sdk_current="$claude_sessions_sdk_root/current"
 readonly claude_sessions_sdk_version="0.2.125"
+readonly claude_sessions_requirements_destination="$claude_sessions_sdk_root/runtime-requirements.txt"
 readonly restore_unit_destination="/etc/systemd/system/terminal-relay-session-restore@.service"
 readonly restore_service="terminal-relay-session-restore@$runtime_user.service"
 readonly agent_update_destination="/usr/local/sbin/terminal-relay-agent-update"
 readonly agent_update_service_destination="/etc/systemd/system/terminal-relay-agent-update.service"
 readonly agent_update_timer_destination="/etc/systemd/system/terminal-relay-agent-update.timer"
 readonly agent_update_timer="terminal-relay-agent-update.timer"
+readonly runtime_update_destination="/usr/local/sbin/terminal-relay-runtime-update"
+readonly runtime_update_service_destination="/etc/systemd/system/terminal-relay-runtime-update.service"
+readonly runtime_update_timer_destination="/etc/systemd/system/terminal-relay-runtime-update.timer"
+readonly runtime_update_path_destination="/etc/systemd/system/terminal-relay-runtime-update.path"
+readonly runtime_update_timer="terminal-relay-runtime-update.timer"
+readonly runtime_update_path="terminal-relay-runtime-update.path"
+readonly command_gateway_destination="/usr/local/libexec/terminal-relay-command-gateway"
+readonly mobile_gateway_destination="/usr/local/bin/terminal-relay-mobile-gateway"
 readonly codex_destination="/usr/bin/codex"
 readonly claude_destination="/usr/bin/claude"
 readonly codex_root="/opt/terminal-relay"
@@ -51,6 +63,7 @@ readonly CODEX_RELEASE="latest"
 readonly minimum_memory_kib=3900000
 
 launcher_source="$script_directory/terminal-relay-session"
+chat_source="$script_directory/terminal-relay-chat"
 mcp_source="$script_directory/terminal-relay-mcp"
 claude_sessions_adapter_source="$script_directory/terminal-relay-claude-sessions"
 claude_sessions_requirements_source="$script_directory/claude-agent-sdk-requirements.txt"
@@ -58,6 +71,14 @@ restore_unit_source="$script_directory/terminal-relay-session-restore@.service"
 agent_update_source="$script_directory/terminal-relay-agent-update"
 agent_update_service_source="$script_directory/terminal-relay-agent-update.service"
 agent_update_timer_source="$script_directory/terminal-relay-agent-update.timer"
+runtime_update_source="$script_directory/terminal-relay-runtime-update"
+runtime_update_service_source="$script_directory/terminal-relay-runtime-update.service"
+runtime_update_timer_source="$script_directory/terminal-relay-runtime-update.timer"
+runtime_update_path_source="$script_directory/terminal-relay-runtime-update.path"
+runtime_update_public_key_source="$script_directory/terminal-relay-runtime-update.pub"
+runtime_manifest_source="$script_directory/runtime-manifest.json"
+command_gateway_source="$script_directory/terminal-relay-review-gateway"
+mobile_gateway_source="$script_directory/terminal-relay-mobile-gateway"
 worker_config_directory="$script_directory/worker-config"
 backup_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 temporary_directory=""
@@ -76,6 +97,11 @@ restore_service_touched=false
 agent_update_timer_initial_enabled=false
 agent_update_timer_initial_active=false
 agent_update_timer_touched=false
+runtime_update_timer_initial_enabled=false
+runtime_update_timer_initial_active=false
+runtime_update_path_initial_enabled=false
+runtime_update_path_initial_active=false
+runtime_update_units_touched=false
 
 declare -a rollback_destinations=()
 declare -a rollback_backups=()
@@ -236,6 +262,31 @@ rollback_agent_update_timer() {
     fi
 }
 
+rollback_runtime_update_units() {
+    [[ "$runtime_update_units_touched" == true ]] || return 0
+
+    /usr/bin/systemctl stop "$runtime_update_timer" "$runtime_update_path" >/dev/null 2>&1 || true
+    if [[ "$runtime_update_timer_initial_enabled" != true ]]; then
+        /usr/bin/systemctl disable "$runtime_update_timer" >/dev/null 2>&1 || true
+    fi
+    if [[ "$runtime_update_path_initial_enabled" != true ]]; then
+        /usr/bin/systemctl disable "$runtime_update_path" >/dev/null 2>&1 || true
+    fi
+    /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
+    if [[ "$runtime_update_timer_initial_enabled" == true ]]; then
+        /usr/bin/systemctl enable "$runtime_update_timer" >/dev/null 2>&1 || true
+    fi
+    if [[ "$runtime_update_path_initial_enabled" == true ]]; then
+        /usr/bin/systemctl enable "$runtime_update_path" >/dev/null 2>&1 || true
+    fi
+    if [[ "$runtime_update_timer_initial_active" == true ]]; then
+        /usr/bin/systemctl start "$runtime_update_timer" >/dev/null 2>&1 || true
+    fi
+    if [[ "$runtime_update_path_initial_active" == true ]]; then
+        /usr/bin/systemctl start "$runtime_update_path" >/dev/null 2>&1 || true
+    fi
+}
+
 cleanup() {
     local exit_code=$?
     local temporary_parent
@@ -249,9 +300,13 @@ cleanup() {
         if [[ "$agent_update_timer_touched" == true ]]; then
             /usr/bin/systemctl stop "$agent_update_timer" >/dev/null 2>&1 || true
         fi
+        if [[ "$runtime_update_units_touched" == true ]]; then
+            /usr/bin/systemctl stop "$runtime_update_timer" "$runtime_update_path" >/dev/null 2>&1 || true
+        fi
         rollback_managed_files || true
         rollback_restore_service || true
         rollback_agent_update_timer || true
+        rollback_runtime_update_units || true
         if [[ "$hostname_was_changed" == true && -n "$original_hostname" ]]; then
             if /bin/hostname "$original_hostname" 2>/dev/null; then
                 log "Restored live hostname after installation failure."
@@ -282,6 +337,7 @@ validate_source_bundle() {
 
     for required_file in \
         "$launcher_source" \
+        "$chat_source" \
         "$mcp_source" \
         "$claude_sessions_adapter_source" \
         "$claude_sessions_requirements_source" \
@@ -289,6 +345,14 @@ validate_source_bundle() {
         "$agent_update_source" \
         "$agent_update_service_source" \
         "$agent_update_timer_source" \
+        "$runtime_update_source" \
+        "$runtime_update_service_source" \
+        "$runtime_update_timer_source" \
+        "$runtime_update_path_source" \
+        "$runtime_update_public_key_source" \
+        "$runtime_manifest_source" \
+        "$command_gateway_source" \
+        "$mobile_gateway_source" \
         "$baseline_file" \
         "$worker_config_directory/install.sh" \
         "$worker_config_directory/AGENTS.md" \
@@ -418,7 +482,7 @@ validate_managed_state() {
         while IFS= read -r -d '' entry; do
             entry_name="$(basename "$entry")"
             case "$entry_name" in
-                installer-version|worker-id|display-name|authorized-keys-installed) ;;
+                installer-version|worker-id|display-name|authorized-keys-installed|runtime-manifest.json|runtime-update-public.pem) ;;
                 *) fail "Unexpected state entry: $entry" ;;
             esac
         done < <(/usr/bin/find "$state_directory" -mindepth 1 -maxdepth 1 -print0)
@@ -464,11 +528,18 @@ validate_managed_state() {
 
         for entry in \
             "$launcher_destination" \
+            "$chat_destination" \
             "$mcp_destination" \
             "$restore_unit_destination" \
             "$agent_update_destination" \
             "$agent_update_service_destination" \
             "$agent_update_timer_destination" \
+            "$runtime_update_destination" \
+            "$runtime_update_service_destination" \
+            "$runtime_update_timer_destination" \
+            "$runtime_update_path_destination" \
+            "$command_gateway_destination" \
+            "$mobile_gateway_destination" \
             "$codex_destination" \
             "$claude_destination" \
             "$codex_root" \
@@ -492,11 +563,18 @@ validate_managed_state() {
     else
         for entry in \
             "$launcher_destination" \
+            "$chat_destination" \
             "$mcp_destination" \
             "$restore_unit_destination" \
             "$agent_update_destination" \
             "$agent_update_service_destination" \
             "$agent_update_timer_destination" \
+            "$runtime_update_destination" \
+            "$runtime_update_service_destination" \
+            "$runtime_update_timer_destination" \
+            "$runtime_update_path_destination" \
+            "$command_gateway_destination" \
+            "$mobile_gateway_destination" \
             "$codex_destination" \
             "$claude_destination" \
             "$claude_key_destination" \
@@ -665,6 +743,48 @@ validate_or_create_runtime_user() {
     fi
 }
 
+enforce_mobile_command_gateway() {
+    local ssh_directory="$runtime_home/.ssh"
+    local authorized_keys="$ssh_directory/authorized_keys"
+    local lock_file="$ssh_directory/.terminal-relay-pairing.lock"
+    local temporary_file
+
+    [[ -d "$ssh_directory" && ! -L "$ssh_directory" \
+        && -f "$authorized_keys" && ! -L "$authorized_keys" ]] \
+        || fail "Managed worker authorized keys are unavailable for mobile gateway migration."
+    /usr/bin/touch "$lock_file"
+    /bin/chown "$runtime_user:$runtime_group" "$lock_file"
+    /bin/chmod 0600 "$lock_file"
+    exec 6>"$lock_file"
+    /usr/bin/flock -x 6
+
+    temporary_file="$(/usr/bin/mktemp "$ssh_directory/.authorized_keys.XXXXXX")" \
+        || fail "Unable to stage mobile gateway authorization."
+    if ! /usr/bin/awk \
+        -v prefix='restrict,command="/usr/local/bin/terminal-relay-mobile-gateway" ' '
+            NF == 3 && $1 == "ssh-ed25519" && $3 == "terminal-relay-ios" {
+                print prefix $0
+                next
+            }
+            { print }
+        ' "$authorized_keys" > "$temporary_file"; then
+        /bin/rm -f -- "$temporary_file"
+        fail "Unable to migrate paired mobile authorization."
+    fi
+    /bin/chown "$runtime_user:$runtime_group" "$temporary_file"
+    /bin/chmod 0600 "$temporary_file"
+    /bin/mv -f -- "$temporary_file" "$authorized_keys"
+    if /usr/bin/awk '
+        NF == 3 && $1 == "ssh-ed25519" && $3 == "terminal-relay-ios" {
+            found = 1
+        }
+        END { exit found ? 0 : 1 }
+    ' "$authorized_keys"; then
+        fail "A paired mobile key bypasses the command gateway."
+    fi
+    exec 6>&-
+}
+
 run_as_worker() {
     /usr/sbin/runuser -u "$runtime_user" -- \
         env \
@@ -705,6 +825,7 @@ install_dependencies() {
         hostname \
         mawk \
         openssh-client \
+        openssl \
         procps \
         python3 \
         python3-venv \
@@ -875,11 +996,30 @@ prepare_worker_guidance() {
 install_runtime_files() {
     /usr/bin/install -d -o "$runtime_user" -g "$runtime_group" -m 0750 "$workspace_directory"
     install_managed_file "$launcher_source" "$launcher_destination" 755
+    install_managed_file "$chat_source" "$chat_destination" 755
     install_managed_file "$mcp_source" "$mcp_destination" 755
+    install_managed_file \
+        "$claude_sessions_requirements_source" \
+        "$claude_sessions_requirements_destination" \
+        644
     install_managed_file "$restore_unit_source" "$restore_unit_destination" 644
     install_managed_file "$agent_update_source" "$agent_update_destination" 755
     install_managed_file "$agent_update_service_source" "$agent_update_service_destination" 644
     install_managed_file "$agent_update_timer_source" "$agent_update_timer_destination" 644
+    install_managed_file "$runtime_update_source" "$runtime_update_destination" 755
+    install_managed_file \
+        "$runtime_update_service_source" \
+        "$runtime_update_service_destination" \
+        644
+    install_managed_file "$runtime_update_timer_source" "$runtime_update_timer_destination" 644
+    install_managed_file "$runtime_update_path_source" "$runtime_update_path_destination" 644
+    install_managed_file \
+        "$runtime_update_public_key_source" \
+        "$runtime_update_public_key_destination" \
+        644
+    install_managed_file "$runtime_manifest_source" "$runtime_manifest_destination" 644
+    install_managed_file "$command_gateway_source" "$command_gateway_destination" 755
+    install_managed_file "$mobile_gateway_source" "$mobile_gateway_destination" 755
     prepare_worker_guidance "$worker_config_directory/AGENTS.md" "$runtime_home/AGENTS.md"
     prepare_worker_guidance "$worker_config_directory/CLAUDE.md" "$runtime_home/CLAUDE.md"
     prepare_worker_guidance "$worker_config_directory/AGENTS.md" "$runtime_home/.codex/AGENTS.md"
@@ -934,9 +1074,33 @@ configure_agent_update_timer() {
     /usr/bin/systemctl enable --now "$agent_update_timer"
 }
 
-acquire_agent_update_lock() {
+configure_runtime_update_units() {
+    if /usr/bin/systemctl is-enabled --quiet "$runtime_update_timer" 2>/dev/null; then
+        runtime_update_timer_initial_enabled=true
+    fi
+    if /usr/bin/systemctl is-active --quiet "$runtime_update_timer" 2>/dev/null; then
+        runtime_update_timer_initial_active=true
+    fi
+    if /usr/bin/systemctl is-enabled --quiet "$runtime_update_path" 2>/dev/null; then
+        runtime_update_path_initial_enabled=true
+    fi
+    if /usr/bin/systemctl is-active --quiet "$runtime_update_path" 2>/dev/null; then
+        runtime_update_path_initial_active=true
+    fi
+    runtime_update_units_touched=true
+
+    /usr/bin/systemd-analyze verify \
+        "$runtime_update_service_destination" \
+        "$runtime_update_timer_destination" \
+        "$runtime_update_path_destination"
+    /usr/bin/systemctl enable --now "$runtime_update_timer" "$runtime_update_path"
+}
+
+acquire_update_locks() {
     exec 9>/run/lock/terminal-relay-agent-update.lock
     /usr/bin/flock 9
+    exec 8>/run/lock/terminal-relay-session-helper.lock
+    /usr/bin/flock 8
 }
 
 set_worker_hostname() {
@@ -984,6 +1148,8 @@ verify_readiness() {
         || fail "Unexpected ownership or mode on $workspace_directory."
     [[ "$(/usr/bin/stat -c '%U:%G:%a' "$launcher_destination")" == "root:root:755" ]] \
         || fail "Unexpected ownership or mode on $launcher_destination."
+    [[ "$(/usr/bin/stat -c '%U:%G:%a' "$chat_destination")" == "root:root:755" ]] \
+        || fail "Unexpected ownership or mode on $chat_destination."
     [[ "$(/usr/bin/stat -c '%U:%G:%a' "$mcp_destination")" == "root:root:755" ]] \
         || fail "Unexpected ownership or mode on $mcp_destination."
     [[ "$(/usr/bin/stat -c '%U:%G:%a' "$restore_unit_destination")" == "root:root:644" ]] \
@@ -994,6 +1160,22 @@ verify_readiness() {
         || fail "Unexpected ownership or mode on $agent_update_service_destination."
     [[ "$(/usr/bin/stat -c '%U:%G:%a' "$agent_update_timer_destination")" == "root:root:644" ]] \
         || fail "Unexpected ownership or mode on $agent_update_timer_destination."
+    [[ "$(/usr/bin/stat -c '%U:%G:%a' "$runtime_update_destination")" == "root:root:755" ]] \
+        || fail "Unexpected ownership or mode on $runtime_update_destination."
+    [[ "$(/usr/bin/stat -c '%U:%G:%a' "$runtime_update_service_destination")" == "root:root:644" ]] \
+        || fail "Unexpected ownership or mode on $runtime_update_service_destination."
+    [[ "$(/usr/bin/stat -c '%U:%G:%a' "$runtime_update_timer_destination")" == "root:root:644" ]] \
+        || fail "Unexpected ownership or mode on $runtime_update_timer_destination."
+    [[ "$(/usr/bin/stat -c '%U:%G:%a' "$runtime_update_path_destination")" == "root:root:644" ]] \
+        || fail "Unexpected ownership or mode on $runtime_update_path_destination."
+    [[ "$(/usr/bin/stat -c '%U:%G:%a' "$runtime_update_public_key_destination")" == "root:root:644" ]] \
+        || fail "Unexpected ownership or mode on $runtime_update_public_key_destination."
+    [[ "$(/usr/bin/stat -c '%U:%G:%a' "$runtime_manifest_destination")" == "root:root:644" ]] \
+        || fail "Unexpected ownership or mode on $runtime_manifest_destination."
+    [[ "$(/usr/bin/stat -c '%U:%G:%a' "$command_gateway_destination")" == "root:root:755" ]] \
+        || fail "Unexpected ownership or mode on $command_gateway_destination."
+    [[ "$(/usr/bin/stat -c '%U:%G:%a' "$mobile_gateway_destination")" == "root:root:755" ]] \
+        || fail "Unexpected ownership or mode on $mobile_gateway_destination."
     /usr/bin/systemctl is-enabled --quiet "$restore_service" \
         || fail "$restore_service is not enabled."
     /usr/bin/systemctl is-active --quiet "$restore_service" \
@@ -1002,6 +1184,14 @@ verify_readiness() {
         || fail "$agent_update_timer is not enabled."
     /usr/bin/systemctl is-active --quiet "$agent_update_timer" \
         || fail "$agent_update_timer is not active."
+    /usr/bin/systemctl is-enabled --quiet "$runtime_update_timer" \
+        || fail "$runtime_update_timer is not enabled."
+    /usr/bin/systemctl is-active --quiet "$runtime_update_timer" \
+        || fail "$runtime_update_timer is not active."
+    /usr/bin/systemctl is-enabled --quiet "$runtime_update_path" \
+        || fail "$runtime_update_path is not enabled."
+    /usr/bin/systemctl is-active --quiet "$runtime_update_path" \
+        || fail "$runtime_update_path is not active."
     [[ "$(/usr/bin/systemctl show -p User --value "$restore_service")" == "$runtime_user" ]] \
         || fail "$restore_service is not running as $runtime_user."
     [[ "$(/usr/bin/stat -c '%U:%G:%a' "$runtime_home/.ssh")" == "$runtime_user:$runtime_group:700" ]] \
@@ -1009,7 +1199,7 @@ verify_readiness() {
     [[ "$(/usr/bin/stat -c '%U:%G:%a' "$runtime_home/.ssh/authorized_keys")" == "$runtime_user:$runtime_group:600" ]] \
         || fail "Unexpected ownership or mode on worker authorized keys."
 
-    for required_command in git ssh awk df nproc flock tmux python3 bwrap codex claude terminal-relay-session terminal-relay-mcp terminal-relay-claude-sessions; do
+    for required_command in git ssh awk df nproc flock tmux python3 bwrap openssl codex claude terminal-relay-session terminal-relay-chat terminal-relay-mcp terminal-relay-claude-sessions; do
         login_command_path="$(run_as_worker /bin/bash -lc \
             "cd \"\$HOME\" && command -v $required_command")" \
             || fail "$required_command is unavailable in the worker login shell."
@@ -1037,10 +1227,15 @@ verify_readiness() {
         "$claude_sessions_adapter_destination" version)" \
         == "$claude_sessions_sdk_version" ]] \
         || fail "The worker account cannot use the Claude session adapter."
+    run_as_worker "$claude_sessions_sdk_current/bin/python3" \
+        "$chat_destination" ready --provider claude >/dev/null \
+        || fail "The worker account cannot use structured Claude chat."
     run_as_worker /usr/bin/awk 'NR == 1 { found = 1 } END { exit !found }' /proc/stat
     run_as_worker /usr/bin/awk \
         '/^MemTotal:/ { found = 1 } END { exit !found }' /proc/meminfo
     run_as_worker /bin/df -Pk "$workspace_directory" >/dev/null
+    run_as_worker "$launcher_destination" runtime-info >/dev/null
+    run_as_worker "$launcher_destination" runtime-update-status >/dev/null
 
     workspace_probe="$(run_as_worker /usr/bin/mktemp \
         "$workspace_directory/.terminal-relay-write.XXXXXX")"
@@ -1071,7 +1266,7 @@ main() {
     validate_or_create_runtime_user
     /usr/bin/install -d -o "$runtime_user" -g "$runtime_group" -m 0750 "$workspace_directory"
     install_dependencies
-    acquire_agent_update_lock
+    acquire_update_locks
     install_codex
     install_claude
     install_claude_session_sdk
@@ -1079,8 +1274,10 @@ main() {
     schedule_codex_app_server_restart
     configure_restore_service
     configure_agent_update_timer
+    configure_runtime_update_units
     set_worker_hostname
     verify_readiness
+    enforce_mobile_command_gateway
 
     installation_succeeded=true
     printf '%s\n' 'TERMINAL_RELAY_RESULT_V1'

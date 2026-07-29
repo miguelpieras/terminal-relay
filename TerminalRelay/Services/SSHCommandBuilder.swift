@@ -78,6 +78,24 @@ enum SSHCommandBuilder {
         )
     }
 
+    static func workerRuntimeInfoConfiguration(
+        for server: ServerProfile
+    ) -> SSHLaunchConfiguration {
+        workerSessionConfiguration(for: server, arguments: ["runtime-info"])
+    }
+
+    static func workerRuntimeUpdateStatusConfiguration(
+        for server: ServerProfile
+    ) -> SSHLaunchConfiguration {
+        workerSessionConfiguration(for: server, arguments: ["runtime-update-status"])
+    }
+
+    static func workerRuntimeUpdateRequestConfiguration(
+        for server: ServerProfile
+    ) -> SSHLaunchConfiguration {
+        workerSessionConfiguration(for: server, arguments: ["runtime-update-request"])
+    }
+
     static func workerSessionStartConfiguration(
         for server: ServerProfile,
         kind: AgentKind,

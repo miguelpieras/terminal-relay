@@ -43,6 +43,18 @@ final class WorkerRemoteCommandTests: XCTestCase {
             "/usr/local/bin/terminal-relay-session update-status"
         )
         XCTAssertEqual(
+            WorkerRemoteCommand.runtimeInfo,
+            "/usr/local/bin/terminal-relay-session runtime-info"
+        )
+        XCTAssertEqual(
+            WorkerRemoteCommand.runtimeUpdateStatus,
+            "/usr/local/bin/terminal-relay-session runtime-update-status"
+        )
+        XCTAssertEqual(
+            WorkerRemoteCommand.runtimeUpdateRequest,
+            "/usr/local/bin/terminal-relay-session runtime-update-request"
+        )
+        XCTAssertEqual(
             WorkerRemoteCommand.resources,
             "/usr/local/bin/terminal-relay-session resources"
         )

@@ -76,6 +76,9 @@ def validate_command(arguments: list[str], working_directory: str | None) -> lis
         "status",
         "resources",
         "update-status",
+        "runtime-info",
+        "runtime-update-status",
+        "runtime-update-request",
         "codex-account",
         "claude-account",
     }:

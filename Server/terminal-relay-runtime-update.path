@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for a Terminal Relay worker runtime update request
+
+[Path]
+PathChanged=/home/terminal-relay/.local/state/terminal-relay/runtime-update-request
+Unit=terminal-relay-runtime-update.service
+
+[Install]
+WantedBy=multi-user.target

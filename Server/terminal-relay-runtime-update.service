@@ -1,0 +1,18 @@
+[Unit]
+Description=Update Terminal Relay worker runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/sbin/terminal-relay-runtime-update
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=10min
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/etc/terminal-relay /home/terminal-relay/.local/state/terminal-relay /opt/terminal-relay/claude-session-sdk /usr/local/bin /usr/local/sbin /etc/systemd/system /var/lib/terminal-relay /run/lock

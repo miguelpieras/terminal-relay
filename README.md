@@ -26,6 +26,7 @@ apps connect directly over SSH.
 - Private Mac-to-mobile pairing with a short-lived, single-use QR code.
 - Optional Hetzner and Tailscale worker lifecycle automation.
 - Signed, in-app macOS updates with daily checks and user-controlled installation.
+- Signed, unattended worker-runtime updates shared by macOS, iPhone, and iPad.
 - No advertising, analytics, tracking, or Terminal Relay cloud service.
 
 Terminal Relay starts with no configured workers or GitHub owner. It reads the
@@ -51,15 +52,18 @@ host or register an existing Terminal Relay worker.
 
 ## Use projects and threads
 
-Freshly bootstrapped workers include thread management automatically. To add it
-to existing managed workers after updating Terminal Relay, reconcile them once:
+Freshly bootstrapped workers include the automatic worker-runtime updater. Run
+one fleet reconciliation to add it to workers created by an older release:
 
 ```bash
 ./Scripts/manage-worker.sh reconcile all
 ```
 
 For an application-only worker, re-run its original
-`./Scripts/bootstrap-worker.sh root@worker.example.com` command instead.
+`./Scripts/bootstrap-worker.sh root@worker.example.com` command instead. After
+this one-time enablement, signed runtime updates are checked automatically and
+compatible clients can request an immediate fixed-channel check. Routine app
+updates no longer require a manual worker migration.
 
 Then use the apps:
 
@@ -119,7 +123,10 @@ Maintainer-signed macOS releases use Sparkle. The app checks the public signed
 feed once per day without sending system-profile data. Use **Terminal Relay →
 Check for Updates…** at any time; automatic checks, downloads, and installation
 remain configurable in **Settings → Agent Defaults**. iPhone and iPad updates
-continue to be installed through the App Store.
+continue to be installed through the App Store. These mechanisms update client
+binaries only. A separate Ed25519-signed stable feed updates the bounded
+root-owned runtime on each worker; it never copies repositories, credentials,
+provider history, relay metadata, restart intents, or terminal contents.
 
 ## Architecture
 
@@ -294,7 +301,8 @@ Source availability and binary distribution are independent:
 A macOS release is cut by pushing a version tag that matches
 `MARKETING_VERSION` on the current `main`. The `macos-release`
 environment runs `Scripts/release-macos.sh`, publishes the notarized ZIP and
-release notes, and deploys the signed appcast. See
+release notes, signed worker runtime, and signed appcast. The workflow deploys
+the worker feed before publishing the corresponding client release. See
 [Distribution/macOS.md](Distribution/macOS.md) for the credential names,
 verification checks, and recovery constraint.
 

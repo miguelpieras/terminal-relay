@@ -360,6 +360,29 @@ final class WorkerSessionServiceTests: XCTestCase {
         XCTAssertNil(service.updateWarning(for: worker.id))
     }
 
+    func testIncompatibleRuntimeRequestsOneFixedUpdateCheck() async {
+        let worker = makeWorker()
+        let recorder = RuntimeInspectionCommandRecorder()
+        let service = WorkerSessionService(
+            runCommand: { configuration in
+                await recorder.run(configuration)
+            },
+            inspectsRuntimeOnRefresh: true
+        )
+
+        _ = await service.refresh(worker: worker)
+        for _ in 0..<100 where !recorder.requestedUpdate {
+            await Task.yield()
+        }
+
+        XCTAssertTrue(recorder.requestedUpdate)
+        XCTAssertEqual(service.runtimeInfos[worker.id]?.maximumProtocol, 1)
+        XCTAssertEqual(
+            service.runtimeMessages[worker.id],
+            "This worker needs a runtime update for the current client. Updating automatically…"
+        )
+    }
+
     func testStartReturnsAndStoresTheExactSessionSnapshot() async {
         let worker = makeWorker()
         let instanceToken = "01234567-89ab-" + "4def-8abc-0123456789ab"
@@ -755,6 +778,15 @@ private final class WorkerSessionCommandRecorder {
     }
 
     func run(_ configuration: SSHLaunchConfiguration) async -> WorkerSessionCommandResult {
+        if configuration.arguments.last?.contains(
+            "'/usr/local/bin/terminal-relay-session' 'runtime-info'"
+        ) == true {
+            return WorkerSessionCommandResult(
+                exitCode: 64,
+                standardOutput: Data(),
+                standardError: Data("unsupported command".utf8)
+            )
+        }
         configurations.append(configuration)
         return results.removeFirst()
     }
@@ -771,6 +803,15 @@ private final class BlockingFirstWorkerSessionCommandRecorder {
     }
 
     func run(_ configuration: SSHLaunchConfiguration) async -> WorkerSessionCommandResult {
+        if configuration.arguments.last?.contains(
+            "'/usr/local/bin/terminal-relay-session' 'runtime-info'"
+        ) == true {
+            return WorkerSessionCommandResult(
+                exitCode: 64,
+                standardOutput: Data(),
+                standardError: Data("unsupported command".utf8)
+            )
+        }
         configurations.append(configuration)
         if configurations.count == 1 {
             return await withCheckedContinuation { continuation in
@@ -783,5 +824,53 @@ private final class BlockingFirstWorkerSessionCommandRecorder {
     func finishFirst(with result: WorkerSessionCommandResult) {
         firstContinuation?.resume(returning: result)
         firstContinuation = nil
+    }
+}
+
+@MainActor
+private final class RuntimeInspectionCommandRecorder {
+    private(set) var requestedUpdate = false
+
+    func run(_ configuration: SSHLaunchConfiguration) async -> WorkerSessionCommandResult {
+        let command = configuration.arguments.last ?? ""
+        if command.contains("'runtime-info'") {
+            return WorkerSessionCommandResult(
+                exitCode: 0,
+                standardOutput: Data(
+                    """
+                    \(WorkerRuntimeInfoProtocol.marker)
+                    runtime|2000000000|1|1|agent-sessions,runtime-updates-v1,threads-v1
+                    """.utf8
+                ),
+                standardError: Data()
+            )
+        }
+        if command.contains("'runtime-update-status'") {
+            return WorkerSessionCommandResult(
+                exitCode: 0,
+                standardOutput: Data("\(WorkerRuntimeUpdateStatusProtocol.marker)\n".utf8),
+                standardError: Data()
+            )
+        }
+        if command.contains("'runtime-update-request'") {
+            requestedUpdate = true
+            return WorkerSessionCommandResult(
+                exitCode: 64,
+                standardOutput: Data(),
+                standardError: Data()
+            )
+        }
+        if command.contains("'update-status'") {
+            return WorkerSessionCommandResult(
+                exitCode: 0,
+                standardOutput: Data("\(WorkerUpdateStatusProtocol.marker)\n".utf8),
+                standardError: Data()
+            )
+        }
+        return WorkerSessionCommandResult(
+            exitCode: 0,
+            standardOutput: Data("\(WorkerSessionProtocol.marker)\n".utf8),
+            standardError: Data()
+        )
     }
 }

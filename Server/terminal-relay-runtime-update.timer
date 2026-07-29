@@ -1,0 +1,12 @@
+[Unit]
+Description=Check for Terminal Relay worker runtime updates
+
+[Timer]
+OnBootSec=5min
+OnCalendar=*-*-* 01,07,13,19:15:00 UTC
+RandomizedDelaySec=20min
+Persistent=true
+Unit=terminal-relay-runtime-update.service
+
+[Install]
+WantedBy=timers.target

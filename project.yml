@@ -109,6 +109,7 @@ targets:
       - path: TerminalRelay/Models/WorkerChatState.swift
       - path: TerminalRelay/Models/WorkerThreadState.swift
       - path: TerminalRelay/Models/WorkerUpdateStatus.swift
+      - path: TerminalRelay/Models/WorkerRuntimeStatus.swift
       - path: LICENSE
         buildPhase: resources
       - path: THIRD_PARTY_NOTICES.md

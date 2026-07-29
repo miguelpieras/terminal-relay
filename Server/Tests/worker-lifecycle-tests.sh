@@ -13,6 +13,7 @@ lifecycle="$repository_root/Scripts/manage-worker.sh"
 review_lifecycle="$repository_root/Scripts/manage-review-worker.sh"
 review_tests="$repository_root/Server/Tests/review-worker-tests.sh"
 bootstrap="$repository_root/Scripts/bootstrap-worker.sh"
+runtime_payload="$repository_root/Server/worker-runtime-files.txt"
 temporary_root="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
 temporary_directory="$(mktemp -d "$temporary_root/terminal-relay-lifecycle-tests.XXXXXX")"
 
@@ -43,6 +44,7 @@ for file in \
     "$lifecycle" \
     "$review_lifecycle" \
     "$review_tests" \
+    "$runtime_payload" \
     "$bootstrap"; do
     [[ -f "$file" && ! -L "$file" ]] || fail "missing or unsafe lifecycle file: $file"
 done
@@ -93,14 +95,18 @@ grep -Fq 'worker-baseline.env' "$application_installer" \
     || fail "application installer does not consume the shared baseline"
 grep -Fq 'node-exporter.service.template' "$lifecycle" \
     || fail "lifecycle does not deploy the monitoring baseline"
-grep -Fq 'terminal-relay-agent-update.timer' "$bootstrap" \
+grep -Fq 'terminal-relay-agent-update.timer' "$runtime_payload" \
     || fail "bootstrap does not include automatic agent updates"
-grep -Fq 'terminal-relay-claude-sessions' "$bootstrap" \
+grep -Fq 'terminal-relay-claude-sessions' "$runtime_payload" \
     || fail "bootstrap does not include the Claude session adapter"
-grep -Fq 'claude-agent-sdk-requirements.txt' "$bootstrap" \
+grep -Fq 'claude-agent-sdk-requirements.txt' "$runtime_payload" \
     || fail "bootstrap does not include the pinned Claude session SDK requirements"
-grep -Fq '"${WORKER_PAYLOAD_PATHS[@]}"' "$bootstrap" \
+grep -Fq '"${runtime_payload_paths[@]}"' "$bootstrap" \
     || fail "bootstrap validation and archive creation do not share one payload list"
+grep -Fq 'terminal-relay-runtime-update.timer' "$runtime_payload" \
+    || fail "bootstrap does not include automatic runtime updates"
+grep -Fq 'worker-runtime-files.txt' "$bootstrap" \
+    || fail "bootstrap does not consume the canonical runtime payload list"
 grep -Fq 'CODEX_NON_INTERACTIVE=1' "$agent_updater" \
     || fail "Codex automatic updates are not unattended"
 grep -Fq 'apt/latest latest main' "$application_installer" \
