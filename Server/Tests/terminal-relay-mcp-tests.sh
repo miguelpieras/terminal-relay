@@ -199,6 +199,7 @@ process = subprocess.run(
 responses = [json.loads(line) for line in process.stdout.splitlines()]
 assert len(responses) == len(requests), responses
 assert responses[0]["result"]["serverInfo"]["name"] == "terminal-relay"
+assert "tell me about my open threads" in responses[0]["result"]["instructions"]
 tools = {tool["name"]: tool for tool in responses[1]["result"]["tools"]}
 assert set(tools) == {
     "list_projects",
@@ -211,6 +212,8 @@ assert set(tools) == {
 }
 assert tools["list_projects"]["annotations"]["readOnlyHint"] is True
 assert tools["archive_thread"]["annotations"]["destructiveHint"] is True
+assert "open threads" in tools["list_projects"]["description"]
+assert "live terminals plus paused Codex threads" in tools["list_threads"]["description"]
 assert responses[2]["result"]["structuredContent"] == {"projects": ["alpha", "beta"]}
 threads = responses[3]["result"]["structuredContent"]["threads"]
 assert {(thread["provider"], thread["threadID"]) for thread in threads} == {

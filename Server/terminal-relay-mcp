@@ -273,16 +273,36 @@ def tool_result(value):
     }
 
 
+SERVER_INSTRUCTIONS = (
+    "Use these tools whenever the user asks about their projects, tasks, "
+    "conversations, or open, active, paused, inactive, or archived threads "
+    "on this worker. For a broad request without a repository, such as "
+    "'tell me about my open threads', call list_projects first and then call "
+    "list_threads for each project. Treat open threads as unarchived threads, "
+    "including both live terminals and paused Codex threads. Do not mutate a "
+    "thread unless the user directly asks for that change."
+)
+
+
 TOOLS = [
     {
         "name": "list_projects",
-        "description": "List repositories available on this worker.",
+        "description": (
+            "List repositories available on this worker. Start here when the "
+            "user asks broadly about their projects, tasks, conversations, or "
+            "open threads without naming a repository."
+        ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         "annotations": {"readOnlyHint": True, "destructiveHint": False},
     },
     {
         "name": "list_threads",
-        "description": "List active or archived threads for one project on this worker.",
+        "description": (
+            "List threads for one project on this worker. With archived=false, "
+            "this returns the user's open threads: live terminals plus paused "
+            "Codex threads. Use archived=true only when archived history is "
+            "requested."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -449,6 +469,7 @@ def handle(message):
                 "protocolVersion": "2025-03-26",
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": "terminal-relay", "version": "1.0.0"},
+                "instructions": SERVER_INSTRUCTIONS,
             },
         )
     elif method == "ping":

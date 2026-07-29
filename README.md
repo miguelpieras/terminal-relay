@@ -87,7 +87,7 @@ worker-local `terminal_relay` MCP. There is nothing to install or configure in
 the agent. For example, ask:
 
 ```text
-Use terminal_relay to list the projects and paused threads on this worker.
+Tell me about my open threads.
 
 Create a Codex thread in example-repo, rename it "Investigate flaky tests",
 and tell me its thread ID.
@@ -98,6 +98,10 @@ attach to it from Terminal Relay.
 Archive the inactive Codex thread 00000000-0000-4000-8000-000000000000 in
 example-repo.
 ```
+
+For the first request, the MCP instructions tell the agent to discover the
+worker's projects and list each project's unarchived threads, including live
+terminals and paused Codex conversations.
 
 The MCP can list projects and threads; start, resume, or rename Codex threads;
 and archive or restore inactive Codex threads on the current worker. It cannot
