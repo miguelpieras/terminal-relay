@@ -886,8 +886,17 @@ if [[ "$restart_required" -eq 1 ]]; then
     "$session_helper" __schedule-codex-app-server-restart
 fi
 "$session_helper" __verify-codex-account >/dev/null
-test ! -e "$codex_restart_marker"
-test ! -L "$codex_restart_marker"
+if [[ -e "$codex_restart_marker" || -L "$codex_restart_marker" ]]; then
+    test -f "$codex_restart_marker"
+    test ! -L "$codex_restart_marker"
+    test "$(stat -c '%U:%G:%a' "$codex_restart_marker")" \
+        = terminal-relay:terminal-relay:600
+    active_codex_terminals="$("$session_helper" status \
+        | /usr/bin/awk -F'|' '$1 == "session" && $2 == "codex" { count++ } END { print count + 0 }')"
+    [[ "$active_codex_terminals" =~ ^[1-9][0-9]*$ ]]
+else
+    test ! -L "$codex_restart_marker"
+fi
 
 /usr/bin/tmux -f /dev/null -L terminal-relay \
     has-session -t "$codex_app_server_session" 2>/dev/null

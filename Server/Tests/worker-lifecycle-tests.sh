@@ -140,11 +140,17 @@ for marker_source in "$application_installer" "$session_helper" "$agent_updater"
         || fail "$(basename "$marker_source") does not share the Codex restart marker"
 done
 grep -Fq 'codex-app-server-restart-required' "$lifecycle" \
-    || fail "fleet verification does not reject a pending Codex app-server restart"
+    || fail "fleet verification does not inspect a pending Codex app-server restart"
 grep -Fq '"$session_helper" __schedule-codex-app-server-restart' "$lifecycle" \
     || fail "fleet verification does not schedule an unsafe Codex app-server rotation"
 grep -Fq '"$session_helper" __verify-codex-account >/dev/null' "$lifecycle" \
     || fail "fleet verification does not require the shared Codex account after rotation"
+grep -Fq 'stat -c '\''%U:%G:%a'\'' "$codex_restart_marker"' "$lifecycle" \
+    || fail "fleet verification does not require a secure deferred restart marker"
+grep -Fq '$1 == "session" && $2 == "codex"' "$lifecycle" \
+    || fail "fleet verification does not limit deferred restarts to active Codex terminals"
+grep -Fq '[[ "$active_codex_terminals" =~ ^[1-9][0-9]*$ ]]' "$lifecycle" \
+    || fail "fleet verification does not require an active Codex terminal for deferral"
 grep -Fq 'run_codex_rpc_with_app_server_lock require-account' "$session_helper" \
     || fail "worker helper does not expose fail-closed shared Codex account verification"
 [[ "$(grep -Fc '/usr/local/bin/terminal-relay-session __verify-codex-account' "$bootstrap")" -eq 2 ]] \
@@ -154,8 +160,6 @@ grep -Fq '/usr/local/bin/terminal-relay-session codex-login' "$bootstrap" \
 if grep -Fq '/usr/bin/codex login' "$bootstrap"; then
     fail "worker bootstrap bypasses the shared Codex app-server during authentication"
 fi
-grep -Fq 'test ! -e "$codex_restart_marker"' "$lifecycle" \
-    || fail "fleet verification does not require the Codex restart marker to clear"
 grep -Fq 'test ! -L "$codex_restart_marker"' "$lifecycle" \
     || fail "fleet verification does not reject a symlinked Codex restart marker"
 grep -Fq "'#{pane_pid}'" "$lifecycle" \
