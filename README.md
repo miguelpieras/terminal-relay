@@ -47,6 +47,63 @@ the Release app, installs it at `/Applications/Terminal Relay.app`, and opens
 it. In the app, choose **Workers → Add Worker** to bootstrap a fresh Ubuntu
 host or register an existing Terminal Relay worker.
 
+## Use projects and threads
+
+Freshly bootstrapped workers include thread management automatically. To add it
+to existing managed workers after updating Terminal Relay, reconcile them once:
+
+```bash
+./Scripts/manage-worker.sh reconcile all
+```
+
+For an application-only worker, re-run its original
+`./Scripts/bootstrap-worker.sh root@worker.example.com` command instead.
+
+Then use the apps:
+
+1. Open a project in Terminal Relay. Live terminals and paused Codex threads
+   appear together below the project.
+2. Choose **New Codex Thread** to create a paused conversation without opening
+   a terminal, or choose **Open Codex** / **Open Claude Code** to start working
+   immediately.
+3. Select a paused Codex thread to resume that exact conversation. On iPhone
+   and iPad, open the project and tap a row under **Paused Threads**.
+4. Control-click on Mac, or use swipe and context actions on iPhone and iPad,
+   to rename or archive an inactive Codex thread. Expand **Archived Threads**
+   to restore one.
+5. Use **Disconnect** when you only want to leave the current device. Use
+   **Stop Terminal** to end that exact worker terminal for every attached
+   device. Archiving a live Codex thread stops that exact terminal first.
+
+Claude sessions support live status, reconnect, stop, device handoff, and
+reboot recovery. Paused Claude history and provider-level rename/archive are
+not currently exposed because Claude Code does not provide the same durable
+thread-management API.
+
+### Ask an agent to manage worker threads
+
+Every Codex and Claude terminal opened by Terminal Relay already has the
+worker-local `terminal_relay` MCP. There is nothing to install or configure in
+the agent. For example, ask:
+
+```text
+Use terminal_relay to list the projects and paused threads on this worker.
+
+Create a Codex thread in example-repo, rename it "Investigate flaky tests",
+and tell me its thread ID.
+
+Resume thread 00000000-0000-4000-8000-000000000000 in example-repo so I can
+attach to it from Terminal Relay.
+
+Archive the inactive Codex thread 00000000-0000-4000-8000-000000000000 in
+example-repo.
+```
+
+The MCP can list projects and threads; start, resume, or rename Codex threads;
+and archive or restore inactive Codex threads on the current worker. It cannot
+read transcripts, type into terminals, run arbitrary shell commands, delete
+projects or threads, or access another worker.
+
 Maintainer-signed macOS releases use Sparkle. The app checks the public signed
 feed once per day without sending system-profile data. Use **Terminal Relay →
 Check for Updates…** at any time; automatic checks, downloads, and installation
