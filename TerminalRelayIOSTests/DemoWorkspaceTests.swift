@@ -79,4 +79,60 @@ final class DemoWorkspaceTests: XCTestCase {
             model.isUnread(replacement, profileID: DemoWorkspace.worker.id)
         )
     }
+
+    func testChatDemoFixtureExercisesRichRenderingStatesLocally() throws {
+        let events = MobileChatDemoFixture.events
+        XCTAssertEqual(
+            events.map(\.type),
+            [
+                "conversation.snapshot",
+                "message.delta",
+                "message.completed",
+                "turn.completed",
+            ]
+        )
+
+        let store = ConversationStore()
+        for event in events {
+            try store.apply(event)
+        }
+
+        let assistant = try XCTUnwrap(
+            store.state.messages.first { $0.role == .assistant }
+        )
+        XCTAssertFalse(assistant.isStreaming)
+        XCTAssertTrue(assistant.text.contains("| Surface | Result |"))
+        XCTAssertTrue(assistant.text.contains("```swift"))
+        XCTAssertTrue(assistant.text.contains("https://example.com/security"))
+        XCTAssertEqual(store.state.tools.first?.status, .completed)
+        XCTAssertTrue(
+            store.state.items.contains {
+                if case .diff = $0 { return true }
+                return false
+            }
+        )
+        XCTAssertEqual(store.state.approvals.first?.status, .approved)
+        XCTAssertTrue(
+            store.state.items.contains {
+                guard case .generic(let item) = $0 else { return false }
+                return item.type == "error"
+            }
+        )
+        XCTAssertEqual(store.state.turnState, .completed)
+    }
+
+    func testChatDemoCoordinatorStreamsFixtureThroughTheRealLifecycle() async {
+        let coordinator = MobileChatDemoFixture.makeCoordinator()
+
+        coordinator.start()
+        for _ in 0..<200 {
+            if coordinator.store.state.lastAppliedSequence == 4 { break }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+
+        XCTAssertEqual(coordinator.store.state.lastAppliedSequence, 4)
+        XCTAssertEqual(coordinator.store.state.turnState, .completed)
+        XCTAssertEqual(coordinator.store.state.connectionState, .streaming)
+        await coordinator.detach()
+    }
 }

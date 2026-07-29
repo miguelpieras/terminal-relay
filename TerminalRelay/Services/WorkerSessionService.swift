@@ -38,6 +38,11 @@ private enum WorkerUpdateStatusFetchResult {
     case unavailable
 }
 
+private enum WorkerChatNegotiation {
+    case available
+    case terminalFallback
+}
+
 @MainActor
 final class WorkerSessionService: ObservableObject {
     typealias CommandRunner = (SSHLaunchConfiguration) async throws -> WorkerSessionCommandResult
@@ -215,6 +220,34 @@ final class WorkerSessionService: ObservableObject {
         }
     }
 
+    private func negotiateChat(
+        kind: AgentKind,
+        repositoryName: String,
+        on worker: ServerProfile
+    ) async throws -> WorkerChatNegotiation {
+        let result = try await runCommand(
+            SSHCommandBuilder.workerChatCapabilitiesConfiguration(
+                for: worker,
+                kind: kind,
+                repositoryName: repositoryName
+            )
+        )
+        guard result.exitCode == 0 else {
+            return .terminalFallback
+        }
+        do {
+            let response = try WorkerChatProtocol.parseCapabilities(
+                result.standardOutput,
+                expectedKind: kind
+            )
+            return response.isAvailable ? .available : .terminalFallback
+        } catch WorkerChatProtocolError.missingMarker {
+            return .terminalFallback
+        } catch {
+            throw WorkerSessionServiceError.startFailed
+        }
+    }
+
     func start(
         kind: AgentKind,
         repositoryName: String,
@@ -235,14 +268,33 @@ final class WorkerSessionService: ObservableObject {
         )
 
         do {
-            let result = try await runCommand(
-                SSHCommandBuilder.workerSessionStartConfiguration(
-                    for: worker,
-                    kind: kind,
-                    repositoryName: repositoryName,
-                    launchDefaults: launchDefaults
-                )
+            let negotiation = try await negotiateChat(
+                kind: kind,
+                repositoryName: repositoryName,
+                on: worker
             )
+            let result: WorkerSessionCommandResult
+            switch negotiation {
+            case .available:
+                result = try await runCommand(
+                    SSHCommandBuilder.workerChatStartConfiguration(
+                        for: worker,
+                        kind: kind,
+                        repositoryName: repositoryName,
+                        threadID: nil,
+                        launchDefaults: launchDefaults
+                    )
+                )
+            case .terminalFallback:
+                result = try await runCommand(
+                    SSHCommandBuilder.workerSessionStartConfiguration(
+                        for: worker,
+                        kind: kind,
+                        repositoryName: repositoryName,
+                        launchDefaults: launchDefaults
+                    )
+                )
+            }
             guard result.exitCode == 0 else {
                 workerSessionLogger.error(
                     "Session start failed for \(kind.rawValue, privacy: .public) on \(worker.destination, privacy: .public) with status \(result.exitCode, privacy: .public): \(Self.logDetail(result.standardError), privacy: .public)"
@@ -250,12 +302,37 @@ final class WorkerSessionService: ObservableObject {
                 throw WorkerSessionServiceError.startFailed
             }
 
-            let response = try WorkerSessionProtocol.parse(result.standardOutput)
-            guard response.sessions.count == 1,
-                  let snapshot = response.sessions.first,
-                  snapshot.kind == kind,
-                  snapshot.repositoryName == repositoryName else {
-                throw WorkerSessionServiceError.startFailed
+            let response: WorkerSessionResponse
+            let snapshot: WorkerSessionSnapshot
+            switch negotiation {
+            case .available:
+                let chat = try WorkerChatProtocol.parseStart(
+                    result.standardOutput,
+                    expectedKind: kind
+                )
+                snapshot = WorkerSessionSnapshot(
+                    kind: kind,
+                    repositoryName: repositoryName,
+                    attachedClientCount: 0,
+                    instanceToken: chat.relayID,
+                    reportedWorking: false,
+                    threadID: chat.providerThreadID,
+                    presentation: .chat
+                )
+                response = WorkerSessionResponse(
+                    projects: [repositoryName],
+                    sessions: [snapshot]
+                )
+            case .terminalFallback:
+                response = try WorkerSessionProtocol.parse(result.standardOutput)
+                guard response.sessions.count == 1,
+                      let terminalSnapshot = response.sessions.first,
+                      terminalSnapshot.kind == kind,
+                      terminalSnapshot.repositoryName == repositoryName,
+                      terminalSnapshot.presentation == .terminal else {
+                    throw WorkerSessionServiceError.startFailed
+                }
+                snapshot = terminalSnapshot
             }
 
             let previousResponse = responses[worker.id]
@@ -296,6 +373,7 @@ final class WorkerSessionService: ObservableObject {
         kind: AgentKind,
         repositoryName: String,
         instanceToken: String,
+        presentation: WorkerSessionPresentation = .terminal,
         on worker: ServerProfile
     ) async -> Bool {
         guard WorkerSessionProtocol.isValidRepositoryName(repositoryName),
@@ -314,13 +392,25 @@ final class WorkerSessionService: ObservableObject {
         )
 
         do {
-            let result = try await runCommand(
-                SSHCommandBuilder.workerSessionStopConfiguration(
+            let configuration: SSHLaunchConfiguration
+            switch presentation {
+            case .terminal:
+                configuration = SSHCommandBuilder.workerSessionStopConfiguration(
                     for: worker,
                     kind: kind,
                     repositoryName: repositoryName,
                     instanceToken: instanceToken
                 )
+            case .chat:
+                configuration = SSHCommandBuilder.workerChatStopConfiguration(
+                    for: worker,
+                    kind: kind,
+                    repositoryName: repositoryName,
+                    instanceToken: instanceToken
+                )
+            }
+            let result = try await runCommand(
+                configuration
             )
             guard result.exitCode == 0 else {
                 workerSessionLogger.error(
@@ -369,6 +459,7 @@ final class WorkerSessionService: ObservableObject {
                 kind: kind,
                 repositoryName: snapshot.repositoryName,
                 instanceToken: snapshot.instanceToken,
+                presentation: snapshot.presentation,
                 on: worker
             ) else {
                 return false
@@ -474,6 +565,7 @@ final class WorkerSessionService: ObservableObject {
         repositoryName: String,
         threadID: String,
         launchDefaults: AgentLaunchDefaults,
+        preferredPresentation: WorkerSessionPresentation = .chat,
         on worker: ServerProfile
     ) async -> WorkerSessionSnapshot? {
         guard Self.isCanonicalUUID(threadID) else {
@@ -481,25 +573,73 @@ final class WorkerSessionService: ObservableObject {
             return nil
         }
         do {
-            let result = try await runCommand(
-                SSHCommandBuilder.workerThreadResumeConfiguration(
-                    for: worker,
+            let negotiation: WorkerChatNegotiation
+            switch preferredPresentation {
+            case .chat:
+                negotiation = try await negotiateChat(
                     kind: kind,
                     repositoryName: repositoryName,
-                    threadID: threadID,
-                    launchDefaults: launchDefaults
+                    on: worker
                 )
-            )
+            case .terminal:
+                negotiation = .terminalFallback
+            }
+            let result: WorkerSessionCommandResult
+            switch negotiation {
+            case .available:
+                result = try await runCommand(
+                    SSHCommandBuilder.workerChatStartConfiguration(
+                        for: worker,
+                        kind: kind,
+                        repositoryName: repositoryName,
+                        threadID: threadID,
+                        launchDefaults: launchDefaults
+                    )
+                )
+            case .terminalFallback:
+                result = try await runCommand(
+                    SSHCommandBuilder.workerThreadResumeConfiguration(
+                        for: worker,
+                        kind: kind,
+                        repositoryName: repositoryName,
+                        threadID: threadID,
+                        launchDefaults: launchDefaults
+                    )
+                )
+            }
             guard result.exitCode == 0 else {
                 throw WorkerSessionServiceError.threadFailed
             }
-            let response = try WorkerSessionProtocol.parse(result.standardOutput)
-            guard response.sessions.count == 1,
-                  let snapshot = response.sessions.first,
-                  snapshot.kind == kind,
-                  snapshot.repositoryName == repositoryName,
-                  snapshot.threadID == threadID else {
-                throw WorkerSessionServiceError.threadFailed
+            let snapshot: WorkerSessionSnapshot
+            switch negotiation {
+            case .available:
+                let chat = try WorkerChatProtocol.parseStart(
+                    result.standardOutput,
+                    expectedKind: kind
+                )
+                guard chat.providerThreadID == threadID else {
+                    throw WorkerSessionServiceError.threadFailed
+                }
+                snapshot = WorkerSessionSnapshot(
+                    kind: kind,
+                    repositoryName: repositoryName,
+                    attachedClientCount: 0,
+                    instanceToken: chat.relayID,
+                    reportedWorking: false,
+                    threadID: chat.providerThreadID,
+                    presentation: .chat
+                )
+            case .terminalFallback:
+                let response = try WorkerSessionProtocol.parse(result.standardOutput)
+                guard response.sessions.count == 1,
+                      let terminalSnapshot = response.sessions.first,
+                      terminalSnapshot.kind == kind,
+                      terminalSnapshot.repositoryName == repositoryName,
+                      terminalSnapshot.threadID == threadID,
+                      terminalSnapshot.presentation == .terminal else {
+                    throw WorkerSessionServiceError.threadFailed
+                }
+                snapshot = terminalSnapshot
             }
             let current = responses[worker.id] ?? WorkerSessionResponse(
                 projects: [repositoryName],

@@ -15,6 +15,11 @@ upload that private key. Conversation titles can be provider-generated from
 prompt content and may therefore contain sensitive text; the apps cache the
 last received catalog locally for display.
 
+Native-chat messages, reasoning, tool activity, diffs, approvals, questions,
+usage, and bounded file previews are held only in app memory while their
+conversation is open. The apps do not write that structured content to
+`UserDefaults`, files, analytics, or a Terminal Relay service.
+
 The iPhone and iPad app uses the camera only to scan a pairing code displayed
 by the Mac app. Camera frames are processed on the device and are not stored or
 transmitted. The short-lived pairing credential is sent directly to the worker
@@ -22,11 +27,14 @@ you selected and is removed from the worker after it authorizes the device key.
 
 ## Data sent to services you choose
 
-Terminal sessions, repository operations, and account requests are sent
-directly to workers and services configured by you, including SSH servers,
-Tailscale, GitHub, Codex, or Claude. Those services process data under their own
-terms and privacy policies. The Terminal Relay project and its maintainers do
-not receive this traffic.
+Native-chat records, terminal sessions, repository operations, and account
+requests are sent directly to workers and services configured by you,
+including SSH servers, Tailscale, GitHub, Codex, or Claude. Native-chat records
+can contain prompts, responses, reasoning summaries, tool input and output,
+diffs, approval or question details, usage, and requested file previews. This
+traffic stays inside the direct SSH connection to the worker you selected; the
+Terminal Relay project and its maintainers do not receive it. Those configured
+services process data under their own terms and privacy policies.
 
 Thread catalog and mutation requests travel over the same direct SSH
 connection. The built-in worker MCP runs only as stdio inside Codex or Claude
@@ -43,20 +51,32 @@ worker. The SDK derives session ID, working directory, provider display title
 or summary, and last-modified time from Claude's local provider history; a
 summary or title can be derived from prompt text. Terminal Relay also asks
 Claude Code's local agent registry for session ID and process ID and validates
-the reported process before classifying activity. Terminal Relay does not call
-the SDK message-history API or parse, copy, index, transmit, or store Claude
-transcript items. Provider entries whose working directory is outside the
-selected repository or its Git worktrees are not returned. Renaming is a
-provider-native mutation: the SDK appends a custom-title entry to the provider
-transcript without rewriting it.
+the reported process before classifying activity. Provider entries whose
+working directory is outside the selected repository or its Git worktrees are
+not returned. Renaming is a provider-native mutation: the SDK appends a
+custom-title entry to the provider transcript without rewriting it.
+
+When native chat is attached, the worker uses Codex's app-server history API or
+Claude's official SDK message-history API to build a bounded snapshot and page
+older content on request. One worker-local broker retains only a bounded
+in-memory snapshot, live replay window, unresolved interaction callbacks, and
+identifier-only recovery metadata. It does not parse Claude JSONL, install a
+transcript database, or send history to another worker or maintainer-operated
+service.
 
 Claude Code keeps its own conversation history in plaintext local provider
 storage on the worker under its own retention and cleanup policy. Terminal
 Relay does not change that retention and does not install a transcript
 `SessionStore`. Exact resume and reboot recovery work only while the provider
-history remains on the same worker. Multi-device handoff sends catalog metadata
-over SSH between your clients and that worker; Terminal Relay does not copy
-history to another worker or a maintainer-operated service.
+history remains on the same worker. Multi-device handoff sends the current
+bounded structured view over direct SSH between your clients and that worker;
+Terminal Relay does not copy history to another worker or a
+maintainer-operated service.
+
+The chat renderer does not automatically fetch remote Markdown images. Opening
+a validated `http` or `https` link hands it to the system browser. Repository
+links request a bounded, read-only preview from the selected worker after it
+verifies the canonical path remains inside that conversation's repository.
 
 For Claude, archive state is a Terminal Relay-only visibility overlay. The
 worker stores one mode-`0600` version marker, named by the provider session UUID,

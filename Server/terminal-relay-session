@@ -5,6 +5,7 @@ readonly protocol_marker="__TERMINAL_RELAY_SESSION_V1__"
 readonly thread_protocol_marker="__TERMINAL_RELAY_THREADS_V1__"
 readonly thread_protocol_marker_v2="__TERMINAL_RELAY_THREADS_V2__"
 readonly agent_update_protocol_marker="__TERMINAL_RELAY_AGENT_UPDATE_V1__"
+readonly chat_protocol_marker="__TERMINAL_RELAY_CHAT_V1__"
 readonly installed_helper_path="/usr/local/bin/terminal-relay-session"
 readonly default_agent_update_status_path="/var/lib/terminal-relay/agent-update-status"
 readonly default_tmux_path="/usr/bin/tmux"
@@ -14,6 +15,7 @@ readonly default_codex_path="/usr/bin/codex"
 readonly default_claude_path="/usr/bin/claude"
 readonly default_claude_sessions_python_path="/opt/terminal-relay/claude-session-sdk/current/bin/python3"
 readonly default_claude_sessions_adapter_path="/usr/local/bin/terminal-relay-claude-sessions"
+readonly default_chat_path="/usr/local/bin/terminal-relay-chat"
 readonly default_flock_path="/usr/bin/flock"
 readonly default_python_path="/usr/bin/python3"
 readonly default_getent_path="/usr/bin/getent"
@@ -76,6 +78,7 @@ if [[ $test_mode -eq 1 ]]; then
     claude_path="${TERMINAL_RELAY_TEST_CLAUDE_PATH:-$default_claude_path}"
     claude_sessions_python_path="${TERMINAL_RELAY_TEST_CLAUDE_SESSIONS_PYTHON_PATH:-$default_python_path}"
     claude_sessions_adapter_path="${TERMINAL_RELAY_TEST_CLAUDE_SESSIONS_ADAPTER_PATH:-$default_claude_sessions_adapter_path}"
+    chat_path="${TERMINAL_RELAY_TEST_CHAT_PATH:-$default_chat_path}"
     flock_path="${TERMINAL_RELAY_TEST_FLOCK_PATH:-$default_flock_path}"
     signal_path="${TERMINAL_RELAY_TEST_SIGNAL_PATH:-}"
     boot_id_path="${TERMINAL_RELAY_TEST_BOOT_ID_PATH:-$default_boot_id_path}"
@@ -105,6 +108,7 @@ else
     claude_path="$default_claude_path"
     claude_sessions_python_path="$default_claude_sessions_python_path"
     claude_sessions_adapter_path="$default_claude_sessions_adapter_path"
+    chat_path="$default_chat_path"
     flock_path="$default_flock_path"
     signal_path=""
     boot_id_path="$default_boot_id_path"
@@ -123,6 +127,10 @@ usage:
   terminal-relay-session status
   terminal-relay-session resources
   terminal-relay-session update-status
+  terminal-relay-session chat-capabilities-v1 <codex|claude> <repository>
+  terminal-relay-session chat-start-v1 <codex|claude> <repository> [provider-thread-id] [agent arguments...]
+  terminal-relay-session chat-attach-v1 <codex|claude> <repository> <relay-id>
+  terminal-relay-session chat-stop-v1 <codex|claude> <repository> <relay-id>
   terminal-relay-session restore
   terminal-relay-session threads <repository> <active|archived> [cursor]
   terminal-relay-session threads-v2 <codex|claude> <repository> <open|archived> [cursor]
@@ -172,6 +180,7 @@ validate_absolute_path "Codex executable" "$codex_path"
 validate_absolute_path "Claude executable" "$claude_path"
 validate_absolute_path "Claude session Python executable" "$claude_sessions_python_path"
 validate_absolute_path "Claude session adapter" "$claude_sessions_adapter_path"
+validate_absolute_path "structured chat broker" "$chat_path"
 validate_absolute_path "flock executable" "$flock_path"
 validate_absolute_path "boot id" "$boot_id_path"
 validate_absolute_path "Codex app-server socket" "$codex_app_server_socket"
@@ -1409,6 +1418,480 @@ run_claude_sessions_adapter() {
     "$claude_sessions_python_path" "$claude_sessions_adapter_path" "$@"
 }
 
+run_chat_broker() {
+    local provider="$1"
+    shift
+
+    if [[ ! -f "$chat_path" || -L "$chat_path" || ! -r "$chat_path" ]]; then
+        echo "Structured chat is unavailable." >&2
+        return 69
+    fi
+    case "$provider" in
+        codex)
+            [[ -x "$default_python_path" ]] || {
+                echo "Structured Codex chat is unavailable." >&2
+                return 69
+            }
+            if [[ $test_mode -eq 1 \
+                && "${TERMINAL_RELAY_TEST_CHAT_FAKE:-0}" == "1" ]]; then
+                TERMINAL_RELAY_CHAT_TEST_MODE=1 \
+                    "$default_python_path" "$chat_path" "$@"
+            else
+                "$default_python_path" "$chat_path" "$@"
+            fi
+            ;;
+        claude)
+            [[ -x "$claude_sessions_python_path" ]] || {
+                echo "Structured Claude chat is unavailable." >&2
+                return 69
+            }
+            if [[ $test_mode -eq 1 \
+                && "${TERMINAL_RELAY_TEST_CHAT_FAKE:-0}" == "1" ]]; then
+                TERMINAL_RELAY_CHAT_TEST_MODE=1 \
+                    "$claude_sessions_python_path" "$chat_path" "$@"
+            else
+                "$claude_sessions_python_path" "$chat_path" "$@"
+            fi
+            ;;
+        *) return 64 ;;
+    esac
+}
+
+chat_session_name_for() {
+    printf 'terminal-relay-chat-%s-%s\n' "$1" "$2"
+}
+
+chat_intent_file_for() {
+    printf '%s/%s.chat-intent\n' "$runtime_directory" "$1"
+}
+
+write_chat_intent() {
+    local provider="$1"
+    local repository="$2"
+    local relay_id="$3"
+    local provider_thread_id="$4"
+    local boot_id="$5"
+    shift 5
+    local path
+    local temporary
+    local argument
+
+    validate_tool "$provider"
+    is_valid_repository_name "$repository" || return 64
+    is_valid_instance "$relay_id" || return 64
+    is_valid_instance "$provider_thread_id" || return 64
+    is_valid_boot_id "$boot_id" || return 64
+    validate_launch_arguments "$provider" "$@" || return $?
+    path="$(chat_intent_file_for "$relay_id")"
+    [[ ! -L "$path" ]] || return 70
+    temporary="$path.$$.$RANDOM.tmp"
+    {
+        printf 'version|1\nprovider|%s\nrepository|%s\nrelay|%s\nthread|%s\nboot|%s\nargc|%s\n' \
+            "$provider" "$repository" "$relay_id" "$provider_thread_id" "$boot_id" "$#"
+        for argument in "$@"; do
+            printf 'arg|%s\n' "$(encode_argument_hex "$argument")"
+        done
+    } > "$temporary"
+    /bin/chmod 600 "$temporary"
+    /bin/mv -f -- "$temporary" "$path"
+}
+
+load_chat_intent() {
+    local path="$1"
+    local key
+    local value
+    local extra
+    local declared_argc=""
+    local argument_count=0
+    local identity
+    local seen_version=0
+    local seen_provider=0
+    local seen_repository=0
+    local seen_relay=0
+    local seen_thread=0
+    local seen_boot=0
+    local seen_argc=0
+
+    chat_intent_provider=""
+    chat_intent_repository=""
+    chat_intent_relay_id=""
+    chat_intent_thread_id=""
+    chat_intent_boot_id=""
+    chat_intent_arguments=()
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    identity="$(path_uid_mode "$path")" || return 2
+    [[ "$identity" == "$user_id:600" ]] || return 2
+    while IFS='|' read -r key value extra; do
+        [[ -z "${extra:-}" ]] || return 2
+        case "$key" in
+            version)
+                [[ $seen_version -eq 0 && "$value" == "1" ]] || return 2
+                seen_version=1
+                ;;
+            provider)
+                [[ $seen_provider -eq 0 ]] || return 2
+                chat_intent_provider="$value"
+                seen_provider=1
+                ;;
+            repository)
+                [[ $seen_repository -eq 0 ]] || return 2
+                chat_intent_repository="$value"
+                seen_repository=1
+                ;;
+            relay)
+                [[ $seen_relay -eq 0 ]] || return 2
+                chat_intent_relay_id="$value"
+                seen_relay=1
+                ;;
+            thread)
+                [[ $seen_thread -eq 0 ]] || return 2
+                chat_intent_thread_id="$value"
+                seen_thread=1
+                ;;
+            boot)
+                [[ $seen_boot -eq 0 ]] || return 2
+                chat_intent_boot_id="$value"
+                seen_boot=1
+                ;;
+            argc)
+                [[ $seen_argc -eq 0 ]] || return 2
+                [[ "$value" =~ ^(0|[1-9][0-9]*)$ && $value -le 64 ]] || return 2
+                declared_argc="$value"
+                seen_argc=1
+                ;;
+            arg)
+                [[ -n "$declared_argc" && $argument_count -lt "$declared_argc" ]] \
+                    || return 2
+                decode_argument_hex "$value" || return 2
+                chat_intent_arguments+=("$decoded_argument")
+                argument_count=$((argument_count + 1))
+                ;;
+            *) return 2 ;;
+        esac
+    done < "$path"
+    [[ $seen_version -eq 1 \
+        && $seen_provider -eq 1 \
+        && $seen_repository -eq 1 \
+        && $seen_relay -eq 1 \
+        && $seen_thread -eq 1 \
+        && $seen_boot -eq 1 \
+        && $seen_argc -eq 1 ]] || return 2
+    validate_tool "$chat_intent_provider"
+    is_valid_repository_name "$chat_intent_repository" || return 2
+    is_valid_instance "$chat_intent_relay_id" || return 2
+    is_valid_instance "$chat_intent_thread_id" || return 2
+    is_valid_boot_id "$chat_intent_boot_id" || return 2
+    [[ -n "$declared_argc" && "$argument_count" == "$declared_argc" ]] || return 2
+    if [[ $argument_count -gt 0 ]]; then
+        validate_launch_arguments \
+            "$chat_intent_provider" "${chat_intent_arguments[@]}" >/dev/null || return 2
+    else
+        validate_launch_arguments "$chat_intent_provider" >/dev/null || return 2
+    fi
+}
+
+chat_capability_json() {
+    local provider="$1"
+    local raw
+    local readiness_status=0
+
+    validate_tool "$provider"
+    if [[ "$provider" == "codex" ]] \
+        && ! [[ $test_mode -eq 1 && "${TERMINAL_RELAY_TEST_CHAT_FAKE:-0}" == "1" ]]; then
+        lock_codex_app_server || return $?
+        ensure_codex_app_server_locked || {
+            readiness_status=$?
+            unlock_codex_app_server
+            return "$readiness_status"
+        }
+        unlock_codex_app_server
+    fi
+    local -a ready_arguments=(
+        ready
+        --provider "$provider"
+        --codex-socket "$codex_app_server_socket"
+    )
+    if [[ $test_mode -eq 1 && "${TERMINAL_RELAY_TEST_CHAT_FAKE:-0}" == "1" ]]; then
+        ready_arguments+=(--fake)
+    fi
+    raw="$(run_chat_broker "$provider" "${ready_arguments[@]}")" || return $?
+    "$default_python_path" - "$provider" "$raw" <<'PYTHON_CHAT_CAPABILITY'
+import json
+import sys
+
+provider = sys.argv[1]
+try:
+    capabilities = json.loads(sys.argv[2])
+except (OSError, ValueError):
+    raise SystemExit(70)
+required = {
+    "protocolVersion",
+    "features",
+    "supportsHistory",
+    "supportsFilePreview",
+    "supportsApprovals",
+    "supportsQuestions",
+    "supportsAttachments",
+}
+if (
+    not isinstance(capabilities, dict)
+    or set(capabilities) != required
+    or capabilities["protocolVersion"] != 1
+    or not isinstance(capabilities["features"], list)
+    or any(not isinstance(value, bool) for key, value in capabilities.items()
+           if key.startswith("supports"))
+):
+    raise SystemExit(70)
+print(json.dumps({
+    "provider": provider,
+    "available": True,
+    "capabilities": capabilities,
+    "reason": None,
+}, separators=(",", ":")))
+PYTHON_CHAT_CAPABILITY
+}
+
+chat_capabilities_v1() {
+    local provider="$1"
+    local repository="$2"
+    local output
+    local status=0
+
+    validate_tool "$provider"
+    project_directory_for "$repository" >/dev/null || return $?
+    if output="$(chat_capability_json "$provider")"; then
+        :
+    else
+        status=$?
+        output="$("$default_python_path" - "$provider" <<'PYTHON_CHAT_UNAVAILABLE'
+import json
+import sys
+print(json.dumps({
+    "provider": sys.argv[1],
+    "available": False,
+    "capabilities": None,
+    "reason": "providerUnavailable",
+}, separators=(",", ":")))
+PYTHON_CHAT_UNAVAILABLE
+)"
+    fi
+    printf '%s\n%s\n' "$chat_protocol_marker" "$output"
+    return 0
+}
+
+chat_start_v1() {
+    local provider="$1"
+    local repository="$2"
+    shift 2
+    local project_directory
+    local provider_thread_id=""
+    local relay_id
+    local session_name
+    local launch_file
+    local launch_command
+    local capability_wrapper
+    local capability_json
+    local state_json=""
+    local attempt
+    local status=0
+    local new_thread=0
+    local argument
+    local boot_id
+
+    validate_tool "$provider"
+    if [[ $# -gt 0 ]] && is_valid_instance "$1"; then
+        provider_thread_id="$1"
+        shift
+    fi
+    validate_launch_arguments "$provider" "$@" || return $?
+    boot_id="$(current_boot_id)" || {
+        echo "Unable to read the worker boot identity from $boot_id_path." >&2
+        return 69
+    }
+    project_directory="$(project_directory_for "$repository")" || return $?
+    [[ -x "$tmux_path" ]] || {
+        echo "Required tmux executable is unavailable: $tmux_path" >&2
+        return 69
+    }
+    require_flock
+    if [[ -n "$provider_thread_id" ]] && thread_is_active "$provider" "$provider_thread_id"; then
+        echo "The requested provider conversation is already active." >&2
+        return 75
+    fi
+    if [[ "$provider" == "claude" && -z "$provider_thread_id" ]]; then
+        provider_thread_id="$(generate_instance)" || return 70
+        new_thread=1
+    fi
+    if [[ "$provider" == "claude" ]]; then
+        prepare_claude_onboarding || return $?
+    fi
+    capability_wrapper="$(chat_capability_json "$provider")" || return $?
+    capability_json="$(printf '%s\n' "$capability_wrapper" \
+        | "$default_python_path" -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["capabilities"],separators=(",",":")))')" \
+        || return 70
+    relay_id="${requested_chat_relay_id:-}"
+    if [[ -z "$relay_id" ]]; then
+        relay_id="$(generate_instance)" || return 70
+    else
+        is_valid_instance "$relay_id" || return 70
+    fi
+    session_name="$(chat_session_name_for "$provider" "$relay_id")"
+    launch_file="$runtime_directory/$relay_id.chat-launch.$$.$RANDOM"
+    {
+        printf '#!/bin/bash\n'
+        printf '/bin/rm -f -- %q\n' "$launch_file"
+        printf 'export PATH=%q\n' "$default_safe_path"
+        if [[ $test_mode -eq 1 && "${TERMINAL_RELAY_TEST_CHAT_FAKE:-0}" == "1" ]]; then
+            printf 'export TERMINAL_RELAY_CHAT_TEST_MODE=1\n'
+        fi
+        if [[ "$provider" == "claude" ]]; then
+            printf 'exec %q %q serve' "$claude_sessions_python_path" "$chat_path"
+        else
+            printf 'exec %q %q serve' "$default_python_path" "$chat_path"
+        fi
+        printf ' --provider %q --repository %q --project-directory %q --runtime-directory %q --relay-id %q' \
+            "$provider" "$repository" "$project_directory" "$runtime_directory" "$relay_id"
+        if [[ -n "$provider_thread_id" ]]; then
+            printf ' --thread-id %q' "$provider_thread_id"
+        fi
+        if [[ $new_thread -eq 1 ]]; then
+            printf ' --new-thread'
+        fi
+        printf ' --codex-socket %q' "$codex_app_server_socket"
+        for argument in "$@"; do
+            printf ' --launch-argument %q' "$argument"
+        done
+        if [[ $test_mode -eq 1 && "${TERMINAL_RELAY_TEST_CHAT_FAKE:-0}" == "1" ]]; then
+            printf ' --fake'
+        fi
+        printf '\n'
+    } > "$launch_file"
+    /bin/chmod 700 "$launch_file"
+    printf -v launch_command '%q' "$launch_file"
+    if ! tmux_command new-session -d -s "$session_name" \
+        -c "$project_directory" "$launch_command"; then
+        /bin/rm -f -- "$launch_file"
+        echo "Unable to start structured chat." >&2
+        return 70
+    fi
+    for attempt in $(seq 1 160); do
+        if state_json="$(run_chat_broker "$provider" inspect \
+            --runtime-directory "$runtime_directory" \
+            --relay-id "$relay_id" 2>/dev/null)"; then
+            break
+        fi
+        if ! tmux_command has-session -t "$session_name" 2>/dev/null; then
+            break
+        fi
+        sleep 0.05
+    done
+    if [[ -z "$state_json" ]]; then
+        tmux_command kill-session -t "$session_name" 2>/dev/null || true
+        echo "Structured chat did not become ready." >&2
+        return 70
+    fi
+    provider_thread_id="$(printf '%s\n' "$state_json" \
+        | "$default_python_path" -c \
+            'import json,sys; value=json.load(sys.stdin); print(value.get("providerThreadId",""))')" \
+        || return 70
+    is_valid_instance "$provider_thread_id" || {
+        tmux_command kill-session -t "$session_name" 2>/dev/null || true
+        echo "Structured chat returned an invalid provider conversation." >&2
+        return 70
+    }
+    if ! write_chat_intent \
+        "$provider" "$repository" "$relay_id" "$provider_thread_id" "$boot_id" "$@"; then
+        run_chat_broker "$provider" stop \
+            --runtime-directory "$runtime_directory" \
+            --relay-id "$relay_id" \
+            --provider "$provider" \
+            --repository "$repository" >/dev/null 2>&1 || true
+        echo "Unable to persist the structured chat restart intent." >&2
+        return 70
+    fi
+    printf '%s\n' "$chat_protocol_marker"
+    "$default_python_path" - "$provider" "$relay_id" \
+        "$capability_json" "$state_json" <<'PYTHON_CHAT_START'
+import json
+import sys
+
+provider, relay_id, capability_text, state_text = sys.argv[1:]
+try:
+    state = json.loads(state_text)
+    capabilities = json.loads(capability_text)
+except ValueError:
+    raise SystemExit(70)
+thread_id = state.get("providerThreadId")
+if (
+    state.get("status") != "ready"
+    or state.get("provider") != provider
+    or state.get("relayId") != relay_id
+    or not isinstance(thread_id, str)
+):
+    raise SystemExit(70)
+print(json.dumps({
+    "relayId": relay_id,
+    "provider": provider,
+    "providerThreadId": thread_id,
+    "capabilities": capabilities,
+    "launchOptions": state.get("launchOptions", {}),
+}, separators=(",", ":")))
+PYTHON_CHAT_START
+}
+
+chat_attach_v1() {
+    local provider="$1"
+    local repository="$2"
+    local relay_id="$3"
+
+    validate_tool "$provider"
+    is_valid_repository_name "$repository" \
+        || fail_usage "Invalid chat repository: $repository"
+    is_valid_instance "$relay_id" || fail_usage "Invalid chat relay identifier."
+    project_directory_for "$repository" >/dev/null || return $?
+    if [[ "$provider" == "claude" ]]; then
+        exec "$claude_sessions_python_path" "$chat_path" attach \
+            --runtime-directory "$runtime_directory" \
+            --relay-id "$relay_id" \
+            --provider "$provider" \
+            --repository "$repository"
+    fi
+    exec "$default_python_path" "$chat_path" attach \
+        --runtime-directory "$runtime_directory" \
+        --relay-id "$relay_id" \
+        --provider "$provider" \
+        --repository "$repository"
+}
+
+chat_stop_v1() {
+    local provider="$1"
+    local repository="$2"
+    local relay_id="$3"
+    local session_name
+    local attempt
+
+    validate_tool "$provider"
+    is_valid_repository_name "$repository" \
+        || fail_usage "Invalid chat repository: $repository"
+    is_valid_instance "$relay_id" || fail_usage "Invalid chat relay identifier."
+    project_directory_for "$repository" >/dev/null || return $?
+    run_chat_broker "$provider" stop \
+        --runtime-directory "$runtime_directory" \
+        --relay-id "$relay_id" \
+        --provider "$provider" \
+        --repository "$repository" || return $?
+    session_name="$(chat_session_name_for "$provider" "$relay_id")"
+    for attempt in $(seq 1 100); do
+        if ! tmux_command has-session -t "$session_name" 2>/dev/null; then
+            /bin/rm -f -- "$(chat_intent_file_for "$relay_id")"
+            return 0
+        fi
+        sleep 0.05
+    done
+    echo "Structured chat did not stop cleanly." >&2
+    return 70
+}
+
 require_flock() {
     if [[ ! -x "$flock_path" ]]; then
         echo "Required flock executable is unavailable: $flock_path" >&2
@@ -1473,7 +1956,7 @@ session_exists() {
 
 any_tool_session_exists() {
     tmux_command list-sessions -F '#{session_name}' 2>/dev/null \
-        | /usr/bin/grep -Eq "^terminal-relay-$1($|-)"
+        | /usr/bin/grep -Eq "^terminal-relay-($1($|-)|chat-$1-)"
 }
 
 load_metadata_unlocked() {
@@ -2365,6 +2848,9 @@ provider_active_bindings() {
     local metadata_file
     local instance
     local tool
+    local chat_directory
+    local chat_state
+    local chat_fields
 
     shopt -s nullglob
     for metadata_file in "$runtime_directory"/*.session; do
@@ -2379,9 +2865,46 @@ provider_active_bindings() {
             && is_valid_instance "$metadata_thread_id" \
             && { session_exists "$tool" "$instance" \
                 || metadata_launch_is_running "$instance"; }; then
-            printf '%s|%s\n' "$metadata_thread_id" "$instance"
+            printf '%s|%s|terminal\n' "$metadata_thread_id" "$instance"
         fi
         unlock_tool_metadata
+    done
+    for chat_directory in "$runtime_directory"/chat-*; do
+        [[ -d "$chat_directory" && ! -L "$chat_directory" ]] || continue
+        instance="${chat_directory##*/chat-}"
+        is_valid_instance "$instance" || continue
+        chat_state="$("$default_python_path" "$chat_path" inspect \
+            --runtime-directory "$runtime_directory" \
+            --relay-id "$instance" 2>/dev/null)" || continue
+        chat_fields="$("$default_python_path" - "$chat_state" \
+            "$requested_provider" "$requested_repository" <<'PYTHON_CHAT_BINDING'
+import json
+import re
+import sys
+
+try:
+    value = json.loads(sys.argv[1])
+except ValueError:
+    raise SystemExit(70)
+pattern = re.compile(
+    r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+)
+if (
+    value.get("status") != "ready"
+    or value.get("provider") != sys.argv[2]
+    or value.get("repository") != sys.argv[3]
+    or not pattern.fullmatch(str(value.get("providerThreadId", "")))
+    or not pattern.fullmatch(str(value.get("relayId", "")))
+):
+    raise SystemExit(75)
+print("{}|{}|chat".format(value["providerThreadId"], value["relayId"]))
+PYTHON_CHAT_BINDING
+)" || continue
+        IFS='|' read -r chat_thread_id chat_relay_id chat_presentation <<< "$chat_fields"
+        tmux_command has-session \
+            -t "$(chat_session_name_for "$requested_provider" "$chat_relay_id")" \
+            2>/dev/null || continue
+        printf '%s\n' "$chat_fields"
     done
     shopt -u nullglob
 }
@@ -2391,7 +2914,13 @@ emit_thread_catalog_v2() {
     local repository="$2"
     local catalog="$3"
     local binding
+    local chat_ready=0
     local -a python_arguments=("$provider")
+
+    if chat_capability_json "$provider" >/dev/null 2>&1; then
+        chat_ready=1
+    fi
+    python_arguments+=("chat-ready|$chat_ready")
 
     while IFS= read -r binding; do
         [[ -n "$binding" ]] && python_arguments+=("$binding")
@@ -2401,7 +2930,10 @@ emit_thread_catalog_v2() {
 import json
 import sys
 
-provider, *bindings = sys.argv[1:]
+provider, readiness, *bindings = sys.argv[1:]
+if readiness not in ("chat-ready|0", "chat-ready|1"):
+    raise SystemExit(70)
+chat_ready = readiness.endswith("|1")
 maximum = 1024 * 1024
 raw = sys.stdin.buffer.read(maximum + 1)
 if len(raw) > maximum:
@@ -2418,9 +2950,9 @@ if not isinstance(value, dict) or not isinstance(value.get("threads"), list):
 active = {}
 for binding in bindings:
     fields = binding.split("|")
-    if len(fields) != 2:
+    if len(fields) != 3 or fields[2] not in ("terminal", "chat"):
         raise SystemExit(70)
-    active[fields[0]] = fields[1]
+    active[fields[0]] = (fields[1], fields[2])
 for row in value["threads"]:
     if not isinstance(row, dict) or row.get("provider") != provider:
         raise SystemExit(70)
@@ -2433,9 +2965,11 @@ for row in value["threads"]:
         raise SystemExit(70)
     if thread_id in active:
         activity = "relay-active"
-        row["activeInstanceToken"] = active[thread_id]
+        row["activeInstanceToken"] = active[thread_id][0]
+        row["activePresentation"] = active[thread_id][1]
     else:
         row["activeInstanceToken"] = None
+        row["activePresentation"] = None
     row["activityState"] = activity
     row["isWorking"] = row.get("isWorking")
     mutable = activity == "inactive"
@@ -2444,6 +2978,7 @@ for row in value["threads"]:
         "rename": mutable and not archived,
         "archive": mutable and not archived,
         "unarchive": mutable and archived,
+        "chat": chat_ready and mutable and not archived,
     }
 encoded = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
 if len(encoded.encode("utf-8")) > maximum:
@@ -3083,6 +3618,9 @@ session_display_fields() {
 
 status_sessions() {
     local metadata_file
+    local chat_directory
+    local chat_state
+    local chat_fields
     local instance
     local tool
     local repository
@@ -3171,7 +3709,47 @@ status_sessions() {
         elif [[ "$session_needs_title_generation" == "1" ]]; then
             needs_active_title_generation=1
         fi
-        records+=("session|$tool|$repository|$attached_client_count|$instance|$session_activity|$session_title_hex|$session_working|$session_thread_id")
+        records+=("session|$tool|$repository|$attached_client_count|$instance|$session_activity|$session_title_hex|$session_working|$session_thread_id|terminal")
+    done
+    for chat_directory in "$runtime_directory"/chat-*; do
+        [[ -d "$chat_directory" && ! -L "$chat_directory" ]] || continue
+        instance="${chat_directory##*/chat-}"
+        is_valid_instance "$instance" || continue
+        chat_state="$("$default_python_path" "$chat_path" inspect \
+            --runtime-directory "$runtime_directory" \
+            --relay-id "$instance" 2>/dev/null)" || continue
+        chat_fields="$("$default_python_path" - "$chat_state" <<'PYTHON_CHAT_STATUS'
+import json
+import re
+import sys
+
+try:
+    value = json.loads(sys.argv[1])
+except ValueError:
+    raise SystemExit(70)
+uuid_pattern = re.compile(
+    r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+)
+if (
+    value.get("status") != "ready"
+    or value.get("provider") not in ("codex", "claude")
+    or not isinstance(value.get("repository"), str)
+    or not uuid_pattern.fullmatch(str(value.get("relayId", "")))
+    or not uuid_pattern.fullmatch(str(value.get("providerThreadId", "")))
+):
+    raise SystemExit(75)
+print("{}|{}|{}|{}".format(
+    value["provider"],
+    value["repository"],
+    value["relayId"],
+    value["providerThreadId"],
+))
+PYTHON_CHAT_STATUS
+)" || continue
+        IFS='|' read -r tool repository instance bound_thread_id <<< "$chat_fields"
+        session_name="$(chat_session_name_for "$tool" "$instance")"
+        tmux_command has-session -t "$session_name" 2>/dev/null || continue
+        records+=("session|$tool|$repository|0|$instance|0|||$bound_thread_id|chat")
     done
     shopt -u nullglob
 
@@ -3291,6 +3869,65 @@ terminate_launch() {
     fi
     remove_metadata_unlocked "$instance"
     unlock_tool_metadata
+}
+
+restore_chat_sessions() {
+    local intent_path
+    local session_name
+    local output
+    local start_status
+    local restore_status=0
+
+    shopt -s nullglob
+    for intent_path in "$runtime_directory"/*.chat-intent; do
+        if ! load_chat_intent "$intent_path"; then
+            echo "The saved structured chat restart intent is invalid." >&2
+            restore_status=70
+            continue
+        fi
+        session_name="$(chat_session_name_for \
+            "$chat_intent_provider" "$chat_intent_relay_id")"
+        if tmux_command has-session -t "$session_name" 2>/dev/null; then
+            continue
+        fi
+        project_directory_for "$chat_intent_repository" >/dev/null || {
+            restore_status=70
+            continue
+        }
+        requested_chat_relay_id="$chat_intent_relay_id"
+        start_status=0
+        if [[ ${#chat_intent_arguments[@]} -gt 0 ]]; then
+            output="$(chat_start_v1 \
+                "$chat_intent_provider" \
+                "$chat_intent_repository" \
+                "$chat_intent_thread_id" \
+                "${chat_intent_arguments[@]}")" || start_status=$?
+        else
+            output="$(chat_start_v1 \
+                "$chat_intent_provider" \
+                "$chat_intent_repository" \
+                "$chat_intent_thread_id")" || start_status=$?
+        fi
+        if [[ $start_status -ne 0 ]] \
+            && tmux_command has-session -t "$session_name" 2>/dev/null \
+            && "$default_python_path" "$chat_path" inspect \
+                --runtime-directory "$runtime_directory" \
+                --relay-id "$chat_intent_relay_id" >/dev/null 2>&1; then
+            start_status=0
+        fi
+        if [[ $start_status -eq 0 ]]; then
+            printf 'Restored %s structured chat %s for repository %s.\n' \
+                "$chat_intent_provider" \
+                "$chat_intent_relay_id" \
+                "$chat_intent_repository"
+        else
+            restore_status=70
+            echo "Unable to restore the structured chat session." >&2
+        fi
+        unset requested_chat_relay_id
+    done
+    shopt -u nullglob
+    return "$restore_status"
 }
 
 restore_sessions() {
@@ -3514,6 +4151,10 @@ restore_sessions() {
         printf 'Restored %s session %s for repository %s.\n' "$tool" "$instance" "$repository"
     done
     shopt -u nullglob
+
+    if ! restore_chat_sessions; then
+        overall_status=70
+    fi
 
     return "$overall_status"
 }
@@ -4823,6 +5464,26 @@ case "$command_name" in
     update-status)
         [[ $# -eq 0 ]] || fail_usage "update-status does not accept arguments."
         agent_update_status
+        ;;
+    chat-capabilities-v1)
+        [[ $# -eq 2 ]] \
+            || fail_usage "chat-capabilities-v1 requires a provider and repository."
+        chat_capabilities_v1 "$1" "$2"
+        ;;
+    chat-start-v1)
+        [[ $# -ge 2 ]] \
+            || fail_usage "chat-start-v1 requires a provider and repository."
+        chat_start_v1 "$@"
+        ;;
+    chat-attach-v1)
+        [[ $# -eq 3 ]] \
+            || fail_usage "chat-attach-v1 requires a provider, repository, and relay id."
+        chat_attach_v1 "$1" "$2" "$3"
+        ;;
+    chat-stop-v1)
+        [[ $# -eq 3 ]] \
+            || fail_usage "chat-stop-v1 requires a provider, repository, and relay id."
+        chat_stop_v1 "$1" "$2" "$3"
         ;;
     restore)
         [[ $# -eq 0 ]] || fail_usage "restore does not accept arguments."

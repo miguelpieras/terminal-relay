@@ -41,6 +41,45 @@ enum SSHExecOutputStream {
     case standardError
 }
 
+enum SSHStreamingExecEvent: Equatable, Sendable {
+    case standardOutput(Data)
+    case standardError(Data)
+    case exitStatus(Int)
+    case exitSignal(String)
+}
+
+enum SSHStreamingExecState: Equatable, Sendable {
+    case connecting
+    case connected
+    case disconnected
+    case failed(SSHStreamingExecFailure)
+}
+
+enum SSHStreamingExecFailure: Equatable, Sendable {
+    case hostKey
+    case authentication
+    case connection
+
+    static func classify(_ error: Error) -> SSHStreamingExecFailure {
+        if let transportError = error as? SSHTransportError {
+            switch transportError {
+            case .invalidHostKey, .hostKeyMismatch:
+                return .hostKey
+            case .publicKeyAuthenticationUnavailable:
+                return .authentication
+            case .invalidChannelType, .connectionClosed, .missingExitStatus,
+                 .commandFailed, .connection:
+                return .connection
+            }
+        }
+        if let sshError = error as? NIOSSHError,
+           sshError.type == .invalidUserAuthSignature {
+            return .authentication
+        }
+        return .connection
+    }
+}
+
 typealias SSHExecCommandResult = (
     status: Int,
     standardOutput: Data,
@@ -131,7 +170,7 @@ private final class PrivateKeyAuthenticationDelegate: NIOSSHClientUserAuthentica
         nextChallengePromise: EventLoopPromise<NIOSSHUserAuthenticationOffer?>
     ) {
         guard !didOfferKey, availableMethods.contains(.publicKey) else {
-            nextChallengePromise.succeed(nil)
+            nextChallengePromise.fail(SSHTransportError.publicKeyAuthenticationUnavailable)
             return
         }
 
@@ -388,6 +427,386 @@ final class SSHWorkerClient {
                 continuation.resume(with: result)
             }
         }
+    }
+}
+
+private final class SSHStreamingExecChannelHandler: ChannelInboundHandler {
+    typealias InboundIn = SSHChannelData
+
+    private let command: String
+    private let onEvent: (SSHStreamingExecEvent) -> Void
+    private let onReady: () -> Void
+    private let onClosed: (Error?) -> Void
+    private var didClose = false
+
+    init(
+        command: String,
+        onEvent: @escaping (SSHStreamingExecEvent) -> Void,
+        onReady: @escaping () -> Void,
+        onClosed: @escaping (Error?) -> Void
+    ) {
+        self.command = command
+        self.onEvent = onEvent
+        self.onReady = onReady
+        self.onClosed = onClosed
+    }
+
+    func handlerAdded(context: ChannelHandlerContext) {
+        context.channel.setOption(ChannelOptions.allowRemoteHalfClosure, value: true).whenFailure {
+            context.fireErrorCaught($0)
+        }
+    }
+
+    func channelActive(context: ChannelHandlerContext) {
+        context.triggerUserOutboundEvent(
+            SSHChannelRequestEvent.EnvironmentRequest(
+                wantReply: false,
+                name: "LANG",
+                value: "en_US.UTF-8"
+            ),
+            promise: nil
+        )
+        context.triggerUserOutboundEvent(
+            SSHChannelRequestEvent.ExecRequest(command: command, wantReply: false),
+            promise: nil
+        )
+        onReady()
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        let payload = unwrapInboundIn(data)
+        guard case .byteBuffer(var buffer) = payload.data,
+              let bytes = buffer.readBytes(length: buffer.readableBytes),
+              !bytes.isEmpty else {
+            return
+        }
+
+        switch payload.type {
+        case .channel:
+            onEvent(.standardOutput(Data(bytes)))
+        case .stdErr:
+            onEvent(.standardError(Data(bytes)))
+        default:
+            break
+        }
+    }
+
+    func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        if let exit = event as? SSHChannelRequestEvent.ExitStatus {
+            onEvent(.exitStatus(exit.exitStatus))
+        } else if let signal = event as? SSHChannelRequestEvent.ExitSignal {
+            onEvent(.exitSignal(signal.signalName))
+        } else {
+            context.fireUserInboundEventTriggered(event)
+        }
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        closeOnce(error: nil)
+        context.fireChannelInactive()
+    }
+
+    func errorCaught(context: ChannelHandlerContext, error: Error) {
+        closeOnce(error: error)
+        context.close(promise: nil)
+    }
+
+    private func closeOnce(error: Error?) {
+        guard !didClose else { return }
+        didClose = true
+        onClosed(error)
+    }
+}
+
+/// One interactive SSH `exec` channel without a pseudo-terminal.
+///
+/// Calls to `send` are serialized on the child channel's event loop. Closing this
+/// local connection never issues a remote stop command, so a chat broker remains
+/// available for a cursor-based foreground reconnect.
+final class SSHStreamingExecConnection {
+    private struct LifecycleState {
+        var group: MultiThreadedEventLoopGroup?
+        var parentChannel: Channel?
+        var childChannel: Channel?
+        var didStart = false
+        var didRequestExec = false
+        var didReportConnected = false
+        var isFinished = false
+    }
+
+    private struct Resources {
+        let group: MultiThreadedEventLoopGroup?
+        let parentChannel: Channel?
+        let childChannel: Channel?
+    }
+
+    private let profile: WorkerProfile
+    private let privateKey: NIOSSHPrivateKey
+    private let command: String
+    private let onEvent: (SSHStreamingExecEvent) -> Void
+    private let onStateChange: (SSHStreamingExecState) -> Void
+    private let lifecycleLock = NSLock()
+    private let callbackQueue = DispatchQueue(
+        label: "TerminalRelay.SSHStreamingExecConnection.callback"
+    )
+    private var lifecycle = LifecycleState()
+
+    init(
+        profile: WorkerProfile,
+        privateKey: NIOSSHPrivateKey,
+        command: String,
+        onEvent: @escaping (SSHStreamingExecEvent) -> Void,
+        onStateChange: @escaping (SSHStreamingExecState) -> Void
+    ) {
+        self.profile = profile
+        self.privateKey = privateKey
+        self.command = command
+        self.onEvent = onEvent
+        self.onStateChange = onStateChange
+    }
+
+    func connect() {
+        let group: MultiThreadedEventLoopGroup? = withLifecycleState { state in
+            guard !state.didStart, !state.isFinished else { return nil }
+            state.didStart = true
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            state.group = group
+            enqueueStateChange(.connecting)
+            return group
+        }
+        guard let group else { return }
+
+        let userAuth = PrivateKeyAuthenticationDelegate(
+            username: profile.username,
+            privateKey: privateKey
+        )
+        let serverAuth = PinnedHostKeyDelegate(
+            expectedFingerprint: profile.expectedHostKeyFingerprint
+        )
+        let bootstrap = ClientBootstrap(group: group)
+            .channelInitializer { [weak self] channel in
+                channel.eventLoop.makeCompletedFuture {
+                    let sshHandler = NIOSSHHandler(
+                        role: .client(
+                            .init(
+                                userAuthDelegate: userAuth,
+                                serverAuthDelegate: serverAuth
+                            )
+                        ),
+                        allocator: channel.allocator,
+                        inboundChildChannelInitializer: nil
+                    )
+                    try channel.pipeline.syncOperations.addHandler(sshHandler)
+                    try channel.pipeline.syncOperations.addHandler(
+                        SSHParentErrorHandler { [weak self] error in
+                            self?.finish(error: error)
+                        }
+                    )
+                }
+            }
+
+        bootstrap.connect(host: profile.host, port: profile.port).whenComplete {
+            [weak self] result in
+            switch result {
+            case .success(let channel):
+                guard let self, self.registerParentChannel(channel) else {
+                    channel.close(promise: nil)
+                    return
+                }
+                self.openStreamingChannel(on: channel)
+            case .failure(let error):
+                self?.finish(error: error)
+            }
+        }
+    }
+
+    func send(
+        _ data: Data,
+        completion: @escaping (Result<Void, Error>) -> Void = { _ in }
+    ) {
+        guard !data.isEmpty else {
+            completion(.success(()))
+            return
+        }
+        guard let childChannel = withLifecycleState({ state -> Channel? in
+            guard !state.isFinished, state.didReportConnected else { return nil }
+            return state.childChannel
+        }) else {
+            completion(.failure(SSHTransportError.connectionClosed))
+            return
+        }
+
+        childChannel.eventLoop.execute { [weak self] in
+            guard let self, self.isCurrentChildChannel(childChannel) else {
+                completion(.failure(SSHTransportError.connectionClosed))
+                return
+            }
+            var buffer = childChannel.allocator.buffer(capacity: data.count)
+            buffer.writeBytes(data)
+            let promise = childChannel.eventLoop.makePromise(of: Void.self)
+            promise.futureResult.whenComplete(completion)
+            childChannel.writeAndFlush(
+                SSHChannelData(type: .channel, data: .byteBuffer(buffer)),
+                promise: promise
+            )
+        }
+    }
+
+    func disconnect() {
+        finish(error: nil)
+    }
+
+    private func openStreamingChannel(on parent: Channel) {
+        parent.pipeline.handler(type: NIOSSHHandler.self).whenComplete {
+            [weak self] result in
+            guard let self, self.isCurrentParentChannel(parent) else { return }
+            switch result {
+            case .failure(let error):
+                finish(error: error)
+            case .success(let sshHandler):
+                let promise = parent.eventLoop.makePromise(of: Channel.self)
+                sshHandler.createChannel(promise, channelType: .session) {
+                    [weak self] child, type in
+                    guard let self, type == .session else {
+                        return child.eventLoop.makeFailedFuture(
+                            SSHTransportError.invalidChannelType
+                        )
+                    }
+                    return child.eventLoop.makeCompletedFuture {
+                        try child.pipeline.syncOperations.addHandler(
+                            SSHStreamingExecChannelHandler(
+                                command: self.command,
+                                onEvent: { [weak self] event in
+                                    self?.enqueueEvent(event)
+                                },
+                                onReady: { [weak self] in
+                                    self?.recordExecRequested()
+                                },
+                                onClosed: { [weak self] error in
+                                    self?.finish(error: error)
+                                }
+                            )
+                        )
+                    }
+                }
+                promise.futureResult.whenComplete { [weak self] result in
+                    switch result {
+                    case .success(let child):
+                        guard let self, self.registerChildChannel(child) else {
+                            child.close(promise: nil)
+                            return
+                        }
+                        self.reportConnectedIfReady()
+                    case .failure(let error):
+                        self?.finish(error: error)
+                    }
+                }
+            }
+        }
+    }
+
+    private func finish(error: Error?) {
+        let resources: Resources? = withLifecycleState { state in
+            guard !state.isFinished else { return nil }
+            state.isFinished = true
+            let resources = Resources(
+                group: state.group,
+                parentChannel: state.parentChannel,
+                childChannel: state.childChannel
+            )
+            state.group = nil
+            state.parentChannel = nil
+            state.childChannel = nil
+            if let error {
+                enqueueStateChange(.failed(SSHStreamingExecFailure.classify(error)))
+            } else {
+                enqueueStateChange(.disconnected)
+            }
+            return resources
+        }
+        guard let resources else { return }
+
+        resources.childChannel?.close(promise: nil)
+        resources.parentChannel?.close(promise: nil)
+        resources.group?.shutdownGracefully { _ in }
+    }
+
+    private func registerParentChannel(_ channel: Channel) -> Bool {
+        withLifecycleState { state in
+            guard !state.isFinished else { return false }
+            state.parentChannel = channel
+            return true
+        }
+    }
+
+    private func registerChildChannel(_ channel: Channel) -> Bool {
+        withLifecycleState { state in
+            guard !state.isFinished else { return false }
+            state.childChannel = channel
+            return true
+        }
+    }
+
+    private func recordExecRequested() {
+        withLifecycleState { state in
+            guard !state.isFinished else { return }
+            state.didRequestExec = true
+        }
+        reportConnectedIfReady()
+    }
+
+    private func reportConnectedIfReady() {
+        let shouldReport = withLifecycleState { state in
+            guard !state.isFinished,
+                  state.childChannel != nil,
+                  state.didRequestExec,
+                  !state.didReportConnected else {
+                return false
+            }
+            state.didReportConnected = true
+            return true
+        }
+        if shouldReport {
+            enqueueStateChange(.connected)
+        }
+    }
+
+    private func isCurrentParentChannel(_ channel: Channel) -> Bool {
+        withLifecycleState { state in
+            !state.isFinished && state.parentChannel === channel
+        }
+    }
+
+    private func isCurrentChildChannel(_ channel: Channel) -> Bool {
+        withLifecycleState { state in
+            !state.isFinished && state.childChannel === channel
+        }
+    }
+
+    private func enqueueEvent(_ event: SSHStreamingExecEvent) {
+        let onEvent = self.onEvent
+        callbackQueue.async {
+            onEvent(event)
+        }
+    }
+
+    private func enqueueStateChange(_ state: SSHStreamingExecState) {
+        let onStateChange = self.onStateChange
+        callbackQueue.async {
+            onStateChange(state)
+        }
+    }
+
+    private func withLifecycleState<T>(
+        _ body: (inout LifecycleState) -> T
+    ) -> T {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        return body(&lifecycle)
+    }
+
+    deinit {
+        disconnect()
     }
 }
 

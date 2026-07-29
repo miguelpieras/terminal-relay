@@ -143,6 +143,40 @@ with the installed versions the next time they refresh the worker, and the timer
 retries automatically. The response contains no package-manager output,
 repository details, credentials, host data, or terminal contents.
 
+## Native structured chat
+
+Supported clients negotiate native chat before starting or resuming an agent.
+The worker exposes four fixed helper operations:
+
+```text
+terminal-relay-session chat-capabilities-v1 <codex|claude> <repository>
+terminal-relay-session chat-start-v1 <codex|claude> <repository> [provider-thread-id] [agent arguments...]
+terminal-relay-session chat-attach-v1 <codex|claude> <repository> <relay-id>
+terminal-relay-session chat-stop-v1 <codex|claude> <repository> <relay-id>
+```
+
+`chat-start-v1` launches one `terminal-relay-chat` broker under the existing
+worker-user supervision and provider-thread lock. The broker owns the provider
+connection and listens only on a mode-`0600` Unix socket. `chat-attach-v1`
+opens a non-PTY, bidirectional NDJSON stream over the authenticated SSH
+connection. Disconnecting that stream leaves the broker and provider running;
+`chat-stop-v1` accepts only the exact relay UUID and ends that instance for all
+attached clients.
+
+Codex chat uses the shared worker-local app-server and its v2 history and turn
+methods. Claude chat uses the pinned official Agent SDK environment. Provider
+history remains authoritative. The broker retains only a bounded in-memory
+snapshot, replay window, and unresolved live interactions; it has no TCP
+listener or transcript database. See
+[`docs/chat-protocol.md`](../docs/chat-protocol.md) for the versioned contract,
+limits, replay behavior, interaction mapping, and repository-preview boundary.
+
+If either adapter is unavailable or an older worker does not advertise chat,
+the clients retain the existing PTY terminal path. Moving an active chat to
+that fallback first interrupts or finishes the turn, stops the exact chat
+relay, and resumes the same provider thread only after its lock is released.
+The two modes never run concurrently against one provider thread.
+
 ## Install or update the session runtime
 
 From the repository root, install the session helper, MCP, Claude session

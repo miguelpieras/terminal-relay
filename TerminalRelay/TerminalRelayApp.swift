@@ -42,11 +42,14 @@ final class TerminalRelayApplicationDelegate: NSObject, NSApplicationDelegate,
     private var registrationErrorHandler: ((String?) -> Void)?
     private let registrationAuthorization: (WorkerRegistration) throws -> Void
     private let defaults: UserDefaults
+    private let terminatesAfterLastWindowForTestHost: Bool
 
     override init() {
         let authorizer = WorkerRegistrationTokenAuthorizer()
         registrationAuthorization = authorizer.authorize
         defaults = .standard
+        terminatesAfterLastWindowForTestHost =
+            !ApplicationUpdateConfiguration.shouldStartUpdater()
         super.init()
     }
 
@@ -56,11 +59,15 @@ final class TerminalRelayApplicationDelegate: NSObject, NSApplicationDelegate,
     ) {
         self.registrationAuthorization = registrationAuthorization
         self.defaults = defaults
+        terminatesAfterLastWindowForTestHost = false
         super.init()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        !ApplicationSettings.keepRunningAfterLastWindowClosed(in: defaults)
+        if terminatesAfterLastWindowForTestHost {
+            return true
+        }
+        return !ApplicationSettings.keepRunningAfterLastWindowClosed(in: defaults)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -166,7 +173,18 @@ struct TerminalRelayApp: App {
         let sessionManager: SessionManager
         let accountUsageService: AccountUsageService
 #if DEBUG
-        if ScreenshotDemoMode.isEnabled {
+        if !ApplicationUpdateConfiguration.shouldStartUpdater() {
+            let suiteName = "com.mpieras.TerminalRelay.xctest-host"
+            let defaults = UserDefaults(suiteName: suiteName) ?? .standard
+            defaults.removePersistentDomain(forName: suiteName)
+            serverStore = ServerStore(defaults: defaults)
+            projectStore = ProjectStore(
+                defaults: defaults,
+                servers: serverStore.servers
+            )
+            sessionManager = SessionManager(defaults: defaults)
+            accountUsageService = AccountUsageService()
+        } else if ScreenshotDemoMode.isEnabled {
             let fixture = ScreenshotDemoMode.fixture()
             let defaults = ScreenshotDemoMode.isolatedDefaults()
             serverStore = ServerStore(

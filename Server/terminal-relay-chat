@@ -1,0 +1,4478 @@
+#!/usr/bin/python3
+"""Terminal Relay's bounded, worker-local structured chat broker.
+
+The broker deliberately exposes only the versioned chat protocol. Provider
+objects are normalized before they cross the Unix socket and conversation
+content is never written to disk.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import base64
+import collections
+import contextlib
+import dataclasses
+import fcntl
+import hashlib
+import inspect
+import json
+import os
+import pathlib
+import pwd
+import re
+import signal
+import socket
+import stat
+import struct
+import sys
+import threading
+import time
+import uuid
+from typing import Any, Awaitable, Callable
+
+
+PROTOCOL_VERSION = 1
+INSTALLED_PATH = "/usr/local/bin/terminal-relay-chat"
+SAFE_PATH = "/usr/local/bin:/usr/bin:/bin"
+MAX_RECORD_BYTES = 1024 * 1024
+MAX_JSON_DEPTH = 32
+MAX_PROMPT_BYTES = 256 * 1024
+MAX_ATTACHMENTS = 32
+MAX_ATTACHMENT_PATH_BYTES = 4 * 1024
+MAX_ATTACHMENT_FILE_BYTES = 25 * 1024 * 1024
+MAX_ITEM_BYTES = 1024 * 1024
+MAX_INLINE_TEXT_BYTES = 512 * 1024
+MAX_PREVIEW_BYTES = 256 * 1024
+MAX_HISTORY_ITEMS = 100
+MAX_HISTORY_BYTES = 4 * 1024 * 1024
+MAX_CLIENT_RECORDS = 512
+MAX_CLIENT_BYTES = 4 * 1024 * 1024
+MAX_REPLAY_RECORDS = 2048
+MAX_REPLAY_BYTES = 8 * 1024 * 1024
+MAX_COMMAND_RESULTS = 1024
+HEARTBEAT_SECONDS = 20
+ATTACH_TIMEOUT_SECONDS = 10
+INTERACTION_TIMEOUT_SECONDS = 10 * 60
+PROVIDER_RECONNECT_DELAYS = (0.0, 0.1, 0.25, 0.5, 1.0)
+PROVIDER_RECONNECT_WAIT_SECONDS = 10
+CLAUDE_HISTORY_PAGE_MESSAGES = 100
+SOCKET_NAME = "broker.sock"
+STATE_NAME = "broker.json"
+LOCK_NAME = "broker.lock"
+
+UUID_PATTERN = re.compile(
+    r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+)
+REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
+SAFE_OPTION_PATTERN = re.compile(r"^[A-Za-z0-9._:/+=,-]{1,4096}$")
+
+
+class ChatError(Exception):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        recoverable: bool = True,
+        exit_code: int = 70,
+        close: bool = False,
+    ):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.recoverable = recoverable
+        self.exit_code = exit_code
+        self.close = close
+
+
+def now_ms() -> int:
+    return time.time_ns() // 1_000_000
+
+
+def new_uuid() -> str:
+    return str(uuid.uuid4())
+
+
+def canonical_uuid(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not UUID_PATTERN.fullmatch(value):
+        raise ChatError("invalidIdentity", f"The {label} is invalid.", exit_code=64)
+    try:
+        canonical = str(uuid.UUID(value))
+    except ValueError as error:
+        raise ChatError(
+            "invalidIdentity", f"The {label} is invalid.", exit_code=64
+        ) from error
+    if canonical != value:
+        raise ChatError("invalidIdentity", f"The {label} is invalid.", exit_code=64)
+    return canonical
+
+
+def canonical_repository(value: str) -> str:
+    if not isinstance(value, str) or not REPOSITORY_PATTERN.fullmatch(value):
+        raise ChatError("invalidRepository", "The repository is invalid.", exit_code=64)
+    return value
+
+
+def canonical_directory(value: str, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not os.path.isabs(value)
+        or value == "/"
+        or "\n" in value
+    ):
+        raise ChatError("invalidPath", f"The {label} is invalid.", exit_code=64)
+    path = pathlib.Path(value)
+    if not path.is_dir() or path.is_symlink():
+        raise ChatError("invalidPath", f"The {label} is unavailable.", exit_code=66)
+    resolved = os.path.realpath(value)
+    if resolved != value:
+        raise ChatError("invalidPath", f"The {label} is invalid.", exit_code=64)
+    return value
+
+
+def json_depth(value: Any, depth: int = 0) -> int:
+    if depth > MAX_JSON_DEPTH:
+        return depth
+    if isinstance(value, dict):
+        if not value:
+            return depth + 1
+        return max(json_depth(key, depth + 1) for key in value) if False else max(
+            [depth + 1]
+            + [json_depth(item, depth + 1) for item in value.values()]
+        )
+    if isinstance(value, list):
+        return max(
+            [depth + 1] + [json_depth(item, depth + 1) for item in value]
+        )
+    return depth + 1
+
+
+def bounded_text(
+    value: Any, maximum: int = MAX_INLINE_TEXT_BYTES
+) -> tuple[str, bool, int]:
+    if value is None:
+        return "", False, 0
+    if not isinstance(value, str):
+        value = json.dumps(
+            sanitize_json(value), separators=(",", ":"), ensure_ascii=False
+        )
+    encoded = value.encode("utf-8", errors="replace")
+    original = len(encoded)
+    if original <= maximum:
+        return value, False, original
+    marker = "\n\n… output truncated by Terminal Relay …"
+    allowance = max(0, maximum - len(marker.encode("utf-8")))
+    result = encoded[:allowance].decode("utf-8", errors="ignore") + marker
+    return result, True, original
+
+
+def sanitize_json(value: Any, depth: int = 0) -> Any:
+    """Return a bounded JSON-compatible value without arbitrary object reprs."""
+    if depth >= 12:
+        return "[nested value omitted]"
+    if value is None or isinstance(value, (bool, int, float, str)):
+        if isinstance(value, str):
+            return bounded_text(value)[0]
+        return value
+    if dataclasses.is_dataclass(value):
+        return sanitize_json(dataclasses.asdict(value), depth + 1)
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in list(value.items())[:256]:
+            if isinstance(key, str) and len(key) <= 256:
+                result[key] = sanitize_json(item, depth + 1)
+        return result
+    if isinstance(value, (list, tuple)):
+        return [sanitize_json(item, depth + 1) for item in list(value)[:512]]
+    if hasattr(value, "__dict__"):
+        return sanitize_json(vars(value), depth + 1)
+    return f"[{type(value).__name__}]"
+
+
+def encode_record(value: dict[str, Any]) -> bytes:
+    encoded = (
+        json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        + b"\n"
+    )
+    if len(encoded) > MAX_RECORD_BYTES:
+        raise ChatError("recordTooLarge", "A protocol record is too large.")
+    return encoded
+
+
+def command_fingerprint(command: dict[str, Any]) -> str:
+    stable = {
+        "type": command.get("type"),
+        "relayId": command.get("relayId"),
+        "provider": command.get("provider"),
+        "providerThreadId": command.get("providerThreadId"),
+        "turnId": command.get("turnId"),
+        "itemId": command.get("itemId"),
+        "payload": command.get("payload"),
+    }
+    return hashlib.sha256(
+        json.dumps(stable, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def load_record(raw: bytes) -> dict[str, Any]:
+    if len(raw) > MAX_RECORD_BYTES:
+        raise ChatError(
+            "recordTooLarge",
+            "The protocol record exceeded the worker limit.",
+            close=True,
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ChatError(
+            "invalidEncoding", "The protocol stream is not valid UTF-8.", close=True
+        ) from error
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ChatError("invalidJSON", "The protocol record is invalid.", close=True) from error
+    if not isinstance(value, dict) or json_depth(value) > MAX_JSON_DEPTH:
+        raise ChatError("invalidJSON", "The protocol record is invalid.", close=True)
+    return value
+
+
+def validate_launch_arguments(arguments: list[str]) -> dict[str, Any]:
+    """Normalize the small provider launch surface used by native chat."""
+    if len(arguments) > 64 or sum(len(item.encode("utf-8")) for item in arguments) > 32768:
+        raise ChatError("invalidOptions", "The provider launch options are too large.", exit_code=64)
+    accepted: dict[str, Any] = {
+        "model": None,
+        "effort": None,
+        "permissionMode": "default",
+        "fullAccess": False,
+        "fastMode": False,
+        "providerArguments": [],
+    }
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if "\x00" in argument or "\n" in argument or len(argument.encode("utf-8")) > 4096:
+            raise ChatError("invalidOptions", "A provider launch option is invalid.", exit_code=64)
+        next_value: str | None = None
+        if argument in {"--model", "--effort", "--permission-mode", "--sandbox"}:
+            index += 1
+            if index >= len(arguments):
+                raise ChatError("invalidOptions", f"{argument} requires a value.", exit_code=64)
+            next_value = arguments[index]
+            if not SAFE_OPTION_PATTERN.fullmatch(next_value):
+                raise ChatError("invalidOptions", f"{argument} has an invalid value.", exit_code=64)
+        if argument == "--model":
+            accepted["model"] = next_value
+        elif argument == "--effort":
+            accepted["effort"] = next_value
+        elif argument == "--permission-mode":
+            if next_value not in {
+                "default",
+                "acceptEdits",
+                "plan",
+                "bypassPermissions",
+                "dontAsk",
+                "auto",
+            }:
+                raise ChatError("invalidOptions", "The permission mode is unsupported.", exit_code=64)
+            accepted["permissionMode"] = next_value
+        elif argument == "--sandbox":
+            if next_value not in {"read-only", "workspace-write", "danger-full-access"}:
+                raise ChatError("invalidOptions", "The sandbox mode is unsupported.", exit_code=64)
+            accepted["sandbox"] = next_value
+            accepted["fullAccess"] = next_value == "danger-full-access"
+        elif argument in {"--dangerously-bypass-approvals-and-sandbox", "--full-access"}:
+            accepted["fullAccess"] = True
+            accepted["permissionMode"] = "bypassPermissions"
+        elif argument in {"--fast", "--fast-mode"}:
+            accepted["fastMode"] = True
+        elif argument.startswith("--model="):
+            value = argument.partition("=")[2]
+            if not SAFE_OPTION_PATTERN.fullmatch(value):
+                raise ChatError("invalidOptions", "The model is invalid.", exit_code=64)
+            accepted["model"] = value
+        elif argument.startswith("--effort="):
+            value = argument.partition("=")[2]
+            if not SAFE_OPTION_PATTERN.fullmatch(value):
+                raise ChatError("invalidOptions", "The effort is invalid.", exit_code=64)
+            accepted["effort"] = value
+        elif argument.startswith("--permission-mode="):
+            value = argument.partition("=")[2]
+            if value not in {
+                "default",
+                "acceptEdits",
+                "plan",
+                "bypassPermissions",
+                "dontAsk",
+                "auto",
+            }:
+                raise ChatError("invalidOptions", "The permission mode is unsupported.", exit_code=64)
+            accepted["permissionMode"] = value
+        elif argument.startswith("--sandbox="):
+            value = argument.partition("=")[2]
+            if value not in {"read-only", "workspace-write", "danger-full-access"}:
+                raise ChatError("invalidOptions", "The sandbox mode is unsupported.", exit_code=64)
+            accepted["sandbox"] = value
+            accepted["fullAccess"] = value == "danger-full-access"
+        elif argument in {"--model", "--effort", "--permission-mode", "--sandbox"}:
+            pass
+        else:
+            # Keep provider arguments visible in the negotiated response but do
+            # not pass unknown switches through to a shell or SDK.
+            raise ChatError(
+                "invalidOptions",
+                f"The provider launch option is unsupported: {argument}",
+                exit_code=64,
+            )
+        index += 1
+    return accepted
+
+
+def chat_capabilities(provider: str) -> dict[str, Any]:
+    common: dict[str, Any] = {
+        "protocolVersion": PROTOCOL_VERSION,
+        "features": [
+            "streaming",
+            "history",
+            "replay",
+            "multi-client",
+            "interrupt",
+            "file-preview",
+            "approvals",
+            "questions",
+            "attachments",
+            "terminal-fallback",
+        ],
+        "supportsHistory": True,
+        "supportsFilePreview": True,
+        "supportsApprovals": True,
+        "supportsQuestions": True,
+        "supportsAttachments": True,
+    }
+    if provider == "codex":
+        common["features"].append("reasoning-effort")
+    elif provider == "claude":
+        pass
+    else:
+        raise ChatError("unsupportedProvider", "The provider is unsupported.", exit_code=64)
+    return common
+
+
+def display_string(value: Any, limit: int = 64 * 1024) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(
+                sanitize_json(value),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            text = f"[{type(value).__name__}]"
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text
+    return encoded[:limit].decode("utf-8", errors="ignore") + "\n…"
+
+
+def approval_decisions(values: Any = None) -> list[dict[str, Any]]:
+    """Return the small, stable decision vocabulary presented by both clients."""
+    normalized: list[dict[str, Any]] = []
+    raw_values = values if isinstance(values, list) else []
+    aliases = {
+        "accept": ("allow", "Allow", False),
+        "approve": ("allow", "Allow", False),
+        "allow": ("allow", "Allow", False),
+        "acceptForSession": ("allowForSession", "Allow for session", False),
+        "allowForSession": ("allowForSession", "Allow for session", False),
+        "decline": ("deny", "Deny", False),
+        "denied": ("deny", "Deny", False),
+        "deny": ("deny", "Deny", False),
+        "cancel": ("cancel", "Deny and stop", True),
+    }
+    for raw in raw_values:
+        raw_id = raw if isinstance(raw, str) else (
+            raw.get("id") if isinstance(raw, dict) else None
+        )
+        if not isinstance(raw_id, str):
+            continue
+        mapped = aliases.get(raw_id)
+        if not mapped:
+            # Complex provider-specific amendments are intentionally not sent
+            # through the generic UI until their typed grant subset is modeled.
+            continue
+        decision_id, label, destructive = mapped
+        if any(item["id"] == decision_id for item in normalized):
+            continue
+        if isinstance(raw, dict):
+            label = str(raw.get("label") or label)
+            destructive = bool(
+                raw.get("destructive", raw.get("isDestructive", destructive))
+            )
+        normalized.append(
+            {
+                "id": decision_id,
+                "label": label[:200],
+                "destructive": destructive,
+                "isDestructive": destructive,
+            }
+        )
+    if not any(item["id"] == "allow" for item in normalized):
+        normalized.insert(
+            0,
+            {
+                "id": "allow",
+                "label": "Allow",
+                "destructive": False,
+                "isDestructive": False,
+            },
+        )
+    if not any(item["id"] == "deny" for item in normalized):
+        normalized.append(
+            {
+                "id": "deny",
+                "label": "Deny",
+                "destructive": False,
+                "isDestructive": False,
+            }
+        )
+    return normalized
+
+
+def canonical_questions(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        source = value.get("questions")
+        if not isinstance(source, list):
+            source = [value]
+    elif isinstance(value, list):
+        source = value
+    else:
+        source = []
+    questions: list[dict[str, Any]] = []
+    for index, raw in enumerate(source[:32]):
+        if not isinstance(raw, dict):
+            continue
+        prompt = raw.get("prompt") or raw.get("question") or raw.get("header")
+        if not isinstance(prompt, str) or not prompt.strip():
+            continue
+        question_id = raw.get("id")
+        if not isinstance(question_id, str) or not question_id:
+            question_id = str(index)
+        raw_options = raw.get("options")
+        options: list[dict[str, Any]] = []
+        if isinstance(raw_options, list):
+            for option_index, option in enumerate(raw_options[:64]):
+                if isinstance(option, str):
+                    option_id = label = option
+                    detail = None
+                elif isinstance(option, dict):
+                    label = option.get("label") or option.get("value")
+                    if not isinstance(label, str):
+                        continue
+                    option_id = option.get("id") or option.get("value") or label
+                    if not isinstance(option_id, str):
+                        option_id = str(option_index)
+                    detail = option.get("detail") or option.get("description")
+                    if not isinstance(detail, str):
+                        detail = None
+                else:
+                    continue
+                options.append(
+                    {
+                        "id": option_id[:500],
+                        "label": label[:1000],
+                        "detail": detail[:4000] if detail else None,
+                    }
+                )
+        is_secret = bool(raw.get("isSecret") or raw.get("secret"))
+        allows_multiple = bool(
+            raw.get("allowsMultiple")
+            or raw.get("multiSelect")
+            or raw.get("multiple")
+        )
+        if is_secret:
+            question_kind = "secret"
+        elif options:
+            question_kind = "multipleChoice" if allows_multiple else "singleChoice"
+        else:
+            question_kind = "freeText"
+        questions.append(
+            {
+                "id": question_id[:500],
+                "prompt": prompt[:8000],
+                "kind": question_kind,
+                "options": options,
+                "allowsOther": bool(raw.get("allowsOther") or raw.get("isOther")),
+            }
+        )
+    return questions
+
+
+def canonical_client_answers(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        return [
+            {
+                "questionID": str(question_id),
+                "selectedOptionIDs": (
+                    answer if isinstance(answer, list) else [answer]
+                ),
+                "text": None,
+            }
+            for question_id, answer in value.items()
+        ]
+    if not isinstance(value, list):
+        raise ChatError("invalidAnswer", "The question answer is invalid.")
+    result: list[dict[str, Any]] = []
+    for raw in value:
+        if not isinstance(raw, dict):
+            raise ChatError("invalidAnswer", "The question answer is invalid.")
+        question_id = raw.get("questionID", raw.get("questionId"))
+        selected = raw.get("selectedOptionIDs", raw.get("selectedOptionIds", []))
+        text = raw.get("text")
+        if (
+            not isinstance(question_id, str)
+            or not isinstance(selected, list)
+            or any(not isinstance(item, str) for item in selected)
+            or (text is not None and not isinstance(text, str))
+        ):
+            raise ChatError("invalidAnswer", "The question answer is invalid.")
+        result.append(
+            {
+                "questionID": question_id,
+                "selectedOptionIDs": selected,
+                "text": text,
+            }
+        )
+    return result
+
+
+def codex_sandbox_policy(value: str) -> dict[str, Any]:
+    policies = {
+        "read-only": {"type": "readOnly"},
+        "workspace-write": {
+            "type": "workspaceWrite",
+            "writableRoots": [],
+            "networkAccess": False,
+            "excludeTmpdirEnvVar": False,
+            "excludeSlashTmp": False,
+        },
+        "danger-full-access": {"type": "dangerFullAccess"},
+    }
+    try:
+        return policies[value]
+    except KeyError as error:
+        raise ChatError("invalidOptions", "The sandbox mode is unsupported.") from error
+
+
+def content_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        return bounded_text(value)[0] if value is not None else ""
+    parts: list[str] = []
+    for item in value:
+        if isinstance(item, str):
+            parts.append(item)
+        elif isinstance(item, dict):
+            candidate = (
+                item.get("text")
+                or item.get("summary")
+                or item.get("thinking")
+            )
+            if isinstance(candidate, str):
+                parts.append(candidate)
+    return "\n".join(parts)
+
+
+def normalized_tool_status(value: Any, completed: bool) -> str:
+    if value in {"failed", "error"}:
+        return "failed"
+    if value in {"declined", "cancelled", "canceled", "interrupted"}:
+        return "cancelled"
+    if value in {"completed", "success", "succeeded"} or completed:
+        return "completed"
+    if value in {"pending", "queued"}:
+        return "pending"
+    return "running"
+
+
+def normalized_tool_kind(provider_type: str, name: Any = None) -> str:
+    value = f"{provider_type} {name or ''}".lower()
+    if any(token in value for token in ("command", "bash", "shell", "terminal")):
+        return "shell"
+    if any(token in value for token in ("filechange", "edit", "write", "patch")):
+        return "edit"
+    if any(token in value for token in ("fileread", "read", "view")):
+        return "fileRead"
+    if any(token in value for token in ("search", "find", "grep")):
+        return "search"
+    if "mcp" in value:
+        return "mcp"
+    if any(token in value for token in ("web", "browser")):
+        return "web"
+    if "plan" in value:
+        return "plan"
+    return "generic"
+
+
+def normalized_usage(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    source = value
+    for key in ("tokenUsage", "usage", "total"):
+        nested = source.get(key)
+        if isinstance(nested, dict):
+            source = nested
+            break
+    aliases = {
+        "inputTokens": ("inputTokens", "input_tokens", "input"),
+        "outputTokens": ("outputTokens", "output_tokens", "output"),
+        "contextTokens": (
+            "contextTokens",
+            "context_tokens",
+            "totalTokens",
+            "total_tokens",
+        ),
+        "contextLimit": (
+            "contextLimit",
+            "context_limit",
+            "modelContextWindow",
+        ),
+    }
+    result: dict[str, int] = {}
+    for destination, keys in aliases.items():
+        candidate = next((source.get(key) for key in keys if key in source), None)
+        if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0:
+            result[destination] = candidate
+    return result
+
+
+@dataclasses.dataclass(eq=False)
+class ClientConnection:
+    reader: asyncio.StreamReader
+    writer: asyncio.StreamWriter
+    queue: asyncio.Queue[bytes | None] = dataclasses.field(
+        default_factory=lambda: asyncio.Queue(MAX_CLIENT_RECORDS)
+    )
+    queued_bytes: int = 0
+    closed: bool = False
+    writer_task: asyncio.Task[None] | None = None
+
+    async def direct_send(self, value: dict[str, Any]) -> None:
+        encoded = encode_record(value)
+        self.writer.write(encoded)
+        await self.writer.drain()
+
+    def enqueue(self, encoded: bytes) -> bool:
+        if (
+            self.closed
+            or self.queue.full()
+            or self.queued_bytes + len(encoded) > MAX_CLIENT_BYTES
+        ):
+            return False
+        self.queued_bytes += len(encoded)
+        self.queue.put_nowait(encoded)
+        return True
+
+    async def run_writer(self) -> None:
+        try:
+            while True:
+                encoded = await self.queue.get()
+                if encoded is None:
+                    return
+                self.queued_bytes -= len(encoded)
+                self.writer.write(encoded)
+                await self.writer.drain()
+        except (BrokenPipeError, ConnectionError, OSError):
+            pass
+        finally:
+            self.closed = True
+
+    async def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        with contextlib.suppress(asyncio.QueueFull):
+            self.queue.put_nowait(None)
+        self.writer.close()
+        with contextlib.suppress(Exception):
+            await self.writer.wait_closed()
+
+
+class ProviderAdapter:
+    def __init__(
+        self,
+        project_directory: str,
+        thread_id: str | None,
+        launch_options: dict[str, Any],
+    ):
+        self.project_directory = project_directory
+        self.thread_id = thread_id
+        self.launch_options = launch_options
+        self.emit: Callable[..., Awaitable[dict[str, Any]]] | None = None
+        self.connection_generation = new_uuid()
+
+    async def start(self, emit: Callable[..., Awaitable[dict[str, Any]]]) -> str:
+        self.emit = emit
+        if self.thread_id is None:
+            self.thread_id = new_uuid()
+        return self.thread_id
+
+    async def history(
+        self, before_item_id: str | None, limit: int
+    ) -> tuple[list[dict[str, Any]], bool]:
+        del before_item_id, limit
+        return [], False
+
+    async def start_turn(self, command: dict[str, Any]) -> dict[str, Any]:
+        raise ChatError("providerUnavailable", "The provider is unavailable.")
+
+    async def interrupt(self, turn_id: str) -> None:
+        del turn_id
+        raise ChatError("providerUnavailable", "The provider is unavailable.")
+
+    async def respond_approval(self, payload: dict[str, Any]) -> None:
+        del payload
+        raise ChatError("staleInteraction", "The approval request is no longer active.")
+
+    async def respond_question(self, payload: dict[str, Any]) -> None:
+        del payload
+        raise ChatError("staleInteraction", "The question is no longer active.")
+
+    async def close(self) -> None:
+        return None
+
+
+class FakeProvider(ProviderAdapter):
+    """Deterministic provider used only by import-level and isolated CLI tests."""
+
+    def __init__(self, *args: Any, scripted_history: list[dict[str, Any]] | None = None):
+        super().__init__(*args)
+        self.scripted_history = scripted_history or []
+        self.active_turn: str | None = None
+        self.start_attempts = 0
+        self.turn_commands: list[str] = []
+        self.turn_payloads: list[dict[str, Any]] = []
+        self.interactions: dict[str, dict[str, Any]] = {}
+        self.approval_responses: list[dict[str, Any]] = []
+        self.question_responses: list[dict[str, Any]] = []
+
+    async def history(
+        self, before_item_id: str | None, limit: int
+    ) -> tuple[list[dict[str, Any]], bool]:
+        items = self.scripted_history
+        if before_item_id:
+            index = next(
+                (i for i, item in enumerate(items) if item.get("itemId") == before_item_id),
+                len(items),
+            )
+            items = items[:index]
+        has_older = len(items) > limit
+        return [dict(item) for item in items[-limit:]], has_older
+
+    async def start_turn(self, command: dict[str, Any]) -> dict[str, Any]:
+        self.start_attempts += 1
+        if self.active_turn:
+            raise ChatError("turnActive", "A provider turn is already active.")
+        assert self.emit is not None
+        request_id = command["requestId"]
+        payload = command["payload"]
+        turn_id = new_uuid()
+        user_id = request_id
+        assistant_id = new_uuid()
+        self.active_turn = turn_id
+        self.turn_commands.append(request_id)
+        self.turn_payloads.append(sanitize_json(payload))
+        await self.emit(
+            "message.started",
+            {"role": "user", "text": payload["text"], "status": "completed"},
+            turn_id=turn_id,
+            item_id=user_id,
+        )
+        await self.emit(
+            "message.completed",
+            {"role": "user", "text": payload["text"], "status": "completed"},
+            turn_id=turn_id,
+            item_id=user_id,
+        )
+        await self.emit("turn.started", {"status": "streaming"}, turn_id=turn_id)
+        await self.emit(
+            "message.started",
+            {"role": "assistant", "text": "", "status": "streaming"},
+            turn_id=turn_id,
+            item_id=assistant_id,
+        )
+        return {"turnId": turn_id, "itemId": user_id}
+
+    async def emit_delta(self, text: str) -> None:
+        assert self.emit is not None and self.active_turn is not None
+        await self.emit(
+            "message.delta",
+            {"role": "assistant", "text": text},
+            turn_id=self.active_turn,
+            item_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        )
+
+    async def interrupt(self, turn_id: str) -> None:
+        if self.active_turn != turn_id:
+            raise ChatError("staleTurn", "The requested turn is no longer active.")
+        assert self.emit is not None
+        await self.emit("turn.interrupted", {"status": "interrupted"}, turn_id=turn_id)
+        self.active_turn = None
+
+    async def respond_approval(self, payload: dict[str, Any]) -> None:
+        if payload.get("decision") not in {"allow", "allowForSession", "deny", "cancel"}:
+            raise ChatError("invalidDecision", "The approval decision is invalid.")
+        self.approval_responses.append(sanitize_json(payload))
+
+    async def respond_question(self, payload: dict[str, Any]) -> None:
+        if not isinstance(payload.get("answers"), (dict, list)):
+            raise ChatError("invalidAnswer", "The question answer is invalid.")
+        self.question_responses.append(sanitize_json(payload))
+
+
+class UnixWebSocket:
+    """Small RFC6455 client for the Codex Unix-domain app-server endpoint."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.socket: socket.socket | None = None
+        self.buffer = b""
+        self.send_lock = threading.Lock()
+
+    def connect(self) -> None:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(10)
+        sock.connect(self.path)
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        request = (
+            "GET / HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        ).encode("ascii")
+        sock.sendall(request)
+        self.socket = sock
+        headers = self._read_headers()
+        status_line, *header_lines = headers.split(b"\r\n")
+        if b" 101 " not in status_line:
+            raise ChatError("providerUnavailable", "The Codex service is unavailable.")
+        response_headers: dict[bytes, bytes] = {}
+        for line in header_lines:
+            name, separator, value = line.partition(b":")
+            if separator:
+                response_headers[name.strip().lower()] = value.strip()
+        expected = base64.b64encode(
+            hashlib.sha1(
+                key.encode("ascii") + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+            ).digest()
+        )
+        if response_headers.get(b"sec-websocket-accept") != expected:
+            raise ChatError("providerUnavailable", "The Codex service is unavailable.")
+        sock.settimeout(None)
+
+    def _socket(self) -> socket.socket:
+        if self.socket is None:
+            raise EOFError
+        return self.socket
+
+    def _read_headers(self) -> bytes:
+        while b"\r\n\r\n" not in self.buffer:
+            chunk = self._socket().recv(4096)
+            if not chunk:
+                raise EOFError
+            self.buffer += chunk
+            if len(self.buffer) > 64 * 1024:
+                raise ChatError("providerUnavailable", "The Codex service is unavailable.")
+        headers, self.buffer = self.buffer.split(b"\r\n\r\n", 1)
+        return headers
+
+    def _read_exact(self, length: int) -> bytes:
+        while len(self.buffer) < length:
+            chunk = self._socket().recv(max(4096, length - len(self.buffer)))
+            if not chunk:
+                raise EOFError
+            self.buffer += chunk
+        value, self.buffer = self.buffer[:length], self.buffer[length:]
+        return value
+
+    def send_json(self, value: dict[str, Any]) -> None:
+        payload = json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode(
+            "utf-8"
+        )
+        if len(payload) > MAX_RECORD_BYTES:
+            raise ChatError("providerRequestTooLarge", "The provider request is too large.")
+        with self.send_lock:
+            length = len(payload)
+            header = b"\x81"
+            if length < 126:
+                header += bytes([0x80 | length])
+            elif length < 65536:
+                header += bytes([0x80 | 126]) + struct.pack("!H", length)
+            else:
+                header += bytes([0x80 | 127]) + struct.pack("!Q", length)
+            mask = os.urandom(4)
+            masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+            self._socket().sendall(header + mask + masked)
+
+    def receive_json(self) -> dict[str, Any]:
+        fragments: list[bytes] = []
+        message_opcode: int | None = None
+        while True:
+            first, second = self._read_exact(2)
+            final = bool(first & 0x80)
+            opcode = first & 0x0F
+            masked = bool(second & 0x80)
+            length = second & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", self._read_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", self._read_exact(8))[0]
+            if length > MAX_RECORD_BYTES:
+                raise ChatError("providerRecordTooLarge", "The provider record is too large.")
+            mask = self._read_exact(4) if masked else None
+            payload = self._read_exact(length)
+            if mask:
+                payload = bytes(
+                    value ^ mask[index % 4] for index, value in enumerate(payload)
+                )
+            if opcode == 8:
+                raise EOFError
+            if opcode == 9:
+                self._send_control(10, payload)
+                continue
+            if opcode in (1, 2):
+                message_opcode = opcode
+                fragments = [payload]
+            elif opcode == 0 and message_opcode is not None:
+                fragments.append(payload)
+            else:
+                continue
+            if final:
+                if message_opcode != 1:
+                    continue
+                value = json.loads(b"".join(fragments).decode("utf-8"))
+                if not isinstance(value, dict):
+                    raise ChatError("providerProtocol", "The provider protocol is unsupported.")
+                return value
+
+    def _send_control(self, opcode: int, payload: bytes = b"") -> None:
+        with self.send_lock:
+            mask = os.urandom(4)
+            masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+            self._socket().sendall(
+                bytes([0x80 | opcode, 0x80 | len(payload)]) + mask + masked
+            )
+
+    def close(self) -> None:
+        if self.socket is None:
+            return
+        with contextlib.suppress(Exception):
+            self._send_control(8)
+        with contextlib.suppress(OSError):
+            self.socket.close()
+        self.socket = None
+
+
+class CodexAdapter(ProviderAdapter):
+    def __init__(
+        self,
+        project_directory: str,
+        thread_id: str | None,
+        launch_options: dict[str, Any],
+        socket_path: str,
+    ):
+        super().__init__(project_directory, thread_id, launch_options)
+        self.socket_path = socket_path
+        self.websocket = UnixWebSocket(socket_path)
+        self.websocket_factory: Callable[[], Any] = lambda: UnixWebSocket(
+            self.socket_path
+        )
+        self.pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
+        self.request_id = 1
+        self.reader_task: asyncio.Task[None] | None = None
+        self.active_turn: str | None = None
+        self.connection_ready = asyncio.Event()
+        self.closing = False
+        self.last_reconciled_thread: dict[str, Any] | None = None
+        self.interactions: dict[str, dict[str, Any]] = {}
+        self.tool_output_buffers: dict[str, str] = {}
+        self.plan_buffers: dict[str, str] = {}
+
+    async def start(self, emit: Callable[..., Awaitable[dict[str, Any]]]) -> str:
+        self.emit = emit
+        await asyncio.to_thread(self.websocket.connect)
+        self.reader_task = asyncio.create_task(self._read_loop())
+        self.connection_ready.set()
+        initialized = await self.request(
+            "initialize",
+            {
+                "clientInfo": {
+                    "name": "terminal_relay",
+                    "title": "Terminal Relay",
+                    "version": "1.0.0",
+                },
+                "experimentalApi": True,
+                "requestAttestation": False,
+            },
+        )
+        if not isinstance(initialized, dict):
+            raise ChatError("unsupportedProvider", "The Codex service is unsupported.")
+        await asyncio.to_thread(
+            self.websocket.send_json, {"method": "initialized", "params": {}}
+        )
+        if self.thread_id:
+            result = await self.request(
+                "thread/resume",
+                {
+                    "threadId": self.thread_id,
+                    "cwd": self.project_directory,
+                },
+            )
+        else:
+            params: dict[str, Any] = {"cwd": self.project_directory}
+            if self.launch_options.get("model"):
+                params["model"] = self.launch_options["model"]
+            result = await self.request("thread/start", params)
+        thread = result.get("thread") if isinstance(result, dict) else None
+        candidate = (
+            thread.get("id")
+            if isinstance(thread, dict)
+            else result.get("threadId") if isinstance(result, dict) else None
+        )
+        self.thread_id = canonical_uuid(candidate or self.thread_id, "provider thread ID")
+        self.connection_ready.set()
+        return self.thread_id
+
+    async def request(
+        self, method: str, params: dict[str, Any], timeout: float = 30
+    ) -> dict[str, Any]:
+        if not self.connection_ready.is_set():
+            try:
+                await asyncio.wait_for(
+                    self.connection_ready.wait(),
+                    min(timeout, PROVIDER_RECONNECT_WAIT_SECONDS),
+                )
+            except asyncio.TimeoutError as error:
+                raise ChatError(
+                    "providerDisconnected", "The Codex service is reconnecting."
+                ) from error
+        request_id = self.request_id
+        self.request_id += 1
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self.pending[request_id] = future
+        try:
+            await asyncio.to_thread(
+                self.websocket.send_json,
+                {"method": method, "id": request_id, "params": params},
+            )
+            response = await asyncio.wait_for(future, timeout)
+        finally:
+            self.pending.pop(request_id, None)
+        if "error" in response:
+            raise ChatError("providerRejected", "Codex rejected the request.")
+        result = response.get("result", {})
+        if not isinstance(result, dict):
+            raise ChatError("providerProtocol", "The Codex response is unsupported.")
+        return result
+
+    async def _read_loop(self) -> None:
+        while not self.closing:
+            try:
+                while not self.closing:
+                    value = await asyncio.to_thread(self.websocket.receive_json)
+                    await self._dispatch_provider_value(value)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if self.closing:
+                    return
+                self.connection_ready.clear()
+                for future in self.pending.values():
+                    if not future.done():
+                        future.set_exception(
+                            ChatError(
+                                "providerDisconnected",
+                                "The Codex service disconnected.",
+                            )
+                        )
+                if self.emit:
+                    await self._expire_interactions()
+                    await self.emit(
+                        "session.state",
+                        {
+                            "connectionState": "offlineAgentRunning",
+                            "reason": "providerDisconnected",
+                        },
+                    )
+                await asyncio.to_thread(self.websocket.close)
+                if not await self._reconnect():
+                    if self.emit:
+                        await self.emit(
+                            "session.state",
+                            {
+                                "connectionState": "offlineAgentRunning",
+                                "reason": "providerReconnectFailed",
+                            },
+                        )
+                    return
+
+    async def _dispatch_provider_value(self, value: dict[str, Any]) -> None:
+        response_id = value.get("id")
+        if response_id in self.pending and (
+            "result" in value or "error" in value
+        ):
+            future = self.pending.get(response_id)
+            if future and not future.done():
+                future.set_result(value)
+            return
+        if "method" in value and "id" in value:
+            await self._server_request(value)
+        elif "method" in value:
+            await self._notification(value["method"], value.get("params", {}))
+
+    async def _direct_request(
+        self,
+        websocket: Any,
+        method: str,
+        params: dict[str, Any],
+        buffered: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        request_id = self.request_id
+        self.request_id += 1
+        await asyncio.to_thread(
+            websocket.send_json,
+            {"method": method, "id": request_id, "params": params},
+        )
+        while True:
+            try:
+                value = await asyncio.wait_for(
+                    asyncio.to_thread(websocket.receive_json),
+                    PROVIDER_RECONNECT_WAIT_SECONDS,
+                )
+            except asyncio.TimeoutError as error:
+                await asyncio.to_thread(websocket.close)
+                raise ChatError(
+                    "providerDisconnected", "The Codex service did not reconnect."
+                ) from error
+            if value.get("id") == request_id and (
+                "result" in value or "error" in value
+            ):
+                if "error" in value:
+                    raise ChatError(
+                        "providerRejected", "Codex rejected the reconnect request."
+                    )
+                result = value.get("result", {})
+                if not isinstance(result, dict):
+                    raise ChatError(
+                        "providerProtocol", "The Codex response is unsupported."
+                    )
+                return result
+            if len(buffered) >= 256:
+                raise ChatError(
+                    "providerProtocol",
+                    "The Codex reconnect buffer exceeded its limit.",
+                )
+            buffered.append(value)
+
+    async def _reconnect(self) -> bool:
+        prior_active_turn = self.active_turn
+        for delay in PROVIDER_RECONNECT_DELAYS:
+            if self.closing:
+                return False
+            if delay:
+                await asyncio.sleep(delay)
+            websocket = self.websocket_factory()
+            buffered: list[dict[str, Any]] = []
+            try:
+                await asyncio.to_thread(websocket.connect)
+                initialized = await self._direct_request(
+                    websocket,
+                    "initialize",
+                    {
+                        "clientInfo": {
+                            "name": "terminal_relay",
+                            "title": "Terminal Relay",
+                            "version": "1.0.0",
+                        },
+                        "experimentalApi": True,
+                        "requestAttestation": False,
+                    },
+                    buffered,
+                )
+                if not isinstance(initialized, dict):
+                    raise ChatError(
+                        "unsupportedProvider",
+                        "The Codex service is unsupported.",
+                    )
+                await asyncio.to_thread(
+                    websocket.send_json,
+                    {"method": "initialized", "params": {}},
+                )
+                resumed = await self._direct_request(
+                    websocket,
+                    "thread/resume",
+                    {
+                        "threadId": self.thread_id,
+                        "cwd": self.project_directory,
+                    },
+                    buffered,
+                )
+                resumed_thread = resumed.get("thread")
+                if (
+                    not isinstance(resumed_thread, dict)
+                    or resumed_thread.get("id") != self.thread_id
+                ):
+                    raise ChatError(
+                        "staleThread",
+                        "Codex resumed a different provider conversation.",
+                    )
+                read = await self._direct_request(
+                    websocket,
+                    "thread/read",
+                    {"threadId": self.thread_id, "includeTurns": True},
+                    buffered,
+                )
+                thread = read.get("thread")
+                if (
+                    not isinstance(thread, dict)
+                    or thread.get("id") != self.thread_id
+                ):
+                    raise ChatError(
+                        "staleThread",
+                        "Codex returned a different provider conversation.",
+                    )
+                self.websocket = websocket
+                self.connection_generation = new_uuid()
+                self.last_reconciled_thread = thread
+                await self._reconcile_thread(thread, prior_active_turn)
+                for value in buffered:
+                    await self._dispatch_provider_value(value)
+                self.connection_ready.set()
+                if self.emit:
+                    await self.emit(
+                        "session.state",
+                        {
+                            "connectionState": "streaming",
+                            "reason": "providerReconnected",
+                        },
+                    )
+                return True
+            except asyncio.CancelledError:
+                await asyncio.to_thread(websocket.close)
+                raise
+            except Exception:
+                await asyncio.to_thread(websocket.close)
+        return False
+
+    @staticmethod
+    def _turn_for_client_command(
+        thread: dict[str, Any], client_command_id: str
+    ) -> dict[str, Any] | None:
+        turns = thread.get("turns")
+        if not isinstance(turns, list):
+            return None
+        for turn in reversed(turns):
+            if not isinstance(turn, dict):
+                continue
+            items = turn.get("items")
+            if not isinstance(items, list):
+                continue
+            if any(
+                isinstance(item, dict)
+                and (
+                    item.get("clientUserMessageId") == client_command_id
+                    or item.get("clientId") == client_command_id
+                )
+                for item in items
+            ):
+                return turn
+        in_progress = [
+            turn
+            for turn in turns
+            if isinstance(turn, dict) and turn.get("status") == "inProgress"
+        ]
+        return in_progress[-1] if len(in_progress) == 1 else None
+
+    async def _reconcile_thread(
+        self, thread: dict[str, Any], prior_active_turn: str | None
+    ) -> None:
+        if not self.emit:
+            return
+        turns = thread.get("turns")
+        if not isinstance(turns, list):
+            turns = []
+        target = next(
+            (
+                turn
+                for turn in reversed(turns)
+                if isinstance(turn, dict)
+                and prior_active_turn
+                and turn.get("id") == prior_active_turn
+            ),
+            None,
+        )
+        if target is None:
+            active = [
+                turn
+                for turn in turns
+                if isinstance(turn, dict) and turn.get("status") == "inProgress"
+            ]
+            if len(active) == 1:
+                target = active[0]
+        if target is None:
+            if prior_active_turn:
+                await self.emit(
+                    "turn.failed",
+                    {
+                        "status": "failed",
+                        "message": "The Codex turn could not be reconciled after reconnect.",
+                        "recoverable": True,
+                    },
+                    turn_id=prior_active_turn,
+                )
+                self.active_turn = None
+            return
+        turn_id = target.get("id")
+        if not isinstance(turn_id, str) or not UUID_PATTERN.fullmatch(turn_id):
+            return
+        turn_status = target.get("status")
+        items = target.get("items")
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                item_id = item.get("id")
+                if not isinstance(item_id, str):
+                    continue
+                provider_type = str(item.get("type", "")).lower()
+                item_status = item.get("status")
+                completed = (
+                    "message" in provider_type
+                    or turn_status != "inProgress"
+                    or item_status
+                    in {
+                        "completed",
+                        "failed",
+                        "declined",
+                        "cancelled",
+                        "canceled",
+                        "interrupted",
+                    }
+                )
+                mapped = self.map_item(item, completed=completed)
+                await self.emit(
+                    mapped["eventType"],
+                    mapped["payload"],
+                    turn_id=turn_id,
+                    item_id=item_id,
+                )
+        if turn_status == "inProgress":
+            self.active_turn = turn_id
+            await self.emit(
+                "turn.started",
+                {"status": "streaming", "reconciled": True},
+                turn_id=turn_id,
+            )
+            return
+        event_type = {
+            "interrupted": "turn.interrupted",
+            "failed": "turn.failed",
+        }.get(turn_status, "turn.completed")
+        await self.emit(
+            event_type,
+            {"status": turn_status or "completed", "reconciled": True},
+            turn_id=turn_id,
+        )
+        self.active_turn = None
+
+    async def _expire_interactions(self) -> None:
+        if not self.emit:
+            return
+        for display_id, interaction in list(self.interactions.items()):
+            kind = interaction["kind"]
+            await self.emit(
+                f"{kind}.expired",
+                {
+                    "displayId": display_id,
+                    "reason": "providerConnectionEnded",
+                },
+                item_id=display_id,
+            )
+        self.interactions.clear()
+
+    async def _server_request(self, value: dict[str, Any]) -> None:
+        assert self.emit is not None
+        method = value.get("method")
+        params = value.get("params")
+        if not isinstance(method, str) or not isinstance(params, dict):
+            return
+        display_id = new_uuid()
+        provider_request_id = value.get("id")
+        lower = method.lower()
+        if "requestuserinput" in lower or "elicitation" in lower:
+            kind = "question"
+            source_questions = (
+                params.get("questions")
+                or (
+                    params.get("request", {}).get("questions")
+                    if isinstance(params.get("request"), dict)
+                    else None
+                )
+                or params.get("request")
+            )
+            questions = canonical_questions(source_questions)
+            if not questions and "elicitation" in lower:
+                server_name = params.get("serverName")
+                questions = [
+                    {
+                        "id": "content",
+                        "prompt": (
+                            f"{server_name} requested input."
+                            if isinstance(server_name, str)
+                            else "An MCP server requested input."
+                        ),
+                        "kind": "freeText",
+                        "options": [],
+                        "allowsOther": True,
+                    }
+                ]
+            if not questions:
+                await self.emit(
+                    "session.terminalFallbackRequired",
+                    {
+                        "reason": "unsupportedInteraction",
+                        "providerMethod": method[:200],
+                    },
+                )
+                return
+            first_question = questions[0]
+            payload = {
+                "displayId": display_id,
+                "id": display_id,
+                "providerConnectionGeneration": self.connection_generation,
+                "providerRequestId": provider_request_id,
+                "providerRequestID": provider_request_id,
+                "prompt": (
+                    "Input requested"
+                    if len(questions) == 1
+                    else f"{len(questions)} answers needed"
+                ),
+                "questions": questions,
+                # Keep the first row available to v1 clients that predate
+                # grouped provider questions.
+                "question": first_question["prompt"],
+                "kind": first_question["kind"],
+                "options": first_question["options"],
+                "allowsOther": first_question["allowsOther"],
+                "status": "pending",
+            }
+        elif any(
+            token in lower
+            for token in ("approval", "permission", "execcommand", "filechange")
+        ):
+            kind = "approval"
+            decisions = approval_decisions(params.get("availableDecisions"))
+            title = {
+                "item/commandExecution/requestApproval": "Run command?",
+                "item/fileChange/requestApproval": "Apply file changes?",
+                "item/permissions/requestApproval": "Grant additional permissions?",
+            }.get(method, "Approval needed")
+            payload = {
+                "displayId": display_id,
+                "id": display_id,
+                "providerConnectionGeneration": self.connection_generation,
+                "providerRequestId": provider_request_id,
+                "providerRequestID": provider_request_id,
+                "approvalKind": method,
+                "title": title,
+                "reason": (
+                    params.get("reason")
+                    if isinstance(params.get("reason"), str)
+                    else None
+                ),
+                "decisions": decisions,
+                "context": display_string(params),
+                "grantablePermissions": sanitize_json(
+                    params.get("permissions")
+                    or params.get("additionalPermissions")
+                ),
+                "status": "pending",
+            }
+        else:
+            await self.emit(
+                "session.terminalFallbackRequired",
+                {
+                    "reason": "unsupportedInteraction",
+                    "providerMethod": method[:200],
+                },
+            )
+            return
+        self.interactions[display_id] = {
+            "kind": kind,
+            "requestId": provider_request_id,
+            "generation": self.connection_generation,
+            "method": method,
+            "params": sanitize_json(params),
+            "questions": payload.get("questions", []),
+        }
+        await self.emit(f"{kind}.requested", payload, item_id=display_id)
+
+    async def _notification(self, method: str, params: Any) -> None:
+        if not self.emit or not isinstance(params, dict):
+            return
+        lower = method.lower()
+        turn = params.get("turn")
+        item = params.get("item")
+        turn_id = (
+            turn.get("id")
+            if isinstance(turn, dict)
+            else params.get("turnId")
+        )
+        item_id = (
+            item.get("id")
+            if isinstance(item, dict)
+            else params.get("itemId")
+        )
+        if isinstance(turn_id, str) and UUID_PATTERN.fullmatch(turn_id):
+            self.active_turn = turn_id
+        if method == "turn/started":
+            await self.emit("turn.started", {"status": "streaming"}, turn_id=turn_id)
+            return
+        if method == "turn/completed":
+            status = (
+                turn.get("status")
+                if isinstance(turn, dict)
+                else params.get("status", "completed")
+            )
+            event_type = {
+                "interrupted": "turn.interrupted",
+                "failed": "turn.failed",
+            }.get(status, "turn.completed")
+            await self.emit(
+                event_type,
+                {"status": status, "turn": sanitize_json(turn or params)},
+                turn_id=turn_id,
+            )
+            self.active_turn = None
+            return
+        if method == "item/started" and isinstance(item, dict):
+            mapped = self.map_item(item, completed=False)
+            await self.emit(
+                mapped["eventType"],
+                mapped["payload"],
+                turn_id=turn_id,
+                item_id=item_id,
+            )
+            return
+        if method == "item/completed" and isinstance(item, dict):
+            mapped = self.map_item(item, completed=True)
+            await self.emit(
+                mapped["eventType"],
+                mapped["payload"],
+                turn_id=turn_id,
+                item_id=item_id,
+            )
+            if isinstance(item_id, str):
+                self.tool_output_buffers.pop(item_id, None)
+                self.plan_buffers.pop(item_id, None)
+            return
+        if method in {
+            "item/agentMessage/delta",
+            "item/reasoning/summaryTextDelta",
+            "item/reasoning/textDelta",
+        }:
+            text, truncated, original = bounded_text(params.get("delta"))
+            event_type = (
+                "reasoning.delta" if "reasoning" in lower else "message.delta"
+            )
+            await self.emit(
+                event_type,
+                {
+                    "text": text,
+                    "truncated": truncated,
+                    "originalByteCount": original,
+                },
+                turn_id=turn_id,
+                item_id=item_id,
+            )
+            return
+        if method in {
+            "item/commandExecution/outputDelta",
+            "item/fileChange/outputDelta",
+        } and isinstance(item_id, str):
+            delta = params.get("delta")
+            if not isinstance(delta, str):
+                return
+            accumulated = self.tool_output_buffers.get(item_id, "") + delta
+            accumulated, truncated, original = bounded_text(
+                accumulated, MAX_ITEM_BYTES
+            )
+            self.tool_output_buffers[item_id] = accumulated
+            await self.emit(
+                "tool.updated",
+                {
+                    "kind": "shell" if "commandExecution" in method else "edit",
+                    "title": (
+                        "Command output"
+                        if "commandExecution" in method
+                        else "File change"
+                    ),
+                    "status": "running",
+                    "output": accumulated,
+                    "truncated": truncated,
+                    "originalByteCount": original,
+                },
+                turn_id=turn_id,
+                item_id=item_id,
+            )
+            return
+        if method == "item/fileChange/patchUpdated":
+            changes = params.get("changes")
+            mapped = self.map_item(
+                {
+                    "id": item_id,
+                    "type": "fileChange",
+                    "status": "inProgress",
+                    "changes": changes if isinstance(changes, list) else [],
+                },
+                completed=False,
+            )
+            await self.emit(
+                "diff.updated",
+                mapped["payload"],
+                turn_id=turn_id,
+                item_id=item_id,
+            )
+            return
+        if method == "item/mcpToolCall/progress":
+            await self.emit(
+                "tool.updated",
+                {
+                    "kind": "mcp",
+                    "title": "MCP tool",
+                    "status": "running",
+                    "output": params.get("message"),
+                },
+                turn_id=turn_id,
+                item_id=item_id,
+            )
+            return
+        if method == "item/plan/delta" and isinstance(item_id, str):
+            delta = params.get("delta")
+            if not isinstance(delta, str):
+                return
+            accumulated = self.plan_buffers.get(item_id, "") + delta
+            accumulated, _, _ = bounded_text(accumulated, MAX_ITEM_BYTES)
+            self.plan_buffers[item_id] = accumulated
+            await self.emit(
+                "plan.updated",
+                {
+                    "title": "Plan",
+                    "steps": [
+                        {
+                            "id": f"{item_id}:0",
+                            "title": accumulated,
+                            "status": "inProgress",
+                        }
+                    ],
+                },
+                turn_id=turn_id,
+                item_id=item_id,
+            )
+            return
+        if method == "turn/plan/updated":
+            raw_steps = params.get("plan")
+            steps: list[dict[str, Any]] = []
+            if isinstance(raw_steps, list):
+                for index, step in enumerate(raw_steps[:128]):
+                    if not isinstance(step, dict) or not isinstance(
+                        step.get("step"), str
+                    ):
+                        continue
+                    steps.append(
+                        {
+                            "id": f"{turn_id or 'turn'}:plan:{index}",
+                            "title": step["step"],
+                            "status": step.get("status", "pending"),
+                        }
+                    )
+            await self.emit(
+                "plan.updated",
+                {
+                    "title": params.get("explanation") or "Plan",
+                    "steps": steps,
+                },
+                turn_id=turn_id,
+                item_id=f"plan:{turn_id}" if turn_id else None,
+            )
+            return
+        if method == "thread/tokenUsage/updated":
+            await self.emit(
+                "usage.updated", normalized_usage(params), turn_id=turn_id
+            )
+            return
+        if method == "turn/diff/updated":
+            diff, truncated, _ = bounded_text(
+                params.get("diff"), MAX_ITEM_BYTES
+            )
+            await self.emit(
+                "diff.updated",
+                {"diff": diff, "truncated": truncated},
+                turn_id=turn_id,
+                item_id=f"diff:{turn_id}" if turn_id else None,
+            )
+            return
+        if method == "error":
+            error_value = params.get("error")
+            message = (
+                error_value.get("message")
+                if isinstance(error_value, dict)
+                else params.get("message")
+            )
+            await self.emit(
+                "error",
+                {
+                    "code": "providerError",
+                    "message": (
+                        message[:1000]
+                        if isinstance(message, str)
+                        else "Codex reported a provider error."
+                    ),
+                    "recoverable": True,
+                },
+                turn_id=turn_id,
+                item_id=item_id,
+            )
+            return
+        if method == "serverRequest/resolved":
+            provider_request_id = params.get("requestId")
+            match = next(
+                (
+                    (display_id, interaction)
+                    for display_id, interaction in self.interactions.items()
+                    if interaction["requestId"] == provider_request_id
+                ),
+                None,
+            )
+            if match:
+                display_id, interaction = match
+                self.interactions.pop(display_id, None)
+                await self.emit(
+                    f"{interaction['kind']}.resolved",
+                    {"displayId": display_id},
+                    item_id=display_id,
+                )
+
+    @staticmethod
+    def map_item(item: dict[str, Any], completed: bool) -> dict[str, Any]:
+        provider_type = str(item.get("type", "generic"))
+        lower = provider_type.lower()
+        event_suffix = "completed" if completed else "started"
+        text_value = item.get("text") or item.get("message")
+        if text_value is None:
+            text_value = content_text(item.get("content") or item.get("summary"))
+        text, truncated, original = bounded_text(text_value)
+        payload: dict[str, Any] = {
+            "providerType": provider_type,
+            "truncated": truncated,
+            "originalByteCount": original,
+        }
+        if provider_type == "userMessage" or (
+            "user" in lower and "message" in lower
+        ):
+            payload.update(
+                {
+                    "role": "user",
+                    "text": text,
+                    "status": "completed" if completed else "streaming",
+                    "clientUserMessageId": (
+                        item.get("clientUserMessageId") or item.get("clientId")
+                    ),
+                }
+            )
+            event_type = f"message.{event_suffix}"
+        elif provider_type == "agentMessage" or any(
+            token in lower for token in ("agentmessage", "assistant", "message")
+        ):
+            payload.update(
+                {
+                    "role": "assistant",
+                    "text": text,
+                    "status": "completed" if completed else "streaming",
+                }
+            )
+            event_type = f"message.{event_suffix}"
+        elif "reasoning" in lower:
+            reasoning_text = content_text(
+                item.get("summary") or item.get("content") or text
+            )
+            payload.update(
+                {
+                    "text": bounded_text(reasoning_text)[0],
+                    "status": "completed" if completed else "streaming",
+                }
+            )
+            event_type = f"reasoning.{event_suffix}"
+        elif "filechange" in lower:
+            changes = item.get("changes")
+            if not isinstance(changes, list):
+                changes = []
+            diff_parts: list[str] = []
+            paths: list[str] = []
+            for change in changes:
+                if not isinstance(change, dict):
+                    continue
+                if isinstance(change.get("path"), str):
+                    paths.append(change["path"])
+                if isinstance(change.get("diff"), str):
+                    diff_parts.append(change["diff"])
+            diff, diff_truncated, _ = bounded_text(
+                "\n".join(diff_parts), MAX_ITEM_BYTES
+            )
+            payload.update(
+                {
+                    "path": paths[0] if len(paths) == 1 else None,
+                    "diff": diff,
+                    "status": normalized_tool_status(item.get("status"), completed),
+                    "truncated": diff_truncated,
+                }
+            )
+            event_type = "diff.updated"
+        elif "plan" in lower:
+            plan_text = item.get("text")
+            payload.update(
+                {
+                    "title": "Plan",
+                    "steps": (
+                        [
+                            {
+                                "id": f"{item.get('id', 'plan')}:0",
+                                "title": plan_text,
+                                "status": "completed" if completed else "inProgress",
+                            }
+                        ]
+                        if isinstance(plan_text, str) and plan_text
+                        else []
+                    ),
+                }
+            )
+            event_type = "plan.updated"
+        else:
+            name = (
+                item.get("tool")
+                or item.get("name")
+                or item.get("command")
+                or provider_type
+            )
+            title = name
+            if provider_type == "mcpToolCall" and item.get("server"):
+                title = f"{item['server']} · {name}"
+            elif provider_type == "webSearch" and item.get("query"):
+                title = f"Search: {item['query']}"
+            elif provider_type == "imageView" and item.get("path"):
+                title = f"View image: {item['path']}"
+            output_value = (
+                item.get("output")
+                or item.get("result")
+                or item.get("aggregatedOutput")
+                or item.get("contentItems")
+                or item.get("results")
+            )
+            error_value = item.get("error")
+            payload.update(
+                {
+                    "kind": normalized_tool_kind(provider_type, name),
+                    "title": str(title),
+                    "status": normalized_tool_status(item.get("status"), completed),
+                    "input": sanitize_json(
+                        item.get("input")
+                        or item.get("arguments")
+                        or item.get("command")
+                        or item.get("prompt")
+                        or item.get("query")
+                    ),
+                    "output": sanitize_json(output_value),
+                    "error": sanitize_json(error_value),
+                    "exitCode": item.get("exitCode"),
+                    "durationMs": item.get("durationMs"),
+                }
+            )
+            event_type = f"tool.{event_suffix}"
+        return {"eventType": event_type, "payload": payload}
+
+    async def history(
+        self, before_item_id: str | None, limit: int
+    ) -> tuple[list[dict[str, Any]], bool]:
+        if not self.thread_id:
+            return [], False
+        result = await self.request(
+            "thread/read",
+            {"threadId": self.thread_id, "includeTurns": True},
+        )
+        thread = result.get("thread")
+        turns = thread.get("turns") if isinstance(thread, dict) else None
+        if not isinstance(turns, list):
+            return [], False
+        mapped: list[dict[str, Any]] = []
+        for turn in turns:
+            if not isinstance(turn, dict):
+                continue
+            turn_id = turn.get("id")
+            for item in turn.get("items", []):
+                if not isinstance(item, dict):
+                    continue
+                normalized = self.map_item(item, completed=True)
+                mapped.append(
+                    {
+                        "type": normalized["eventType"],
+                        "turnId": turn_id,
+                        "itemId": item.get("id") or new_uuid(),
+                        "payload": normalized["payload"],
+                    }
+                )
+        if before_item_id:
+            before_index = next(
+                (
+                    index
+                    for index, item in enumerate(mapped)
+                    if item.get("itemId") == before_item_id
+                ),
+                len(mapped),
+            )
+            mapped = mapped[:before_index]
+        has_older = len(mapped) > limit
+        return mapped[-limit:], has_older
+
+    async def start_turn(self, command: dict[str, Any]) -> dict[str, Any]:
+        if self.active_turn:
+            raise ChatError("turnActive", "A provider turn is already active.")
+        payload = command["payload"]
+        inputs: list[dict[str, Any]] = [{"type": "text", "text": payload["text"]}]
+        for attachment in payload.get("attachments", []):
+            inputs.append({"type": "localImage", "path": attachment["path"]})
+        params: dict[str, Any] = {
+            "threadId": self.thread_id,
+            "input": inputs,
+            "cwd": self.project_directory,
+            "clientUserMessageId": command["requestId"],
+        }
+        options = {**self.launch_options, **payload.get("options", {})}
+        for source, destination in (("model", "model"), ("effort", "effort")):
+            if options.get(source) is not None:
+                params[destination] = options[source]
+        if options.get("sandbox") is not None:
+            params["sandboxPolicy"] = codex_sandbox_policy(options["sandbox"])
+        if options.get("fastMode"):
+            params["serviceTier"] = "fast"
+        if options.get("approvalPolicy") is not None:
+            params["approvalPolicy"] = options["approvalPolicy"]
+        if options.get("fullAccess"):
+            params["approvalPolicy"] = "never"
+            params["sandboxPolicy"] = codex_sandbox_policy(
+                "danger-full-access"
+            )
+        try:
+            result = await self.request("turn/start", params)
+            turn = result.get("turn")
+            turn_id = (
+                turn.get("id") if isinstance(turn, dict) else result.get("turnId")
+            )
+        except ChatError as error:
+            if error.code != "providerDisconnected":
+                raise
+            try:
+                await asyncio.wait_for(
+                    self.connection_ready.wait(),
+                    PROVIDER_RECONNECT_WAIT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                raise error
+            reconciled = (
+                self._turn_for_client_command(
+                    self.last_reconciled_thread, command["requestId"]
+                )
+                if self.last_reconciled_thread
+                else None
+            )
+            turn_id = reconciled.get("id") if reconciled else None
+            if not isinstance(turn_id, str):
+                raise error
+        self.active_turn = canonical_uuid(turn_id, "turn ID")
+        return {"turnId": self.active_turn, "clientUserMessageId": command["requestId"]}
+
+    async def interrupt(self, turn_id: str) -> None:
+        if self.active_turn != turn_id:
+            raise ChatError("staleTurn", "The requested turn is no longer active.")
+        await self.request(
+            "turn/interrupt", {"threadId": self.thread_id, "turnId": turn_id}
+        )
+
+    def _interaction_for_payload(
+        self, payload: dict[str, Any], expected_kind: str
+    ) -> tuple[str, dict[str, Any]]:
+        display_id = canonical_uuid(payload.get("displayId"), "interaction ID")
+        interaction = self.interactions.get(display_id)
+        if (
+            not interaction
+            or interaction["kind"] != expected_kind
+            or payload.get(
+                "connectionGeneration",
+                payload.get("providerConnectionGeneration"),
+            )
+            != self.connection_generation
+            or payload.get("providerRequestId") != interaction["requestId"]
+        ):
+            raise ChatError("staleInteraction", "The interaction is no longer active.")
+        return display_id, interaction
+
+    async def _respond_interaction(
+        self, display_id: str, interaction: dict[str, Any], result: dict[str, Any]
+    ) -> None:
+        await asyncio.to_thread(
+            self.websocket.send_json,
+            {"id": interaction["requestId"], "result": result},
+        )
+        self.interactions.pop(display_id, None)
+
+    async def respond_approval(self, payload: dict[str, Any]) -> None:
+        decision = payload.get("decision")
+        if decision not in {"allow", "allowForSession", "deny", "cancel"}:
+            raise ChatError("invalidDecision", "The approval decision is invalid.")
+        display_id, interaction = self._interaction_for_payload(payload, "approval")
+        method = interaction.get("method")
+        if method in {
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+        }:
+            provider_decision = {
+                "allow": "accept",
+                "allowForSession": "acceptForSession",
+                "deny": "decline",
+                "cancel": "cancel",
+            }[decision]
+            result: dict[str, Any] = {"decision": provider_decision}
+        elif method == "item/permissions/requestApproval":
+            requested = interaction.get("params", {}).get("permissions")
+            permission_changes = payload.get(
+                "permissionUpdates", payload.get("permissionChanges")
+            )
+            if decision in {"allow", "allowForSession"}:
+                permissions = (
+                    permission_changes
+                    if isinstance(permission_changes, dict)
+                    else requested
+                )
+                if not isinstance(permissions, dict):
+                    permissions = {}
+            else:
+                permissions = {}
+            result = {
+                "permissions": sanitize_json(permissions),
+                "scope": "session" if decision == "allowForSession" else "turn",
+            }
+        elif method in {"execCommandApproval", "applyPatchApproval"}:
+            provider_decision = {
+                "allow": "approved",
+                "allowForSession": "approved_for_session",
+                "deny": {
+                    "denied": {"rejection": "Denied in Terminal Relay."}
+                },
+                "cancel": "abort",
+            }[decision]
+            result = {"decision": provider_decision}
+        else:
+            raise ChatError(
+                "unsupportedInteraction",
+                "This approval requires the terminal fallback.",
+            )
+        await self._respond_interaction(
+            display_id,
+            interaction,
+            result,
+        )
+
+    async def respond_question(self, payload: dict[str, Any]) -> None:
+        display_id, interaction = self._interaction_for_payload(payload, "question")
+        answers = canonical_client_answers(payload.get("answers"))
+        method = interaction.get("method")
+        if method == "item/tool/requestUserInput":
+            provider_answers: dict[str, dict[str, list[str]]] = {}
+            expected_ids = {
+                question.get("id")
+                for question in interaction.get("questions", [])
+                if isinstance(question, dict)
+            }
+            for answer in answers:
+                question_id = answer["questionID"]
+                if question_id not in expected_ids:
+                    raise ChatError(
+                        "invalidAnswer", "The question answer is invalid."
+                    )
+                values = list(answer["selectedOptionIDs"])
+                if answer["text"] is not None:
+                    values.append(answer["text"])
+                provider_answers[question_id] = {"answers": values}
+            if provider_answers.keys() != expected_ids:
+                raise ChatError(
+                    "invalidAnswer", "Every provider question requires an answer."
+                )
+            result: dict[str, Any] = {"answers": provider_answers}
+        elif method == "mcpServer/elicitation/request":
+            content: dict[str, Any] = {}
+            for answer in answers:
+                values = list(answer["selectedOptionIDs"])
+                if answer["text"] is not None:
+                    content[answer["questionID"]] = answer["text"]
+                elif len(values) == 1:
+                    content[answer["questionID"]] = values[0]
+                else:
+                    content[answer["questionID"]] = values
+            result = {"action": "accept", "content": content}
+        else:
+            raise ChatError(
+                "unsupportedInteraction",
+                "This question requires the terminal fallback.",
+            )
+        await self._respond_interaction(
+            display_id, interaction, sanitize_json(result)
+        )
+
+    async def close(self) -> None:
+        self.closing = True
+        if self.thread_id and self.connection_ready.is_set():
+            with contextlib.suppress(Exception):
+                await self.request(
+                    "thread/unsubscribe", {"threadId": self.thread_id}, timeout=5
+                )
+        if self.reader_task:
+            self.reader_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.reader_task
+        await self._expire_interactions()
+        await asyncio.to_thread(self.websocket.close)
+
+
+class ClaudeAdapter(ProviderAdapter):
+    """Official Claude Agent SDK adapter kept behind the worker SDK venv."""
+
+    def __init__(self, *args: Any):
+        super().__init__(*args)
+        self.client: Any = None
+        self.receive_task: asyncio.Task[None] | None = None
+        self.active_turn: str | None = None
+        self.pending_callbacks: dict[str, tuple[asyncio.Future[Any], dict[str, Any]]] = {}
+        self.partial_blocks: dict[tuple[str, int], str] = {}
+        self.tool_items: dict[str, str] = {}
+        self._sdk: Any = None
+        self.client_factory: Callable[[Any], Any] | None = None
+        self.options_kwargs: dict[str, Any] = {}
+        self.connection_ready = asyncio.Event()
+        self.closing = False
+
+    def _load_sdk(self) -> Any:
+        try:
+            import claude_agent_sdk as sdk
+        except (ImportError, OSError) as error:
+            raise ChatError(
+                "providerUnavailable",
+                "Claude structured chat is unavailable.",
+                exit_code=69,
+            ) from error
+        required = (
+            "ClaudeSDKClient",
+            "ClaudeAgentOptions",
+            "get_session_info",
+            "get_session_messages",
+        )
+        if any(not hasattr(sdk, name) for name in required):
+            raise ChatError(
+                "unsupportedProvider",
+                "The Claude Agent SDK is unsupported.",
+                exit_code=69,
+            )
+        try:
+            history_parameters = inspect.signature(
+                sdk.get_session_messages
+            ).parameters
+        except (TypeError, ValueError) as error:
+            raise ChatError(
+                "unsupportedProvider",
+                "The Claude Agent SDK history surface is unsupported.",
+                exit_code=69,
+            ) from error
+        if not (
+            "limit" in history_parameters
+            and "offset" in history_parameters
+        ) and not any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in history_parameters.values()
+        ):
+            raise ChatError(
+                "unsupportedProvider",
+                "The Claude Agent SDK history paging surface is unsupported.",
+                exit_code=69,
+            )
+        return sdk
+
+    async def start(self, emit: Callable[..., Awaitable[dict[str, Any]]]) -> str:
+        self.emit = emit
+        self._sdk = self._load_sdk()
+        new_session = bool(self.launch_options.pop("_newSession", False))
+        if self.thread_id and not new_session:
+            info = self._sdk.get_session_info(
+                self.thread_id, directory=self.project_directory
+            )
+            if info is None:
+                raise ChatError("notFound", "The Claude session was not found.", exit_code=66)
+        else:
+            self.thread_id = new_uuid()
+        options_kwargs: dict[str, Any] = {
+            "cwd": self.project_directory,
+            "include_partial_messages": True,
+            "replay_user_messages": True,
+            "can_use_tool": self._can_use_tool,
+        }
+        if new_session:
+            options_kwargs["extra_args"] = {"session-id": self.thread_id}
+        else:
+            options_kwargs["resume"] = self.thread_id
+        if self.launch_options.get("model"):
+            options_kwargs["model"] = self.launch_options["model"]
+        permission = self.launch_options.get("permissionMode")
+        if permission:
+            options_kwargs["permission_mode"] = permission
+        self.options_kwargs = options_kwargs
+        if self.client_factory is None:
+            self.client_factory = self._sdk.ClaudeSDKClient
+        try:
+            self.client = await self._connect_client(reconnect=False)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            raise ChatError(
+                "providerUnavailable", "Claude structured chat is unavailable."
+            ) from error
+        self.connection_ready.set()
+        self.receive_task = asyncio.create_task(self._receive_loop())
+        return canonical_uuid(self.thread_id, "provider thread ID")
+
+    async def _connect_client(self, reconnect: bool) -> Any:
+        kwargs = dict(self.options_kwargs)
+        if reconnect:
+            kwargs.pop("extra_args", None)
+            kwargs["resume"] = self.thread_id
+        options = self._sdk.ClaudeAgentOptions(**kwargs)
+        assert self.client_factory is not None
+        client = self.client_factory(options)
+        await client.connect()
+        return client
+
+    async def _can_use_tool(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        context: Any,
+    ) -> Any:
+        assert self.emit is not None
+        tool_use_id = (
+            getattr(context, "tool_use_id", None)
+            or tool_input.get("tool_use_id")
+            or new_uuid()
+        )
+        agent_id = getattr(context, "agent_id", None) or "main"
+        display_id = new_uuid()
+        future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        kind = "question" if tool_name == "AskUserQuestion" else "approval"
+        interaction: dict[str, Any] = {
+            "displayId": display_id,
+            "id": display_id,
+            "providerConnectionGeneration": self.connection_generation,
+            "providerRequestId": str(tool_use_id),
+            "providerRequestID": str(tool_use_id),
+            "agentId": str(agent_id),
+            "toolUseId": str(tool_use_id),
+            "toolName": tool_name,
+            "input": sanitize_json(tool_input),
+            "status": "pending",
+        }
+        if kind == "question":
+            questions = canonical_questions(tool_input.get("questions"))
+            if not questions:
+                questions = canonical_questions(tool_input)
+            if not questions:
+                await self.emit(
+                    "session.terminalFallbackRequired",
+                    {
+                        "reason": "unsupportedInteraction",
+                        "providerMethod": "AskUserQuestion",
+                    },
+                )
+                return self._permission_deny(
+                    "This question requires the terminal fallback."
+                )
+            first_question = questions[0]
+            interaction.update(
+                {
+                    "prompt": (
+                        "Input requested"
+                        if len(questions) == 1
+                        else f"{len(questions)} answers needed"
+                    ),
+                    "questions": questions,
+                    "question": first_question["prompt"],
+                    "kind": first_question["kind"],
+                    "options": first_question["options"],
+                    "allowsOther": first_question["allowsOther"],
+                }
+            )
+        else:
+            interaction.update(
+                {
+                    "title": f"Allow {tool_name}?",
+                    "reason": None,
+                    "context": display_string(tool_input),
+                    "decisions": approval_decisions(),
+                }
+            )
+        self.pending_callbacks[display_id] = (future, interaction | {"kind": kind})
+        await self.emit(f"{kind}.requested", interaction, item_id=display_id)
+        try:
+            return await asyncio.wait_for(future, INTERACTION_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            await self.emit(
+                f"{kind}.expired",
+                {"displayId": display_id, "reason": "timeout"},
+                item_id=display_id,
+            )
+            return self._permission_deny("The request timed out.")
+        finally:
+            self.pending_callbacks.pop(display_id, None)
+
+    def _permission_allow(
+        self, updated_input: dict[str, Any] | None = None, updates: list[Any] | None = None
+    ) -> Any:
+        permission_result = getattr(self._sdk, "PermissionResultAllow", None)
+        kwargs = {
+            "updated_input": updated_input,
+            "updated_permissions": updates or [],
+        }
+        if permission_result:
+            return permission_result(**kwargs)
+        return {"behavior": "allow", **kwargs}
+
+    def _permission_deny(self, message: str) -> Any:
+        permission_result = getattr(self._sdk, "PermissionResultDeny", None)
+        if permission_result:
+            return permission_result(message=message)
+        return {"behavior": "deny", "message": message}
+
+    async def _receive_loop(self) -> None:
+        while not self.closing:
+            try:
+                async for message in self.client.receive_messages():
+                    await self._map_message(message)
+                if not self.closing:
+                    raise EOFError
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if self.closing:
+                    return
+                self.connection_ready.clear()
+                await self._expire_pending_callbacks(
+                    "providerConnectionEnded",
+                    "The Claude connection ended.",
+                )
+                if self.emit:
+                    await self.emit(
+                        "session.state",
+                        {
+                            "connectionState": "offlineAgentRunning",
+                            "reason": "providerDisconnected",
+                        },
+                    )
+                if not await self._reconnect():
+                    if self.emit:
+                        await self.emit(
+                            "session.state",
+                            {
+                                "connectionState": "offlineAgentRunning",
+                                "reason": "providerReconnectFailed",
+                            },
+                        )
+                    return
+
+    async def _expire_pending_callbacks(
+        self, reason: str, denial_message: str
+    ) -> None:
+        for future, interaction in list(self.pending_callbacks.values()):
+            if not future.done():
+                future.set_result(self._permission_deny(denial_message))
+            if self.emit:
+                await self.emit(
+                    f"{interaction['kind']}.expired",
+                    {
+                        "displayId": interaction["displayId"],
+                        "reason": reason,
+                    },
+                    item_id=interaction["displayId"],
+                )
+        self.pending_callbacks.clear()
+
+    async def _reconnect(self) -> bool:
+        prior_active_turn = self.active_turn
+        prior_client = self.client
+        with contextlib.suppress(Exception):
+            await prior_client.disconnect()
+        for delay in PROVIDER_RECONNECT_DELAYS:
+            if self.closing:
+                return False
+            if delay:
+                await asyncio.sleep(delay)
+            candidate: Any = None
+            try:
+                candidate = await self._connect_client(reconnect=True)
+                self.client = candidate
+                self.connection_generation = new_uuid()
+                self.partial_blocks.clear()
+                self.tool_items.clear()
+                history, _ = await self.history(None, MAX_HISTORY_ITEMS)
+                if prior_active_turn:
+                    latest_user = next(
+                        (
+                            item
+                            for item in reversed(history)
+                            if item.get("type") == "message.completed"
+                            and item.get("payload", {}).get("role") == "user"
+                        ),
+                        None,
+                    )
+                    if latest_user:
+                        latest_user["turnId"] = prior_active_turn
+                        latest_user["payload"][
+                            "clientUserMessageId"
+                        ] = prior_active_turn
+                if self.emit:
+                    for item in history:
+                        await self.emit(
+                            item["type"],
+                            item["payload"],
+                            turn_id=item.get("turnId"),
+                            item_id=item.get("itemId"),
+                        )
+                    if prior_active_turn:
+                        await self.emit(
+                            "turn.failed",
+                            {
+                                "status": "failed",
+                                "message": (
+                                    "Claude reconnected, but the interrupted "
+                                    "turn could not be resumed safely."
+                                ),
+                                "recoverable": True,
+                                "reconciled": True,
+                            },
+                            turn_id=prior_active_turn,
+                        )
+                self.active_turn = None
+                self.connection_ready.set()
+                if self.emit:
+                    await self.emit(
+                        "session.state",
+                        {
+                            "connectionState": "streaming",
+                            "reason": "providerReconnected",
+                        },
+                    )
+                return True
+            except asyncio.CancelledError:
+                if candidate is not None:
+                    with contextlib.suppress(Exception):
+                        await candidate.disconnect()
+                raise
+            except Exception:
+                if candidate is not None:
+                    with contextlib.suppress(Exception):
+                        await candidate.disconnect()
+        return False
+
+    async def _map_message(self, message: Any) -> None:
+        if not self.emit:
+            return
+        value = sanitize_json(message)
+        class_name = type(message).__name__
+        message_uuid = (
+            value.get("uuid") if isinstance(value, dict) else None
+        ) or (
+            value.get("session_id") if isinstance(value, dict) else None
+        ) or new_uuid()
+        if class_name == "StreamEvent" or (
+            isinstance(value, dict) and "event" in value
+        ):
+            event = value.get("event", value)
+            event_type = event.get("type") if isinstance(event, dict) else None
+            index = event.get("index", 0) if isinstance(event, dict) else 0
+            delta = event.get("delta", {}) if isinstance(event, dict) else {}
+            text = delta.get("text") if isinstance(delta, dict) else None
+            if isinstance(text, str):
+                key = (str(message_uuid), int(index) if isinstance(index, int) else 0)
+                self.partial_blocks[key] = self.partial_blocks.get(key, "") + text
+                await self.emit(
+                    "message.delta",
+                    {"role": "assistant", "text": text, "blockIndex": key[1]},
+                    turn_id=self.active_turn,
+                    item_id=f"{message_uuid}:{key[1]}",
+                )
+            return
+        if class_name == "AssistantMessage":
+            await self._map_claude_content(value, "assistant", str(message_uuid))
+            return
+        if class_name == "UserMessage":
+            await self._map_claude_content(
+                value,
+                "user",
+                str(message_uuid),
+                client_user_message_id=self.active_turn,
+            )
+            return
+        if class_name == "ResultMessage":
+            status = "failed" if value.get("is_error") else "completed"
+            event_type = "turn.failed" if status == "failed" else "turn.completed"
+            await self._expire_pending_callbacks(
+                "turnEnded", "The Claude turn ended."
+            )
+            usage = normalized_usage(value.get("usage"))
+            if usage:
+                await self.emit(
+                    "usage.updated", usage, turn_id=self.active_turn
+                )
+            await self.emit(
+                event_type,
+                {
+                    "status": status,
+                    "message": (
+                        "Claude could not complete this turn."
+                        if status == "failed"
+                        else None
+                    ),
+                },
+                turn_id=self.active_turn,
+            )
+            self.active_turn = None
+            return
+        await self.emit(
+            "tool.completed",
+            {
+                "kind": normalized_tool_kind(class_name),
+                "title": class_name,
+                "output": display_string(value),
+                "status": "completed",
+            },
+            turn_id=self.active_turn,
+            item_id=str(message_uuid),
+        )
+
+    async def _map_claude_content(
+        self,
+        value: dict[str, Any],
+        role: str,
+        message_uuid: str,
+        client_user_message_id: str | None = None,
+    ) -> None:
+        assert self.emit is not None
+        content = value.get("content", [])
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        if not isinstance(content, list):
+            content = []
+        for index, block in enumerate(content):
+            if not isinstance(block, dict):
+                continue
+            item_id = f"{message_uuid}:{index}"
+            block_type = block.get("type", "generic")
+            if block_type in {"text", "thinking"}:
+                event_prefix = "reasoning" if block_type == "thinking" else "message"
+                text, truncated, original = bounded_text(
+                    block.get("text") or block.get("thinking")
+                )
+                payload: dict[str, Any] = {
+                    "role": role,
+                    "text": text,
+                    "blockIndex": index,
+                    "truncated": truncated,
+                    "originalByteCount": original,
+                    "status": "completed",
+                }
+                if role == "user" and client_user_message_id:
+                    payload["clientUserMessageId"] = client_user_message_id
+                await self.emit(
+                    f"{event_prefix}.completed",
+                    payload,
+                    turn_id=self.active_turn,
+                    item_id=item_id,
+                )
+            elif block_type == "tool_use":
+                tool_use_id = block.get("id")
+                if isinstance(tool_use_id, str):
+                    self.tool_items[tool_use_id] = item_id
+                tool_name = str(block.get("name") or "Tool")
+                await self.emit(
+                    "tool.started",
+                    {
+                        "kind": normalized_tool_kind(
+                            str(block_type), tool_name
+                        ),
+                        "title": tool_name,
+                        "input": sanitize_json(block.get("input")),
+                        "toolUseId": tool_use_id,
+                        "status": "running",
+                    },
+                    turn_id=self.active_turn,
+                    item_id=item_id,
+                )
+            elif block_type == "tool_result":
+                tool_use_id = block.get("tool_use_id")
+                result_item_id = (
+                    self.tool_items.get(tool_use_id, item_id)
+                    if isinstance(tool_use_id, str)
+                    else item_id
+                )
+                await self.emit(
+                    "tool.completed",
+                    {
+                        "kind": "generic",
+                        "title": "Tool result",
+                        "output": sanitize_json(block.get("content")),
+                        "toolUseId": tool_use_id,
+                        "status": "failed" if block.get("is_error") else "completed",
+                    },
+                    turn_id=self.active_turn,
+                    item_id=result_item_id,
+                )
+                if isinstance(tool_use_id, str):
+                    self.tool_items.pop(tool_use_id, None)
+            else:
+                await self.emit(
+                    "tool.completed",
+                    {
+                        "kind": normalized_tool_kind(str(block_type)),
+                        "title": str(block_type),
+                        "output": display_string(block),
+                        "status": "completed",
+                    },
+                    turn_id=self.active_turn,
+                    item_id=item_id,
+                )
+
+    def _claude_history_records(
+        self,
+        message: Any,
+        result_by_id: collections.OrderedDict[str, dict[str, Any]],
+        tool_items: collections.OrderedDict[str, str],
+    ) -> list[dict[str, Any]]:
+        value = sanitize_json(message)
+        if not isinstance(value, dict):
+            return []
+        message_uuid = value.get("uuid")
+        if not isinstance(message_uuid, str):
+            return []
+        message_value = value.get("message")
+        if not isinstance(message_value, dict):
+            message_value = value
+        role = str(
+            value.get("type")
+            or message_value.get("role")
+            or value.get("role")
+            or type(message).__name__.replace("Message", "").lower()
+        )
+        content = message_value.get("content")
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        if not isinstance(content, list):
+            content = []
+        records: list[dict[str, Any]] = []
+        for index, block in enumerate(content):
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            item_id = f"{message_uuid}:{index}"
+            if block_type in {"text", "thinking"}:
+                text, truncated, original = bounded_text(
+                    block.get("text") or block.get("thinking")
+                )
+                record = {
+                    "type": (
+                        "reasoning.completed"
+                        if block_type == "thinking"
+                        else "message.completed"
+                    ),
+                    "turnId": message_uuid if role == "user" else None,
+                    "itemId": item_id,
+                    "payload": {
+                        "role": (
+                            role if role in {"user", "assistant"} else "assistant"
+                        ),
+                        "text": text,
+                        "status": "completed",
+                        "blockIndex": index,
+                        "truncated": truncated,
+                        "originalByteCount": original,
+                    },
+                }
+                records.append(record)
+                result_by_id[item_id] = record
+            elif block_type == "tool_use":
+                tool_use_id = block.get("id")
+                if isinstance(tool_use_id, str):
+                    tool_items[tool_use_id] = item_id
+                record = {
+                    "type": "tool.completed",
+                    "turnId": None,
+                    "itemId": item_id,
+                    "payload": {
+                        "kind": normalized_tool_kind(
+                            "tool_use", block.get("name")
+                        ),
+                        "title": str(block.get("name") or "Tool"),
+                        "input": sanitize_json(block.get("input")),
+                        "status": "completed",
+                    },
+                }
+                records.append(record)
+                result_by_id[item_id] = record
+            elif block_type == "tool_result":
+                tool_use_id = block.get("tool_use_id")
+                source_item_id = (
+                    tool_items.get(tool_use_id)
+                    if isinstance(tool_use_id, str)
+                    else None
+                )
+                record = (
+                    result_by_id.get(source_item_id) if source_item_id else None
+                )
+                if record:
+                    record["payload"]["output"] = sanitize_json(
+                        block.get("content")
+                    )
+                    record["payload"]["status"] = (
+                        "failed" if block.get("is_error") else "completed"
+                    )
+                else:
+                    records.append(
+                        {
+                            "type": "tool.completed",
+                            "turnId": None,
+                            "itemId": item_id,
+                            "payload": {
+                                "kind": "generic",
+                                "title": "Tool result",
+                                "output": sanitize_json(block.get("content")),
+                                "toolUseId": tool_use_id,
+                                "status": (
+                                    "failed"
+                                    if block.get("is_error")
+                                    else "completed"
+                                ),
+                            },
+                        }
+                    )
+        for bounded in (result_by_id, tool_items):
+            while len(bounded) > 512:
+                bounded.popitem(last=False)
+        return records
+
+    async def history(
+        self, before_item_id: str | None, limit: int
+    ) -> tuple[list[dict[str, Any]], bool]:
+        get_messages = getattr(self._sdk, "get_session_messages", None)
+        if not callable(get_messages) or not self.thread_id:
+            return [], False
+        retained: collections.deque[dict[str, Any]] = collections.deque(
+            maxlen=limit + 1
+        )
+        result_by_id: collections.OrderedDict[
+            str, dict[str, Any]
+        ] = collections.OrderedDict()
+        tool_items: collections.OrderedDict[str, str] = collections.OrderedDict()
+        offset = 0
+        record_count = 0
+        reached_before = False
+        while not reached_before:
+            try:
+                messages = await asyncio.to_thread(
+                    get_messages,
+                    self.thread_id,
+                    directory=self.project_directory,
+                    limit=CLAUDE_HISTORY_PAGE_MESSAGES,
+                    offset=offset,
+                )
+                if inspect.isawaitable(messages):
+                    messages = await messages
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                raise ChatError(
+                    "providerUnavailable", "Claude history is unavailable."
+                ) from error
+            if not isinstance(messages, list):
+                raise ChatError(
+                    "providerProtocol", "Claude history is unsupported."
+                )
+            for message in messages:
+                records = self._claude_history_records(
+                    message, result_by_id, tool_items
+                )
+                for record in records:
+                    if (
+                        before_item_id is not None
+                        and record.get("itemId") == before_item_id
+                    ):
+                        reached_before = True
+                        break
+                    retained.append(record)
+                    record_count += 1
+                if reached_before:
+                    break
+            if reached_before or len(messages) < CLAUDE_HISTORY_PAGE_MESSAGES:
+                break
+            offset += len(messages)
+        has_older = record_count > limit
+        return list(retained)[-limit:], has_older
+
+    async def start_turn(self, command: dict[str, Any]) -> dict[str, Any]:
+        if self.active_turn:
+            raise ChatError("turnActive", "A provider turn is already active.")
+        if not self.connection_ready.is_set():
+            try:
+                await asyncio.wait_for(
+                    self.connection_ready.wait(),
+                    PROVIDER_RECONNECT_WAIT_SECONDS,
+                )
+            except asyncio.TimeoutError as error:
+                raise ChatError(
+                    "providerDisconnected", "Claude is reconnecting."
+                ) from error
+        self.active_turn = command["requestId"]
+        payload = command["payload"]
+        prompt = payload["text"]
+        attachments = payload.get("attachments", [])
+        if attachments:
+            if not prompt.strip():
+                prompt = (
+                    "Please review the attached image."
+                    if len(attachments) == 1
+                    else "Please review the attached images."
+                )
+            prompt += (
+                "\n\nAttached image:\n"
+                if len(attachments) == 1
+                else "\n\nAttached images:\n"
+            )
+            prompt += "\n".join(
+                f"- `{attachment['path']}`" for attachment in attachments
+            )
+        try:
+            await self.client.query(prompt)
+        except Exception as error:
+            self.active_turn = None
+            raise ChatError(
+                "providerUnavailable", "Claude could not start the turn."
+            ) from error
+        assert self.emit is not None
+        await self.emit(
+            "turn.started",
+            {"status": "streaming"},
+            turn_id=self.active_turn,
+        )
+        return {
+            "turnId": self.active_turn,
+            "clientUserMessageId": command["requestId"],
+        }
+
+    async def interrupt(self, turn_id: str) -> None:
+        if self.active_turn != turn_id:
+            raise ChatError("staleTurn", "The requested turn is no longer active.")
+        if not self.connection_ready.is_set():
+            raise ChatError("providerDisconnected", "Claude is reconnecting.")
+        await self.client.interrupt()
+        await self._expire_pending_callbacks(
+            "interrupted", "The Claude turn was interrupted."
+        )
+
+    async def respond_approval(self, payload: dict[str, Any]) -> None:
+        display_id = canonical_uuid(payload.get("displayId"), "interaction ID")
+        pending = self.pending_callbacks.get(display_id)
+        if (
+            not pending
+            or pending[1]["kind"] != "approval"
+            or payload.get(
+                "connectionGeneration",
+                payload.get("providerConnectionGeneration"),
+            )
+            != self.connection_generation
+            or payload.get("providerRequestId") != pending[1]["providerRequestId"]
+        ):
+            raise ChatError("staleInteraction", "The approval request is no longer active.")
+        future, _ = pending
+        if payload.get("decision") in {"allow", "allowForSession"}:
+            permission_updates = sanitize_json(
+                payload.get(
+                    "permissionUpdates",
+                    payload.get("permissionChanges", []),
+                )
+            )
+            if not isinstance(permission_updates, list):
+                permission_updates = []
+            future.set_result(
+                self._permission_allow(
+                    updates=permission_updates
+                )
+            )
+        elif payload.get("decision") in {"deny", "cancel"}:
+            future.set_result(self._permission_deny("Denied in Terminal Relay."))
+        else:
+            raise ChatError("invalidDecision", "The approval decision is invalid.")
+
+    async def respond_question(self, payload: dict[str, Any]) -> None:
+        display_id = canonical_uuid(payload.get("displayId"), "interaction ID")
+        pending = self.pending_callbacks.get(display_id)
+        if (
+            not pending
+            or pending[1]["kind"] != "question"
+            or payload.get(
+                "connectionGeneration",
+                payload.get("providerConnectionGeneration"),
+            )
+            != self.connection_generation
+            or payload.get("providerRequestId") != pending[1]["providerRequestId"]
+        ):
+            raise ChatError("staleInteraction", "The question is no longer active.")
+        future, interaction = pending
+        answers = canonical_client_answers(payload.get("answers"))
+        expected = {
+            question.get("id"): question
+            for question in interaction.get("questions", [])
+            if isinstance(question, dict) and isinstance(question.get("id"), str)
+        }
+        if {answer["questionID"] for answer in answers} != set(expected):
+            raise ChatError("invalidAnswer", "Every provider question requires an answer.")
+        provider_answers: dict[str, str] = {}
+        for answer in answers:
+            question = expected[answer["questionID"]]
+            values = list(answer["selectedOptionIDs"])
+            if answer["text"] is not None:
+                values.append(answer["text"])
+            provider_answers[question["prompt"]] = ", ".join(values)
+        updated_input = dict(interaction.get("input") or {})
+        updated_input["answers"] = provider_answers
+        future.set_result(self._permission_allow(updated_input=updated_input))
+
+    async def close(self) -> None:
+        self.closing = True
+        await self._expire_pending_callbacks(
+            "sessionEnded", "The chat session ended."
+        )
+        if self.receive_task:
+            self.receive_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.receive_task
+        if self.client:
+            with contextlib.suppress(Exception):
+                await self.client.disconnect()
+
+
+class ChatBroker:
+    MUTATION_TYPES = {
+        "turn.start",
+        "turn.interrupt",
+        "approval.respond",
+        "question.respond",
+        "session.stop",
+    }
+
+    def __init__(
+        self,
+        provider_name: str,
+        repository: str,
+        project_directory: str,
+        runtime_directory: str,
+        relay_id: str,
+        provider: ProviderAdapter,
+        launch_options: dict[str, Any],
+    ):
+        self.provider_name = provider_name
+        self.repository = repository
+        self.project_directory = project_directory
+        self.runtime_directory = runtime_directory
+        self.relay_id = relay_id
+        self.provider = provider
+        self.launch_options = launch_options
+        self.provider_thread_id: str | None = provider.thread_id
+        self.snapshot_generation = new_uuid()
+        self.sequence = 0
+        self.replay: collections.deque[tuple[int, bytes]] = collections.deque()
+        self.replay_bytes = 0
+        self.clients: set[ClientConnection] = set()
+        self.items: collections.OrderedDict[str, dict[str, Any]] = collections.OrderedDict()
+        self.approvals: dict[str, dict[str, Any]] = {}
+        self.questions: dict[str, dict[str, Any]] = {}
+        self.usage: dict[str, Any] | None = None
+        self.connection_state = "connecting"
+        self.turn_state = "idle"
+        self.active_turn_id: str | None = None
+        self.has_older_history = False
+        self.oldest_item_id: str | None = None
+        self.command_results: collections.OrderedDict[
+            str, tuple[str, str, dict[str, Any]]
+        ] = collections.OrderedDict()
+        self.command_lock = asyncio.Lock()
+        self.stop_event = asyncio.Event()
+        self.explicit_stop = False
+        self.server: asyncio.AbstractServer | None = None
+        self.heartbeat_task: asyncio.Task[None] | None = None
+        self.last_emit = time.monotonic()
+        self.session_directory = os.path.join(runtime_directory, f"chat-{relay_id}")
+        self.socket_path = os.path.join(self.session_directory, SOCKET_NAME)
+        self.state_path = os.path.join(self.session_directory, STATE_NAME)
+        account_home = pwd.getpwuid(os.getuid()).pw_dir
+        self.attachment_root = os.path.realpath(
+            os.path.join(
+                account_home,
+                ".terminal-relay",
+                "attachments",
+                relay_id,
+            )
+        )
+        self.provider_lock_descriptor: int | None = None
+        self.rebuilding_snapshot = False
+        self.buffered_provider_events: list[
+            tuple[str, dict[str, Any], str | None, str | None, bool]
+        ] = []
+
+    def event(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        turn_id: str | None = None,
+        item_id: str | None = None,
+    ) -> dict[str, Any]:
+        self.sequence += 1
+        return {
+            "v": PROTOCOL_VERSION,
+            "type": event_type,
+            "eventId": new_uuid(),
+            "relayId": self.relay_id,
+            "provider": self.provider_name,
+            "providerThreadId": self.provider_thread_id,
+            "snapshotGeneration": self.snapshot_generation,
+            "seq": self.sequence,
+            "occurredAt": now_ms(),
+            "turnId": turn_id,
+            "itemId": item_id,
+            "payload": payload,
+        }
+
+    def control_event(
+        self, event_type: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Create an attachment-local pre-sequence control record."""
+        return {
+            "v": PROTOCOL_VERSION,
+            "type": event_type,
+            "eventId": new_uuid(),
+            "relayId": self.relay_id,
+            "provider": self.provider_name,
+            "providerThreadId": self.provider_thread_id,
+            "snapshotGeneration": self.snapshot_generation,
+            "seq": 0,
+            "occurredAt": now_ms(),
+            "turnId": None,
+            "itemId": None,
+            "payload": sanitize_json(payload),
+        }
+
+    async def emit(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        turn_id: str | None = None,
+        item_id: str | None = None,
+        remember: bool = True,
+    ) -> dict[str, Any]:
+        if self.rebuilding_snapshot:
+            self.buffered_provider_events.append(
+                (
+                    event_type,
+                    sanitize_json(payload),
+                    turn_id,
+                    item_id,
+                    remember,
+                )
+            )
+            return {
+                "type": event_type,
+                "payload": sanitize_json(payload),
+                "turnId": turn_id,
+                "itemId": item_id,
+            }
+        return await self._publish(
+            event_type,
+            payload,
+            turn_id=turn_id,
+            item_id=item_id,
+            remember=remember,
+        )
+
+    async def _publish(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        turn_id: str | None = None,
+        item_id: str | None = None,
+        remember: bool = True,
+    ) -> dict[str, Any]:
+        value = self.event(
+            event_type,
+            sanitize_json(payload),
+            turn_id=turn_id,
+            item_id=item_id,
+        )
+        try:
+            encoded = encode_record(value)
+        except ChatError as error:
+            if error.code != "recordTooLarge":
+                raise
+            original = len(
+                json.dumps(value.get("payload"), ensure_ascii=False).encode("utf-8")
+            )
+            value["payload"] = {
+                "truncated": True,
+                "originalByteCount": original,
+                "message": "This provider item exceeded the chat protocol limit.",
+            }
+            encoded = encode_record(value)
+        if remember:
+            self._remember_event(value, encoded)
+        await self._broadcast_encoded(encoded)
+        self.last_emit = time.monotonic()
+        return value
+
+    async def _broadcast_encoded(self, encoded: bytes) -> None:
+        stale: list[ClientConnection] = []
+        for client in tuple(self.clients):
+            if not client.enqueue(encoded):
+                stale.append(client)
+        for client in stale:
+            self.clients.discard(client)
+            await client.close()
+
+    def _remember_event(self, event: dict[str, Any], encoded: bytes) -> None:
+        self.replay.append((event["seq"], encoded))
+        self.replay_bytes += len(encoded)
+        while (
+            len(self.replay) > MAX_REPLAY_RECORDS
+            or self.replay_bytes > MAX_REPLAY_BYTES
+        ):
+            _, removed = self.replay.popleft()
+            self.replay_bytes -= len(removed)
+        self._apply_to_snapshot(event)
+
+    def _apply_to_snapshot(self, event: dict[str, Any]) -> None:
+        event_type = event["type"]
+        item_id = event.get("itemId")
+        turn_id = event.get("turnId")
+        payload = event.get("payload", {})
+        if event_type in {
+            "message.started",
+            "reasoning.started",
+            "tool.started",
+            "fileChange.updated",
+            "diff.updated",
+            "plan.updated",
+        } and item_id:
+            self.items[item_id] = {
+                "type": event_type,
+                "itemId": item_id,
+                "turnId": turn_id,
+                "payload": payload,
+            }
+        elif event_type in {"message.delta", "reasoning.delta"} and item_id:
+            item = self.items.setdefault(
+                item_id,
+                {
+                    "type": event_type.replace(".delta", ".started"),
+                    "itemId": item_id,
+                    "turnId": turn_id,
+                    "payload": {"text": ""},
+                },
+            )
+            item_payload = item.setdefault("payload", {})
+            item_payload["text"] = str(item_payload.get("text", "")) + str(
+                payload.get("text", "")
+            )
+        elif event_type in {
+            "message.completed",
+            "reasoning.completed",
+            "tool.completed",
+        } and item_id:
+            self.items[item_id] = {
+                "type": event_type,
+                "itemId": item_id,
+                "turnId": turn_id,
+                "payload": payload,
+            }
+        elif event_type == "tool.updated" and item_id:
+            item = self.items.setdefault(
+                item_id,
+                {
+                    "type": "tool.updated",
+                    "itemId": item_id,
+                    "turnId": turn_id,
+                    "payload": {},
+                },
+            )
+            item["type"] = "tool.updated"
+            item["turnId"] = turn_id or item.get("turnId")
+            item_payload = item.setdefault("payload", {})
+            item_payload.update(
+                {key: value for key, value in payload.items() if value is not None}
+            )
+        elif event_type == "approval.requested" and item_id:
+            self.approvals[item_id] = payload
+            self.connection_state = "awaitingApproval"
+        elif event_type in {"approval.resolved", "approval.expired"} and item_id:
+            self.approvals.pop(item_id, None)
+        elif event_type == "question.requested" and item_id:
+            self.questions[item_id] = payload
+            self.connection_state = "awaitingApproval"
+        elif event_type in {"question.resolved", "question.expired"} and item_id:
+            self.questions.pop(item_id, None)
+        elif event_type == "usage.updated":
+            self.usage = payload
+        elif event_type == "turn.started":
+            self.turn_state = "streaming"
+            self.connection_state = "streaming"
+            self.active_turn_id = turn_id
+        elif event_type in {"turn.completed", "turn.failed", "turn.interrupted"}:
+            self.turn_state = event_type.partition(".")[2]
+            self.connection_state = (
+                "interrupted" if event_type == "turn.interrupted" else "streaming"
+            )
+            self.active_turn_id = None
+        elif event_type == "session.state":
+            self.connection_state = payload.get(
+                "connectionState", self.connection_state
+            )
+        elif event_type == "session.ended":
+            self.connection_state = "stopped"
+            self.turn_state = "stopped"
+        if self.items:
+            self.oldest_item_id = next(iter(self.items))
+
+    def snapshot_payload(self) -> dict[str, Any]:
+        return {
+            "snapshotGeneration": self.snapshot_generation,
+            # The snapshot record itself consumes the next broker sequence.
+            # Clients use baseSeq as their durable cursor before the following
+            # live event, so it must equal that record's sequence.
+            "baseSeq": self.sequence + 1,
+            "items": list(self.items.values()),
+            "approvals": list(self.approvals.values()),
+            "questions": list(self.questions.values()),
+            "connectionState": self.connection_state,
+            "turnState": self.turn_state,
+            "activeTurnId": self.active_turn_id,
+            "capabilities": chat_capabilities(self.provider_name),
+            "usage": self.usage,
+            "hasOlderHistory": self.has_older_history,
+            "oldestItemId": self.oldest_item_id,
+        }
+
+    def bounded_snapshot_event(self) -> tuple[dict[str, Any], bytes]:
+        while True:
+            payload = self.snapshot_payload()
+            # Leave enough room for the event envelope and future identity
+            # fields while keeping the encoded NDJSON record below 1 MiB.
+            payload_size = len(
+                json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode(
+                    "utf-8"
+                )
+            )
+            if payload_size <= MAX_RECORD_BYTES - 16 * 1024:
+                break
+            if self.items:
+                self.items.popitem(last=False)
+                self.has_older_history = True
+                self.oldest_item_id = next(iter(self.items), None)
+                continue
+            raise ChatError(
+                "snapshotTooLarge",
+                "The provider snapshot exceeded the chat protocol limit.",
+            )
+        snapshot = self.event("conversation.snapshot", payload)
+        return snapshot, encode_record(snapshot)
+
+    async def rebuild_snapshot(self) -> None:
+        history, has_older = await self.provider.history(None, MAX_HISTORY_ITEMS)
+        self.snapshot_generation = new_uuid()
+        self.items.clear()
+        for item in history:
+            item_id = item.get("itemId")
+            if isinstance(item_id, str):
+                self.items[item_id] = sanitize_json(item)
+        self.has_older_history = has_older
+        self.oldest_item_id = next(iter(self.items), None)
+        while self.buffered_provider_events:
+            buffered = self.buffered_provider_events
+            self.buffered_provider_events = []
+            for event_type, payload, turn_id, item_id, remember in buffered:
+                await self._publish(
+                    event_type,
+                    payload,
+                    turn_id=turn_id,
+                    item_id=item_id,
+                    remember=remember,
+                )
+        self.rebuilding_snapshot = False
+
+    def _write_state(self, status: str) -> None:
+        state = {
+            "v": 1,
+            "status": status,
+            "provider": self.provider_name,
+            "repository": self.repository,
+            "relayId": self.relay_id,
+            "providerThreadId": self.provider_thread_id,
+            "pid": os.getpid(),
+            "processStart": process_start_identity(os.getpid()),
+            "socket": self.socket_path,
+            "capabilities": chat_capabilities(self.provider_name),
+            "launchOptions": self.launch_options,
+        }
+        temporary = f"{self.state_path}.{os.getpid()}.{new_uuid()}.tmp"
+        descriptor = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+        )
+        try:
+            encoded = json.dumps(state, separators=(",", ":")).encode("utf-8")
+            os.write(descriptor, encoded)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, self.state_path)
+
+    def _acquire_provider_lock(self) -> None:
+        assert self.provider_thread_id is not None
+        path = os.path.join(
+            self.runtime_directory,
+            f"provider-{self.provider_name}-{self.provider_thread_id}.lock",
+        )
+        if os.path.islink(path):
+            raise ChatError("unsafeState", "The provider session lock is invalid.")
+        descriptor = os.open(
+            path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600
+        )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            os.close(descriptor)
+            raise ChatError(
+                "threadActive",
+                "The provider conversation is already active.",
+                exit_code=75,
+            ) from error
+        self.provider_lock_descriptor = descriptor
+
+    async def run(self) -> None:
+        prepare_session_directory(self.runtime_directory, self.relay_id)
+        if os.path.lexists(self.socket_path):
+            socket_stat = os.lstat(self.socket_path)
+            if not stat.S_ISSOCK(socket_stat.st_mode) or socket_stat.st_uid != os.getuid():
+                raise ChatError("unsafeState", "The chat socket path is unsafe.")
+            os.unlink(self.socket_path)
+        if self.provider_thread_id is not None:
+            self._acquire_provider_lock()
+        self.rebuilding_snapshot = True
+        self.provider_thread_id = await self.provider.start(self.emit)
+        self.provider_thread_id = canonical_uuid(
+            self.provider_thread_id, "provider thread ID"
+        )
+        if self.provider_lock_descriptor is None:
+            self._acquire_provider_lock()
+        await self.rebuild_snapshot()
+        self.connection_state = "streaming"
+        self._write_state("ready")
+        self.server = await asyncio.start_unix_server(
+            self.handle_client,
+            path=self.socket_path,
+            limit=MAX_RECORD_BYTES + 1,
+        )
+        os.chmod(self.socket_path, 0o600)
+        self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        await self.emit(
+            "session.state",
+            {"connectionState": "streaming", "reason": "providerReady"},
+        )
+        async with self.server:
+            await self.stop_event.wait()
+        await self.emit(
+            "session.ended",
+            {"reason": "stopped", "connectionState": "stopped"},
+        )
+        await asyncio.sleep(0)
+        if self.heartbeat_task:
+            self.heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.heartbeat_task
+        await self.provider.close()
+        for client in tuple(self.clients):
+            await client.close()
+        self.clients.clear()
+        if self.server:
+            self.server.close()
+            await self.server.wait_closed()
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(self.socket_path)
+        self._write_state("stopped")
+        if self.explicit_stop:
+            intent_path = os.path.join(
+                self.runtime_directory, f"{self.relay_id}.chat-intent"
+            )
+            if os.path.lexists(intent_path):
+                info = os.lstat(intent_path)
+                if (
+                    stat.S_ISREG(info.st_mode)
+                    and not stat.S_ISLNK(info.st_mode)
+                    and info.st_uid == os.getuid()
+                    and stat.S_IMODE(info.st_mode) == 0o600
+                ):
+                    os.unlink(intent_path)
+        if self.provider_lock_descriptor is not None:
+            os.close(self.provider_lock_descriptor)
+            self.provider_lock_descriptor = None
+
+    async def _heartbeat_loop(self) -> None:
+        while not self.stop_event.is_set():
+            await asyncio.sleep(1)
+            if time.monotonic() - self.last_emit >= HEARTBEAT_SECONDS:
+                await self.emit(
+                    "session.heartbeat",
+                    {"connectionState": self.connection_state},
+                )
+
+    async def _read_command(
+        self, reader: asyncio.StreamReader, timeout: float | None = None
+    ) -> dict[str, Any]:
+        try:
+            awaitable = reader.readline()
+            raw = (
+                await asyncio.wait_for(awaitable, timeout)
+                if timeout is not None
+                else await awaitable
+            )
+        except (asyncio.LimitOverrunError, ValueError) as error:
+            raise ChatError("recordTooLarge", "The protocol record is too large.", close=True) from error
+        if not raw:
+            raise EOFError
+        if len(raw) > MAX_RECORD_BYTES or not raw.endswith(b"\n"):
+            raise ChatError("recordTooLarge", "The protocol record is too large.", close=True)
+        raw = raw[:-1]
+        if raw.endswith(b"\r"):
+            raw = raw[:-1]
+        return load_record(raw)
+
+    def validate_command(
+        self, command: dict[str, Any], expected_type: str | None = None
+    ) -> tuple[str, str, dict[str, Any]]:
+        if command.get("v") != PROTOCOL_VERSION:
+            raise ChatError("unsupportedVersion", "The chat protocol version is unsupported.", close=True)
+        command_type = command.get("type")
+        if not isinstance(command_type, str) or (
+            expected_type is not None and command_type != expected_type
+        ):
+            raise ChatError("invalidCommand", "The chat command is invalid.", close=expected_type is not None)
+        request_id = canonical_uuid(command.get("requestId"), "request ID")
+        if command.get("relayId") != self.relay_id:
+            raise ChatError("staleRelay", "The chat relay identity is stale.", close=True)
+        if command.get("provider") != self.provider_name:
+            raise ChatError("staleRelay", "The chat provider identity is stale.", close=True)
+        provider_thread = command.get("providerThreadId")
+        if provider_thread is not None and provider_thread != self.provider_thread_id:
+            raise ChatError("staleThread", "The provider conversation identity is stale.", close=True)
+        sent_at = command.get("sentAt")
+        if not isinstance(sent_at, int) or isinstance(sent_at, bool) or sent_at < 0:
+            raise ChatError("invalidCommand", "The chat command timestamp is invalid.")
+        payload = command.get("payload")
+        if not isinstance(payload, dict):
+            raise ChatError("invalidCommand", "The chat command payload is invalid.")
+        return command_type, request_id, payload
+
+    async def handle_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        client = ClientConnection(reader, writer)
+        try:
+            first = await self._read_command(reader, ATTACH_TIMEOUT_SECONDS)
+            _, request_id, payload = self.validate_command(first, "session.attach")
+            after_seq = payload.get("afterSeq", 0)
+            generation = payload.get("snapshotGeneration")
+            if (
+                not isinstance(after_seq, int)
+                or isinstance(after_seq, bool)
+                or after_seq < 0
+                or (generation is not None and not UUID_PATTERN.fullmatch(str(generation)))
+            ):
+                raise ChatError("invalidCursor", "The replay cursor is invalid.")
+            hello = self.control_event(
+                "session.hello",
+                {
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "connectionState": self.connection_state,
+                    "capabilities": chat_capabilities(self.provider_name),
+                    "replayOldestSeq": self.replay[0][0] if self.replay else self.sequence,
+                    "replayNewestSeq": self.sequence,
+                },
+            )
+            await client.direct_send(hello)
+            replay_possible = (
+                generation == self.snapshot_generation
+                and after_seq <= self.sequence
+                and (
+                    after_seq == self.sequence
+                    or (
+                        bool(self.replay)
+                        and after_seq >= self.replay[0][0] - 1
+                    )
+                )
+            )
+            if replay_possible:
+                for sequence, encoded in tuple(self.replay):
+                    if sequence > after_seq:
+                        writer.write(encoded)
+                await writer.drain()
+            else:
+                # The broker updates this provider-derived materialized view
+                # before publishing every live record. It is therefore safe
+                # during an active turn and avoids reading a mutating provider
+                # transcript merely because one client missed the replay ring.
+                snapshot, encoded = self.bounded_snapshot_event()
+                self._remember_event(snapshot, encoded)
+                await self._broadcast_encoded(encoded)
+                await client.direct_send(snapshot)
+            ack = self.event(
+                "ack",
+                {
+                    "requestId": request_id,
+                    "commandType": "session.attach",
+                    "replayed": replay_possible,
+                    "afterSeq": after_seq,
+                },
+            )
+            encoded_ack = encode_record(ack)
+            self._remember_event(ack, encoded_ack)
+            await self._broadcast_encoded(encoded_ack)
+            await client.direct_send(ack)
+            client.writer_task = asyncio.create_task(client.run_writer())
+            self.clients.add(client)
+            while not client.closed and not self.stop_event.is_set():
+                command = await self._read_command(reader)
+                should_close = await self.handle_command(client, command)
+                if should_close:
+                    break
+        except EOFError:
+            pass
+        except asyncio.TimeoutError:
+            await self._send_unsequenced_error(client, None, "attachTimeout", "The chat attach timed out.")
+        except ChatError as error:
+            request_id = None
+            with contextlib.suppress(Exception):
+                request_id = first.get("requestId")  # type: ignore[possibly-undefined]
+            await self._send_unsequenced_error(
+                client, request_id, error.code, error.message
+            )
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            self.clients.discard(client)
+            await client.close()
+            if client.writer_task:
+                client.writer_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await client.writer_task
+
+    async def _send_unsequenced_error(
+        self,
+        client: ClientConnection,
+        request_id: str | None,
+        code: str,
+        message: str,
+    ) -> None:
+        # This path is used before a client is admitted to broadcast state.
+        value = self.control_event(
+            "error",
+            {
+                "requestId": request_id,
+                "code": code,
+                "message": message,
+                "recoverable": False,
+            },
+        )
+        with contextlib.suppress(Exception):
+            await client.direct_send(value)
+
+    async def handle_command(
+        self, client: ClientConnection, command: dict[str, Any]
+    ) -> bool:
+        # The result lookup, provider side effect, ack/error publication, and
+        # idempotency record form one serialized operation. Otherwise two
+        # attached devices can race the same request ID through the lookup and
+        # invoke a provider mutation twice before either result is remembered.
+        async with self.command_lock:
+            return await self._handle_command_serialized(client, command)
+
+    async def _handle_command_serialized(
+        self, client: ClientConnection, command: dict[str, Any]
+    ) -> bool:
+        try:
+            command_type, request_id, payload = self.validate_command(command)
+            if command_type == "session.attach":
+                raise ChatError("invalidCommand", "session.attach may only be sent once.", close=True)
+            fingerprint = command_fingerprint(command)
+            prior = self.command_results.get(request_id)
+            if prior:
+                prior_fingerprint, prior_type, prior_payload = prior
+                if prior_fingerprint != fingerprint:
+                    raise ChatError(
+                        "requestIdReused",
+                        "The request ID was reused for a different command.",
+                        close=True,
+                    )
+                await self.emit(
+                    prior_type,
+                    prior_payload,
+                    turn_id=command.get("turnId"),
+                    item_id=command.get("itemId"),
+                )
+                return command_type == "session.detach"
+            result = await self._execute_command(
+                command_type, request_id, payload, command
+            )
+            response_payload = {
+                "requestId": request_id,
+                "commandType": command_type,
+                **result,
+            }
+            closes_attachment = command_type in {"session.detach", "session.stop"}
+            if closes_attachment:
+                self.clients.discard(client)
+                event = await self.emit(
+                    "ack",
+                    response_payload,
+                    turn_id=command.get("turnId"),
+                    item_id=command.get("itemId"),
+                )
+                await client.direct_send(event)
+            else:
+                event = await self.emit(
+                    "ack",
+                    response_payload,
+                    turn_id=command.get("turnId"),
+                    item_id=command.get("itemId"),
+                )
+            if command_type in self.MUTATION_TYPES:
+                self._remember_command(
+                    request_id, fingerprint, "ack", event["payload"]
+                )
+            if command_type == "session.stop":
+                self.stop_event.set()
+            return closes_attachment
+        except ChatError as error:
+            request_id = command.get("requestId")
+            payload = {
+                "requestId": request_id if isinstance(request_id, str) else None,
+                "code": error.code,
+                "message": error.message,
+                "recoverable": error.recoverable,
+            }
+            if error.close:
+                self.clients.discard(client)
+                event = await self.emit(
+                    "error",
+                    payload,
+                    turn_id=command.get("turnId"),
+                    item_id=command.get("itemId"),
+                )
+                await client.direct_send(event)
+            else:
+                event = await self.emit(
+                    "error",
+                    payload,
+                    turn_id=command.get("turnId"),
+                    item_id=command.get("itemId"),
+                )
+            if (
+                isinstance(request_id, str)
+                and UUID_PATTERN.fullmatch(request_id)
+                and command.get("type") in self.MUTATION_TYPES
+                and error.code != "requestIdReused"
+            ):
+                self._remember_command(
+                    request_id, command_fingerprint(command), "error", event["payload"]
+                )
+            return error.close
+
+    def _remember_command(
+        self,
+        request_id: str,
+        fingerprint: str,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        self.command_results[request_id] = (fingerprint, event_type, payload)
+        self.command_results.move_to_end(request_id)
+        while len(self.command_results) > MAX_COMMAND_RESULTS:
+            self.command_results.popitem(last=False)
+
+    async def _execute_command(
+        self,
+        command_type: str,
+        request_id: str,
+        payload: dict[str, Any],
+        command: dict[str, Any],
+    ) -> dict[str, Any]:
+        if command_type == "ping":
+            return {"pong": True}
+        if command_type == "session.detach":
+            return {"detached": True}
+        if command_type == "session.stop":
+            if command.get("relayId") != self.relay_id:
+                raise ChatError("staleRelay", "The chat relay identity is stale.")
+            self.explicit_stop = True
+            return {"stopped": True}
+        if command_type == "history.load":
+            if self.active_turn_id:
+                raise ChatError(
+                    "historyBusy",
+                    "Older history is unavailable while the turn is running.",
+                    recoverable=True,
+                )
+            limit = payload.get("limit", 50)
+            before = payload.get("beforeItemId")
+            if (
+                not isinstance(limit, int)
+                or isinstance(limit, bool)
+                or not 1 <= limit <= MAX_HISTORY_ITEMS
+                or (before is not None and not isinstance(before, str))
+            ):
+                raise ChatError("invalidHistoryRequest", "The history request is invalid.")
+            items, has_older = await self.provider.history(before, limit)
+            encoded_items: list[dict[str, Any]] = []
+            encoded_bytes = 0
+            for item in items:
+                size = len(json.dumps(item, ensure_ascii=False).encode("utf-8"))
+                if encoded_bytes + size > min(
+                    MAX_HISTORY_BYTES, MAX_RECORD_BYTES - 16 * 1024
+                ):
+                    has_older = True
+                    break
+                encoded_items.append(sanitize_json(item))
+                encoded_bytes += size
+            await self.emit(
+                "history.page",
+                {
+                    "items": encoded_items,
+                    "hasOlderHistory": has_older,
+                    "oldestItemId": (
+                        encoded_items[0].get("itemId") if encoded_items else before
+                    ),
+                },
+            )
+            return {"loaded": len(encoded_items)}
+        if command_type == "turn.start":
+            text = payload.get("text")
+            attachments = payload.get("attachments", [])
+            if not isinstance(text, str) or len(text.encode("utf-8")) > MAX_PROMPT_BYTES:
+                raise ChatError("invalidPrompt", "The prompt is invalid.")
+            if not text.strip() and not attachments:
+                raise ChatError("invalidPrompt", "A prompt or attachment is required.")
+            if not isinstance(attachments, list) or len(attachments) > MAX_ATTACHMENTS:
+                raise ChatError("invalidAttachments", "The attachment list is invalid.")
+            normalized_attachments = []
+            for attachment in attachments:
+                if not isinstance(attachment, dict) or not isinstance(
+                    attachment.get("path"), str
+                ):
+                    raise ChatError("invalidAttachments", "An attachment is invalid.")
+                path = attachment["path"]
+                if len(path.encode("utf-8")) > MAX_ATTACHMENT_PATH_BYTES:
+                    raise ChatError("invalidAttachments", "An attachment path is too large.")
+                normalized_attachments.append(
+                    {"path": self.resolve_turn_attachment(path)}
+                )
+            payload["attachments"] = normalized_attachments
+            payload_options = payload.get("options", {})
+            if not isinstance(payload_options, dict):
+                raise ChatError("invalidOptions", "The turn options are invalid.")
+            allowed_nested_option_keys = {
+                "model",
+                "effort",
+                "reasoningEffort",
+                "permissionMode",
+                "approvalPolicy",
+                "sandbox",
+                "fullAccess",
+                "fastMode",
+            }
+            if set(payload_options) - allowed_nested_option_keys:
+                raise ChatError("invalidOptions", "The turn options are unsupported.")
+            # Protocol v1 carries launch options directly in the turn payload.
+            # Retain the nested form only for compatibility with early worker
+            # fixtures, then normalize both forms before calling an adapter.
+            for key in (
+                "model",
+                "reasoningEffort",
+                "sandbox",
+                "approvalPolicy",
+                "fastMode",
+            ):
+                if key in payload:
+                    payload_options[key] = payload[key]
+            if "reasoningEffort" in payload_options:
+                payload_options["effort"] = payload_options.pop("reasoningEffort")
+            for key in ("model", "effort", "permissionMode", "approvalPolicy", "sandbox"):
+                value = payload_options.get(key)
+                if value is not None and (
+                    not isinstance(value, str)
+                    or len(value.encode("utf-8")) > 256
+                    or not SAFE_OPTION_PATTERN.fullmatch(value)
+                ):
+                    raise ChatError("invalidOptions", "A turn option is invalid.")
+            for key in ("fullAccess", "fastMode"):
+                value = payload_options.get(key)
+                if value is not None and not isinstance(value, bool):
+                    raise ChatError("invalidOptions", "A turn option is invalid.")
+            if payload_options.get("sandbox") not in {
+                None,
+                "read-only",
+                "workspace-write",
+                "danger-full-access",
+            }:
+                raise ChatError("invalidOptions", "The sandbox mode is unsupported.")
+            payload["options"] = payload_options
+            result = await self.provider.start_turn(command)
+            return sanitize_json(result)
+        if command_type == "turn.interrupt":
+            turn_id = canonical_uuid(
+                command.get("turnId") or payload.get("turnId"), "turn ID"
+            )
+            await self.provider.interrupt(turn_id)
+            return {"turnId": turn_id, "interruptRequested": True}
+        if command_type == "approval.respond":
+            normalized = self._resolve_interaction_payload(payload, self.approvals)
+            await self.provider.respond_approval(normalized)
+            display_id = normalized["displayId"]
+            await self.emit(
+                "approval.resolved",
+                {
+                    "displayId": display_id,
+                    "decision": normalized.get("decision"),
+                },
+                item_id=display_id if isinstance(display_id, str) else None,
+            )
+            return {"displayId": display_id, "resolved": True}
+        if command_type == "question.respond":
+            normalized = self._resolve_interaction_payload(payload, self.questions)
+            await self.provider.respond_question(normalized)
+            display_id = normalized["displayId"]
+            await self.emit(
+                "question.resolved",
+                {"displayId": display_id},
+                item_id=display_id if isinstance(display_id, str) else None,
+            )
+            return {"displayId": display_id, "resolved": True}
+        if command_type == "file.preview":
+            path = payload.get("path")
+            if not isinstance(path, str):
+                raise ChatError("invalidPath", "The file preview path is invalid.")
+            line = payload.get("line")
+            column = payload.get("column")
+            for value in (line, column):
+                if value is not None and (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or not 1 <= value <= 10_000_000
+                ):
+                    raise ChatError("invalidPosition", "The file position is invalid.")
+            resolved = self.resolve_repository_file(path)
+            descriptor = os.open(
+                resolved, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+            )
+            try:
+                data = os.read(descriptor, MAX_PREVIEW_BYTES + 1)
+            finally:
+                os.close(descriptor)
+            if b"\x00" in data[:8192]:
+                raise ChatError("binaryFile", "Binary files cannot be previewed.")
+            text = data[:MAX_PREVIEW_BYTES].decode("utf-8", errors="strict")
+            relative = os.path.relpath(resolved, self.project_directory)
+            await self.emit(
+                "file.preview",
+                {
+                    "path": relative,
+                    "content": text,
+                    "line": line,
+                    "column": column,
+                    "truncated": len(data) > MAX_PREVIEW_BYTES,
+                    "originalByteCount": os.stat(
+                        resolved, follow_symlinks=False
+                    ).st_size,
+                },
+                item_id=request_id,
+            )
+            return {"path": relative, "previewed": True}
+        raise ChatError("unknownCommand", "The chat command is unsupported.")
+
+    def _resolve_interaction_payload(
+        self,
+        payload: dict[str, Any],
+        pending: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        generation = payload.get("providerConnectionGeneration")
+        provider_request_id = payload.get("providerRequestId")
+        if not isinstance(generation, str) or provider_request_id is None:
+            raise ChatError(
+                "invalidInteraction", "The interaction response is invalid."
+            )
+        matches = [
+            (display_id, interaction)
+            for display_id, interaction in pending.items()
+            if interaction.get("providerConnectionGeneration") == generation
+            and (
+                interaction.get("providerRequestId") == provider_request_id
+                or interaction.get("providerRequestID") == provider_request_id
+            )
+        ]
+        if len(matches) != 1:
+            raise ChatError(
+                "staleInteraction", "The interaction is no longer active."
+            )
+        display_id, _ = matches[0]
+        normalized = dict(payload)
+        normalized["displayId"] = display_id
+        normalized["connectionGeneration"] = generation
+        if "permissionChanges" in normalized:
+            normalized["permissionUpdates"] = normalized["permissionChanges"]
+        return normalized
+
+    def resolve_repository_file(self, value: str, allow_binary: bool = False) -> str:
+        if (
+            not value
+            or "\x00" in value
+            or "\n" in value
+            or len(value.encode("utf-8")) > MAX_ATTACHMENT_PATH_BYTES
+        ):
+            raise ChatError("invalidPath", "The repository file path is invalid.")
+        candidate = (
+            value if os.path.isabs(value) else os.path.join(self.project_directory, value)
+        )
+        resolved = os.path.realpath(candidate)
+        if not (
+            resolved.startswith(self.project_directory + os.sep)
+            and resolved != self.project_directory
+        ):
+            raise ChatError("pathOutOfScope", "The repository file path is outside the project.")
+        try:
+            info = os.stat(resolved, follow_symlinks=False)
+        except OSError as error:
+            raise ChatError("notFound", "The repository file is unavailable.") from error
+        if not stat.S_ISREG(info.st_mode) or os.path.islink(resolved):
+            raise ChatError("invalidPath", "The repository file is not a regular file.")
+        if not allow_binary:
+            with open(resolved, "rb") as stream:
+                if b"\x00" in stream.read(8192):
+                    raise ChatError("binaryFile", "Binary files cannot be previewed.")
+        return resolved
+
+    def resolve_turn_attachment(self, value: str) -> str:
+        if (
+            not value
+            or not os.path.isabs(value)
+            or "\x00" in value
+            or "\n" in value
+            or len(value.encode("utf-8")) > MAX_ATTACHMENT_PATH_BYTES
+        ):
+            raise ChatError("invalidAttachments", "The attachment path is invalid.")
+        candidate = os.path.abspath(value)
+        resolved = os.path.realpath(candidate)
+        if os.path.dirname(candidate) != self.attachment_root:
+            raise ChatError(
+                "pathOutOfScope",
+                "The attachment is outside this relay's private upload directory.",
+            )
+        if resolved != candidate:
+            raise ChatError("invalidAttachments", "A symbolic attachment is invalid.")
+        file_name = os.path.basename(candidate)
+        if not file_name.endswith(".png") or not UUID_PATTERN.fullmatch(file_name[:-4]):
+            raise ChatError("invalidAttachments", "The attachment name is invalid.")
+        try:
+            root_info = os.lstat(self.attachment_root)
+            file_info = os.lstat(candidate)
+        except OSError as error:
+            raise ChatError(
+                "notFound", "The uploaded attachment is unavailable."
+            ) from error
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or stat.S_ISLNK(root_info.st_mode)
+            or root_info.st_uid != os.getuid()
+            or stat.S_IMODE(root_info.st_mode) & 0o077
+        ):
+            raise ChatError(
+                "invalidAttachments",
+                "The private attachment directory is unsafe.",
+            )
+        if (
+            not stat.S_ISREG(file_info.st_mode)
+            or stat.S_ISLNK(file_info.st_mode)
+            or file_info.st_uid != os.getuid()
+            or stat.S_IMODE(file_info.st_mode) & 0o077
+            or not 8 <= file_info.st_size <= MAX_ATTACHMENT_FILE_BYTES
+        ):
+            raise ChatError("invalidAttachments", "The uploaded attachment is invalid.")
+        try:
+            descriptor = os.open(
+                candidate,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            try:
+                opened_info = os.fstat(descriptor)
+                if (
+                    opened_info.st_dev != file_info.st_dev
+                    or opened_info.st_ino != file_info.st_ino
+                    or os.read(descriptor, 8) != b"\x89PNG\r\n\x1a\n"
+                ):
+                    raise ChatError(
+                        "invalidAttachments",
+                        "The uploaded attachment is invalid.",
+                    )
+            finally:
+                os.close(descriptor)
+        except ChatError:
+            raise
+        except OSError as error:
+            raise ChatError(
+                "invalidAttachments", "The uploaded attachment is invalid."
+            ) from error
+        return candidate
+
+
+def process_start_identity(pid: int) -> str:
+    try:
+        data = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        fields = data[data.rfind(") ") + 2 :].split()
+        if len(fields) >= 20 and fields[19].isdigit():
+            return f"proc_{fields[19]}"
+    except OSError:
+        pass
+    # Used only by isolated macOS tests; production workers expose /proc.
+    return f"pid_{pid}"
+
+
+def prepare_session_directory(runtime_directory: str, relay_id: str) -> str:
+    canonical_directory(runtime_directory, "runtime directory")
+    identity = os.stat(runtime_directory, follow_symlinks=False)
+    if identity.st_uid != os.getuid() or stat.S_IMODE(identity.st_mode) != 0o700:
+        raise ChatError("unsafeState", "The runtime directory permissions are unsafe.")
+    session_directory = os.path.join(runtime_directory, f"chat-{relay_id}")
+    if os.path.lexists(session_directory):
+        info = os.lstat(session_directory)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != os.getuid()
+        ):
+            raise ChatError("unsafeState", "The chat state directory is unsafe.")
+        os.chmod(session_directory, 0o700)
+    else:
+        os.mkdir(session_directory, 0o700)
+    return session_directory
+
+
+def load_state(runtime_directory: str, relay_id: str) -> dict[str, Any]:
+    relay_id = canonical_uuid(relay_id, "relay ID")
+    session_directory = os.path.join(runtime_directory, f"chat-{relay_id}")
+    state_path = os.path.join(session_directory, STATE_NAME)
+    for path, expected_mode, expected_kind in (
+        (runtime_directory, 0o700, "directory"),
+        (session_directory, 0o700, "directory"),
+        (state_path, 0o600, "file"),
+    ):
+        try:
+            info = os.lstat(path)
+        except OSError as error:
+            raise ChatError("notFound", "The chat relay is not active.", exit_code=75) from error
+        if (
+            info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != expected_mode
+            or (expected_kind == "directory" and not stat.S_ISDIR(info.st_mode))
+            or (expected_kind == "file" and not stat.S_ISREG(info.st_mode))
+            or stat.S_ISLNK(info.st_mode)
+        ):
+            raise ChatError("unsafeState", "The chat relay state is unsafe.")
+    try:
+        with open(state_path, "r", encoding="utf-8") as stream:
+            state_value = json.load(stream)
+    except (OSError, ValueError) as error:
+        raise ChatError("unsafeState", "The chat relay state is invalid.") from error
+    if (
+        not isinstance(state_value, dict)
+        or state_value.get("status") not in {"ready", "stopped"}
+        or state_value.get("relayId") != relay_id
+        or state_value.get("provider") not in {"codex", "claude"}
+        or not REPOSITORY_PATTERN.fullmatch(str(state_value.get("repository", "")))
+        or state_value.get("socket") != os.path.join(session_directory, SOCKET_NAME)
+        or not isinstance(state_value.get("pid"), int)
+        or state_value.get("pid") <= 0
+        or not isinstance(state_value.get("processStart"), str)
+        or not UUID_PATTERN.fullmatch(
+            str(state_value.get("providerThreadId", ""))
+        )
+    ):
+        raise ChatError("unsafeState", "The chat relay state is invalid.")
+    return state_value
+
+
+def validate_live_state_process(state: dict[str, Any]) -> None:
+    pid = state["pid"]
+    try:
+        os.kill(pid, 0)
+    except OSError as error:
+        raise ChatError(
+            "staleRelay", "The requested chat relay is no longer active.", exit_code=75
+        ) from error
+    if process_start_identity(pid) != state["processStart"]:
+        raise ChatError(
+            "staleRelay", "The requested chat relay is no longer active.", exit_code=75
+        )
+    proc_directory = f"/proc/{pid}"
+    if os.path.isdir(proc_directory):
+        try:
+            if os.stat(proc_directory, follow_symlinks=False).st_uid != os.getuid():
+                raise ChatError(
+                    "unsafeState", "The chat relay process identity is unsafe."
+                )
+            command_line = pathlib.Path(
+                os.path.join(proc_directory, "cmdline")
+            ).read_bytes()
+        except OSError as error:
+            raise ChatError(
+                "staleRelay",
+                "The requested chat relay is no longer active.",
+                exit_code=75,
+            ) from error
+        arguments = [
+            os.path.basename(part.decode("utf-8", errors="ignore"))
+            for part in command_line.split(b"\0")
+            if part
+        ]
+        if "terminal-relay-chat" not in arguments or "serve" not in arguments:
+            raise ChatError(
+                "unsafeState", "The chat relay process identity is unsafe."
+            )
+
+
+async def proxy_stdio(socket_path: str) -> int:
+    reader, writer = await asyncio.open_unix_connection(socket_path)
+    loop = asyncio.get_running_loop()
+    stdin_descriptor = sys.stdin.fileno()
+    stdout_descriptor = sys.stdout.fileno()
+
+    async def read_stdin() -> bytes:
+        future: asyncio.Future[bytes] = loop.create_future()
+
+        def readable() -> None:
+            if future.done():
+                return
+            try:
+                future.set_result(os.read(stdin_descriptor, 65536))
+            except OSError as error:
+                future.set_exception(error)
+
+        loop.add_reader(stdin_descriptor, readable)
+        try:
+            return await future
+        finally:
+            loop.remove_reader(stdin_descriptor)
+
+    async def stdin_to_socket() -> None:
+        while True:
+            data = await read_stdin()
+            if not data:
+                with contextlib.suppress(Exception):
+                    writer.write_eof()
+                return
+            writer.write(data)
+            await writer.drain()
+
+    async def socket_to_stdout() -> None:
+        while True:
+            data = await reader.read(65536)
+            if not data:
+                return
+            offset = 0
+            while offset < len(data):
+                offset += os.write(stdout_descriptor, data[offset:])
+    tasks = {
+        asyncio.create_task(stdin_to_socket()),
+        asyncio.create_task(socket_to_stdout()),
+    }
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        task.cancel()
+    for task in done:
+        with contextlib.suppress(BrokenPipeError, ConnectionError, OSError):
+            await task
+    writer.close()
+    with contextlib.suppress(Exception):
+        await writer.wait_closed()
+    return 0
+
+
+async def stop_remote(state: dict[str, Any]) -> int:
+    reader, writer = await asyncio.open_unix_connection(state["socket"])
+    request_id = new_uuid()
+    attach = {
+        "v": 1,
+        "type": "session.attach",
+        "requestId": request_id,
+        "relayId": state["relayId"],
+        "provider": state["provider"],
+        "providerThreadId": state["providerThreadId"],
+        "sentAt": now_ms(),
+        "payload": {"afterSeq": 0},
+    }
+    writer.write(encode_record(attach))
+    await writer.drain()
+    attached = False
+    while not attached:
+        value = load_record((await reader.readline()).rstrip(b"\r\n"))
+        if value.get("type") == "ack" and value.get("payload", {}).get("requestId") == request_id:
+            attached = True
+    stop_id = new_uuid()
+    stop = {
+        "v": 1,
+        "type": "session.stop",
+        "requestId": stop_id,
+        "relayId": state["relayId"],
+        "provider": state["provider"],
+        "providerThreadId": state["providerThreadId"],
+        "sentAt": now_ms(),
+        "payload": {},
+    }
+    writer.write(encode_record(stop))
+    await writer.drain()
+    while True:
+        raw = await asyncio.wait_for(reader.readline(), 10)
+        if not raw:
+            break
+        value = load_record(raw.rstrip(b"\r\n"))
+        if value.get("type") == "ack" and value.get("payload", {}).get("requestId") == stop_id:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            return 0
+        if value.get("type") == "error" and value.get("payload", {}).get("requestId") == stop_id:
+            raise ChatError("stopFailed", "The chat relay could not be stopped.")
+    raise ChatError("stopFailed", "The chat relay ended before acknowledging stop.")
+
+
+def provider_for(arguments: argparse.Namespace, options: dict[str, Any]) -> ProviderAdapter:
+    if arguments.fake:
+        return FakeProvider(
+            arguments.project_directory,
+            arguments.thread_id,
+            options,
+        )
+    if arguments.provider == "codex":
+        return CodexAdapter(
+            arguments.project_directory,
+            arguments.thread_id,
+            options,
+            arguments.codex_socket,
+        )
+    if arguments.provider == "claude":
+        return ClaudeAdapter(
+            arguments.project_directory,
+            arguments.thread_id,
+            options,
+        )
+    raise ChatError("unsupportedProvider", "The provider is unsupported.", exit_code=64)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    ready = subparsers.add_parser("ready", add_help=False)
+    ready.add_argument("--provider", choices=("codex", "claude"), required=True)
+    ready.add_argument("--codex-socket", default="")
+    ready.add_argument("--fake", action="store_true")
+
+    serve = subparsers.add_parser("serve", add_help=False)
+    serve.add_argument("--provider", choices=("codex", "claude"), required=True)
+    serve.add_argument("--repository", required=True)
+    serve.add_argument("--project-directory", required=True)
+    serve.add_argument("--runtime-directory", required=True)
+    serve.add_argument("--relay-id", required=True)
+    serve.add_argument("--thread-id")
+    serve.add_argument("--new-thread", action="store_true")
+    serve.add_argument("--codex-socket", default="")
+    serve.add_argument("--launch-argument", action="append", default=[])
+    serve.add_argument("--fake", action="store_true")
+
+    inspect_parser = subparsers.add_parser("inspect", add_help=False)
+    inspect_parser.add_argument("--runtime-directory", required=True)
+    inspect_parser.add_argument("--relay-id", required=True)
+
+    attach = subparsers.add_parser("attach", add_help=False)
+    attach.add_argument("--runtime-directory", required=True)
+    attach.add_argument("--relay-id", required=True)
+    attach.add_argument("--provider", choices=("codex", "claude"), required=True)
+    attach.add_argument("--repository", required=True)
+
+    stop = subparsers.add_parser("stop", add_help=False)
+    stop.add_argument("--runtime-directory", required=True)
+    stop.add_argument("--relay-id", required=True)
+    stop.add_argument("--provider", choices=("codex", "claude"), required=True)
+    stop.add_argument("--repository", required=True)
+
+    return parser
+
+
+async def async_main(arguments: argparse.Namespace) -> int:
+    if arguments.command == "serve":
+        repository = canonical_repository(arguments.repository)
+        relay_id = canonical_uuid(arguments.relay_id, "relay ID")
+        project_directory = canonical_directory(
+            arguments.project_directory, "project directory"
+        )
+        runtime_directory = canonical_directory(
+            arguments.runtime_directory, "runtime directory"
+        )
+        if arguments.thread_id:
+            canonical_uuid(arguments.thread_id, "provider thread ID")
+        options = validate_launch_arguments(arguments.launch_argument)
+        if arguments.new_thread:
+            if arguments.provider != "claude" or not arguments.thread_id:
+                raise ChatError(
+                    "invalidOptions",
+                    "The new-provider-thread option is invalid.",
+                    exit_code=64,
+                )
+            options["_newSession"] = True
+        provider = provider_for(arguments, options)
+        broker = ChatBroker(
+            arguments.provider,
+            repository,
+            project_directory,
+            runtime_directory,
+            relay_id,
+            provider,
+            options,
+        )
+        loop = asyncio.get_running_loop()
+        for name in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            with contextlib.suppress(NotImplementedError):
+                loop.add_signal_handler(name, broker.stop_event.set)
+        await broker.run()
+        return 0
+    if arguments.command in {"attach", "stop"}:
+        runtime_directory = canonical_directory(
+            arguments.runtime_directory, "runtime directory"
+        )
+        state = load_state(runtime_directory, arguments.relay_id)
+        if (
+            state["provider"] != arguments.provider
+            or state["repository"] != canonical_repository(arguments.repository)
+            or state["status"] != "ready"
+        ):
+            raise ChatError(
+                "staleRelay",
+                "The requested chat relay is no longer active.",
+                exit_code=75,
+            )
+        validate_live_state_process(state)
+        socket_info = os.lstat(state["socket"])
+        if (
+            not stat.S_ISSOCK(socket_info.st_mode)
+            or socket_info.st_uid != os.getuid()
+            or stat.S_IMODE(socket_info.st_mode) != 0o600
+        ):
+            raise ChatError("unsafeState", "The chat relay socket is unsafe.")
+        if arguments.command == "attach":
+            return await proxy_stdio(state["socket"])
+        return await stop_remote(state)
+    raise ChatError("invalidCommand", "The chat broker command is invalid.", exit_code=64)
+
+
+def main() -> int:
+    parser = build_parser()
+    arguments = parser.parse_args()
+    if getattr(arguments, "fake", False):
+        if (
+            os.path.realpath(__file__) == INSTALLED_PATH
+            or os.environ.get("TERMINAL_RELAY_CHAT_TEST_MODE") != "1"
+        ):
+            raise ChatError(
+                "testOverrideRefused",
+                "The structured chat broker refuses test overrides.",
+                exit_code=78,
+            )
+    if arguments.command == "ready":
+        capabilities = chat_capabilities(arguments.provider)
+        if arguments.fake:
+            pass
+        elif arguments.provider == "codex":
+            if (
+                not arguments.codex_socket
+                or not os.path.isabs(arguments.codex_socket)
+                or not stat.S_ISSOCK(os.stat(arguments.codex_socket).st_mode)
+            ):
+                raise ChatError(
+                    "providerUnavailable",
+                    "Codex structured chat is unavailable.",
+                    exit_code=69,
+                )
+        else:
+            ClaudeAdapter("", None, {})._load_sdk()
+        print(json.dumps(capabilities, separators=(",", ":")))
+        return 0
+    if arguments.command == "inspect":
+        runtime_directory = canonical_directory(
+            arguments.runtime_directory, "runtime directory"
+        )
+        state = load_state(runtime_directory, arguments.relay_id)
+        if state["status"] == "ready":
+            validate_live_state_process(state)
+        print(json.dumps(state, separators=(",", ":")))
+        return 0
+    return asyncio.run(async_main(arguments))
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except ChatError as error:
+        print(error.message, file=sys.stderr)
+        raise SystemExit(error.exit_code)
+    except (BrokenPipeError, ConnectionError, OSError, ValueError, json.JSONDecodeError):
+        print("Structured chat is unavailable.", file=sys.stderr)
+        raise SystemExit(70)

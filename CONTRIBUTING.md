@@ -15,8 +15,8 @@ Thanks for helping improve Terminal Relay.
 
 ## Development setup
 
-Terminal Relay requires macOS 14 or later, Xcode 26 or later, XcodeGen, and
-Apple's Metal toolchain component:
+Terminal Relay requires macOS 14 or later, Xcode 26 or later, XcodeGen 2.46.0
+or later, and Apple's Metal toolchain component:
 
 ```bash
 brew install xcodegen

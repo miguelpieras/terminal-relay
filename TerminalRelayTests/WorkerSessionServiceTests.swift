@@ -366,6 +366,11 @@ final class WorkerSessionServiceTests: XCTestCase {
         let recorder = WorkerSessionCommandRecorder(
             results: [
                 WorkerSessionCommandResult(
+                    exitCode: 64,
+                    standardOutput: Data(),
+                    standardError: Data("unsupported command".utf8)
+                ),
+                WorkerSessionCommandResult(
                     exitCode: 0,
                     standardOutput: Data(
                         """
@@ -402,6 +407,11 @@ final class WorkerSessionServiceTests: XCTestCase {
         XCTAssertEqual(
             recorder.configurations,
             [
+                SSHCommandBuilder.workerChatCapabilitiesConfiguration(
+                    for: worker,
+                    kind: .codex,
+                    repositoryName: "terminal-relay"
+                ),
                 SSHCommandBuilder.workerSessionStartConfiguration(
                     for: worker,
                     kind: .codex,
@@ -418,6 +428,11 @@ final class WorkerSessionServiceTests: XCTestCase {
         let worker = makeWorker()
         let recorder = WorkerSessionCommandRecorder(
             results: [
+                WorkerSessionCommandResult(
+                    exitCode: 64,
+                    standardOutput: Data(),
+                    standardError: Data("unsupported command".utf8)
+                ),
                 WorkerSessionCommandResult(
                     exitCode: 0,
                     standardOutput: Data(
@@ -578,12 +593,82 @@ final class WorkerSessionServiceTests: XCTestCase {
         )
     }
 
+    func testStartNegotiatesAndStoresNativeChatByDefault() async {
+        let worker = makeWorker()
+        let relayID = "01234567-89ab-4def-8abc-0123456789ab"
+        let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let capabilities =
+            #"{"protocolVersion":1,"features":["streaming"],"supportsHistory":true,"supportsFilePreview":true,"supportsApprovals":true,"supportsQuestions":true,"supportsAttachments":false}"#
+        let recorder = WorkerSessionCommandRecorder(
+            results: [
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data(
+                        """
+                        \(WorkerChatProtocol.marker)
+                        {"provider":"codex","available":true,"capabilities":\(capabilities),"reason":null}
+
+                        """.utf8
+                    ),
+                    standardError: Data()
+                ),
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data(
+                        """
+                        \(WorkerChatProtocol.marker)
+                        {"relayId":"\(relayID)","provider":"codex","providerThreadId":"\(threadID)","capabilities":\(capabilities),"launchOptions":{"model":"gpt-example"}}
+
+                        """.utf8
+                    ),
+                    standardError: Data()
+                ),
+            ]
+        )
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+
+        let snapshot = await service.start(
+            kind: .codex,
+            repositoryName: "terminal-relay",
+            launchDefaults: .standard,
+            on: worker
+        )
+
+        XCTAssertEqual(snapshot?.instanceToken, relayID)
+        XCTAssertEqual(snapshot?.threadID, threadID)
+        XCTAssertEqual(snapshot?.presentation, .chat)
+        XCTAssertEqual(
+            recorder.configurations,
+            [
+                SSHCommandBuilder.workerChatCapabilitiesConfiguration(
+                    for: worker,
+                    kind: .codex,
+                    repositoryName: "terminal-relay"
+                ),
+                SSHCommandBuilder.workerChatStartConfiguration(
+                    for: worker,
+                    kind: .codex,
+                    repositoryName: "terminal-relay",
+                    threadID: nil,
+                    launchDefaults: .standard
+                ),
+            ]
+        )
+    }
+
     func testResumeThreadRequiresAndStoresTheExactProviderThreadID() async {
         let worker = makeWorker()
         let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         let instanceID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         let recorder = WorkerSessionCommandRecorder(
             results: [
+                WorkerSessionCommandResult(
+                    exitCode: 64,
+                    standardOutput: Data(),
+                    standardError: Data("unsupported command".utf8)
+                ),
                 WorkerSessionCommandResult(
                     exitCode: 0,
                     standardOutput: Data(
@@ -623,6 +708,14 @@ final class WorkerSessionServiceTests: XCTestCase {
         XCTAssertEqual(service.response(for: worker.id)?.sessions, [snapshot].compactMap { $0 })
         XCTAssertEqual(
             recorder.configurations.first,
+            SSHCommandBuilder.workerChatCapabilitiesConfiguration(
+                for: worker,
+                kind: .codex,
+                repositoryName: "terminal-relay"
+            )
+        )
+        XCTAssertEqual(
+            recorder.configurations.dropFirst().first,
             SSHCommandBuilder.workerThreadResumeConfiguration(
                 for: worker,
                 kind: .codex,

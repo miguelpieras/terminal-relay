@@ -1,5 +1,10 @@
 import Foundation
 
+enum WorkerSessionPresentation: String, Equatable {
+    case terminal
+    case chat
+}
+
 struct WorkerSessionSnapshot: Equatable, Identifiable {
     let kind: AgentKind
     let repositoryName: String
@@ -9,6 +14,7 @@ struct WorkerSessionSnapshot: Equatable, Identifiable {
     let lastActivityAt: Int?
     let reportedWorking: Bool?
     let threadID: String?
+    let presentation: WorkerSessionPresentation
 
     var id: String { instanceToken }
 
@@ -20,7 +26,8 @@ struct WorkerSessionSnapshot: Equatable, Identifiable {
         title: String? = nil,
         lastActivityAt: Int? = nil,
         reportedWorking: Bool? = nil,
-        threadID: String? = nil
+        threadID: String? = nil,
+        presentation: WorkerSessionPresentation = .terminal
     ) {
         self.kind = kind
         self.repositoryName = repositoryName
@@ -30,6 +37,7 @@ struct WorkerSessionSnapshot: Equatable, Identifiable {
         self.lastActivityAt = lastActivityAt
         self.reportedWorking = reportedWorking
         self.threadID = threadID
+        self.presentation = presentation
     }
 
     func isWorking(now: Date = Date()) -> Bool {
@@ -95,7 +103,8 @@ enum WorkerSessionProtocol {
                 projects.append(fields[1])
             case "session":
                 guard fields.count == 5 || fields.count == 7
-                        || fields.count == 8 || fields.count == 9,
+                        || fields.count == 8 || fields.count == 9
+                        || fields.count == 10,
                       let kind = AgentKind(rawValue: fields[1]),
                       isValidRepositoryName(fields[2]),
                       let attachedClientCount = Int(fields[3]),
@@ -111,6 +120,7 @@ enum WorkerSessionProtocol {
                 let title: String?
                 let reportedWorking: Bool?
                 let threadID: String?
+                let presentation: WorkerSessionPresentation
                 if fields.count >= 7 {
                     guard let activity = Int(fields[5]), activity >= 0,
                           let decodedTitle = decodeHexUTF8(fields[6]),
@@ -127,7 +137,7 @@ enum WorkerSessionProtocol {
                     } else {
                         reportedWorking = nil
                     }
-                    if fields.count == 9 {
+                    if fields.count >= 9 {
                         if fields[8].isEmpty {
                             threadID = nil
                         } else {
@@ -139,11 +149,22 @@ enum WorkerSessionProtocol {
                     } else {
                         threadID = nil
                     }
+                    if fields.count == 10 {
+                        guard let parsedPresentation = WorkerSessionPresentation(
+                            rawValue: fields[9]
+                        ) else {
+                            throw WorkerSessionProtocolError.invalidRecord
+                        }
+                        presentation = parsedPresentation
+                    } else {
+                        presentation = .terminal
+                    }
                 } else {
                     lastActivityAt = nil
                     title = nil
                     reportedWorking = nil
                     threadID = nil
+                    presentation = .terminal
                 }
                 sessions.append(
                     WorkerSessionSnapshot(
@@ -154,7 +175,8 @@ enum WorkerSessionProtocol {
                         title: title,
                         lastActivityAt: lastActivityAt,
                         reportedWorking: reportedWorking,
-                        threadID: threadID
+                        threadID: threadID,
+                        presentation: presentation
                     )
                 )
             default:

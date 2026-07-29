@@ -26,10 +26,12 @@ The categories are:
   cancellation, and failure.
 - `worker-session`: session/thread refresh, start, resume, mutation, and stop
   results.
-- `terminal-session`: terminal attachment start and exit.
+- `terminal-session`: native-chat and terminal attachment start, reconnect,
+  sanitized failure, and exit.
 
 The app deliberately does not log authorization URL or code contents,
-credentials, or terminal contents.
+credentials, native-chat records, file previews, secret answers, or terminal
+contents.
 
 ## Worker session checks
 
@@ -84,6 +86,47 @@ The installer verifies that both SSH targets reach the same machine, installs
 atomically, and preserves the systemd service state. It leaves no retained host
 copies by default. Use `--retain-backups` only when a host-side rollback was
 explicitly requested; that mode prints a guarded rollback command.
+
+## Native chat is unavailable or reconnecting
+
+Check capability negotiation without starting a turn or reading provider
+history:
+
+```bash
+ssh terminal-relay-worker-N \
+  '/usr/local/bin/terminal-relay-session chat-capabilities-v1 codex example-repository'
+ssh terminal-relay-worker-N \
+  '/usr/local/bin/terminal-relay-session chat-capabilities-v1 claude example-repository'
+```
+
+A ready adapter returns `__TERMINAL_RELAY_CHAT_V1__` followed by one bounded
+capability object. A missing marker means the worker predates structured chat.
+An unavailable result means the selected provider adapter failed its readiness
+check; existing terminal sessions remain usable.
+
+For a chat that already exists, compare only its provider, repository, exact
+relay UUID, and `chat` presentation in the normal `status` response. Do not
+print the broker's NDJSON stream, provider app-server traffic, SDK message
+objects, or transcript files. A local app disconnect should leave that status
+row present with zero attached clients. **Stop Agent** should remove only the
+row with the matching relay UUID.
+
+If the app reports a sequence gap, leave the agent running and use
+**Reconnect** once. The client reattaches with its last cursor; the broker
+replays its bounded window or rebuilds an authoritative snapshot from the
+provider. Persistent protocol errors should be reproduced with the app's
+sanitized `terminal-session` logs and the focused local suites:
+
+```bash
+./Server/Tests/terminal-relay-chat-tests.py
+./Server/Tests/terminal-relay-chat-session-tests.py
+```
+
+**Open Terminal Fallback** is an explicit same-thread migration. If stopping
+the exact chat relay or releasing its provider lock fails, the operation must
+fail closed and must not open a PTY. Retry the migration or stop that exact
+agent before starting a terminal session; never bypass the lock or run both
+modes against the same provider thread.
 
 ## Thread catalog or built-in MCP is unavailable
 

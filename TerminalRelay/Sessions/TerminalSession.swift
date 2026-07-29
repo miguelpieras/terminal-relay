@@ -137,7 +137,9 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
     let sequenceNumber: Int
     let startedAt: Date
     let instanceToken: String
+    let presentation: WorkerSessionPresentation
     let terminalView: LocalProcessTerminalView
+    let chatCoordinator: ConversationCoordinator?
 
     @Published private(set) var status: TerminalSessionStatus
     @Published private(set) var terminalTitle: String?
@@ -157,6 +159,8 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
     private var statusBeforeStopping: TerminalSessionStatus?
     private var remoteStopRequested = false
     private var explicitDisconnectRequested = false
+    private var chatIndicatesWorking = false
+    private var chatStateObserver: AnyCancellable?
 
     init(
         project: ProjectProfile,
@@ -169,7 +173,9 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         initialStatus: TerminalSessionStatus = .connecting,
         terminalTitle: String? = nil,
         threadID: String? = nil,
-        remoteAttachedClientCount: Int? = nil
+        remoteAttachedClientCount: Int? = nil,
+        presentation: WorkerSessionPresentation = .terminal,
+        launchDefaults: AgentLaunchDefaults = .standard
     ) {
         self.id = id
         self.projectID = project.id
@@ -182,16 +188,45 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         self.sequenceNumber = sequenceNumber
         self.startedAt = startedAt
         self.instanceToken = instanceToken
+        self.presentation = presentation
         self.status = initialStatus
         self.terminalTitle = nil
         self.threadID = threadID ?? (kind == .claude ? instanceToken : nil)
         self.remoteAttachedClientCount = remoteAttachedClientCount
-        self.configuration = SSHCommandBuilder.configuration(
-            for: server,
-            project: project,
-            kind: kind,
-            instanceToken: instanceToken
-        )
+        switch presentation {
+        case .terminal:
+            self.configuration = SSHCommandBuilder.configuration(
+                for: server,
+                project: project,
+                kind: kind,
+                instanceToken: instanceToken
+            )
+            self.chatCoordinator = nil
+        case .chat:
+            let transport = MacChatTransport(
+                configuration: SSHCommandBuilder.workerChatAttachConfiguration(
+                    for: server,
+                    kind: kind,
+                    repositoryName: project.displayName,
+                    instanceToken: instanceToken
+                )
+            )
+            self.configuration = SSHCommandBuilder.workerChatAttachConfiguration(
+                for: server,
+                kind: kind,
+                repositoryName: project.displayName,
+                instanceToken: instanceToken
+            )
+            self.chatCoordinator = ConversationCoordinator(
+                transport: transport,
+                identity: ChatConversationIdentity(
+                    relayID: instanceToken,
+                    provider: ChatProvider(rawValue: kind.rawValue),
+                    providerThreadID: threadID
+                ),
+                launchOptions: launchDefaults.chatOptions(for: kind)
+            )
+        }
         self.terminalView = LocalProcessTerminalView(frame: NSRect(x: 0, y: 0, width: 900, height: 600))
         super.init()
 
@@ -204,6 +239,13 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
 
         if let terminalTitle {
             applyTerminalTitle(terminalTitle)
+        }
+
+        if let chatCoordinator {
+            chatStateObserver = chatCoordinator.store.$state
+                .sink { [weak self] state in
+                    self?.applyChatState(state)
+                }
         }
 
         terminalView.getTerminal().registerOscHandler(code: 9) { [weak self, weak terminalView] payload in
@@ -231,6 +273,10 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         "\(projectName) · \(kind.displayName)"
     }
 
+    var usesNativeChat: Bool {
+        presentation == .chat && chatCoordinator != nil
+    }
+
     var displayTitle: String {
         guard let terminalTitle else {
             return "\(kind.displayName) \(sequenceNumber)"
@@ -255,6 +301,13 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
               !isExited else { return }
         hasStarted = true
         status = .connecting
+        if let chatCoordinator {
+            terminalSessionLogger.notice(
+                "Attaching native chat \(self.kind.rawValue, privacy: .public) session \(self.instanceToken, privacy: .public) for \(self.projectName, privacy: .public) on \(self.serverName, privacy: .public)"
+            )
+            chatCoordinator.start()
+            return
+        }
         terminalSessionLogger.notice(
             "Attaching \(self.kind.rawValue, privacy: .public) session \(self.instanceToken, privacy: .public) for \(self.projectName, privacy: .public) on \(self.serverName, privacy: .public)"
         )
@@ -278,10 +331,35 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         }
     }
 
-    func sendPrompt(_ prompt: String) {
+    func sendPrompt(
+        _ prompt: String,
+        attachments: [ChatAttachmentReference] = []
+    ) {
+        if let chatCoordinator {
+            guard !prompt.isEmpty else { return }
+            Task {
+                await chatCoordinator.send(
+                    text: prompt,
+                    attachments: attachments
+                )
+            }
+            return
+        }
         guard status == .running, !prompt.isEmpty else { return }
         terminalView.send(txt: "\u{1B}[200~\(prompt)\u{1B}[201~")
         pressReturn()
+    }
+
+    func updateChatLaunchOptions(
+        model: String,
+        reasoningEffort: String,
+        fastMode: Bool
+    ) {
+        chatCoordinator?.updateLaunchOptions(
+            model: model,
+            reasoningEffort: reasoningEffort,
+            fastMode: fastMode
+        )
     }
 
     func sendCommand(_ command: String, focusesTerminal: Bool = false) {
@@ -321,6 +399,12 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
     }
 
     func interrupt() {
+        if let chatCoordinator {
+            Task {
+                await chatCoordinator.interrupt()
+            }
+            return
+        }
         guard status == .running else { return }
         sendEscape()
         DispatchQueue.main.async { [weak self] in
@@ -409,6 +493,17 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         guard status.isLocallyAttached, !hasFinished else { return }
         explicitDisconnectRequested = true
 
+        if let chatCoordinator {
+            status = .remoteRunning
+            chatIndicatesWorking = false
+            updateWorkingState()
+            Task { [weak self] in
+                await chatCoordinator.detach()
+                self?.hasFinished = true
+            }
+            return
+        }
+
         if !hasStarted {
             hasFinished = true
             status = .exited(nil)
@@ -469,13 +564,19 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         if terminalView.process.shellPid > 0 {
             terminalView.terminate()
         }
+        if let chatCoordinator {
+            Task {
+                await chatCoordinator.detach()
+            }
+        }
         updateWorkingState()
     }
 
     func applyRemoteSnapshot(_ snapshot: WorkerSessionSnapshot) {
         guard snapshot.kind == kind,
               snapshot.repositoryName == projectName,
-              snapshot.instanceToken == instanceToken else {
+              snapshot.instanceToken == instanceToken,
+              snapshot.presentation == presentation else {
             return
         }
         remoteAttachedClientCount = snapshot.attachedClientCount
@@ -512,6 +613,11 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         if terminalView.process.shellPid > 0 {
             terminalView.terminate()
         }
+        if let chatCoordinator {
+            Task {
+                await chatCoordinator.detach()
+            }
+        }
         updateWorkingState()
     }
 
@@ -520,6 +626,12 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         remoteAttachedClientCount = nil
         remoteIndicatesWorking = false
         status = .exited(lastLocalExitCode)
+        hasFinished = true
+        if let chatCoordinator {
+            Task {
+                await chatCoordinator.detach()
+            }
+        }
         updateWorkingState()
     }
 
@@ -607,6 +719,24 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
 
     private func updateWorkingState() {
         let wasWorking = isWorking
+        if presentation == .chat {
+            switch status {
+            case .connecting, .running:
+                isWorking = chatIndicatesWorking
+            case .remoteRunning, .disconnected:
+                isWorking = remoteIndicatesWorking
+            case .stopping, .exited:
+                isWorking = false
+            }
+            if wasWorking,
+               !isWorking,
+               !explicitDisconnectRequested,
+               !remoteStopRequested,
+               status == .running || status == .remoteRunning {
+                taskCompletionCount += 1
+            }
+            return
+        }
         switch status {
         case .connecting, .running:
             isWorking = titleIndicatesWorking
@@ -623,7 +753,55 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
            !explicitDisconnectRequested,
            !remoteStopRequested,
            status == .running || status == .remoteRunning {
-            taskCompletionCount += 1
+           taskCompletionCount += 1
+        }
+    }
+
+    private func applyChatState(_ state: ConversationState) {
+        guard presentation == .chat,
+              hasStarted,
+              !hasFinished,
+              status != .stopping,
+              !remoteStopRequested else {
+            return
+        }
+
+        chatIndicatesWorking = state.turnState.isActive
+        switch state.connectionState {
+        case .connecting:
+            status = .connecting
+        case .streaming, .awaitingApproval, .interrupted:
+            status = .running
+        case .offlineAgentRunning:
+            status = .remoteRunning
+        case .stopped:
+            status = .exited(nil)
+            hasFinished = true
+        case .unsupportedWorker, .failed:
+            status = .disconnected(nil)
+        case .unknown:
+            status = .running
+        }
+        updateWorkingState()
+    }
+}
+
+private extension AgentLaunchDefaults {
+    func chatOptions(for kind: AgentKind) -> ChatLaunchOptions {
+        switch kind {
+        case .codex:
+            ChatLaunchOptions(
+                model: codexModel,
+                reasoningEffort: codexReasoningEffort.rawValue,
+                sandbox: fullAccessEnabled ? "danger-full-access" : "workspace-write",
+                approvalPolicy: fullAccessEnabled ? "never" : "on-request"
+            )
+        case .claude:
+            ChatLaunchOptions(
+                model: claudeModel,
+                reasoningEffort: claudeReasoningEffort.rawValue,
+                approvalPolicy: fullAccessEnabled ? "bypassPermissions" : "default"
+            )
         }
     }
 }

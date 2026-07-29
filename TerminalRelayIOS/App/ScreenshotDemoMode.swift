@@ -48,7 +48,8 @@ enum DemoWorkspace {
             title: "Build adaptive iPad workspace",
             lastActivityAt: 1_800_000_000,
             reportedWorking: true,
-            threadID: "00000000-0000-4000-8000-000000003001"
+            threadID: "00000000-0000-4000-8000-000000003001",
+            presentation: .chat
         ),
         WorkerSessionSnapshot(
             kind: .claude,
@@ -58,7 +59,8 @@ enum DemoWorkspace {
             title: "Review private pairing flow",
             lastActivityAt: 1_799_999_980,
             reportedWorking: false,
-            threadID: "00000000-0000-4000-8000-000000003002"
+            threadID: "00000000-0000-4000-8000-000000003002",
+            presentation: .chat
         ),
         WorkerSessionSnapshot(
             kind: .codex,
@@ -68,7 +70,8 @@ enum DemoWorkspace {
             title: "Prepare App Store release",
             lastActivityAt: 1_799_999_960,
             reportedWorking: false,
-            threadID: "00000000-0000-4000-8000-000000003003"
+            threadID: "00000000-0000-4000-8000-000000003003",
+            presentation: .chat
         ),
     ]
 

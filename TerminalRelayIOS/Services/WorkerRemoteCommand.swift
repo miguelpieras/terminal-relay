@@ -173,6 +173,86 @@ enum WorkerRemoteCommand {
         return "\(WorkerSessionProtocol.helperPath) stop \(arguments)"
     }
 
+    static func chatCapabilities(
+        kind: AgentKind,
+        repositoryName: String
+    ) throws -> String {
+        try validateRepository(repositoryName)
+        return [
+            WorkerSessionProtocol.helperPath,
+            "chat-capabilities-v1",
+            kind.rawValue,
+            repositoryName,
+        ].map(shellQuote).joined(separator: " ")
+    }
+
+    static func startChat(
+        kind: AgentKind,
+        repositoryName: String,
+        providerThreadID: String? = nil,
+        launchArguments: [String]
+    ) throws -> String {
+        try validateRepository(repositoryName)
+        if let providerThreadID {
+            try validateThread(
+                repositoryName: repositoryName,
+                threadID: providerThreadID
+            )
+        }
+
+        let workingDirectory = "/workspace/\(repositoryName)"
+        var command = [
+            WorkerSessionProtocol.helperPath,
+            "chat-start-v1",
+            kind.rawValue,
+            repositoryName,
+        ]
+        if let providerThreadID {
+            command.append(providerThreadID)
+        }
+        command.append(contentsOf: launchArguments)
+        return "cd -- \(shellQuote(workingDirectory)) && exec \(command.map(shellQuote).joined(separator: " "))"
+    }
+
+    static func attachChat(
+        kind: AgentKind,
+        repositoryName: String,
+        relayID: String
+    ) throws -> String {
+        try validateSessionIdentity(
+            repositoryName: repositoryName,
+            instanceToken: relayID
+        )
+        return [
+            "exec",
+            WorkerSessionProtocol.helperPath,
+            "chat-attach-v1",
+            kind.rawValue,
+            repositoryName,
+            relayID,
+        ].enumerated().map { index, value in
+            index == 0 ? value : shellQuote(value)
+        }.joined(separator: " ")
+    }
+
+    static func stopChat(
+        kind: AgentKind,
+        repositoryName: String,
+        relayID: String
+    ) throws -> String {
+        try validateSessionIdentity(
+            repositoryName: repositoryName,
+            instanceToken: relayID
+        )
+        return [
+            WorkerSessionProtocol.helperPath,
+            "chat-stop-v1",
+            kind.rawValue,
+            repositoryName,
+            relayID,
+        ].map(shellQuote).joined(separator: " ")
+    }
+
     static func threads(
         kind: AgentKind,
         repositoryName: String,

@@ -23,6 +23,10 @@ packages:
   SwiftCrypto:
     url: https://github.com/apple/swift-crypto.git
     exactVersion: 4.5.1
+  MarkdownView:
+    url: https://github.com/LiYanan2004/MarkdownView.git
+    exactVersion: 3.0.0
+    traits: []
 
 targets:
   TerminalRelay:
@@ -30,6 +34,7 @@ targets:
     platform: macOS
     sources:
       - path: TerminalRelay
+      - path: Shared/Chat
       - path: LICENSE
         buildPhase: resources
       - path: THIRD_PARTY_NOTICES.md
@@ -59,6 +64,7 @@ targets:
     dependencies:
       - package: Sparkle
       - package: SwiftTerm
+      - package: MarkdownView
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.mpieras.TerminalRelay
@@ -95,10 +101,12 @@ targets:
     platform: iOS
     sources:
       - path: TerminalRelayIOS
+      - path: Shared/Chat
       - path: TerminalRelay/Models/AgentKind.swift
       - path: TerminalRelay/Models/AgentLaunchDefaults.swift
       - path: TerminalRelay/Models/MobilePairingPayload.swift
       - path: TerminalRelay/Models/WorkerSessionState.swift
+      - path: TerminalRelay/Models/WorkerChatState.swift
       - path: TerminalRelay/Models/WorkerThreadState.swift
       - path: TerminalRelay/Models/WorkerUpdateStatus.swift
       - path: LICENSE
@@ -112,6 +120,7 @@ targets:
         product: NIOCore
       - package: SwiftNIO
         product: NIOPosix
+      - package: MarkdownView
     info:
       path: TerminalRelayIOS/Info.plist
       properties:

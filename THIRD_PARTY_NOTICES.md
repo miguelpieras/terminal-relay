@@ -12,6 +12,15 @@ Terminal Relay includes the following Swift packages:
 - Swift Atomics 1.3.1 — Apache License 2.0
 - Swift ASN.1 1.7.1 — Apache License 2.0
 - Swift Argument Parser 1.8.2 — Apache License 2.0
+- MarkdownView 3.0.0 — MIT License
+- RichText 1.0.0 — MIT License
+- Highlightr 2.3.0 — MIT License
+- highlight.js 11.11.1, bundled by Highlightr — BSD 3-Clause License
+- swift-markdown 0.8.0 — Apache License 2.0
+- swift-cmark 0.8.0 — BSD-style License with MIT-licensed derived portions
+
+MarkdownView is configured without its optional LaTeX trait, so Terminal Relay
+does not include SwiftMath.
 
 The Apache-licensed components are distributed under the repository's
 [Apache License 2.0](LICENSE).

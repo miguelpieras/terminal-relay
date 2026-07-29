@@ -161,6 +161,63 @@ final class WorkerRemoteCommandTests: XCTestCase {
         }
     }
 
+    func testChatCommandsAreCapabilityGatedAndExactInstanceScoped() throws {
+        let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+        XCTAssertEqual(
+            try WorkerRemoteCommand.chatCapabilities(
+                kind: .codex,
+                repositoryName: "terminal-relay"
+            ),
+            "'/usr/local/bin/terminal-relay-session' 'chat-capabilities-v1' 'codex' 'terminal-relay'"
+        )
+        XCTAssertEqual(
+            try WorkerRemoteCommand.startChat(
+                kind: .claude,
+                repositoryName: "terminal-relay",
+                providerThreadID: threadID,
+                launchArguments: ["--model", "sonnet"]
+            ),
+            "cd -- '/workspace/terminal-relay' && exec '/usr/local/bin/terminal-relay-session' 'chat-start-v1' 'claude' 'terminal-relay' '\(threadID)' '--model' 'sonnet'"
+        )
+        XCTAssertEqual(
+            try WorkerRemoteCommand.attachChat(
+                kind: .codex,
+                repositoryName: "terminal-relay",
+                relayID: instanceToken
+            ),
+            "exec '/usr/local/bin/terminal-relay-session' 'chat-attach-v1' 'codex' 'terminal-relay' '\(instanceToken)'"
+        )
+        XCTAssertEqual(
+            try WorkerRemoteCommand.stopChat(
+                kind: .codex,
+                repositoryName: "terminal-relay",
+                relayID: instanceToken
+            ),
+            "'/usr/local/bin/terminal-relay-session' 'chat-stop-v1' 'codex' 'terminal-relay' '\(instanceToken)'"
+        )
+
+        XCTAssertThrowsError(
+            try WorkerRemoteCommand.attachChat(
+                kind: .codex,
+                repositoryName: "terminal-relay",
+                relayID: "not-a-relay"
+            )
+        ) { error in
+            XCTAssertEqual(error as? WorkerRemoteCommandError, .invalidInstanceToken)
+        }
+        XCTAssertThrowsError(
+            try WorkerRemoteCommand.startChat(
+                kind: .codex,
+                repositoryName: "terminal-relay",
+                providerThreadID: threadID.uppercased(),
+                launchArguments: []
+            )
+        ) { error in
+            XCTAssertEqual(error as? WorkerRemoteCommandError, .invalidInstanceToken)
+        }
+    }
+
     func testThreadCommandsValidateIdentityAndQuoteNames() throws {
         let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
@@ -273,6 +330,26 @@ final class WorkerRemoteCommandTests: XCTestCase {
         XCTAssertEqual(
             terminalCommand,
             "exec '/usr/local/bin/terminal-relay-session' 'reattach' 'codex' 'terminal-relay' '88b888aa-4d15-4e2b-aacc-4932f440b9ee'"
+        )
+
+        let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        XCTAssertEqual(
+            try TerminalSessionCommandPolicy.launchCommand(
+                kind: .codex,
+                repositoryName: "terminal-relay",
+                providerThreadID: threadID,
+                launchArguments: ["--model", "gpt"]
+            ),
+            "'/usr/local/bin/terminal-relay-session' 'thread-resume-v2' 'codex' 'terminal-relay' '\(threadID)' '--model' 'gpt'"
+        )
+        XCTAssertEqual(
+            try TerminalSessionCommandPolicy.launchCommand(
+                kind: .codex,
+                repositoryName: "terminal-relay",
+                providerThreadID: nil,
+                launchArguments: []
+            ),
+            "cd -- '/workspace/terminal-relay' && exec '/usr/local/bin/terminal-relay-session' 'start' 'codex' 'terminal-relay'"
         )
     }
 

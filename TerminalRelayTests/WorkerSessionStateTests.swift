@@ -75,6 +75,35 @@ final class WorkerSessionStateTests: XCTestCase {
         )
     }
 
+    func testParsesChatPresentationAndDefaultsLegacyRecordsToTerminal() throws {
+        let relayID = "01234567-89ab-4def-8abc-0123456789ab"
+        let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let response = try WorkerSessionProtocol.parse(
+            """
+            \(WorkerSessionProtocol.marker)
+            session|codex|terminal-relay|2|\(relayID)|123|43686174|1|\(threadID)|chat
+            session|claude|website-api|0|11111111-2222-4333-8444-555555555555
+            """
+        )
+
+        XCTAssertEqual(response.sessions[0].presentation, .chat)
+        XCTAssertEqual(response.sessions[0].threadID, threadID)
+        XCTAssertEqual(response.sessions[1].presentation, .terminal)
+    }
+
+    func testRejectsUnknownPresentation() {
+        XCTAssertThrowsError(
+            try WorkerSessionProtocol.parse(
+                """
+                \(WorkerSessionProtocol.marker)
+                session|codex|terminal-relay|0|01234567-89ab-4def-8abc-0123456789ab|1||0|aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa|screen
+                """
+            )
+        ) {
+            XCTAssertEqual($0 as? WorkerSessionProtocolError, .invalidRecord)
+        }
+    }
+
     func testRejectsDuplicateInstancesAndUnsafeProjectNames() {
         let duplicateInstance = """
         __TERMINAL_RELAY_SESSION_V1__

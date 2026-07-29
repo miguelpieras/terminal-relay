@@ -6,6 +6,22 @@ struct TerminalRoute: Identifiable, Equatable {
     let kind: AgentKind
     let repositoryName: String
     let instanceToken: String?
+    let providerThreadID: String?
+    let presentation: WorkerSessionPresentation?
+
+    init(
+        kind: AgentKind,
+        repositoryName: String,
+        instanceToken: String?,
+        providerThreadID: String? = nil,
+        presentation: WorkerSessionPresentation? = nil
+    ) {
+        self.kind = kind
+        self.repositoryName = repositoryName
+        self.instanceToken = instanceToken
+        self.providerThreadID = providerThreadID
+        self.presentation = presentation
+    }
 }
 
 enum WorkerSessionModelError: LocalizedError, Equatable {
@@ -417,59 +433,28 @@ final class WorkerSessionModel: ObservableObject {
             return
         }
         if isDemoMode {
-            terminalRoute = TerminalRoute(
+            let route = TerminalRoute(
                 kind: thread.kind,
                 repositoryName: thread.repositoryName,
-                instanceToken: nil
+                instanceToken: nil,
+                providerThreadID: thread.threadID
             )
+            lastOpenedTerminalRoute = route
+            terminalRoute = route
             return
         }
         guard let worker = profiles.first(where: { $0.id == workerID }) else { return }
-        do {
-            let command = try WorkerRemoteCommand.resumeThread(
-                kind: thread.kind,
-                repositoryName: thread.repositoryName,
-                threadID: thread.threadID,
-                launchArguments: AgentLaunchDefaults.standard.arguments(for: thread.kind)
-            )
-            let data = try await workerClient.execute(command, on: worker)
-            let response = try WorkerSessionProtocol.parse(data)
-            guard response.sessions.count == 1,
-                  let snapshot = response.sessions.first,
-                  snapshot.kind == thread.kind,
-                  snapshot.threadID == thread.threadID else {
-                throw WorkerThreadProtocolError.invalidResponse
-            }
-            if profile?.id != workerID {
-                selectProfile(id: workerID)
-            }
-            sessions = sessions.filter { $0.instanceToken != snapshot.instanceToken } + [snapshot]
-            if let overview = workerOverviews[workerID] {
-                let workerSessions = overview.sessions.filter {
-                    $0.instanceToken != snapshot.instanceToken
-                } + [snapshot]
-                workerOverviews[workerID] = WorkerOverviewSnapshot(
-                    projects: overview.projects,
-                    sessions: workerSessions,
-                    resources: overview.resources,
-                    accounts: overview.accounts,
-                    accountErrors: overview.accountErrors,
-                    connectionError: overview.connectionError,
-                    updateStatus: overview.updateStatus
-                )
-                mergeLiveSessionsIntoThreadCatalogs(
-                    workerID: workerID,
-                    sessions: workerSessions
-                )
-            }
-            openTerminal(snapshot)
-            await refreshThreads(
-                workerID: workerID,
-                repositoryName: thread.repositoryName
-            )
-        } catch {
-            errorMessage = error.localizedDescription
+        if profile?.id != workerID {
+            selectProfile(id: workerID)
         }
+        let route = TerminalRoute(
+            kind: thread.kind,
+            repositoryName: thread.repositoryName,
+            instanceToken: nil,
+            providerThreadID: thread.threadID
+        )
+        lastOpenedTerminalRoute = route
+        terminalRoute = route
     }
 
     func renameThread(
@@ -514,7 +499,9 @@ final class WorkerSessionModel: ObservableObject {
         let route = TerminalRoute(
             kind: session.kind,
             repositoryName: session.repositoryName,
-            instanceToken: session.instanceToken
+            instanceToken: session.instanceToken,
+            providerThreadID: session.threadID,
+            presentation: session.presentation
         )
         markSessionRead(session)
         lastOpenedTerminalRoute = route

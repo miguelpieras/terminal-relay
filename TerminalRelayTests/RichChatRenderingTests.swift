@@ -1,0 +1,365 @@
+import XCTest
+@testable import TerminalRelay
+
+final class RichChatRenderingTests: XCTestCase {
+    func testViewportPolicyAnchorsInitialSnapshotOnceAndPreservesReadingPosition() {
+        var policy = ConversationViewportPolicy()
+        XCTAssertFalse(policy.acceptsBottomMeasurements)
+        XCTAssertEqual(
+            policy.actionForContentUpdate(
+                hasContent: false,
+                isPagination: false,
+                wasNearBottom: true
+            ),
+            .preserve
+        )
+        XCTAssertEqual(
+            policy.actionForContentUpdate(
+                hasContent: true,
+                isPagination: false,
+                wasNearBottom: true
+            ),
+            .anchorInitialLatest
+        )
+        XCTAssertFalse(policy.acceptsBottomMeasurements)
+        XCTAssertEqual(
+            policy.actionForContentUpdate(
+                hasContent: true,
+                isPagination: false,
+                wasNearBottom: true
+            ),
+            .preserve,
+            "Replay updates must wait for the pending initial anchor."
+        )
+
+        policy.completeInitialAnchor()
+        XCTAssertTrue(policy.acceptsBottomMeasurements)
+        XCTAssertEqual(
+            policy.actionForContentUpdate(
+                hasContent: true,
+                isPagination: false,
+                wasNearBottom: true
+            ),
+            .anchorLatest
+        )
+        XCTAssertEqual(
+            policy.actionForContentUpdate(
+                hasContent: true,
+                isPagination: false,
+                wasNearBottom: false
+            ),
+            .preserve
+        )
+        XCTAssertEqual(
+            policy.actionForContentUpdate(
+                hasContent: true,
+                isPagination: true,
+                wasNearBottom: true
+            ),
+            .preserve,
+            "Prepending history must preserve the visible reading anchor."
+        )
+    }
+
+    func testComposerReturnPolicyKeepsPlainReturnAsNewlineAndCommandReturnAsSend() {
+        XCTAssertEqual(
+            ComposerInputPolicy.returnAction(
+                commandKeyPressed: false,
+                canSend: true
+            ),
+            .insertNewline
+        )
+        XCTAssertEqual(
+            ComposerInputPolicy.returnAction(
+                commandKeyPressed: true,
+                canSend: true
+            ),
+            .send
+        )
+        XCTAssertEqual(
+            ComposerInputPolicy.returnAction(
+                commandKeyPressed: true,
+                canSend: false
+            ),
+            .ignore
+        )
+    }
+
+    func testExternalLinksAllowOnlyExplicitCredentialFreeHTTPDestinations() throws {
+        let safeHTTP = try XCTUnwrap(URL(string: "http://example.com/docs?q=chat#streaming"))
+        let safeHTTPS = try XCTUnwrap(URL(string: "https://example.com/docs"))
+        XCTAssertEqual(ChatURLPolicy.classify(safeHTTP), .external(safeHTTP))
+        XCTAssertEqual(ChatURLPolicy.classify(safeHTTPS), .external(safeHTTPS))
+
+        let blockedValues = [
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "file:///etc/passwd",
+            "mailto:hello@example.com",
+            "https://user:password@example.com/private",
+            "custom://example.com/action",
+        ]
+        for rawValue in blockedValues {
+            let url = try XCTUnwrap(URL(string: rawValue))
+            XCTAssertEqual(
+                ChatURLPolicy.classify(url),
+                .blocked,
+                "Expected \(rawValue) to be blocked"
+            )
+        }
+    }
+
+    func testRepositoryLinksAcceptCanonicalAndRelativePathsWithLocations() throws {
+        XCTAssertEqual(
+            ChatURLPolicy.repositoryLink(
+                from: "/workspace/example/Sources/App.swift:12:3"
+            ),
+            ChatRepositoryLink(
+                path: "/workspace/example/Sources/App.swift",
+                line: 12,
+                column: 3
+            )
+        )
+        XCTAssertEqual(
+            ChatURLPolicy.repositoryLink(from: "Sources/App.swift:9"),
+            ChatRepositoryLink(path: "Sources/App.swift", line: 9, column: nil)
+        )
+
+        let fragmentURL = try XCTUnwrap(
+            URL(string: "terminal-relay-file:///Sources/App.swift#L22")
+        )
+        XCTAssertEqual(
+            ChatURLPolicy.classify(fragmentURL),
+            .repository(
+                ChatRepositoryLink(path: "Sources/App.swift", line: 22, column: nil)
+            )
+        )
+    }
+
+    func testRepositoryLinksRejectTraversalAmbiguousHostsAndNonWorkspaceAbsolutePaths() throws {
+        let rejectedStrings = [
+            "../Secrets.txt",
+            "Sources/../Secrets.txt",
+            "Sources/./App.swift",
+            "/private/etc/passwd",
+            "Sources/",
+            "",
+        ]
+        for rawValue in rejectedStrings {
+            XCTAssertNil(
+                ChatURLPolicy.repositoryLink(from: rawValue),
+                "Expected \(rawValue) to be rejected"
+            )
+        }
+
+        let rejectedURLs = [
+            "terminal-relay-file://untrusted-host/Sources/App.swift",
+            "terminal-relay-file:///Sources/%2E%2E/Secrets.txt",
+            "terminal-relay-file:///Sources/App.swift?redirect=Secrets.txt",
+        ]
+        for rawValue in rejectedURLs {
+            let url = try XCTUnwrap(URL(string: rawValue))
+            XCTAssertEqual(
+                ChatURLPolicy.classify(url),
+                .blocked,
+                "Expected \(rawValue) to be blocked"
+            )
+        }
+    }
+
+    func testRawHTMLIsEscapedWithoutDamagingInlineOrFencedCode() {
+        let source = """
+        Before <script>alert("x")</script>
+        Inline: `let tag = <value>`
+        ```html
+        <div>code sample</div>
+        ```
+        After <img src="https://example.com/pixel.png">
+        """
+
+        let escaped = MarkdownSafety.escapedRawHTML(source)
+
+        XCTAssertTrue(escaped.contains("Before &lt;script>alert"))
+        XCTAssertTrue(escaped.contains("&lt;/script>"))
+        XCTAssertTrue(escaped.contains("`let tag = <value>`"))
+        XCTAssertTrue(escaped.contains("<div>code sample</div>"))
+        XCTAssertTrue(escaped.contains("After &lt;img"))
+        XCTAssertFalse(escaped.contains("After <img"))
+    }
+
+    func testMarkdownSanitizationNeutralizesEveryRenderableImageWithoutChangingCode() {
+        let source = """
+        | Name | Value |
+        | --- | ---: |
+        | Streaming | 50 ms |
+
+        [Docs](https://example.com/docs)
+        [Source](Sources/App.swift:12)
+        ![HTTP](http://example.com/http.png)
+        ![HTTPS](https://example.com/https.png)
+        ![File](file:///etc/passwd)
+        ![Data](data:image/png;base64,AAAA)
+        ![FTP](ftp://example.com/image.png)
+        ![Custom](arbitrary-scheme://example.com/image.png)
+        ![Relative](Assets/diagram.png)
+        ![Reference][diagram]
+        ![Collapsed][]
+        ![Shortcut]
+
+        [diagram]: https://example.com/reference.png
+        [collapsed]: Assets/collapsed.png
+        [shortcut]: https://example.com/shortcut.png
+
+        Inline code: `![Code image](https://example.com/code.png)`
+        ```markdown
+        ![Fenced image](https://example.com/fenced.png)
+        ```
+        """
+
+        XCTAssertTrue(MarkdownSafety.containsRenderableImage(in: source))
+        let sanitized = MarkdownSafety.sanitizedSource(source)
+
+        XCTAssertFalse(MarkdownSafety.containsRenderableImage(in: sanitized))
+        XCTAssertTrue(sanitized.contains("| Name | Value |"))
+        XCTAssertTrue(sanitized.contains("[Docs](https://example.com/docs)"))
+        XCTAssertTrue(sanitized.contains("[Source](Sources/App.swift:12)"))
+        XCTAssertTrue(sanitized.contains("[Image: HTTP](<http://example.com/http.png>)"))
+        XCTAssertTrue(sanitized.contains("[Image: HTTPS](<https://example.com/https.png>)"))
+        XCTAssertTrue(sanitized.contains("[Image: Relative](<Assets/diagram.png>)"))
+        XCTAssertTrue(sanitized.contains("[Image: Reference](<https://example.com/reference.png>)"))
+        XCTAssertTrue(sanitized.contains("[Image: Collapsed](<Assets/collapsed.png>)"))
+        XCTAssertTrue(sanitized.contains("[Image: Shortcut](<https://example.com/shortcut.png>)"))
+        XCTAssertTrue(sanitized.contains("Image: File"))
+        XCTAssertTrue(sanitized.contains("Image: Data"))
+        XCTAssertTrue(sanitized.contains("Image: FTP"))
+        XCTAssertTrue(sanitized.contains("Image: Custom"))
+        XCTAssertFalse(sanitized.contains("file:///etc/passwd"))
+        XCTAssertFalse(sanitized.contains("data:image/png"))
+        XCTAssertFalse(sanitized.contains("ftp://example.com/image.png"))
+        XCTAssertFalse(sanitized.contains("arbitrary-scheme://"))
+        XCTAssertTrue(
+            sanitized.contains("`![Code image](https://example.com/code.png)`")
+        )
+        XCTAssertTrue(
+            sanitized.contains("![Fenced image](https://example.com/fenced.png)")
+        )
+    }
+
+    func testCodeBlockPresentationExpandsLongContentWithoutChangingCopiedSource() {
+        let short = CodeBlockPresentation(code: "let answer = 42", isExpanded: false)
+        XCTAssertFalse(short.needsExpansion)
+        XCTAssertEqual(short.displayedCode, short.code)
+
+        let longCode = (1...30).map { "line \($0)" }.joined(separator: "\n")
+        let collapsed = CodeBlockPresentation(code: longCode, isExpanded: false)
+        XCTAssertTrue(collapsed.needsExpansion)
+        XCTAssertTrue(collapsed.wasTruncated)
+        XCTAssertTrue(collapsed.displayedCode.hasSuffix("\n…"))
+        XCTAssertLessThan(collapsed.displayedCode.count, longCode.count)
+
+        let expanded = CodeBlockPresentation(code: longCode, isExpanded: true)
+        XCTAssertFalse(expanded.wasTruncated)
+        XCTAssertEqual(expanded.displayedCode, longCode)
+        XCTAssertEqual(expanded.code, collapsed.code)
+    }
+
+    @MainActor
+    func testSyntaxHighlightingWorkRunsOffMainAndKeepsPlainFallback() async {
+        let highlighted = await ChatSyntaxHighlighter.tokensOffMain(
+            for: "let answer = 42 // done",
+            language: "swift"
+        )
+        XCTAssertFalse(highlighted.performedOnMainThread)
+        XCTAssertEqual(highlighted.tokens.map(\.text).joined(), "let answer = 42 // done")
+        XCTAssertTrue(highlighted.tokens.contains { $0.kind == .keyword })
+        XCTAssertTrue(highlighted.tokens.contains { $0.kind == .number })
+        XCTAssertTrue(highlighted.tokens.contains { $0.kind == .comment })
+
+        let fallback = await ChatSyntaxHighlighter.tokensOffMain(
+            for: "opaque <content>",
+            language: "future-language"
+        )
+        XCTAssertFalse(fallback.performedOnMainThread)
+        XCTAssertEqual(
+            fallback.tokens,
+            [ChatCodeToken(text: "opaque <content>", kind: .plain)]
+        )
+    }
+
+    func testAllQuestionTypesMustBeCompleteBeforeAtomicSubmission() {
+        let request = QuestionRequest(
+            id: "request",
+            providerConnectionGeneration: "generation",
+            providerRequestID: .number(7),
+            prompt: "Answer these questions",
+            kind: .freeText,
+            fields: [
+                QuestionField(
+                    id: "single",
+                    prompt: "Choose one",
+                    kind: .singleChoice,
+                    options: [
+                        QuestionOption(id: "a", label: "A"),
+                        QuestionOption(id: "b", label: "B"),
+                    ]
+                ),
+                QuestionField(
+                    id: "multiple",
+                    prompt: "Choose several",
+                    kind: .multipleChoice,
+                    options: [
+                        QuestionOption(id: "x", label: "X"),
+                        QuestionOption(id: "y", label: "Y"),
+                    ]
+                ),
+                QuestionField(
+                    id: "free",
+                    prompt: "Explain",
+                    kind: .freeText
+                ),
+                QuestionField(
+                    id: "secret",
+                    prompt: "Enter token",
+                    kind: .secret
+                ),
+            ]
+        )
+        let selected = [
+            request.draftKey(for: request.resolvedFields[0]): Set(["b"]),
+            request.draftKey(for: request.resolvedFields[1]): Set(["y", "x"]),
+        ]
+        let text = [
+            request.draftKey(for: request.resolvedFields[2]): "Because it is safer.",
+        ]
+
+        XCTAssertFalse(
+            QuestionResponsePresentation.canSubmit(
+                request: request,
+                selectedOptions: selected,
+                text: text,
+                secretTextByField: [:]
+            )
+        )
+
+        let secrets = ["secret": "ephemeral-value"]
+        XCTAssertTrue(
+            QuestionResponsePresentation.canSubmit(
+                request: request,
+                selectedOptions: selected,
+                text: text,
+                secretTextByField: secrets
+            )
+        )
+        let answers = QuestionResponsePresentation.answers(
+            request: request,
+            selectedOptions: selected,
+            text: text,
+            secretTextByField: secrets
+        )
+        XCTAssertEqual(answers.map(\.questionID), ["single", "multiple", "free", "secret"])
+        XCTAssertEqual(answers[0].selectedOptionIDs, ["b"])
+        XCTAssertEqual(answers[1].selectedOptionIDs, ["x", "y"])
+        XCTAssertEqual(answers[2].text, "Because it is safer.")
+        XCTAssertEqual(answers[3].text, "ephemeral-value")
+    }
+}

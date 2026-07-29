@@ -1272,6 +1272,8 @@ private struct TerminalPane: View {
     let launchDefaults: AgentLaunchDefaults
 
     @State private var isConfirmingStop = false
+    @State private var isConfirmingTerminalFallback = false
+    @State private var isOpeningTerminalFallback = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1330,46 +1332,65 @@ private struct TerminalPane: View {
             .frame(height: 34)
             .background(Color(nsColor: .controlBackgroundColor))
 
-            ZStack {
-                if session.status.canReconnect {
-                    if case .disconnected = session.status {
-                        ContentUnavailableView {
-                            Label("Connection interrupted", systemImage: "network.slash")
-                        } description: {
-                            Text("The remote agent state is unknown. Reconnect will verify it on \(worker.displayName).")
-                        } actions: {
-                            Button("Reconnect", action: reconnect)
-                                .buttonStyle(.borderedProminent)
+            if session.usesNativeChat, let coordinator = session.chatCoordinator {
+                ZStack {
+                    ConversationView(
+                        coordinator: coordinator,
+                        showsComposer: false,
+                        onOpenTerminalFallback: {
+                            isConfirmingTerminalFallback = true
+                        }
+                    )
+
+                    if isOpeningTerminalFallback || session.status == .stopping {
+                        sessionProgressOverlay(
+                            isOpeningTerminalFallback
+                                ? "Opening terminal fallback…"
+                                : "Stopping remote session…"
+                        )
+                    }
+                }
+
+                AgentComposerView(
+                    session: session,
+                    worker: worker
+                )
+            } else {
+                ZStack {
+                    if session.status.canReconnect {
+                        if case .disconnected = session.status {
+                            ContentUnavailableView {
+                                Label("Connection interrupted", systemImage: "network.slash")
+                            } description: {
+                                Text("The remote agent state is unknown. Reconnect will verify it on \(worker.displayName).")
+                            } actions: {
+                                Button("Reconnect", action: reconnect)
+                                    .buttonStyle(.borderedProminent)
+                            }
+                        } else {
+                            ContentUnavailableView {
+                                Label("Agent running remotely", systemImage: "network")
+                            } description: {
+                                Text("This terminal is disconnected. The agent is still running on \(worker.displayName).")
+                            } actions: {
+                                Button("Reconnect", action: reconnect)
+                                    .buttonStyle(.borderedProminent)
+                            }
                         }
                     } else {
-                        ContentUnavailableView {
-                            Label("Agent running remotely", systemImage: "network")
-                        } description: {
-                            Text("This terminal is disconnected. The agent is still running on \(worker.displayName).")
-                        } actions: {
-                            Button("Reconnect", action: reconnect)
-                                .buttonStyle(.borderedProminent)
-                        }
+                        TerminalHostView(session: session)
                     }
-                } else {
-                    TerminalHostView(session: session)
+
+                    if session.status == .stopping {
+                        sessionProgressOverlay("Stopping remote session…")
+                    }
                 }
 
-                if session.status == .stopping {
-                    VStack(spacing: 10) {
-                        ProgressView()
-                        Text("Stopping remote session…")
-                            .font(.callout)
-                    }
-                    .padding(20)
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-                }
+                AgentComposerView(
+                    session: session,
+                    worker: worker
+                )
             }
-
-            AgentComposerView(
-                session: session,
-                worker: worker
-            )
         }
         .alert("Stop \(session.kind.displayName) agent?", isPresented: $isConfirmingStop) {
             Button("Cancel", role: .cancel) {}
@@ -1387,6 +1408,28 @@ private struct TerminalPane: View {
         } message: {
             Text("This ends the persistent remote agent for \(project.displayName). Disconnect instead if you want it to keep running.")
         }
+        .alert("Open terminal fallback?", isPresented: $isConfirmingTerminalFallback) {
+            Button("Cancel", role: .cancel) {}
+            Button("Open Terminal") {
+                openTerminalFallback()
+            }
+        } message: {
+            Text(
+                "Terminal Relay will stop native chat, verify the provider thread is released, and reopen this same conversation in its terminal interface. Both modes will never run at the same time."
+            )
+        }
+    }
+
+    private func sessionProgressOverlay(_ message: String) -> some View {
+        VStack(spacing: 10) {
+            ProgressView()
+            Text(message)
+                .font(.callout)
+        }
+        .padding(20)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(message)
     }
 
     private func reconnect() {
@@ -1399,6 +1442,22 @@ private struct TerminalPane: View {
                 launchDefaults: launchDefaults,
                 using: workerSessionService
             )
+        }
+    }
+
+    private func openTerminalFallback() {
+        guard !isOpeningTerminalFallback else { return }
+        isOpeningTerminalFallback = true
+        Task {
+            _ = await sessionManager.openTerminalFallbackAfterRefresh(
+                sessionID: session.id,
+                project: project,
+                on: worker,
+                projects: projectStore.projects,
+                launchDefaults: launchDefaults,
+                using: workerSessionService
+            )
+            isOpeningTerminalFallback = false
         }
     }
 }

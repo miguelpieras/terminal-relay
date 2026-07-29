@@ -40,10 +40,15 @@ struct AgentComposerView: View {
     ]
 
     private var canSend: Bool {
-        session.status == .running
-            && !attachments.contains(where: \.isUploading)
-            && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                || attachments.contains(where: \.isUploaded))
+        AgentComposerSendPolicy.canSend(
+            status: session.status,
+            usesNativeChat: session.usesNativeChat,
+            isWorking: session.isWorking,
+            draft: draft,
+            hasUploadingAttachments: attachments.contains(where: \.isUploading),
+            hasFailedAttachments: attachments.contains { $0.errorMessage != nil },
+            hasUploadedAttachments: attachments.contains(where: \.isUploaded)
+        )
     }
 
     private var editorHeight: CGFloat {
@@ -61,7 +66,7 @@ struct AgentComposerView: View {
                     text: $draft,
                     onSubmit: send,
                     onPasteImages: addImages,
-                    onEscape: session.sendEscape,
+                    onEscape: interruptOrEscape,
                     onFocusChange: { isEditorFocused = $0 }
                 )
 
@@ -100,26 +105,27 @@ struct AgentComposerView: View {
                     } label: {
                         Image(systemName: "stop.fill")
                             .font(.system(size: 11, weight: .bold))
-                            .foregroundStyle(Color.black.opacity(0.72))
+                            .foregroundStyle(stopButtonForeground)
                             .frame(width: 30, height: 30)
-                            .background(Color.white.opacity(0.58), in: Circle())
+                            .background(stopButtonBackground, in: Circle())
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel("Stop current turn")
+                    .accessibilityHint("Interrupts only the current agent turn.")
                     .help("Interrupt current work")
                 } else {
                     Button(action: send) {
                         Image(systemName: "arrow.up")
                             .font(.system(size: 15, weight: .medium))
-                            .foregroundStyle(Color.black.opacity(canSend ? 0.9 : 0.62))
+                            .foregroundStyle(sendButtonForeground)
                             .frame(width: 30, height: 30)
-                            .background(
-                                Color.white.opacity(canSend ? 0.92 : 0.58),
-                                in: Circle()
-                            )
+                            .background(sendButtonBackground, in: Circle())
                     }
                     .buttonStyle(.plain)
                     .disabled(!canSend)
                     .keyboardShortcut(.return, modifiers: .command)
+                    .accessibilityLabel("Send message")
+                    .accessibilityHint("Return sends. Shift Return inserts a new line.")
                     .help("Send message (Return)")
                 }
             }
@@ -131,23 +137,24 @@ struct AgentComposerView: View {
         .padding(.bottom, 5)
         .background {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(Color(red: 0.165, green: 0.165, blue: 0.165))
+                .fill(composerSurface)
                 .overlay {
                     RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                        .stroke(composerBorder, lineWidth: 1)
                 }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 6)
-        .background(Color(red: 0.071, green: 0.071, blue: 0.078))
+        .background(composerBackdrop)
         .onExitCommand {
-            session.sendEscape()
+            interruptOrEscape()
         }
         .onAppear {
             modelPanelClickMonitor.start {
                 closeModelPanel()
             }
             modelPanelClickMonitor.isActive = isShowingModelPanel
+            synchronizeNativeChatLaunchOptions()
         }
         .onChange(of: isShowingModelPanel) { _, isShowing in
             modelPanelClickMonitor.isActive = isShowing
@@ -188,6 +195,7 @@ struct AgentComposerView: View {
                         }
                         .buttonStyle(.plain)
                         .foregroundStyle(.secondary)
+                        .accessibilityLabel("Remove \(attachment.name)")
                     }
                     .padding(.leading, 4)
                     .padding(.trailing, 7)
@@ -241,6 +249,10 @@ struct AgentComposerView: View {
             (isHovering ? NSCursor.pointingHand : NSCursor.arrow).set()
         }
         .disabled(session.status != .running)
+        .accessibilityLabel("Model and reasoning controls")
+        .accessibilityValue(
+            "\(modelDisplayName), \(selectedReasoningEffort.displayName.capitalized), \(isFastModeEnabled ? "Fast" : "Standard")"
+        )
         .help("Change \(session.kind.displayName) model or reasoning effort")
         .overlay(alignment: .bottomTrailing) {
             if isShowingModelPanel {
@@ -263,7 +275,7 @@ struct AgentComposerView: View {
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
             .frame(width: 215)
-            .panelSurface()
+            .panelSurface(nativeChat: session.usesNativeChat)
 
             if let selectedModelSection {
                 sectionPanel(selectedModelSection)
@@ -400,7 +412,7 @@ struct AgentComposerView: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .frame(width: 205)
-        .panelSurface()
+        .panelSurface(nativeChat: session.usesNativeChat)
     }
 
     private func selectionRow(
@@ -454,7 +466,9 @@ struct AgentComposerView: View {
             if model != "opus" {
                 claudeFastModeEnabled = false
             }
-            sendCommand("/model \(model)")
+            if !session.usesNativeChat {
+                sendCommand("/model \(model)")
+            }
         } else if let option = Self.codexModels.first(where: { $0.id == model }) {
             let effort: AgentReasoningEffort =
                 codexReasoningEffort == .ultra && !option.supportsUltra
@@ -462,19 +476,27 @@ struct AgentComposerView: View {
                 : codexReasoningEffort
             codexModel = option.id
             codexReasoningEffort = effort
-            session.selectCodexModel(pickerIndex: option.pickerIndex, effort: effort)
+            if !session.usesNativeChat {
+                session.selectCodexModel(pickerIndex: option.pickerIndex, effort: effort)
+            }
         }
+        synchronizeNativeChatLaunchOptions()
         closeModelPanel()
     }
 
     private func setReasoningEffort(_ effort: AgentReasoningEffort) {
         if session.kind == .claude {
             claudeReasoningEffort = effort
-            sendCommand("/effort \(effort.rawValue)")
+            if !session.usesNativeChat {
+                sendCommand("/effort \(effort.rawValue)")
+            }
         } else if let option = Self.codexModels.first(where: { $0.id == codexModel }) {
             codexReasoningEffort = effort
-            session.selectCodexModel(pickerIndex: option.pickerIndex, effort: effort)
+            if !session.usesNativeChat {
+                session.selectCodexModel(pickerIndex: option.pickerIndex, effort: effort)
+            }
         }
+        synchronizeNativeChatLaunchOptions()
         closeModelPanel()
     }
 
@@ -485,7 +507,9 @@ struct AgentComposerView: View {
                 return
             }
             codexFastModeEnabled = isEnabled
-            sendCommand(isEnabled ? "/fast on" : "/fast off")
+            if !session.usesNativeChat {
+                sendCommand(isEnabled ? "/fast on" : "/fast off")
+            }
         } else {
             guard claudeFastModeEnabled != isEnabled else {
                 closeModelPanel()
@@ -495,8 +519,11 @@ struct AgentComposerView: View {
             if isEnabled {
                 claudeModel = "opus"
             }
-            sendCommand("/fast")
+            if !session.usesNativeChat {
+                sendCommand("/fast")
+            }
         }
+        synchronizeNativeChatLaunchOptions()
         closeModelPanel()
     }
 
@@ -529,6 +556,31 @@ struct AgentComposerView: View {
 
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         let remotePaths = attachments.compactMap(\.remotePath)
+        if session.usesNativeChat {
+            var prompt = text
+            if prompt.isEmpty, !remotePaths.isEmpty {
+                prompt = "Please review the attached \(remotePaths.count == 1 ? "image" : "images")."
+            }
+            let structuredAttachments: [ChatAttachmentReference] = attachments.compactMap {
+                attachment in
+                guard let path = attachment.remotePath else { return nil }
+                return ChatAttachmentReference(
+                    path: path,
+                    displayName: attachment.name,
+                    mediaType: "image/png"
+                )
+            }
+            synchronizeNativeChatLaunchOptions()
+            session.sendPrompt(
+                prompt,
+                attachments: structuredAttachments
+            )
+            draft = ""
+            attachments.removeAll()
+            pasteNotice = nil
+            return
+        }
+
         var prompt = text
         if !remotePaths.isEmpty {
             if prompt.isEmpty {
@@ -542,6 +594,67 @@ struct AgentComposerView: View {
         draft = ""
         attachments.removeAll()
         pasteNotice = nil
+    }
+
+    private func synchronizeNativeChatLaunchOptions() {
+        guard session.usesNativeChat else { return }
+        session.updateChatLaunchOptions(
+            model: session.kind == .codex ? codexModel : claudeModel,
+            reasoningEffort: selectedReasoningEffort.rawValue,
+            fastMode: isFastModeEnabled
+        )
+    }
+
+    private func interruptOrEscape() {
+        if session.usesNativeChat {
+            if session.isWorking {
+                session.interrupt()
+            } else if isShowingModelPanel {
+                closeModelPanel()
+            }
+        } else {
+            session.sendEscape()
+        }
+    }
+
+    private var composerSurface: Color {
+        session.usesNativeChat
+            ? Color(nsColor: .controlBackgroundColor)
+            : Color(red: 0.165, green: 0.165, blue: 0.165)
+    }
+
+    private var composerBorder: Color {
+        session.usesNativeChat
+            ? Color(nsColor: .separatorColor)
+            : Color.white.opacity(0.08)
+    }
+
+    private var composerBackdrop: Color {
+        session.usesNativeChat
+            ? Color(nsColor: .windowBackgroundColor)
+            : Color(red: 0.071, green: 0.071, blue: 0.078)
+    }
+
+    private var sendButtonForeground: Color {
+        if session.usesNativeChat {
+            return canSend ? .white : .secondary
+        }
+        return Color.black.opacity(canSend ? 0.9 : 0.62)
+    }
+
+    private var sendButtonBackground: Color {
+        if session.usesNativeChat {
+            return canSend ? .accentColor : Color.primary.opacity(0.08)
+        }
+        return Color.white.opacity(canSend ? 0.92 : 0.58)
+    }
+
+    private var stopButtonForeground: Color {
+        session.usesNativeChat ? .red : Color.black.opacity(0.72)
+    }
+
+    private var stopButtonBackground: Color {
+        session.usesNativeChat ? Color.red.opacity(0.12) : Color.white.opacity(0.58)
     }
 
     private func sendCommand(_ command: String) {
@@ -603,16 +716,27 @@ private struct CodexModelOption {
 }
 
 private extension View {
-    func panelSurface() -> some View {
+    func panelSurface(nativeChat: Bool) -> some View {
         background(
-            Color(red: 0.165, green: 0.165, blue: 0.165),
+            nativeChat
+                ? Color(nsColor: .controlBackgroundColor)
+                : Color(red: 0.165, green: 0.165, blue: 0.165),
             in: RoundedRectangle(cornerRadius: 14, style: .continuous)
         )
         .overlay {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(Color.white.opacity(0.16), lineWidth: 1)
+                .stroke(
+                    nativeChat
+                        ? Color(nsColor: .separatorColor)
+                        : Color.white.opacity(0.16),
+                    lineWidth: 1
+                )
         }
-        .shadow(color: .black.opacity(0.28), radius: 18, y: 8)
+        .shadow(
+            color: .black.opacity(nativeChat ? 0.14 : 0.28),
+            radius: 18,
+            y: 8
+        )
     }
 
     func modelPanelCursor() -> some View {
@@ -740,6 +864,46 @@ private struct ClipboardImage {
     }
 }
 
+enum AgentComposerSendPolicy {
+    static func canSend(
+        status: TerminalSessionStatus,
+        usesNativeChat: Bool,
+        isWorking: Bool,
+        draft: String,
+        hasUploadingAttachments: Bool,
+        hasFailedAttachments: Bool,
+        hasUploadedAttachments: Bool
+    ) -> Bool {
+        status == .running
+            && (!usesNativeChat || !isWorking)
+            && !hasUploadingAttachments
+            && !hasFailedAttachments
+            && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || hasUploadedAttachments)
+    }
+}
+
+enum AgentComposerKeyAction: Equatable {
+    case submit
+    case insertNewline
+    case escape
+    case system
+}
+
+enum AgentComposerKeyPolicy {
+    static func action(
+        keyCode: UInt16,
+        modifiers: NSEvent.ModifierFlags
+    ) -> AgentComposerKeyAction {
+        if keyCode == 53 {
+            return .escape
+        }
+        let usesReturn = keyCode == 36 || keyCode == 76
+        guard usesReturn else { return .system }
+        return modifiers.contains(.shift) ? .insertNewline : .submit
+    }
+}
+
 private struct PromptEditor: NSViewRepresentable {
     @Binding var text: String
 
@@ -776,6 +940,8 @@ private struct PromptEditor: NSViewRepresentable {
         )
         textView.textContainer?.widthTracksTextView = true
         textView.string = text
+        textView.setAccessibilityLabel("Message")
+        textView.setAccessibilityHelp("Return sends. Shift Return inserts a new line.")
         textView.onSubmit = onSubmit
         textView.onPasteImages = onPasteImages
         textView.onEscape = onEscape
@@ -826,17 +992,17 @@ private final class ComposerTextView: NSTextView {
     var onFocusChange: ((Bool) -> Void)?
 
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 {
+        switch AgentComposerKeyPolicy.action(
+            keyCode: event.keyCode,
+            modifiers: event.modifierFlags
+        ) {
+        case .escape:
             onEscape?()
-            return
-        }
-
-        let usesReturn = event.keyCode == 36 || event.keyCode == 76
-        if usesReturn, !event.modifierFlags.contains(.shift) {
+        case .submit:
             onSubmit?()
-            return
+        case .insertNewline, .system:
+            super.keyDown(with: event)
         }
-        super.keyDown(with: event)
     }
 
     override func becomeFirstResponder() -> Bool {

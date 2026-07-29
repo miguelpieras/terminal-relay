@@ -1,0 +1,783 @@
+import Foundation
+import Markdown
+import MarkdownView
+import SwiftUI
+
+#if os(macOS)
+import AppKit
+#elseif os(iOS)
+import UIKit
+#endif
+
+enum ChatURLPolicy {
+    static let repositoryScheme = "terminal-relay-file"
+
+    static func classify(_ url: URL) -> ChatLinkDestination {
+        let scheme = url.scheme?.lowercased()
+        if scheme == "http" || scheme == "https" {
+            guard url.user == nil,
+                  url.password == nil,
+                  let host = url.host,
+                  !host.isEmpty else {
+                return .blocked
+            }
+            return .external(url)
+        }
+
+        if scheme == repositoryScheme {
+            guard let link = repositoryLink(from: url) else { return .blocked }
+            return .repository(link)
+        }
+        return .blocked
+    }
+
+    static func repositoryLink(from rawValue: String) -> ChatRepositoryLink? {
+        if let url = URL(string: rawValue), url.scheme != nil {
+            return repositoryLink(from: url)
+        }
+        return parseRepositoryPath(rawValue)
+    }
+
+    static func repositoryLink(from url: URL) -> ChatRepositoryLink? {
+        guard url.scheme?.lowercased() == repositoryScheme,
+              url.host == nil,
+              url.user == nil,
+              url.password == nil,
+              url.query == nil else {
+            return nil
+        }
+        var path = url.path.removingPercentEncoding ?? url.path
+        if path.hasPrefix("/"), !path.hasPrefix("/workspace/") {
+            path.removeFirst()
+        }
+        let fragmentLine = parseFragmentLine(url.fragment)
+        guard var link = parseRepositoryPath(path) else { return nil }
+        if link.line == nil, let fragmentLine {
+            link = ChatRepositoryLink(path: link.path, line: fragmentLine, column: nil)
+        }
+        return link
+    }
+
+    private static func parseRepositoryPath(_ rawPath: String) -> ChatRepositoryLink? {
+        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !trimmed.contains("\0"),
+              !trimmed.contains("\\"),
+              !trimmed.hasSuffix("/") else {
+            return nil
+        }
+
+        let isCanonicalWorkspacePath = trimmed.hasPrefix("/workspace/")
+        let isRelativePath = !trimmed.hasPrefix("/")
+        guard isCanonicalWorkspacePath || isRelativePath else { return nil }
+
+        var path = trimmed
+        var line: Int?
+        var column: Int?
+        let components = path.split(separator: ":", omittingEmptySubsequences: false)
+        if components.count >= 2, let last = components.last.flatMap({ Int($0) }), last > 0 {
+            if components.count >= 3,
+               let secondLast = Int(components[components.count - 2]),
+               secondLast > 0 {
+                line = secondLast
+                column = last
+                path = components.dropLast(2).joined(separator: ":")
+            } else {
+                line = last
+                path = components.dropLast().joined(separator: ":")
+            }
+        }
+
+        let pathComponents = path.split(separator: "/", omittingEmptySubsequences: true)
+        guard !pathComponents.isEmpty,
+              !pathComponents.contains("."),
+              !pathComponents.contains(".."),
+              path.utf8.count <= 4_096 else {
+            return nil
+        }
+        if isCanonicalWorkspacePath {
+            guard pathComponents.count >= 3, pathComponents.first == "workspace" else {
+                return nil
+            }
+        }
+        return ChatRepositoryLink(path: path, line: line, column: column)
+    }
+
+    private static func parseFragmentLine(_ fragment: String?) -> Int? {
+        guard let fragment else { return nil }
+        let value = fragment.hasPrefix("L") ? String(fragment.dropFirst()) : fragment
+        return Int(value).flatMap { $0 > 0 ? $0 : nil }
+    }
+}
+
+enum MarkdownSafety {
+    static func sanitizedSource(_ source: String) -> String {
+        neutralizingImages(in: escapedRawHTML(source))
+    }
+
+    static func escapedRawHTML(_ source: String) -> String {
+        var insideFence = false
+        return source
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { substring -> String in
+                let line = String(substring)
+                if line.trimmingCharacters(in: .whitespaces).hasPrefix("```")
+                    || line.trimmingCharacters(in: .whitespaces).hasPrefix("~~~") {
+                    insideFence.toggle()
+                    return line
+                }
+                guard !insideFence else { return line }
+                return escapeOpeningAnglesOutsideInlineCode(line)
+            }
+            .joined(separator: "\n")
+    }
+
+    static func containsRenderableImage(in source: String) -> Bool {
+        var collector = MarkdownImageCollector()
+        collector.visit(Document(parsing: source))
+        return !collector.images.isEmpty
+    }
+
+    private static func neutralizingImages(in source: String) -> String {
+        var collector = MarkdownImageCollector()
+        collector.visit(Document(parsing: source))
+        guard !collector.images.isEmpty else { return source }
+
+        let lineStarts = utf8LineStartOffsets(in: source)
+        var bytes = Array(source.utf8)
+        let replacements = collector.images.compactMap { image -> (Range<Int>, [UInt8])? in
+            guard let lowerBound = utf8Offset(
+                for: image.range.lowerBound,
+                lineStarts: lineStarts,
+                byteCount: bytes.count
+            ),
+            let upperBound = utf8Offset(
+                for: image.range.upperBound,
+                lineStarts: lineStarts,
+                byteCount: bytes.count
+            ),
+            lowerBound < upperBound else {
+                return nil
+            }
+            let replacement = imageAffordance(
+                alternativeText: image.alternativeText,
+                source: image.source,
+                isInsideLink: image.isInsideLink
+            )
+            return (lowerBound..<upperBound, Array(replacement.utf8))
+        }
+        .sorted { $0.0.lowerBound > $1.0.lowerBound }
+
+        for (range, replacement) in replacements {
+            bytes.replaceSubrange(range, with: replacement)
+        }
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
+    private static func imageAffordance(
+        alternativeText: String,
+        source: String?,
+        isInsideLink: Bool
+    ) -> String {
+        let trimmedAlternative = alternativeText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let label = "Image: \(trimmedAlternative.isEmpty ? "external image" : trimmedAlternative)"
+        let escapedLabel = label
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "]", with: "\\]")
+
+        guard !isInsideLink,
+              let source,
+              isAllowedImageAffordanceDestination(source) else {
+            return escapedLabel
+        }
+        let escapedDestination = source
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: ">", with: "%3E")
+        return "[\(escapedLabel)](<\(escapedDestination)>)"
+    }
+
+    private static func isAllowedImageAffordanceDestination(_ source: String) -> Bool {
+        if let url = URL(string: source), url.scheme != nil {
+            switch ChatURLPolicy.classify(url) {
+            case .external, .repository:
+                return true
+            case .blocked:
+                return false
+            }
+        }
+        return ChatURLPolicy.repositoryLink(from: source) != nil
+    }
+
+    private static func utf8LineStartOffsets(in source: String) -> [Int] {
+        let bytes = Array(source.utf8)
+        var starts = [0]
+        var index = 0
+        while index < bytes.count {
+            if bytes[index] == 0x0A {
+                starts.append(index + 1)
+            } else if bytes[index] == 0x0D {
+                if index + 1 < bytes.count, bytes[index + 1] == 0x0A {
+                    index += 1
+                }
+                starts.append(index + 1)
+            }
+            index += 1
+        }
+        return starts
+    }
+
+    private static func utf8Offset(
+        for location: SourceLocation,
+        lineStarts: [Int],
+        byteCount: Int
+    ) -> Int? {
+        guard location.line > 0,
+              location.line <= lineStarts.count,
+              location.column > 0 else {
+            return nil
+        }
+        let offset = lineStarts[location.line - 1] + location.column - 1
+        return offset <= byteCount ? offset : nil
+    }
+
+    private static func escapeOpeningAnglesOutsideInlineCode(_ line: String) -> String {
+        var output = ""
+        var insideCode = false
+        var index = line.startIndex
+        while index < line.endIndex {
+            let character = line[index]
+            if character == "`" {
+                insideCode.toggle()
+                output.append(character)
+            } else if character == "<", !insideCode {
+                output.append("&lt;")
+            } else {
+                output.append(character)
+            }
+            index = line.index(after: index)
+        }
+        return output
+    }
+}
+
+private struct MarkdownImageRecord {
+    let range: SourceRange
+    let alternativeText: String
+    let source: String?
+    let isInsideLink: Bool
+}
+
+private struct MarkdownImageCollector: MarkupWalker {
+    var images: [MarkdownImageRecord] = []
+
+    mutating func visitImage(_ image: Markdown.Image) {
+        guard let range = image.range else { return }
+        images.append(
+            MarkdownImageRecord(
+                range: range,
+                alternativeText: image.plainText,
+                source: image.source,
+                isInsideLink: image.parent is Markdown.Link
+            )
+        )
+    }
+}
+
+private struct TerminalRelayImageRenderer: MarkdownImageRenderer {
+    let onOpenExternal: (URL) -> Void
+
+    func makeBody(configuration: Configuration) -> some View {
+        Button {
+            if case .external(let url) = ChatURLPolicy.classify(configuration.url) {
+                onOpenExternal(url)
+            }
+        } label: {
+            Label(
+                configuration.alternativeText ?? "External image",
+                systemImage: "photo.badge.arrow.down"
+            )
+            .font(.callout)
+            .foregroundStyle(.secondary)
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint("Opens the image in your browser. It is not loaded inside Terminal Relay.")
+    }
+}
+
+private struct TerminalRelayLinkRenderer: MarkdownLinkRenderer {
+    let onOpenExternal: (URL) -> Void
+    let onOpenRepository: (ChatRepositoryLink) -> Void
+
+    func makeBody(configuration: Configuration) -> some View {
+        Button {
+            switch ChatURLPolicy.classify(configuration.url) {
+            case .external(let url):
+                onOpenExternal(url)
+            case .repository(let link):
+                onOpenRepository(link)
+            case .blocked:
+                break
+            }
+        } label: {
+            configuration.label
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.tint)
+        .underline()
+        .accessibilityHint(accessibilityHint(for: configuration.url))
+    }
+
+    private func accessibilityHint(for url: URL) -> String {
+        switch ChatURLPolicy.classify(url) {
+        case .external:
+            "Opens in your browser."
+        case .repository:
+            "Opens a read-only repository preview."
+        case .blocked:
+            "This link is blocked."
+        }
+    }
+}
+
+struct TerminalRelayMarkdownCodeBlockStyle: MarkdownCodeBlockStyle {
+    let isStreaming: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        CodeBlockView(
+            id: "markdown-code:\(configuration.code.hashValue)",
+            code: configuration.code,
+            language: configuration.language,
+            isStreaming: isStreaming
+        )
+    }
+}
+
+struct TerminalRelayMarkdownTableStyle: MarkdownTableStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        TerminalRelayMarkdownTable(configuration: configuration)
+    }
+}
+
+private struct TerminalRelayMarkdownTable: View {
+    let configuration: MarkdownTableStyleConfiguration
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    var body: some View {
+        Group {
+            if dynamicTypeSize.isAccessibilitySize {
+                VStack(alignment: .leading, spacing: 8) {
+                    Grid { configuration.table.header }
+                    ForEach(Array(configuration.table.rows.enumerated()), id: \.offset) { index, row in
+                        Grid { row }
+                            .background(index.isMultiple(of: 2) ? Color.clear : Color.secondary.opacity(0.06))
+                    }
+                }
+            } else {
+                ScrollView(.horizontal) {
+                    tableGrid
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+                .scrollIndicators(.visible)
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Scrollable table")
+                .accessibilityHint("Swipe horizontally to read every table column.")
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.secondary.opacity(0.18))
+        }
+        .textSelection(.enabled)
+    }
+
+    private var tableGrid: some View {
+        Grid(horizontalSpacing: 0, verticalSpacing: 0) {
+            configuration.table.header
+                .markdownTableRowBackgroundStyle(Color.accentColor.opacity(0.08))
+            ForEach(Array(configuration.table.rows.enumerated()), id: \.offset) { index, row in
+                row.markdownTableRowBackgroundStyle(
+                    index.isMultiple(of: 2) ? Color.clear : Color.secondary.opacity(0.06)
+                )
+            }
+        }
+        .markdownTableCellPadding(.horizontal, 12)
+        .markdownTableCellPadding(.vertical, 8)
+        .markdownTableCellOverlay {
+            Rectangle().strokeBorder(Color.secondary.opacity(0.18))
+        }
+    }
+}
+
+struct RichMarkdownView: View {
+    let text: String
+    let isStreaming: Bool
+    let onOpenExternal: (URL) -> Void
+    let onOpenRepository: (ChatRepositoryLink) -> Void
+
+    @State private var source: StreamingMarkdownSource
+    @State private var didFinishStreaming: Bool
+
+    init(
+        text: String,
+        isStreaming: Bool,
+        onOpenExternal: @escaping (URL) -> Void,
+        onOpenRepository: @escaping (ChatRepositoryLink) -> Void
+    ) {
+        self.text = text
+        self.isStreaming = isStreaming
+        self.onOpenExternal = onOpenExternal
+        self.onOpenRepository = onOpenRepository
+        let safeText = MarkdownSafety.sanitizedSource(text)
+        _source = State(initialValue: StreamingMarkdownSource(safeText))
+        _didFinishStreaming = State(initialValue: false)
+    }
+
+    var body: some View {
+        StreamingMarkdownReader(source) { parseResult in
+            MarkdownView(parseResult)
+        }
+        .markdownStreamingRenderThrottle(.milliseconds(50))
+        .markdownCodeBlockStyle(TerminalRelayMarkdownCodeBlockStyle(isStreaming: isStreaming))
+        .markdownTableStyle(TerminalRelayMarkdownTableStyle())
+        .markdownBaseURL(URL(string: "\(ChatURLPolicy.repositoryScheme):///")!)
+        .markdownElementRenderer(
+            .image(TerminalRelayImageRenderer(onOpenExternal: onOpenExternal), urlScheme: "http")
+        )
+        .markdownElementRenderer(
+            .image(TerminalRelayImageRenderer(onOpenExternal: onOpenExternal), urlScheme: "https")
+        )
+        .markdownElementRenderer(
+            .image(TerminalRelayImageRenderer(onOpenExternal: onOpenExternal), urlScheme: ChatURLPolicy.repositoryScheme)
+        )
+        .markdownElementRenderer(
+            .link(
+                TerminalRelayLinkRenderer(
+                    onOpenExternal: onOpenExternal,
+                    onOpenRepository: onOpenRepository
+                ),
+                urlScheme: "http"
+            )
+        )
+        .markdownElementRenderer(
+            .link(
+                TerminalRelayLinkRenderer(
+                    onOpenExternal: onOpenExternal,
+                    onOpenRepository: onOpenRepository
+                ),
+                urlScheme: "https"
+            )
+        )
+        .markdownElementRenderer(
+            .link(
+                TerminalRelayLinkRenderer(
+                    onOpenExternal: onOpenExternal,
+                    onOpenRepository: onOpenRepository
+                ),
+                urlScheme: ChatURLPolicy.repositoryScheme
+            )
+        )
+        .environment(
+            \.openURL,
+            OpenURLAction { url in
+                switch ChatURLPolicy.classify(url) {
+                case .external(let externalURL):
+                    onOpenExternal(externalURL)
+                case .repository(let link):
+                    onOpenRepository(link)
+                case .blocked:
+                    break
+                }
+                return .handled
+            }
+        )
+        .textSelection(.enabled)
+        .onAppear(perform: synchronizeSource)
+        .onChange(of: text) { _, _ in synchronizeSource() }
+        .onChange(of: isStreaming) { _, _ in synchronizeSource() }
+    }
+
+    private func synchronizeSource() {
+        let safeText = MarkdownSafety.sanitizedSource(text)
+        if didFinishStreaming {
+            source = StreamingMarkdownSource(safeText)
+            didFinishStreaming = false
+        } else {
+            source.text = safeText
+        }
+        if !isStreaming {
+            source.finishStreaming()
+            didFinishStreaming = true
+        }
+    }
+}
+
+struct CodeBlockView: View {
+    let id: String
+    let code: String
+    let language: String?
+    let isStreaming: Bool
+
+    @State private var isExpanded = false
+    @State private var didCopy = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var presentation: CodeBlockPresentation {
+        CodeBlockPresentation(code: code, isExpanded: isExpanded)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Text(language?.isEmpty == false ? language! : "Code")
+                    .font(.caption.monospaced().weight(.medium))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if presentation.needsExpansion {
+                    Button(isExpanded ? "Collapse" : "Show all") {
+                        if reduceMotion {
+                            isExpanded.toggle()
+                        } else {
+                            withAnimation(.easeInOut(duration: 0.16)) {
+                                isExpanded.toggle()
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .font(.caption.weight(.medium))
+                    .accessibilityLabel(isExpanded ? "Collapse code block" : "Expand code block")
+                }
+                Button {
+                    ChatClipboard.copy(code)
+                    didCopy = true
+                    Task {
+                        try? await Task.sleep(nanoseconds: 1_500_000_000)
+                        didCopy = false
+                    }
+                } label: {
+                    Label(didCopy ? "Copied" : "Copy", systemImage: didCopy ? "checkmark" : "doc.on.doc")
+                }
+                .buttonStyle(.plain)
+                .font(.caption.weight(.medium))
+                .accessibilityLabel(didCopy ? "Code copied" : "Copy code")
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+
+            Divider()
+
+            ScrollView(.horizontal) {
+                HighlightedCodeText(
+                    code: presentation.displayedCode,
+                    language: language,
+                    usesHighlighting: !isStreaming
+                )
+                .font(.system(.callout, design: .monospaced))
+                .lineSpacing(3)
+                .fixedSize(horizontal: true, vertical: false)
+                .textSelection(.enabled)
+                .padding(12)
+            }
+            .scrollIndicators(.visible)
+
+            if presentation.wasTruncated {
+                Text("Showing a shortened preview. Copy still includes the complete block.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 9)
+            }
+        }
+        .background(Color.secondary.opacity(0.065))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Color.secondary.opacity(0.16))
+        }
+        .accessibilityElement(children: .contain)
+    }
+}
+
+struct CodeBlockPresentation: Equatable {
+    static let collapsedCharacterLimit = 16_384
+    static let collapsedLineLimit = 24
+
+    let code: String
+    let isExpanded: Bool
+
+    var needsExpansion: Bool {
+        code.count > Self.collapsedCharacterLimit
+            || code.split(separator: "\n", omittingEmptySubsequences: false).count > Self.collapsedLineLimit
+    }
+
+    var wasTruncated: Bool { needsExpansion && !isExpanded }
+
+    var displayedCode: String {
+        guard wasTruncated else { return code }
+        let lines = code.split(separator: "\n", omittingEmptySubsequences: false)
+        let lineLimited = lines.prefix(Self.collapsedLineLimit).joined(separator: "\n")
+        return String(lineLimited.prefix(Self.collapsedCharacterLimit)) + "\n…"
+    }
+}
+
+enum ChatClipboard {
+    static func copy(_ value: String) {
+        #if os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+        #elseif os(iOS)
+        UIPasteboard.general.string = value
+        #endif
+    }
+}
+
+private struct HighlightedCodeText: View {
+    let code: String
+    let language: String?
+    let usesHighlighting: Bool
+    @State private var tokens: [ChatCodeToken]?
+
+    var body: some View {
+        Group {
+            if let tokens {
+                highlightedText(tokens)
+            } else {
+                Text(verbatim: code)
+            }
+        }
+        .task(id: HighlightConfiguration(code: code, language: language, enabled: usesHighlighting)) {
+            tokens = nil
+            guard usesHighlighting else { return }
+            let result = await ChatSyntaxHighlighter.tokensOffMain(
+                for: code,
+                language: language
+            )
+            guard !Task.isCancelled else { return }
+            tokens = result.tokens
+        }
+    }
+
+    private func highlightedText(_ tokens: [ChatCodeToken]) -> SwiftUI.Text {
+        tokens.reduce(SwiftUI.Text("")) { partial, token in
+            partial + SwiftUI.Text(verbatim: token.text).foregroundColor(token.kind.color)
+        }
+    }
+
+    private struct HighlightConfiguration: Hashable {
+        let code: String
+        let language: String?
+        let enabled: Bool
+    }
+}
+
+struct ChatCodeToken: Equatable, Sendable {
+    enum Kind: Equatable, Sendable {
+        case plain
+        case keyword
+        case string
+        case comment
+        case number
+
+        @MainActor
+        var color: Color {
+            switch self {
+            case .plain: .primary
+            case .keyword: .purple
+            case .string: .green
+            case .comment: .secondary
+            case .number: .blue
+            }
+        }
+    }
+
+    let text: String
+    let kind: Kind
+}
+
+struct ChatSyntaxHighlightingResult: Equatable, Sendable {
+    let tokens: [ChatCodeToken]
+    let performedOnMainThread: Bool
+}
+
+enum ChatSyntaxHighlighter {
+    private static let supportedLanguages: Set<String> = [
+        "bash", "c", "cpp", "css", "go", "html", "javascript", "js", "json",
+        "kotlin", "objective-c", "python", "ruby", "rust", "sh", "shell", "sql",
+        "swift", "typescript", "ts", "xml", "yaml", "yml",
+    ]
+
+    private static let keywords = [
+        "actor", "async", "await", "break", "case", "catch", "class", "const",
+        "continue", "default", "defer", "do", "else", "enum", "extension", "false",
+        "finally", "for", "func", "function", "guard", "if", "import", "in", "interface",
+        "let", "nil", "null", "private", "protocol", "public", "return", "static",
+        "struct", "switch", "throw", "throws", "true", "try", "typealias", "var", "while",
+    ]
+
+    static func tokens(for code: String, language: String?) -> [ChatCodeToken] {
+        guard let language = language?.lowercased(),
+              supportedLanguages.contains(language),
+              code.utf8.count <= 200_000 else {
+            return [ChatCodeToken(text: code, kind: .plain)]
+        }
+
+        let escapedKeywords = keywords.map(NSRegularExpression.escapedPattern(for:)).joined(separator: "|")
+        let pattern = #"(//[^\n]*|#[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\b(?:\#(escapedKeywords))\b|\b\d+(?:\.\d+)?\b)"#
+        guard let expression = try? NSRegularExpression(pattern: pattern) else {
+            return [ChatCodeToken(text: code, kind: .plain)]
+        }
+
+        let source = code as NSString
+        let matches = expression.matches(in: code, range: NSRange(location: 0, length: source.length))
+        var tokens: [ChatCodeToken] = []
+        var location = 0
+        for match in matches {
+            if match.range.location > location {
+                tokens.append(
+                    ChatCodeToken(
+                        text: source.substring(with: NSRange(location: location, length: match.range.location - location)),
+                        kind: .plain
+                    )
+                )
+            }
+            let value = source.substring(with: match.range)
+            let kind: ChatCodeToken.Kind
+            if value.hasPrefix("//") || value.hasPrefix("#") || value.hasPrefix("/*") {
+                kind = .comment
+            } else if value.hasPrefix("\"") || value.hasPrefix("'") {
+                kind = .string
+            } else if Double(value) != nil {
+                kind = .number
+            } else {
+                kind = .keyword
+            }
+            tokens.append(ChatCodeToken(text: value, kind: kind))
+            location = NSMaxRange(match.range)
+        }
+        if location < source.length {
+            tokens.append(
+                ChatCodeToken(
+                    text: source.substring(from: location),
+                    kind: .plain
+                )
+            )
+        }
+        return tokens
+    }
+
+    static func tokensOffMain(
+        for code: String,
+        language: String?
+    ) async -> ChatSyntaxHighlightingResult {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                continuation.resume(
+                    returning: ChatSyntaxHighlightingResult(
+                        tokens: tokens(for: code, language: language),
+                        performedOnMainThread: Thread.isMainThread
+                    )
+                )
+            }
+        }
+    }
+}

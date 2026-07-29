@@ -105,6 +105,61 @@ enum SSHCommandBuilder {
         )
     }
 
+    static func workerChatCapabilitiesConfiguration(
+        for server: ServerProfile,
+        kind: AgentKind,
+        repositoryName: String
+    ) -> SSHLaunchConfiguration {
+        workerSessionConfiguration(
+            for: server,
+            arguments: ["chat-capabilities-v1", kind.rawValue, repositoryName]
+        )
+    }
+
+    static func workerChatStartConfiguration(
+        for server: ServerProfile,
+        kind: AgentKind,
+        repositoryName: String,
+        threadID: String?,
+        launchDefaults: AgentLaunchDefaults
+    ) -> SSHLaunchConfiguration {
+        var arguments = ["chat-start-v1", kind.rawValue, repositoryName]
+        if let threadID {
+            arguments.append(threadID)
+        }
+        arguments += launchDefaults.arguments(for: kind)
+        return workerSessionConfiguration(for: server, arguments: arguments)
+    }
+
+    static func workerChatAttachConfiguration(
+        for server: ServerProfile,
+        kind: AgentKind,
+        repositoryName: String,
+        instanceToken: String
+    ) -> SSHLaunchConfiguration {
+        workerSessionStreamConfiguration(
+            for: server,
+            arguments: [
+                "chat-attach-v1",
+                kind.rawValue,
+                repositoryName,
+                instanceToken,
+            ]
+        )
+    }
+
+    static func workerChatStopConfiguration(
+        for server: ServerProfile,
+        kind: AgentKind,
+        repositoryName: String,
+        instanceToken: String
+    ) -> SSHLaunchConfiguration {
+        workerSessionConfiguration(
+            for: server,
+            arguments: ["chat-stop-v1", kind.rawValue, repositoryName, instanceToken]
+        )
+    }
+
     static func workerThreadListConfiguration(
         for server: ServerProfile,
         kind: AgentKind,
@@ -224,9 +279,24 @@ enum SSHCommandBuilder {
         return batchConfiguration(for: server, remoteCommand: remoteCommand)
     }
 
+    private static func workerSessionStreamConfiguration(
+        for server: ServerProfile,
+        arguments remoteArguments: [String]
+    ) -> SSHLaunchConfiguration {
+        let remoteCommand = ([WorkerSessionProtocol.helperPath] + remoteArguments)
+            .map(shellQuote)
+            .joined(separator: " ")
+        return batchConfiguration(
+            for: server,
+            remoteCommand: remoteCommand,
+            disablesPTY: true
+        )
+    }
+
     private static func batchConfiguration(
         for server: ServerProfile,
-        remoteCommand: String
+        remoteCommand: String,
+        disablesPTY: Bool = false
     ) -> SSHLaunchConfiguration {
         var arguments = [
             "-o", "BatchMode=yes",
@@ -235,6 +305,9 @@ enum SSHCommandBuilder {
             "-o", "ServerAliveCountMax=3",
             "-o", "StrictHostKeyChecking=accept-new"
         ]
+        if disablesPTY {
+            arguments.append("-T")
+        }
 
         if server.port != 22 {
             arguments += ["-p", String(server.port)]

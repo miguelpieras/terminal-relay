@@ -5,16 +5,18 @@
 
 Terminal Relay provides native macOS, iPhone, and iPad clients for Codex CLI
 and Claude Code sessions running on workers you control. Repositories, agent
-credentials, and terminal processes remain on the worker; the apps connect
-over SSH.
+credentials, provider history, and agent processes remain on the worker; the
+apps connect directly over SSH.
 
 ## Features
 
-- Project-first macOS workspace with embedded interactive terminals.
-- Shared, persistent Codex and Claude sessions backed by worker-side `tmux`.
+- Shared native streaming chat on macOS, iPhone, and iPad, including Markdown,
+  code, tables, safe links, tool progress, diffs, approvals, and questions.
+- Persistent Codex and Claude conversations with multi-device handoff and a
+  capability-gated interactive terminal fallback.
 - Inactive and archived Codex and Claude conversations can be searched, resumed
   exactly, renamed, archived, and restored from macOS, iPhone, and iPad.
-- Every managed agent terminal includes a worker-local MCP for safe project and
+- Every managed agent session includes a worker-local MCP for safe project and
   thread operations on that worker.
 - Handoff between Mac, iPhone, and iPad without stopping the remote agent.
 - GitHub repository creation, deploy-key setup, and worker checkout from macOS.
@@ -61,10 +63,10 @@ For an application-only worker, re-run its original
 
 Then use the apps:
 
-1. Open a project in Terminal Relay. Live terminals and inactive Codex and
+1. Open a project in Terminal Relay. Live agents and inactive Codex and
    Claude conversations appear together below the project.
 2. Choose **New Codex Thread** to create a paused conversation without opening
-   a terminal, or choose **Open Codex** / **Open Claude Code** to start working
+   it, or choose **Open Codex** / **Open Claude Code** to start working
    immediately.
 3. Select an inactive Codex or Claude row to resume that exact conversation.
    On iPhone and iPad, open the project and tap a row under **Paused Threads**.
@@ -72,8 +74,10 @@ Then use the apps:
    to rename or archive an inactive conversation. Expand **Archived Threads**
    to restore one.
 5. Use **Disconnect** when you only want to leave the current device. Use
-   **Stop Terminal** to end that exact worker terminal for every attached
-   device. Archiving a live conversation stops that exact relay terminal first.
+   **Stop Agent** to end that exact worker agent for every attached device.
+   **Open Terminal Fallback** performs a controlled same-thread migration when
+   native chat is unavailable or an expert recovery needs the provider TUI.
+   Archiving a live conversation stops that exact relay instance first.
 
 Claude list, metadata read, and rename use the official Claude Agent SDK;
 resume uses Claude Code's exact provider session UUID. Terminal Relay archive
@@ -84,7 +88,7 @@ resumable.
 
 ### Ask an agent to manage worker threads
 
-Every Codex and Claude terminal opened by Terminal Relay already has the
+Every Codex and Claude session opened by Terminal Relay already has the
 worker-local `terminal_relay` MCP. There is nothing to install or configure in
 the agent. For example, ask:
 
@@ -119,14 +123,19 @@ continue to be installed through the App Store.
 
 ## Architecture
 
-The macOS app starts the system SSH client inside a pseudo-terminal. The
-universal iPhone and iPad app uses SwiftNIO SSH and SwiftTerm. Both clients talk
-to the `terminal-relay-session` helper installed on each worker.
+For native chat, macOS starts the system SSH client without a PTY and iPhone
+and iPad use a bidirectional SwiftNIO SSH exec channel. Structured NDJSON moves
+only between the app and `terminal-relay-session` on the selected worker. One
+worker-local `terminal-relay-chat` broker owns each live provider conversation,
+listens only on a mode-`0600` Unix socket, and keeps a bounded in-memory replay
+window. It has no TCP listener or transcript database.
 
-The helper supports concurrent Codex and Claude terminals, permits multiple
-client attachments to each one, and preserves exact restart intent across
-worker reboots. Disconnecting a client leaves the remote agent running;
-**Stop Agent** ends only the relay UUID that was selected.
+The same clients retain the existing PTY/SwiftTerm path for older workers,
+already-running terminal sessions, and explicit fallback. The helper supports
+concurrent Codex and Claude agents, permits multiple client attachments, and
+preserves exact restart intent across worker reboots. Disconnecting a client
+leaves the remote agent running; **Stop Agent** ends only the selected relay
+UUID.
 
 Codex's worker-local app server and the official Claude Agent SDK provide
 paginated catalogs of persisted conversations. The apps keep each provider
@@ -136,12 +145,13 @@ provider UUID. Claude activity is classified by combining validated
 `claude agents --json` process records with relay state; externally active or
 unknown conversations remain visible but cannot be resumed or mutated.
 
-The provider's worker-local history remains authoritative. Terminal Relay does
-not copy transcripts or provide cross-worker migration. Handoff works between
-clients connected to the same worker, and reboot recovery works while that
-worker's provider data and relay restart intent remain intact. Moving to a
-different worker or replacing its disk requires a separate provider-data
-migration.
+The provider's worker-local history remains authoritative. Native clients keep
+only their currently rendered conversation in memory, and the broker keeps
+only a bounded materialized snapshot and replay window in memory. On a replay
+gap or broker restart it rebuilds from Codex or Claude history on that same
+worker. Terminal Relay does not add a transcript store or cross-worker
+migration. Moving to a different worker or replacing its disk requires a
+separate provider-data migration.
 
 Managed Codex and Claude terminals receive
 `/usr/local/bin/terminal-relay-mcp`, a root-owned stdio MCP server with only
@@ -155,16 +165,17 @@ Terminal Relay does not operate a central backend:
 
 ```text
 macOS app ───────┐
-                 ├─ SSH over your network ─ worker ─ Codex / Claude
-iPhone/iPad app ┘                         ├ repositories in /workspace
-                                          └ local thread MCP (stdio only)
+                 ├─ direct SSH ─ worker ─ chat broker ─ Codex / Claude
+iPhone/iPad app ┘              ├ repositories in /workspace
+                               ├ local thread MCP (stdio only)
+                               └ terminal fallback (PTY/tmux)
 ```
 
 ## Requirements
 
 - macOS 14 or later
 - Xcode 26 or later
-- [XcodeGen](https://github.com/yonaskolb/XcodeGen)
+- [XcodeGen 2.46.0 or later](https://github.com/yonaskolb/XcodeGen)
 - Apple's Metal toolchain component
 - Working SSH access to an Ubuntu 24.04 amd64 worker with at least 4 GB RAM
 - GitHub CLI authenticated on the Mac for repository management

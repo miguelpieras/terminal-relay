@@ -253,6 +253,90 @@ final class SSHCommandBuilderTests: XCTestCase {
         XCTAssertFalse(configuration.arguments.contains("-tt"))
     }
 
+    func testChatCommandsUseFixedHelperExactIdentityAndNonPTYStreaming() throws {
+        let server = makeServer(port: 2_222, identityFile: "~/Keys/agent key")
+        let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let defaults = AgentLaunchDefaults(
+            codexModel: "custom model",
+            codexReasoningEffort: .high,
+            claudeModel: "unused",
+            claudeReasoningEffort: .low,
+            fullAccessEnabled: false
+        )
+
+        XCTAssertEqual(
+            SSHCommandBuilder.workerChatCapabilitiesConfiguration(
+                for: server,
+                kind: .codex,
+                repositoryName: "relay's repo"
+            ).arguments.last,
+            "'/usr/local/bin/terminal-relay-session' 'chat-capabilities-v1' 'codex' 'relay'\"'\"'s repo'"
+        )
+        XCTAssertEqual(
+            SSHCommandBuilder.workerChatStartConfiguration(
+                for: server,
+                kind: .codex,
+                repositoryName: "terminal-relay",
+                threadID: threadID,
+                launchDefaults: defaults
+            ).arguments.last,
+            (
+                [
+                    WorkerSessionProtocol.helperPath,
+                    "chat-start-v1",
+                    "codex",
+                    "terminal-relay",
+                    threadID,
+                ] + defaults.arguments(for: .codex)
+            ).map(SSHCommandBuilder.shellQuote).joined(separator: " ")
+        )
+        let attach = SSHCommandBuilder.workerChatAttachConfiguration(
+            for: server,
+            kind: .codex,
+            repositoryName: "terminal-relay",
+            instanceToken: instanceToken
+        )
+        XCTAssertTrue(attach.arguments.contains("-T"))
+        XCTAssertFalse(attach.arguments.contains("-tt"))
+        XCTAssertEqual(
+            attach.arguments.last,
+            "'/usr/local/bin/terminal-relay-session' 'chat-attach-v1' 'codex' 'terminal-relay' '\(instanceToken)'"
+        )
+        XCTAssertEqual(
+            SSHCommandBuilder.workerChatStopConfiguration(
+                for: server,
+                kind: .codex,
+                repositoryName: "terminal-relay",
+                instanceToken: instanceToken
+            ).arguments.last,
+            "'/usr/local/bin/terminal-relay-session' 'chat-stop-v1' 'codex' 'terminal-relay' '\(instanceToken)'"
+        )
+    }
+
+    func testNewChatStartOmitsProviderThreadIdentity() {
+        let server = makeServer()
+
+        let command = SSHCommandBuilder.workerChatStartConfiguration(
+            for: server,
+            kind: .claude,
+            repositoryName: "terminal-relay",
+            threadID: nil,
+            launchDefaults: .standard
+        ).arguments.last
+
+        XCTAssertEqual(
+            command,
+            (
+                [
+                    WorkerSessionProtocol.helperPath,
+                    "chat-start-v1",
+                    "claude",
+                    "terminal-relay",
+                ] + AgentLaunchDefaults.standard.arguments(for: .claude)
+            ).map(SSHCommandBuilder.shellQuote).joined(separator: " ")
+        )
+    }
+
     func testAttachmentUploadUsesPrivateSessionDirectoryAndStandardSSHOptions() throws {
         let server = makeServer(port: 2_222, identityFile: "~/Keys/agent key")
         let configuration = SSHCommandBuilder.attachmentUploadConfiguration(

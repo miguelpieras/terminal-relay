@@ -57,6 +57,27 @@ enum TerminalSessionCommandPolicy {
             instanceToken: instanceToken
         )
     }
+
+    static func launchCommand(
+        kind: AgentKind,
+        repositoryName: String,
+        providerThreadID: String?,
+        launchArguments: [String]
+    ) throws -> String {
+        if let providerThreadID {
+            return try WorkerRemoteCommand.resumeThread(
+                kind: kind,
+                repositoryName: repositoryName,
+                threadID: providerThreadID,
+                launchArguments: launchArguments
+            )
+        }
+        return try WorkerRemoteCommand.start(
+            kind: kind,
+            repositoryName: repositoryName,
+            launchArguments: launchArguments
+        )
+    }
 }
 
 @MainActor
@@ -75,6 +96,7 @@ final class TerminalSessionController: ObservableObject, RelayTerminalIO {
     private var connectionID = UUID()
     private var operationID = UUID()
     private var instanceToken: String?
+    private var providerThreadID: String?
     private var didStartInitialConnection = false
     private var isStartingSession = false
     private var isConfirmingReconnect = false
@@ -86,12 +108,14 @@ final class TerminalSessionController: ObservableObject, RelayTerminalIO {
         kind: AgentKind,
         repositoryName: String,
         instanceToken: String? = nil,
+        providerThreadID: String? = nil,
         identityStore: SSHIdentityStore = SSHIdentityStore()
     ) {
         self.profile = profile
         self.kind = kind
         self.repositoryName = repositoryName
         self.instanceToken = instanceToken
+        self.providerThreadID = providerThreadID
         self.identityStore = identityStore
         self.workerClient = SSHWorkerClient(identityStore: identityStore)
         self.launchArguments = AgentLaunchDefaults.standard.arguments(for: kind)
@@ -113,6 +137,21 @@ final class TerminalSessionController: ObservableObject, RelayTerminalIO {
         }
     }
 
+    /// Configures the terminal fallback to resume the provider conversation
+    /// released by native chat. This is only valid before the PTY view binds,
+    /// which prevents a fallback race from launching a fresh conversation.
+    @discardableResult
+    func configureForChatFallback(providerThreadID: String) -> Bool {
+        guard ChatWireValidation.isCanonicalUUID(providerThreadID),
+              !didStartInitialConnection,
+              connection == nil,
+              instanceToken == nil else {
+            return false
+        }
+        self.providerThreadID = providerThreadID
+        return true
+    }
+
     private func startSessionAndConnect() async {
         if let instanceToken {
             connectToInstance(instanceToken)
@@ -125,9 +164,10 @@ final class TerminalSessionController: ObservableObject, RelayTerminalIO {
         defer { isStartingSession = false }
 
         do {
-            let command = try WorkerRemoteCommand.start(
+            let command = try TerminalSessionCommandPolicy.launchCommand(
                 kind: kind,
                 repositoryName: repositoryName,
+                providerThreadID: providerThreadID,
                 launchArguments: launchArguments
             )
             let data = try await workerClient.execute(command, on: profile)
@@ -137,6 +177,12 @@ final class TerminalSessionController: ObservableObject, RelayTerminalIO {
                 kind: kind,
                 repositoryName: repositoryName
             )
+            if let providerThreadID, session.threadID != providerThreadID {
+                throw TerminalSessionRecoveryError.invalidStartResponse(
+                    kind: kind,
+                    repositoryName: repositoryName
+                )
+            }
             instanceToken = session.instanceToken
 
             guard shouldReconnect, !isSuspended, connection == nil else { return }

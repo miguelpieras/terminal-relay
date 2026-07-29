@@ -29,7 +29,20 @@ Terminal Relay is a client for infrastructure controlled by its user:
 - The project does not operate a shared Terminal Relay backend.
 - Provider thread IDs and relay instance UUIDs are separate identities. Resume
   uses the provider thread ID; attach and stop remain bound to the immutable
-  relay UUID so stale clients cannot target a replacement terminal.
+  relay UUID so stale clients cannot target a replacement agent.
+- Native chat uses versioned, size- and depth-bounded NDJSON over authenticated
+  SSH without a PTY. Each live broker has an owner-only Unix socket, no TCP
+  listener, a bounded per-client queue and replay ring, canonical repository
+  validation, provider-thread locking, command idempotency, and exact-instance
+  stop protection.
+- Provider history remains authoritative. The broker and clients keep bounded
+  conversation state in memory and never add a Terminal Relay transcript
+  database. Broker recovery metadata contains identifiers and state, not
+  prompts, responses, tool payloads, diffs, approvals, or file previews.
+- Markdown raw HTML and automatic remote images are disabled. External links
+  accept only validated credential-free `http` and `https` URLs; repository
+  previews reject directories, binaries, symlink escapes, and paths outside
+  the selected repository.
 - The built-in MCP is a root-owned, worker-local stdio process. It delegates
   seven typed project/thread operations to the fixed helper path, validates
   project and UUID inputs, bounds runtime and output, and exposes no shell,

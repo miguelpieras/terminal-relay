@@ -5,9 +5,12 @@ struct TerminalScreen: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var controller: TerminalSessionController
+    @StateObject private var chatController: MobileChatSessionController
     @State private var confirmsStop = false
+    @State private var confirmsTerminalFallback = false
     @State private var stopError: String?
     @State private var isStopping = false
+    @State private var isSwitchingToTerminal = false
     private let isDemo: Bool
     private let onExitDemo: (() -> Void)?
     private let onClose: (() -> Void)?
@@ -22,12 +25,21 @@ struct TerminalScreen: View {
         self.isDemo = isDemo
         self.onExitDemo = onExitDemo
         self.onClose = onClose
+        let opensExistingTerminal = route.presentation == .terminal
         _controller = StateObject(
             wrappedValue: TerminalSessionController(
                 profile: profile,
                 kind: route.kind,
                 repositoryName: route.repositoryName,
-                instanceToken: route.instanceToken
+                instanceToken: opensExistingTerminal ? route.instanceToken : nil,
+                providerThreadID:
+                    opensExistingTerminal ? nil : route.providerThreadID
+            )
+        )
+        _chatController = StateObject(
+            wrappedValue: MobileChatSessionController(
+                profile: profile,
+                route: route
             )
         )
     }
@@ -35,38 +47,21 @@ struct TerminalScreen: View {
     var body: some View {
         NavigationStack {
             ZStack {
-                Color.black.ignoresSafeArea()
-                if isDemo {
-                    DemoTerminalRepresentable(
-                        kind: controller.kind,
-                        repositoryName: controller.repositoryName
-                    )
-                    .padding(.top, hidesEmbeddedDemoNavigation ? 40 : 0)
-                } else {
-                    TerminalRepresentable(controller: controller)
-                }
-
-                if !isDemo, let recovery = recoveryPresentation {
-                    VStack(spacing: 12) {
-                        Text(recovery.message)
-                            .font(.footnote)
-                            .multilineTextAlignment(.center)
-                        if recovery.canReconnect {
-                            Button("Reconnect") {
-                                Task { await controller.reconnect() }
-                            }
-                            .buttonStyle(.borderedProminent)
-                        } else {
-                            Button("Back to Projects") {
-                                controller.disconnect(manually: true)
-                                close()
-                            }
-                            .buttonStyle(.borderedProminent)
-                        }
+                (showsTerminal ? Color.black : Color(uiColor: .systemBackground))
+                    .ignoresSafeArea()
+                sessionContent
+                if isSwitchingToTerminal {
+                    ZStack {
+                        Color.black.opacity(0.18)
+                            .ignoresSafeArea()
+                        ProgressView("Switching to Terminal…")
+                            .padding(18)
+                            .background(
+                                .regularMaterial,
+                                in: RoundedRectangle(cornerRadius: 16)
+                            )
                     }
-                    .padding()
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
-                    .padding()
+                    .transition(.opacity)
                 }
             }
             .navigationTitle("\(controller.kind.displayName) · \(controller.repositoryName)")
@@ -75,8 +70,6 @@ struct TerminalScreen: View {
                 hidesEmbeddedDemoNavigation ? .hidden : .automatic,
                 for: .navigationBar
             )
-            .toolbarBackground(.black, for: .navigationBar)
-            .toolbarColorScheme(.dark, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     if isDemo {
@@ -98,11 +91,15 @@ struct TerminalScreen: View {
                         }
                     } else {
                         Button("Stop", role: .destructive) { confirmsStop = true }
-                            .disabled(isStopping)
+                            .disabled(
+                                isStopping
+                                    || isSwitchingToTerminal
+                                    || !canStop
+                            )
                         Button("Disconnect") {
-                            controller.disconnect(manually: true)
-                            close()
+                            disconnectAndClose()
                         }
+                        .disabled(isStopping || isSwitchingToTerminal)
                         .keyboardShortcut("w", modifiers: .command)
                     }
                 }
@@ -120,25 +117,45 @@ struct TerminalScreen: View {
                     .padding(.horizontal, 14)
                     .padding(.vertical, 10)
                     .background(Color(uiColor: .secondarySystemBackground))
-                } else {
+                } else if showsTerminal {
                     MobileTerminalKeyBar(controller: controller)
                 }
+            }
+        }
+        .onAppear {
+            if !isDemo {
+                chatController.start()
             }
         }
         .onChange(of: scenePhase) { _, phase in
             guard !isDemo else { return }
             switch phase {
             case .background:
-                controller.suspendForBackground()
+                if showsTerminal {
+                    controller.suspendForBackground()
+                } else {
+                    Task {
+                        await chatController.suspendForBackground()
+                    }
+                }
             case .active:
-                Task { await controller.reconnectAfterForeground() }
+                if showsTerminal {
+                    Task { await controller.reconnectAfterForeground() }
+                } else {
+                    chatController.reconnectAfterForeground()
+                }
             default:
                 break
             }
         }
         .onDisappear {
             if !isDemo {
-                controller.disconnect(manually: true)
+                Task {
+                    await chatController.detach()
+                }
+                if showsTerminal {
+                    controller.disconnect(manually: true)
+                }
             }
         }
         .alert("Stop \(controller.kind.displayName)?", isPresented: $confirmsStop) {
@@ -149,8 +166,32 @@ struct TerminalScreen: View {
         } message: {
             Text("This ends the remote agent for every attached client. To leave it running, choose Disconnect instead.")
         }
+        .alert("Open terminal fallback?", isPresented: $confirmsTerminalFallback) {
+            Button("Switch to Terminal", role: .destructive) {
+                Task {
+                    isSwitchingToTerminal = true
+                    defer { isSwitchingToTerminal = false }
+                    do {
+                        try await chatController.openTerminalFallback {
+                            controller.configureForChatFallback(
+                                providerThreadID: $0
+                            )
+                        }
+                    } catch {
+                        stopError = (error as? MobileChatSessionError)?
+                            .localizedDescription
+                            ?? "The terminal fallback could not be opened safely."
+                    }
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                "This stops the exact native-chat agent, then resumes the same provider conversation in the raw terminal."
+            )
+        }
         .alert(
-            "Could not stop agent",
+            "Could not complete action",
             isPresented: Binding(get: { stopError != nil }, set: { if !$0 { stopError = nil } })
         ) {
             Button("OK") { stopError = nil }
@@ -160,22 +201,171 @@ struct TerminalScreen: View {
     }
 
     @ViewBuilder
-    private var connectionLabel: some View {
-        switch controller.state {
-        case .connecting:
-            ProgressView().tint(.white)
-        case .connected:
-            Label("Connected", systemImage: "checkmark.circle.fill")
-                .font(.caption)
+    private var sessionContent: some View {
+        if isDemo {
+            DemoChatConversationView()
+                .padding(.top, hidesEmbeddedDemoNavigation ? 40 : 0)
+        } else {
+            switch chatController.phase {
+            case .preparing:
+                preparationView
+            case .chat:
+                if let coordinator = chatController.coordinator {
+                    ConversationView(
+                        coordinator: coordinator,
+                        onOpenTerminalFallback: {
+                            confirmsTerminalFallback = true
+                        }
+                    )
+                } else {
+                    preparationView
+                }
+            case .terminalFallback(let reason):
+                TerminalRepresentable(controller: controller)
+                if let reason {
+                    VStack {
+                        Label(reason, systemImage: "terminal")
+                            .font(.caption)
+                            .multilineTextAlignment(.leading)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 9)
+                            .background(
+                                .regularMaterial,
+                                in: RoundedRectangle(cornerRadius: 12)
+                            )
+                            .padding(12)
+                        Spacer()
+                    }
+                }
+                if let recovery = recoveryPresentation {
+                    recoveryView(recovery)
+                }
+            case .failed(let message):
+                failureView(message)
+            case .stopped:
+                endedView
+            }
+        }
+    }
+
+    private var preparationView: some View {
+        VStack(spacing: 14) {
+            ProgressView()
+                .controlSize(.large)
+            Text("Preparing native chat…")
+                .font(.headline)
+            Text("Connecting directly to your worker over SSH.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Preparing native chat")
+    }
+
+    private func failureView(_ message: String) -> some View {
+        VStack(spacing: 14) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 28))
+                .foregroundStyle(.orange)
+            Text("Could not open native chat")
+                .font(.headline)
+            Text(message)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            HStack {
+                Button("Back to Projects") {
+                    disconnectAndClose()
+                }
+                .buttonStyle(.bordered)
+                Button("Try Again") {
+                    chatController.retryPreparation()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var endedView: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 30))
                 .foregroundStyle(.green)
-        case .disconnected:
-            Text("Disconnected").font(.caption).foregroundStyle(.secondary)
+            Text("Agent session ended")
+                .font(.headline)
+            Button("Back to Projects") {
+                close()
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func recoveryView(
+        _ recovery: (message: String, canReconnect: Bool)
+    ) -> some View {
+        VStack(spacing: 12) {
+            Text(recovery.message)
+                .font(.footnote)
+                .multilineTextAlignment(.center)
+            if recovery.canReconnect {
+                Button("Reconnect") {
+                    Task { await controller.reconnect() }
+                }
+                .buttonStyle(.borderedProminent)
+            } else {
+                Button("Back to Projects") {
+                    controller.disconnect(manually: true)
+                    close()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding()
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+        .padding()
+    }
+
+    @ViewBuilder
+    private var connectionLabel: some View {
+        switch chatController.phase {
+        case .preparing:
+            ProgressView()
+        case .chat:
+            if let coordinator = chatController.coordinator {
+                ChatNavigationStatus(store: coordinator.store)
+            } else {
+                ProgressView()
+            }
+        case .terminalFallback:
+            switch controller.state {
+            case .connecting:
+                ProgressView()
+            case .connected:
+                Label("Terminal", systemImage: "terminal.fill")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+            case .disconnected:
+                Text("Disconnected").font(.caption).foregroundStyle(.secondary)
+            case .failed:
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+            case .ended:
+                Label("Ended", systemImage: "stop.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
         case .failed:
-            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-        case .ended:
-            Label("Ended", systemImage: "stop.circle.fill")
+            Label("Offline", systemImage: "exclamationmark.triangle.fill")
                 .font(.caption)
                 .foregroundStyle(.orange)
+        case .stopped:
+            Label("Ended", systemImage: "stop.circle.fill")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -199,17 +389,48 @@ struct TerminalScreen: View {
         }
     }
 
+    private var showsTerminal: Bool {
+        guard !isDemo else { return false }
+        if case .terminalFallback = chatController.phase {
+            return true
+        }
+        return false
+    }
+
+    private var canStop: Bool {
+        switch chatController.phase {
+        case .chat, .terminalFallback:
+            true
+        case .preparing, .failed, .stopped:
+            false
+        }
+    }
+
     private func stopAgent() {
         isStopping = true
         Task {
             do {
-                try await controller.stopAgent()
+                if chatController.phase == .chat {
+                    try await chatController.stopChat()
+                } else {
+                    try await controller.stopAgent()
+                }
                 close()
             } catch {
-                stopError = error.localizedDescription
+                stopError = "The agent could not be stopped. It may still be running; reconnect and try again."
                 isStopping = false
             }
         }
+    }
+
+    private func disconnectAndClose() {
+        Task {
+            await chatController.detach()
+        }
+        if showsTerminal {
+            controller.disconnect(manually: true)
+        }
+        close()
     }
 
     private func close() {
@@ -221,54 +442,64 @@ struct TerminalScreen: View {
     }
 }
 
-private struct DemoTerminalRepresentable: UIViewRepresentable {
-    let kind: AgentKind
-    let repositoryName: String
+private struct DemoChatConversationView: View {
+    @State private var coordinator: ConversationCoordinator
 
-    func makeUIView(context: Context) -> RelayTerminalView {
-        let view = RelayTerminalView(frame: .zero)
-        view.font = .monospacedSystemFont(ofSize: 14, weight: .regular)
-        view.nativeBackgroundColor = .black
-        view.nativeForegroundColor = UIColor(white: 0.88, alpha: 1)
-        view.isUserInteractionEnabled = false
-        DispatchQueue.main.async {
-            view.feed(text: transcript)
-        }
-        return view
+    init() {
+        _coordinator = State(
+            initialValue: MobileChatDemoFixture.makeCoordinator()
+        )
     }
 
-    func updateUIView(_ uiView: RelayTerminalView, context: Context) {}
+    var body: some View {
+        ConversationView(coordinator: coordinator, isReadOnly: true)
+    }
+}
 
-    private var transcript: String {
-        let accent = "\u{001B}[38;5;75m"
-        let success = "\u{001B}[38;5;114m"
-        let muted = "\u{001B}[38;5;245m"
-        let primary = "\u{001B}[38;5;252m"
-        let reset = "\u{001B}[0m"
+private struct ChatNavigationStatus: View {
+    @ObservedObject var store: ConversationStore
 
-        let content = """
-        \(muted)example-user@private-worker:/workspace/\(repositoryName)$\(reset) \(kind.rawValue)
-
-        \(accent)> Make the iPad workspace feel native. Keep projects and terminals in a compact sidebar, then give the active terminal as much room as possible.\(reset)
-
-        \(primary)I will simplify the iPad layout into two columns and keep the phone navigation compact. The worker, pairing, and session logic remains shared across both device experiences.\(reset)
-
-        \(muted)- Inspecting the adaptive workspace
-        - Combining projects and active terminals in the sidebar
-        - Expanding the terminal detail across the remaining display\(reset)
-
-        \(success)Done. The iPad now keeps navigation close at hand while the terminal uses the full detail area. Switching projects or sessions never stops the remote agent.\(reset)
-
-        \(accent)> Review the private pairing path and prepare the App Store release.\(reset)
-
-        \(primary)Pairing uses a short-lived, enrollment-only key. Every user connects to a worker they control; this demo contains example data and makes no network connection.\(reset)
-
-        \(success)Ready for review.\(reset)
-        """
-        return content
-            .components(separatedBy: "\n")
-            .map { $0.isEmpty ? "" : "  \($0)" }
-            .joined(separator: "\r\n")
+    var body: some View {
+        switch store.state.connectionState {
+        case .connecting:
+            ProgressView()
+        case .streaming:
+            Label(
+                store.state.turnState.isActive ? "Working" : "Chat",
+                systemImage: store.state.turnState.isActive
+                    ? "sparkles"
+                    : "checkmark.circle.fill"
+            )
+            .font(.caption)
+            .foregroundStyle(.green)
+        case .awaitingApproval:
+            Label("Needs you", systemImage: "person.crop.circle.badge.questionmark")
+                .font(.caption)
+                .foregroundStyle(.orange)
+        case .offlineAgentRunning:
+            Label("Offline", systemImage: "wifi.slash")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .interrupted:
+            Label("Interrupted", systemImage: "stop.circle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .stopped:
+            Label("Ended", systemImage: "checkmark.circle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .unsupportedWorker:
+            Label("Terminal", systemImage: "terminal")
+                .font(.caption)
+        case .failed:
+            Label("Failed", systemImage: "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundStyle(.red)
+        case .unknown:
+            Label("Updating", systemImage: "circle.dotted")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
     }
 }
 

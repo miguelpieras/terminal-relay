@@ -132,7 +132,7 @@ wait_for_session() {
         attempt=$((attempt + 1))
         line="$(session_line "$tool" "$repository" 2>/dev/null || true)"
         IFS='|' read -r record_type actual_tool actual_repository actual_clients instance \
-            activity title working thread_id extra <<< "$line"
+            activity title working thread_id presentation extra <<< "$line"
         if [[ "$record_type" == "session" \
             && "$actual_tool" == "$tool" \
             && "$actual_repository" == "$repository" \
@@ -142,6 +142,7 @@ wait_for_session() {
             && "$title" =~ ^([a-f0-9]{2})*$ \
             && "$working" =~ ^[01]?$ \
             && "$thread_id" =~ ^([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})?$ \
+            && "$presentation" == "terminal" \
             && -z "${extra:-}" ]]; then
             printf '%s\n' "$line"
             return 0

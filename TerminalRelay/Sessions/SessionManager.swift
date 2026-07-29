@@ -215,7 +215,8 @@ final class SessionManager: ObservableObject {
             project: project,
             on: server,
             snapshot: snapshot,
-            selectResult: shouldSelectResult
+            selectResult: shouldSelectResult,
+            launchDefaults: launchDefaults
         )
         return shouldSelectResult ? result : nil
     }
@@ -254,7 +255,8 @@ final class SessionManager: ObservableObject {
             project: project,
             on: server,
             snapshot: snapshot,
-            selectResult: shouldSelectResult
+            selectResult: shouldSelectResult,
+            launchDefaults: launchDefaults
         )
         return shouldSelectResult ? result : nil
     }
@@ -273,7 +275,8 @@ final class SessionManager: ObservableObject {
         project: ProjectProfile,
         on server: ServerProfile,
         snapshot: WorkerSessionSnapshot,
-        selectResult: Bool = true
+        selectResult: Bool = true,
+        launchDefaults: AgentLaunchDefaults = .standard
     ) -> SessionOpenResult? {
         guard project.serverID == server.id,
               snapshot.repositoryName == project.displayName,
@@ -287,7 +290,8 @@ final class SessionManager: ObservableObject {
                 && $0.instanceToken == snapshot.instanceToken
                 && ($0.projectID != project.id
                     || $0.projectName != project.displayName
-                    || $0.kind != snapshot.kind)
+                    || $0.kind != snapshot.kind
+                    || $0.presentation != snapshot.presentation)
         }) {
             return .occupied(SessionOccupant(session: occupant))
         }
@@ -311,7 +315,8 @@ final class SessionManager: ObservableObject {
                    project: project,
                    on: server,
                    confirmedSnapshot: snapshot,
-                   selectReplacement: selectResult
+                   selectReplacement: selectResult,
+                   launchDefaults: launchDefaults
                ) {
                 return .selectedExisting(replacement)
             }
@@ -329,7 +334,9 @@ final class SessionManager: ObservableObject {
             instanceToken: snapshot.instanceToken,
             terminalTitle: snapshot.title,
             threadID: snapshot.threadID,
-            remoteAttachedClientCount: snapshot.attachedClientCount
+            remoteAttachedClientCount: snapshot.attachedClientCount,
+            presentation: snapshot.presentation,
+            launchDefaults: launchDefaults
         )
         append(session)
         if selectResult {
@@ -368,7 +375,8 @@ final class SessionManager: ObservableObject {
             project: project,
             on: server,
             confirmedSnapshot: snapshot,
-            selectReplacement: selectedSessionID == sessionID
+            selectReplacement: selectedSessionID == sessionID,
+            launchDefaults: launchDefaults
         )
     }
 
@@ -377,7 +385,8 @@ final class SessionManager: ObservableObject {
         project: ProjectProfile,
         on server: ServerProfile,
         confirmedSnapshot: WorkerSessionSnapshot,
-        selectReplacement: Bool
+        selectReplacement: Bool,
+        launchDefaults: AgentLaunchDefaults = .standard
     ) -> TerminalSession? {
         guard let index = sessions.firstIndex(where: { $0.id == sessionID }) else { return nil }
         let existing = sessions[index]
@@ -387,7 +396,8 @@ final class SessionManager: ObservableObject {
               existing.status.canReconnect,
               confirmedSnapshot.kind == existing.kind,
               confirmedSnapshot.repositoryName == existing.projectName,
-              confirmedSnapshot.instanceToken == existing.instanceToken else {
+              confirmedSnapshot.instanceToken == existing.instanceToken,
+              confirmedSnapshot.presentation == existing.presentation else {
             return nil
         }
         let launchIdentity = confirmedSnapshot.instanceToken
@@ -403,7 +413,9 @@ final class SessionManager: ObservableObject {
             initialStatus: .connecting,
             terminalTitle: existing.terminalTitle,
             threadID: confirmedSnapshot.threadID ?? existing.threadID,
-            remoteAttachedClientCount: confirmedSnapshot.attachedClientCount
+            remoteAttachedClientCount: confirmedSnapshot.attachedClientCount,
+            presentation: confirmedSnapshot.presentation,
+            launchDefaults: launchDefaults
         )
         sessionObservers[existing.id] = nil
         taskCompletionObservers[existing.id] = nil
@@ -533,7 +545,9 @@ final class SessionManager: ObservableObject {
                     initialStatus: .remoteRunning,
                     terminalTitle: snapshot.title,
                     threadID: snapshot.threadID,
-                    remoteAttachedClientCount: snapshot.attachedClientCount
+                    remoteAttachedClientCount: snapshot.attachedClientCount,
+                    presentation: snapshot.presentation,
+                    launchDefaults: launchDefaults
                 )
                 append(session)
                 session.applyRemoteSnapshot(snapshot)
@@ -573,6 +587,7 @@ final class SessionManager: ObservableObject {
             kind: session.kind,
             repositoryName: repositoryName,
             instanceToken: instanceToken,
+            presentation: session.presentation,
             on: worker
         ) else {
             session.cancelRemoteStop()
@@ -615,6 +630,57 @@ final class SessionManager: ObservableObject {
             return false
         }
         return await stopAgent(sessionID: sessionID, on: worker, using: service)
+    }
+
+    @discardableResult
+    func openTerminalFallbackAfterRefresh(
+        sessionID: UUID,
+        project: ProjectProfile,
+        on worker: ServerProfile,
+        projects: [ProjectProfile],
+        launchDefaults: AgentLaunchDefaults,
+        using service: WorkerSessionService
+    ) async -> TerminalSession? {
+        guard let session = sessions.first(where: { $0.id == sessionID }),
+              session.projectID == project.id,
+              session.projectName == project.displayName,
+              session.serverKey == worker.concurrencyKey,
+              session.presentation == .chat,
+              let threadID = session.threadID,
+              await refresh(
+                  worker: worker,
+                  projects: projects,
+                  launchDefaults: launchDefaults,
+                  using: service
+              ),
+              await stopAgent(
+                  sessionID: sessionID,
+                  on: worker,
+                  using: service
+              ),
+              let snapshot = await service.resumeThread(
+                  kind: session.kind,
+                  repositoryName: project.displayName,
+                  threadID: threadID,
+                  launchDefaults: launchDefaults,
+                  preferredPresentation: .terminal,
+                  on: worker
+              ),
+              snapshot.presentation == .terminal else {
+            return nil
+        }
+
+        guard let result = openConfirmedRemote(
+            project: project,
+            on: worker,
+            snapshot: snapshot,
+            selectResult: true,
+            launchDefaults: launchDefaults
+        ), let terminalSession = result.localSession else {
+            return nil
+        }
+        removeSession(id: sessionID)
+        return terminalSession
     }
 
     private func append(_ session: TerminalSession) {
