@@ -235,16 +235,19 @@ struct TerminalRelayApp: App {
                 .preferredColorScheme(.dark)
                 .frame(minWidth: 980, minHeight: 640)
                 .onAppear {
+                    DispatchQueue.main.async {
+                        guard let window = NSApplication.shared.windows.first(where: \.isVisible)
+                        else { return }
 #if DEBUG
-                    if ScreenshotDemoMode.isEnabled {
-                        DispatchQueue.main.async {
-                            guard let window = NSApplication.shared.windows.first(where: \.isVisible)
-                            else { return }
+                        if ScreenshotDemoMode.isEnabled {
                             window.setContentSize(NSSize(width: 1_260, height: 820))
                             window.center()
+                            return
                         }
-                    }
 #endif
+                        guard let screen = window.screen ?? NSScreen.main else { return }
+                        window.setFrame(screen.visibleFrame, display: true)
+                    }
                     appDelegate.sessionManager = sessionManager
                     appDelegate.attach(
                         serverStore: serverStore,
