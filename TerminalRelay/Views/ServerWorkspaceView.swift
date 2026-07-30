@@ -814,6 +814,8 @@ private struct AccountUsageCard: View {
                     HStack(spacing: 6) {
                         Text(productName)
                             .font(.headline)
+                            .lineLimit(1)
+                            .layoutPriority(1)
                         Circle()
                             .fill(
                                 snapshot == nil
@@ -842,6 +844,7 @@ private struct AccountUsageCard: View {
                     controlSize: .small,
                     showsIcon: true
                 )
+                .labelStyle(.iconOnly)
             }
 
             Divider()
