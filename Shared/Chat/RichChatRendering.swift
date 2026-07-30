@@ -162,6 +162,28 @@ enum MarkdownSafety {
         neutralizingImages(in: escapedRawHTML(source))
     }
 
+    static func sanitizedSourceOffMain(
+        _ source: String
+    ) async -> MarkdownSanitizationResult {
+        let task = Task.detached(priority: .userInitiated) {
+            sanitizationResult(source)
+        }
+        return await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    private static func sanitizationResult(
+        _ source: String
+    ) -> MarkdownSanitizationResult {
+        MarkdownSanitizationResult(
+            source: sanitizedSource(source),
+            performedOnMainThread: Thread.isMainThread
+        )
+    }
+
     static func escapedRawHTML(_ source: String) -> String {
         var insideFence = false
         return source
@@ -305,6 +327,11 @@ enum MarkdownSafety {
         }
         return output
     }
+}
+
+struct MarkdownSanitizationResult: Equatable, Sendable {
+    let source: String
+    let performedOnMainThread: Bool
 }
 
 private struct MarkdownImageRecord {
@@ -470,8 +497,8 @@ struct RichMarkdownView: View {
     let onOpenExternal: (URL) -> Void
     let onOpenRepository: (ChatRepositoryLink) -> Void
 
-    @State private var source: StreamingMarkdownSource
-    @State private var didFinishStreaming: Bool
+    @State private var source = StreamingMarkdownSource()
+    @State private var didFinishStreaming = false
 
     init(
         text: String,
@@ -483,16 +510,13 @@ struct RichMarkdownView: View {
         self.isStreaming = isStreaming
         self.onOpenExternal = onOpenExternal
         self.onOpenRepository = onOpenRepository
-        let safeText = MarkdownSafety.sanitizedSource(text)
-        _source = State(initialValue: StreamingMarkdownSource(safeText))
-        _didFinishStreaming = State(initialValue: false)
     }
 
     var body: some View {
         StreamingMarkdownReader(source) { parseResult in
             MarkdownView(parseResult)
         }
-        .markdownStreamingRenderThrottle(.milliseconds(50))
+        .markdownStreamingRenderThrottle(.milliseconds(33))
         .markdownCodeBlockStyle(TerminalRelayMarkdownCodeBlockStyle(isStreaming: isStreaming))
         .markdownTableStyle(TerminalRelayMarkdownTableStyle())
         .markdownBaseURL(URL(string: "\(ChatURLPolicy.repositoryScheme):///")!)
@@ -547,24 +571,30 @@ struct RichMarkdownView: View {
             }
         )
         .textSelection(.enabled)
-        .onAppear(perform: synchronizeSource)
-        .onChange(of: text) { _, _ in synchronizeSource() }
-        .onChange(of: isStreaming) { _, _ in synchronizeSource() }
+        .task(id: MarkdownRenderInput(text: text, isStreaming: isStreaming)) {
+            await synchronizeSource()
+        }
     }
 
-    private func synchronizeSource() {
-        let safeText = MarkdownSafety.sanitizedSource(text)
+    private func synchronizeSource() async {
+        let result = await MarkdownSafety.sanitizedSourceOffMain(text)
+        guard !Task.isCancelled else { return }
         if didFinishStreaming {
-            source = StreamingMarkdownSource(safeText)
+            source = StreamingMarkdownSource(result.source)
             didFinishStreaming = false
         } else {
-            source.text = safeText
+            source.text = result.source
         }
         if !isStreaming {
             source.finishStreaming()
             didFinishStreaming = true
         }
     }
+}
+
+private struct MarkdownRenderInput: Hashable {
+    let text: String
+    let isStreaming: Bool
 }
 
 struct CodeBlockView: View {

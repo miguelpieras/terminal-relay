@@ -151,7 +151,6 @@ struct ConversationReducer {
                 return
             }
             applyUnknown(envelope, to: &state)
-            enforceMemoryBounds(on: &state)
             return
         }
 
@@ -256,7 +255,6 @@ struct ConversationReducer {
             break
         }
 
-        enforceMemoryBounds(on: &state)
     }
 
     private func applySnapshot(_ envelope: ChatEnvelope, to state: inout ConversationState) throws {
@@ -290,7 +288,6 @@ struct ConversationReducer {
         state.hasOlderHistory = snapshot.hasOlderHistory
         state.oldestItemID = snapshot.oldestItemID
         state.lastErrorMessage = nil
-        enforceMemoryBounds(on: &state)
     }
 
     private func applyHello(_ envelope: ChatEnvelope, to state: inout ConversationState) {
@@ -827,20 +824,26 @@ struct ConversationReducer {
         return values.filter { seen.insert($0.id).inserted }
     }
 
-    private func enforceMemoryBounds(on state: inout ConversationState) {
+    func enforceMemoryBounds(
+        on state: inout ConversationState,
+        retainedContentBytes: inout Int
+    ) {
         var removed = false
         if state.items.count > maximumRetainedItems {
-            state.items.removeFirst(state.items.count - maximumRetainedItems)
+            let removalCount = state.items.count - maximumRetainedItems
+            retainedContentBytes -= state.items.prefix(removalCount).reduce(0) {
+                $0 + $1.approximateContentByteCount
+            }
+            state.items.removeFirst(removalCount)
             removed = true
         }
 
-        var byteCount = state.items.reduce(0) { result, item in
-            result + item.approximateContentByteCount
-        }
-        while state.items.count > 1, byteCount > maximumRetainedContentBytes {
-            byteCount -= state.items.removeFirst().approximateContentByteCount
+        while state.items.count > 1,
+              retainedContentBytes > maximumRetainedContentBytes {
+            retainedContentBytes -= state.items.removeFirst().approximateContentByteCount
             removed = true
         }
+        retainedContentBytes = max(0, retainedContentBytes)
 
         if removed {
             state.didTruncateHistory = true
@@ -871,16 +874,20 @@ final class ConversationStore: ObservableObject {
     private let reducer: ConversationReducer
     private let streamingPublishNanoseconds: UInt64
     private var streamingPublishTask: Task<Void, Never>?
+    private var retainedContentBytes: Int
 
     init(
         state: ConversationState = ConversationState(),
         reducer: ConversationReducer = ConversationReducer(),
-        streamingPublishNanoseconds: UInt64 = 50_000_000
+        streamingPublishNanoseconds: UInt64 = 33_000_000
     ) {
         self.state = state
         workingState = state
         self.reducer = reducer
         self.streamingPublishNanoseconds = streamingPublishNanoseconds
+        retainedContentBytes = state.items.reduce(0) {
+            $0 + $1.approximateContentByteCount
+        }
     }
 
     deinit {
@@ -892,7 +899,33 @@ final class ConversationStore: ObservableObject {
 
     func apply(_ envelope: ChatEnvelope) throws {
         let previousItemCount = workingState.items.count
+        let changedItemID = changedItemID(for: envelope)
+        let changedItemIndex = changedItemID.flatMap { id in
+            workingState.items.firstIndex(where: { $0.id == id })
+        }
+        let previousChangedItemBytes = changedItemIndex.map {
+            workingState.items[$0].approximateContentByteCount
+        } ?? 0
         try reducer.reduce(envelope, into: &workingState)
+        let requiresFullByteRecount =
+            envelope.type == ChatEventKind.conversationSnapshot.rawValue
+            || envelope.type == ChatEventKind.historyPage.rawValue
+            || envelope.payload["clientUserMessageId"]?.stringValue != nil
+            || workingState.items.count != previousItemCount
+        if requiresFullByteRecount {
+            recountRetainedContentBytes()
+        } else if let changedItemID,
+                  let changedItemIndex,
+                  workingState.items.indices.contains(changedItemIndex),
+                  workingState.items[changedItemIndex].id == changedItemID {
+            retainedContentBytes +=
+                workingState.items[changedItemIndex].approximateContentByteCount
+                    - previousChangedItemBytes
+        }
+        reducer.enforceMemoryBounds(
+            on: &workingState,
+            retainedContentBytes: &retainedContentBytes
+        )
         if envelope.type == ChatEventKind.conversationSnapshot.rawValue {
             resetReconnectTransients()
         }
@@ -935,6 +968,11 @@ final class ConversationStore: ObservableObject {
             hasOlderHistory: snapshot.hasOlderHistory,
             oldestItemID: snapshot.oldestItemID
         )
+        recountRetainedContentBytes()
+        reducer.enforceMemoryBounds(
+            on: &workingState,
+            retainedContentBytes: &retainedContentBytes
+        )
         resetReconnectTransients()
         clearStaleDestructiveApprovalConfirmation()
         publishImmediately()
@@ -948,15 +986,29 @@ final class ConversationStore: ObservableObject {
             occurredAt: Int64(Date().timeIntervalSince1970 * 1_000),
             isOptimistic: true
         )
-        workingState.items.append(.message(message))
+        let item = ConversationItem.message(message)
+        workingState.items.append(item)
+        retainedContentBytes += item.approximateContentByteCount
+        reducer.enforceMemoryBounds(
+            on: &workingState,
+            retainedContentBytes: &retainedContentBytes
+        )
         publishImmediately()
     }
 
     func removeOptimisticUserMessage(requestID: String) {
+        retainedContentBytes -= workingState.items.reduce(0) { result, item in
+            guard case .message(let message) = item,
+                  message.id == "client:\(requestID)" else {
+                return result
+            }
+            return result + item.approximateContentByteCount
+        }
         workingState.items.removeAll { item in
             guard case .message(let message) = item else { return false }
             return message.id == "client:\(requestID)"
         }
+        retainedContentBytes = max(0, retainedContentBytes)
         publishImmediately()
     }
 
@@ -1135,6 +1187,22 @@ final class ConversationStore: ObservableObject {
         }
         if !remainsConfirmable {
             pendingDestructiveApprovalConfirmation = nil
+        }
+    }
+
+    private func changedItemID(for envelope: ChatEnvelope) -> String? {
+        if let itemID = envelope.itemID
+            ?? envelope.payload["itemId"]?.stringValue
+            ?? envelope.payload["id"]?.stringValue {
+            return itemID
+        }
+        guard ChatEventKind(rawValue: envelope.type) == nil else { return nil }
+        return envelope.eventID ?? envelope.id
+    }
+
+    private func recountRetainedContentBytes() {
+        retainedContentBytes = workingState.items.reduce(0) {
+            $0 + $1.approximateContentByteCount
         }
     }
 

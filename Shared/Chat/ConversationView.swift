@@ -1,10 +1,15 @@
 import Foundation
 import SwiftUI
 
+#if os(macOS)
+import AppKit
+#elseif os(iOS)
+import UIKit
+#endif
+
 enum ConversationViewportAction: Equatable {
     case preserve
     case anchorInitialLatest
-    case anchorLatest
 }
 
 struct ConversationViewportPolicy: Equatable {
@@ -15,34 +20,53 @@ struct ConversationViewportPolicy: Equatable {
     }
 
     private var phase: Phase = .awaitingContent
+    private(set) var isUserInteracting = false
+    private(set) var followsLatest = true
 
     var acceptsBottomMeasurements: Bool {
         phase == .positioned
     }
 
+    var shouldFollowLatestLayout: Bool {
+        phase == .positioned && followsLatest && !isUserInteracting
+    }
+
     mutating func actionForContentUpdate(
-        hasContent: Bool,
-        isPagination: Bool,
-        wasNearBottom: Bool
+        hasContent: Bool
     ) -> ConversationViewportAction {
         if phase == .awaitingContent, hasContent {
             phase = .initialAnchorPending
             return .anchorInitialLatest
         }
-        guard phase == .positioned, !isPagination else {
-            return .preserve
-        }
-        return wasNearBottom ? .anchorLatest : .preserve
+        return .preserve
     }
 
     mutating func completeInitialAnchor() {
         guard phase == .initialAnchorPending else { return }
         phase = .positioned
+        followsLatest = true
+    }
+
+    mutating func beginUserInteraction() {
+        guard phase == .positioned else { return }
+        isUserInteracting = true
+        followsLatest = false
+    }
+
+    mutating func endUserInteraction(isAtBottom: Bool) {
+        isUserInteracting = false
+        if isAtBottom {
+            followsLatest = true
+        }
+    }
+
+    mutating func jumpToLatest() {
+        isUserInteracting = false
+        followsLatest = true
     }
 }
 
 private struct ConversationViewportUpdateToken: Equatable {
-    let sequence: Int64
     let lastItemID: String?
     let pendingApprovalCount: Int
     let pendingQuestionCount: Int
@@ -66,6 +90,8 @@ struct ConversationView: View {
     @State private var escapeRouter = ComposerEscapeRouter()
     #endif
     @State private var viewportPolicy = ConversationViewportPolicy()
+    @State private var isAtBottom = true
+    @State private var pendingFollowScroll: Task<Void, Never>?
 
     init(
         coordinator: ConversationCoordinator,
@@ -194,9 +220,14 @@ struct ConversationView: View {
                 .coordinateSpace(name: "conversation-scroll")
                 .onPreferenceChange(ConversationBottomPreferenceKey.self) { bottomY in
                     guard viewportPolicy.acceptsBottomMeasurements else { return }
+                    let atBottom = bottomY <= geometry.size.height + 2
                     let nearBottom = bottomY <= geometry.size.height + 180
+                    isAtBottom = atBottom
                     if nearBottom != store.isNearBottom {
                         store.setNearBottom(nearBottom)
+                    }
+                    if !atBottom, viewportPolicy.shouldFollowLatestLayout {
+                        scheduleFollowScroll(proxy)
                     }
                 }
                 .onChange(of: viewportUpdateSignal, initial: true) { _, update in
@@ -214,6 +245,9 @@ struct ConversationView: View {
                 .overlay(alignment: .bottomTrailing) {
                     if !store.isNearBottom {
                         Button {
+                            pendingFollowScroll?.cancel()
+                            pendingFollowScroll = nil
+                            viewportPolicy.jumpToLatest()
                             store.jumpToLatest()
                             scrollToBottom(proxy)
                         } label: {
@@ -246,6 +280,13 @@ struct ConversationView: View {
                     reduceMotion ? nil : .easeInOut(duration: 0.16),
                     value: store.isNearBottom
                 )
+                .conversationScrollActivity { isActive in
+                    handleScrollActivity(isActive)
+                }
+                .onDisappear {
+                    pendingFollowScroll?.cancel()
+                    pendingFollowScroll = nil
+                }
             }
         }
     }
@@ -383,7 +424,6 @@ struct ConversationView: View {
 
     private var viewportUpdateSignal: ConversationViewportUpdateToken {
         ConversationViewportUpdateToken(
-            sequence: store.state.lastAppliedSequence,
             lastItemID: store.state.items.last?.id,
             pendingApprovalCount: store.state.approvals.count,
             pendingQuestionCount: store.state.questions.count
@@ -428,14 +468,10 @@ struct ConversationView: View {
         proxy: ScrollViewProxy
     ) {
         switch viewportPolicy.actionForContentUpdate(
-            hasContent: update.hasContent,
-            isPagination: store.isLoadingOlderHistory,
-            wasNearBottom: store.isNearBottom
+            hasContent: update.hasContent
         ) {
         case .preserve:
             break
-        case .anchorLatest:
-            scrollToBottom(proxy)
         case .anchorInitialLatest:
             Task { @MainActor in
                 // Wait for the lazy transcript to install the bottom anchor,
@@ -446,8 +482,36 @@ struct ConversationView: View {
                 await Task.yield()
                 proxy.scrollTo("chat-bottom", anchor: .bottom)
                 viewportPolicy.completeInitialAnchor()
+                isAtBottom = true
                 store.setNearBottom(true)
             }
+        }
+    }
+
+    private func handleScrollActivity(_ isActive: Bool) {
+        if isActive {
+            pendingFollowScroll?.cancel()
+            pendingFollowScroll = nil
+            viewportPolicy.beginUserInteraction()
+        } else {
+            viewportPolicy.endUserInteraction(isAtBottom: isAtBottom)
+        }
+    }
+
+    private func scheduleFollowScroll(_ proxy: ScrollViewProxy) {
+        guard pendingFollowScroll == nil else { return }
+        pendingFollowScroll = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(16))
+            guard !Task.isCancelled, viewportPolicy.shouldFollowLatestLayout else {
+                pendingFollowScroll = nil
+                return
+            }
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                proxy.scrollTo("chat-bottom", anchor: .bottom)
+            }
+            pendingFollowScroll = nil
         }
     }
 }
@@ -459,6 +523,258 @@ private struct ConversationBottomPreferenceKey: PreferenceKey {
         value = nextValue()
     }
 }
+
+private extension View {
+    @ViewBuilder
+    func conversationScrollActivity(
+        _ onChange: @escaping (Bool) -> Void
+    ) -> some View {
+        if #available(iOS 18.0, macOS 15.0, *) {
+            onScrollPhaseChange { _, phase in
+                switch phase {
+                case .tracking, .interacting, .decelerating:
+                    onChange(true)
+                case .idle:
+                    onChange(false)
+                case .animating:
+                    break
+                }
+            }
+        } else {
+            background(ConversationLegacyScrollActivityObserver(onChange: onChange))
+        }
+    }
+}
+
+#if os(macOS)
+private struct ConversationLegacyScrollActivityObserver: NSViewRepresentable {
+    let onChange: (Bool) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onChange: onChange)
+    }
+
+    func makeNSView(context: Context) -> LocatorView {
+        let view = LocatorView()
+        view.coordinator = context.coordinator
+        return view
+    }
+
+    func updateNSView(_ nsView: LocatorView, context: Context) {
+        context.coordinator.onChange = onChange
+        context.coordinator.attach(from: nsView)
+    }
+
+    static func dismantleNSView(_ nsView: LocatorView, coordinator: Coordinator) {
+        coordinator.detach()
+    }
+
+    final class LocatorView: NSView {
+        weak var coordinator: Coordinator?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                coordinator?.attach(from: self)
+            }
+        }
+
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            nil
+        }
+    }
+
+    @MainActor
+    final class Coordinator {
+        var onChange: (Bool) -> Void
+        private weak var scrollView: NSScrollView?
+        private var eventMonitor: Any?
+        private var endTask: Task<Void, Never>?
+        private var isActive = false
+
+        init(onChange: @escaping (Bool) -> Void) {
+            self.onChange = onChange
+        }
+
+        func attach(from view: NSView) {
+            guard scrollView == nil else { return }
+            var ancestor = view.superview
+            while let current = ancestor {
+                if let scrollView = current as? NSScrollView {
+                    attach(to: scrollView)
+                    return
+                }
+                ancestor = current.superview
+            }
+        }
+
+        private func attach(to scrollView: NSScrollView) {
+            self.scrollView = scrollView
+            eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) {
+                [weak self, weak scrollView] event in
+                guard let self,
+                      let scrollView,
+                      event.window === scrollView.window else {
+                    return event
+                }
+                let location = scrollView.convert(event.locationInWindow, from: nil)
+                guard scrollView.bounds.contains(location) else { return event }
+                recordActivity()
+                return event
+            }
+        }
+
+        func detach() {
+            endTask?.cancel()
+            endTask = nil
+            if let eventMonitor {
+                NSEvent.removeMonitor(eventMonitor)
+            }
+            eventMonitor = nil
+            scrollView = nil
+            setActive(false)
+        }
+
+        private func recordActivity() {
+            setActive(true)
+            endTask?.cancel()
+            endTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(150))
+                guard !Task.isCancelled else { return }
+                self?.setActive(false)
+            }
+        }
+
+        private func setActive(_ value: Bool) {
+            guard value != isActive else { return }
+            isActive = value
+            onChange(value)
+        }
+    }
+}
+#elseif os(iOS)
+private struct ConversationLegacyScrollActivityObserver: UIViewRepresentable {
+    let onChange: (Bool) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onChange: onChange)
+    }
+
+    func makeUIView(context: Context) -> LocatorView {
+        let view = LocatorView()
+        view.coordinator = context.coordinator
+        return view
+    }
+
+    func updateUIView(_ uiView: LocatorView, context: Context) {
+        context.coordinator.onChange = onChange
+        context.coordinator.attach(from: uiView)
+    }
+
+    static func dismantleUIView(_ uiView: LocatorView, coordinator: Coordinator) {
+        coordinator.detach()
+    }
+
+    final class LocatorView: UIView {
+        weak var coordinator: Coordinator?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                coordinator?.attach(from: self)
+            }
+        }
+
+        override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+            false
+        }
+    }
+
+    @MainActor
+    final class Coordinator: NSObject {
+        var onChange: (Bool) -> Void
+        private weak var scrollView: UIScrollView?
+        private var endTask: Task<Void, Never>?
+        private var isActive = false
+
+        init(onChange: @escaping (Bool) -> Void) {
+            self.onChange = onChange
+        }
+
+        func attach(from view: UIView) {
+            guard scrollView == nil else { return }
+            var ancestor = view.superview
+            while let current = ancestor {
+                if let scrollView = current as? UIScrollView {
+                    attach(to: scrollView)
+                    return
+                }
+                ancestor = current.superview
+            }
+        }
+
+        private func attach(to scrollView: UIScrollView) {
+            self.scrollView = scrollView
+            scrollView.panGestureRecognizer.addTarget(
+                self,
+                action: #selector(handlePan(_:))
+            )
+        }
+
+        func detach() {
+            endTask?.cancel()
+            endTask = nil
+            scrollView?.panGestureRecognizer.removeTarget(
+                self,
+                action: #selector(handlePan(_:))
+            )
+            scrollView = nil
+            setActive(false)
+        }
+
+        @objc
+        private func handlePan(_ recognizer: UIPanGestureRecognizer) {
+            switch recognizer.state {
+            case .began, .changed:
+                endTask?.cancel()
+                endTask = nil
+                setActive(true)
+            case .ended:
+                waitForScrollingToEnd()
+            case .cancelled, .failed:
+                setActive(false)
+            case .possible:
+                break
+            @unknown default:
+                setActive(false)
+            }
+        }
+
+        private func waitForScrollingToEnd() {
+            endTask?.cancel()
+            endTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                try? await Task.sleep(for: .milliseconds(16))
+                guard !Task.isCancelled else { return }
+                while let scrollView,
+                      scrollView.isDragging || scrollView.isDecelerating {
+                    try? await Task.sleep(for: .milliseconds(16))
+                    guard !Task.isCancelled else { return }
+                }
+                setActive(false)
+            }
+        }
+
+        private func setActive(_ value: Bool) {
+            guard value != isActive else { return }
+            isActive = value
+            onChange(value)
+        }
+    }
+}
+#endif
 
 private struct ChatMessageView: View {
     let message: ChatMessage

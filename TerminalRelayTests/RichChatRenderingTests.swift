@@ -17,26 +17,20 @@ final class RichChatRenderingTests: XCTestCase {
         XCTAssertFalse(policy.acceptsBottomMeasurements)
         XCTAssertEqual(
             policy.actionForContentUpdate(
-                hasContent: false,
-                isPagination: false,
-                wasNearBottom: true
+                hasContent: false
             ),
             .preserve
         )
         XCTAssertEqual(
             policy.actionForContentUpdate(
-                hasContent: true,
-                isPagination: false,
-                wasNearBottom: true
+                hasContent: true
             ),
             .anchorInitialLatest
         )
         XCTAssertFalse(policy.acceptsBottomMeasurements)
         XCTAssertEqual(
             policy.actionForContentUpdate(
-                hasContent: true,
-                isPagination: false,
-                wasNearBottom: true
+                hasContent: true
             ),
             .preserve,
             "Replay updates must wait for the pending initial anchor."
@@ -44,31 +38,39 @@ final class RichChatRenderingTests: XCTestCase {
 
         policy.completeInitialAnchor()
         XCTAssertTrue(policy.acceptsBottomMeasurements)
+        XCTAssertTrue(policy.shouldFollowLatestLayout)
         XCTAssertEqual(
             policy.actionForContentUpdate(
-                hasContent: true,
-                isPagination: false,
-                wasNearBottom: true
-            ),
-            .anchorLatest
-        )
-        XCTAssertEqual(
-            policy.actionForContentUpdate(
-                hasContent: true,
-                isPagination: false,
-                wasNearBottom: false
-            ),
-            .preserve
-        )
-        XCTAssertEqual(
-            policy.actionForContentUpdate(
-                hasContent: true,
-                isPagination: true,
-                wasNearBottom: true
+                hasContent: true
             ),
             .preserve,
-            "Prepending history must preserve the visible reading anchor."
+            "Laid-out bottom changes, rather than token sequences, drive follow mode."
         )
+    }
+
+    func testViewportPolicyGivesManualScrollingOwnershipUntilBottomIsReached() {
+        var policy = ConversationViewportPolicy()
+        XCTAssertEqual(
+            policy.actionForContentUpdate(hasContent: true),
+            .anchorInitialLatest
+        )
+        policy.completeInitialAnchor()
+
+        policy.beginUserInteraction()
+        XCTAssertTrue(policy.isUserInteracting)
+        XCTAssertFalse(policy.followsLatest)
+        XCTAssertFalse(policy.shouldFollowLatestLayout)
+
+        policy.endUserInteraction(isAtBottom: false)
+        XCTAssertFalse(policy.isUserInteracting)
+        XCTAssertFalse(policy.shouldFollowLatestLayout)
+
+        policy.jumpToLatest()
+        XCTAssertTrue(policy.shouldFollowLatestLayout)
+
+        policy.beginUserInteraction()
+        policy.endUserInteraction(isAtBottom: true)
+        XCTAssertTrue(policy.shouldFollowLatestLayout)
     }
 
     func testComposerReturnPolicyKeepsPlainReturnAsNewlineAndCommandReturnAsSend() {
@@ -341,6 +343,20 @@ final class RichChatRenderingTests: XCTestCase {
         )
         XCTAssertTrue(
             sanitized.contains("![Fenced image](https://example.com/fenced.png)")
+        )
+    }
+
+    @MainActor
+    func testMarkdownSanitizationRunsOffMain() async {
+        let result = await MarkdownSafety.sanitizedSourceOffMain(
+            "Before <script>x</script>\n![Image](https://example.com/image.png)"
+        )
+
+        XCTAssertFalse(result.performedOnMainThread)
+        XCTAssertFalse(MarkdownSafety.containsRenderableImage(in: result.source))
+        XCTAssertTrue(result.source.contains("&lt;script>"))
+        XCTAssertTrue(
+            result.source.contains("[Image: Image](<https://example.com/image.png>)")
         )
     }
 

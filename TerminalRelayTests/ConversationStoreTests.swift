@@ -531,6 +531,46 @@ final class ConversationStoreTests: XCTestCase {
         XCTAssertLessThan(elapsedSeconds, 2.0)
     }
 
+    func testIncrementalContentAccountingEnforcesByteLimitAfterStreamingGrowth() throws {
+        let store = ConversationStore(
+            reducer: ConversationReducer(
+                maximumRetainedItems: 10,
+                maximumRetainedContentBytes: 6
+            ),
+            streamingPublishNanoseconds: 1_000_000_000
+        )
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.completed",
+                sequence: 1,
+                itemID: "message-1",
+                payload: .object(["text": .string("1234")])
+            )
+        )
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.started",
+                sequence: 2,
+                itemID: "message-2",
+                payload: .object(["text": .string("5")])
+            )
+        )
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.delta",
+                sequence: 3,
+                itemID: "message-2",
+                payload: .object(["text": .string("6789")])
+            )
+        )
+
+        XCTAssertEqual(store.state.items.map(\.id), ["message-1", "message-2"])
+        store.flushStreamingUpdates()
+        XCTAssertEqual(store.state.items.map(\.id), ["message-2"])
+        XCTAssertEqual(store.state.messages.last?.text, "56789")
+        XCTAssertTrue(store.state.didTruncateHistory)
+    }
+
     func testGroupedQuestionParsingAndFilePreviewLifecycle() throws {
         let store = ConversationStore()
         try store.apply(
