@@ -179,25 +179,15 @@ final class SessionManager: ObservableObject {
     }
 
     @discardableResult
-    func openAfterRefresh(
+    func openNewSession(
         project: ProjectProfile,
         on server: ServerProfile,
         kind: AgentKind,
-        projects: [ProjectProfile],
         launchDefaults: AgentLaunchDefaults,
         using service: WorkerSessionService
     ) async -> SessionOpenResult? {
         let openSelectionRevision = claimOpenSelectionIntent()
         guard project.serverID == server.id else { return nil }
-
-        guard await refresh(
-            worker: server,
-            projects: projects,
-            launchDefaults: launchDefaults,
-            using: service
-        ) else {
-            return nil
-        }
 
         guard let snapshot = await service.start(
             kind: kind,

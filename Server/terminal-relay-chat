@@ -2236,20 +2236,21 @@ class ClaudeAdapter(ProviderAdapter):
             )
             if info is None:
                 raise ChatError("notFound", "The Claude session was not found.", exit_code=66)
-        else:
+        elif not self.thread_id:
             self.thread_id = new_uuid()
         options_kwargs: dict[str, Any] = {
             "cwd": self.project_directory,
             "include_partial_messages": True,
-            "replay_user_messages": True,
             "can_use_tool": self._can_use_tool,
         }
         if new_session:
-            options_kwargs["extra_args"] = {"session-id": self.thread_id}
+            options_kwargs["session_id"] = self.thread_id
         else:
             options_kwargs["resume"] = self.thread_id
         if self.launch_options.get("model"):
             options_kwargs["model"] = self.launch_options["model"]
+        if self.launch_options.get("effort"):
+            options_kwargs["effort"] = self.launch_options["effort"]
         permission = self.launch_options.get("permissionMode")
         if permission:
             options_kwargs["permission_mode"] = permission

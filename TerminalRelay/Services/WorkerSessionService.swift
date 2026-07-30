@@ -396,24 +396,16 @@ final class WorkerSessionService: ObservableObject {
         )
 
         do {
-            let negotiation = try await negotiateChat(
-                kind: kind,
-                repositoryName: repositoryName,
-                on: worker
-            )
-            let result: WorkerSessionCommandResult
-            switch negotiation {
-            case .available:
-                result = try await runCommand(
-                    SSHCommandBuilder.workerChatStartConfiguration(
-                        for: worker,
-                        kind: kind,
-                        repositoryName: repositoryName,
-                        threadID: nil,
-                        launchDefaults: launchDefaults
-                    )
+            let result = try await runCommand(
+                SSHCommandBuilder.workerChatStartConfiguration(
+                    for: worker,
+                    kind: kind,
+                    repositoryName: repositoryName,
+                    threadID: nil,
+                    launchDefaults: launchDefaults
                 )
-            case .unsupported:
+            )
+            if result.exitCode == 64 {
                 throw WorkerSessionServiceError.nativeChatUnavailable
             }
             guard result.exitCode == 0 else {
@@ -423,16 +415,10 @@ final class WorkerSessionService: ObservableObject {
                 throw WorkerSessionServiceError.startFailed
             }
 
-            let chat: WorkerChatStartResponse
-            switch negotiation {
-            case .available:
-                chat = try WorkerChatProtocol.parseStart(
-                    result.standardOutput,
-                    expectedKind: kind
-                )
-            case .unsupported:
-                throw WorkerSessionServiceError.nativeChatUnavailable
-            }
+            let chat = try WorkerChatProtocol.parseStart(
+                result.standardOutput,
+                expectedKind: kind
+            )
             let snapshot = WorkerSessionSnapshot(
                 kind: kind,
                 repositoryName: repositoryName,

@@ -1063,11 +1063,10 @@ struct ContentView: View {
         }
 
         Task {
-            guard let result = await sessionManager.openAfterRefresh(
+            guard let result = await sessionManager.openNewSession(
                 project: project,
                 on: worker,
                 kind: kind,
-                projects: projectStore.projects,
                 launchDefaults: launchDefaults,
                 using: workerSessionService
             ) else { return }

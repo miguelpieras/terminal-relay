@@ -706,14 +706,13 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(manager.sessions.count, 1)
     }
 
-    func testExplicitStartUsesStatusThenStartAndKeepsReturnedInstanceToken() async {
+    func testNewSessionUsesOneStartCommandAndKeepsReturnedInstanceToken() async {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let project = makeProject(name: "Terminal Relay", server: server)
         let manager = SessionManager()
         let instanceToken = "01234567-89ab-" + "4def-8abc-0123456789ab"
         let recorder = WorkerSessionCommandRecorder(
             results: [
-                Self.emptyStatusResult(),
                 Self.statusResult(
                     kind: .codex,
                     repositoryName: project.displayName,
@@ -725,11 +724,10 @@ final class SessionManagerTests: XCTestCase {
             await recorder.run(configuration)
         }
 
-        let result = await manager.openAfterRefresh(
+        let result = await manager.openNewSession(
             project: project,
             on: server,
             kind: .codex,
-            projects: [project],
             launchDefaults: .standard,
             using: service
         )
@@ -742,12 +740,6 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(
             recorder.configurations,
             [
-                SSHCommandBuilder.workerSessionStatusConfiguration(for: server),
-                SSHCommandBuilder.workerChatCapabilitiesConfiguration(
-                    for: server,
-                    kind: .codex,
-                    repositoryName: project.displayName
-                ),
                 SSHCommandBuilder.workerChatStartConfiguration(
                     for: server,
                     kind: .codex,
@@ -759,19 +751,21 @@ final class SessionManagerTests: XCTestCase {
         )
     }
 
-    func testExplicitStartForKnownSameRepositoryStillUsesReturnedExactSnapshot() async {
+    func testNewSessionDoesNotReplaceKnownSameRepositorySession() async {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let project = makeProject(name: "Terminal Relay", server: server)
         let manager = SessionManager()
-        let statusToken = "01234567-89ab-" + "4def-8abc-0123456789ab"
+        let existingToken = "01234567-89ab-" + "4def-8abc-0123456789ab"
         let startedToken = "11111111-2222-" + "4333-8444-555555555555"
+        let existing = manager.open(
+            project: project,
+            on: server,
+            kind: .claude,
+            launchDefaults: .standard,
+            instanceToken: existingToken
+        ).localSession!
         let recorder = WorkerSessionCommandRecorder(
             results: [
-                Self.statusResult(
-                    kind: .claude,
-                    repositoryName: project.displayName,
-                    instanceToken: statusToken
-                ),
                 Self.statusResult(
                     kind: .claude,
                     repositoryName: project.displayName,
@@ -783,11 +777,10 @@ final class SessionManagerTests: XCTestCase {
             await recorder.run(configuration)
         }
 
-        let result = await manager.openAfterRefresh(
+        let result = await manager.openNewSession(
             project: project,
             on: server,
             kind: .claude,
-            projects: [project],
             launchDefaults: .standard,
             using: service
         )
@@ -798,11 +791,8 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(session.instanceToken, startedToken)
         XCTAssertEqual(session.status, .connecting)
         XCTAssertEqual(manager.sessions.count, 2)
-        XCTAssertEqual(
-            manager.sessions.first(where: { $0.instanceToken == statusToken })?.status,
-            .remoteRunning
-        )
-        XCTAssertEqual(recorder.configurations.count, 3)
+        XCTAssertTrue(manager.sessions.contains { $0 === existing })
+        XCTAssertEqual(recorder.configurations.count, 1)
         XCTAssertEqual(
             recorder.configurations.last,
             SSHCommandBuilder.workerChatStartConfiguration(
@@ -815,18 +805,21 @@ final class SessionManagerTests: XCTestCase {
         )
     }
 
-    func testExplicitStartRunsWhenStatusReportsAnotherRepository() async {
+    func testNewSessionStartsWhenSameKindIsKnownOnAnotherRepository() async {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let project = makeProject(name: "Terminal Relay", server: server)
+        let otherProject = makeProject(name: "Another Repository", server: server)
         let manager = SessionManager()
         let startedToken = "11111111-2222-" + "4333-8444-555555555555"
+        _ = manager.open(
+            project: otherProject,
+            on: server,
+            kind: .codex,
+            launchDefaults: .standard,
+            instanceToken: "01234567-89ab-" + "4def-8abc-0123456789ab"
+        )
         let recorder = WorkerSessionCommandRecorder(
             results: [
-                Self.statusResult(
-                    kind: .codex,
-                    repositoryName: "another-repository",
-                    instanceToken: "01234567-89ab-" + "4def-8abc-0123456789ab"
-                ),
                 Self.statusResult(
                     kind: .codex,
                     repositoryName: project.displayName,
@@ -838,11 +831,10 @@ final class SessionManagerTests: XCTestCase {
             await recorder.run(configuration)
         }
 
-        let result = await manager.openAfterRefresh(
+        let result = await manager.openNewSession(
             project: project,
             on: server,
             kind: .codex,
-            projects: [project],
             launchDefaults: .standard,
             using: service
         )
@@ -854,12 +846,6 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(
             recorder.configurations,
             [
-                SSHCommandBuilder.workerSessionStatusConfiguration(for: server),
-                SSHCommandBuilder.workerChatCapabilitiesConfiguration(
-                    for: server,
-                    kind: .codex,
-                    repositoryName: project.displayName
-                ),
                 SSHCommandBuilder.workerChatStartConfiguration(
                     for: server,
                     kind: .codex,
@@ -869,7 +855,7 @@ final class SessionManagerTests: XCTestCase {
                 )
             ]
         )
-        XCTAssertEqual(manager.sessions.count, 1)
+        XCTAssertEqual(manager.sessions.count, 2)
     }
 
     func testReconnectReplacesTheTerminalViewWithoutChangingSidebarIdentity() async {
@@ -1002,20 +988,15 @@ final class SessionManagerTests: XCTestCase {
             await recorder.run(configuration)
         }
         let start = Task {
-            await manager.openAfterRefresh(
+            await manager.openNewSession(
                 project: thirdProject,
                 on: server,
                 kind: .codex,
-                projects: [firstProject, secondProject, thirdProject],
                 launchDefaults: .standard,
                 using: service
             )
         }
         while recorder.callCount == 0 {
-            await Task.yield()
-        }
-        recorder.finish(with: Self.emptyStatusResult())
-        while recorder.callCount < 2 {
             await Task.yield()
         }
 
@@ -1056,20 +1037,15 @@ final class SessionManagerTests: XCTestCase {
             await recorder.run(configuration)
         }
         let start = Task {
-            await manager.openAfterRefresh(
+            await manager.openNewSession(
                 project: startingProject,
                 on: server,
                 kind: .codex,
-                projects: [selectedProject, startingProject],
                 launchDefaults: .standard,
                 using: service
             )
         }
         while recorder.callCount == 0 {
-            await Task.yield()
-        }
-        recorder.finish(with: Self.emptyStatusResult())
-        while recorder.callCount < 2 {
             await Task.yield()
         }
 
@@ -1111,20 +1087,15 @@ final class SessionManagerTests: XCTestCase {
             await olderRecorder.run(configuration)
         }
         let olderStart = Task {
-            await manager.openAfterRefresh(
+            await manager.openNewSession(
                 project: olderProject,
                 on: server,
                 kind: .claude,
-                projects: [selectedProject, olderProject, newerProject],
                 launchDefaults: .standard,
                 using: olderService
             )
         }
         while olderRecorder.callCount == 0 {
-            await Task.yield()
-        }
-        olderRecorder.finish(with: Self.emptyStatusResult())
-        while olderRecorder.callCount < 2 {
             await Task.yield()
         }
 
@@ -1133,20 +1104,15 @@ final class SessionManagerTests: XCTestCase {
             await newerRecorder.run(configuration)
         }
         let newerStart = Task {
-            await manager.openAfterRefresh(
+            await manager.openNewSession(
                 project: newerProject,
                 on: server,
                 kind: .codex,
-                projects: [selectedProject, olderProject, newerProject],
                 launchDefaults: .standard,
                 using: newerService
             )
         }
         while newerRecorder.callCount == 0 {
-            await Task.yield()
-        }
-        newerRecorder.finish(with: Self.emptyStatusResult())
-        while newerRecorder.callCount < 2 {
             await Task.yield()
         }
 
@@ -1202,20 +1168,15 @@ final class SessionManagerTests: XCTestCase {
             await recorder.run(configuration)
         }
         let start = Task {
-            await manager.openAfterRefresh(
+            await manager.openNewSession(
                 project: startingProject,
                 on: server,
                 kind: .codex,
-                projects: [selectedProject, startingProject],
                 launchDefaults: .standard,
                 using: service
             )
         }
         while recorder.callCount == 0 {
-            await Task.yield()
-        }
-        recorder.finish(with: Self.emptyStatusResult())
-        while recorder.callCount < 2 {
             await Task.yield()
         }
 
@@ -1286,7 +1247,7 @@ final class SessionManagerTests: XCTestCase {
         )
     }
 
-    func testFailedStatusRefreshDoesNotReconnectOrStartANewAgent() async {
+    func testFailedStartDoesNotReplaceAReconnectableSession() async {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let project = makeProject(name: "Terminal Relay", server: server)
         let manager = SessionManager()
@@ -1307,11 +1268,10 @@ final class SessionManagerTests: XCTestCase {
             )
         }
 
-        let result = await manager.openAfterRefresh(
+        let result = await manager.openNewSession(
             project: project,
             on: server,
             kind: .codex,
-            projects: [project],
             launchDefaults: .standard,
             using: service
         )
@@ -1327,7 +1287,7 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertNotNil(service.error(for: server.id))
     }
 
-    func testOverlappingStatusRefreshDoesNotReconnectOrStartANewAgent() async {
+    func testNewSessionStartsWhileStatusRefreshIsInFlight() async {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let project = makeProject(name: "Terminal Relay", server: server)
         let manager = SessionManager()
@@ -1356,29 +1316,42 @@ final class SessionManagerTests: XCTestCase {
             await Task.yield()
         }
 
-        let result = await manager.openAfterRefresh(
-            project: project,
-            on: server,
-            kind: .codex,
-            projects: [project],
-            launchDefaults: .standard,
-            using: service
-        )
-
-        XCTAssertNil(result)
-        XCTAssertTrue(manager.sessions.first === session)
-        XCTAssertEqual(session.status, .disconnected(255))
-        XCTAssertEqual(manager.sessions.count, 1)
-
+        let start = Task {
+            await manager.openNewSession(
+                project: project,
+                on: server,
+                kind: .codex,
+                launchDefaults: .standard,
+                using: service
+            )
+        }
+        while recorder.callCount < 2 {
+            await Task.yield()
+        }
         recorder.finish(
             with: Self.statusResult(
                 kind: .codex,
                 repositoryName: project.displayName,
-                instanceToken: "01234567-89ab-" + "4def-8abc-0123456789ab"
+                instanceToken: session.instanceToken
+            )
+        )
+        let startedInstance = "01234567-89ab-" + "4def-8abc-0123456789ab"
+        recorder.finish(
+            with: Self.statusResult(
+                kind: .codex,
+                repositoryName: project.displayName,
+                instanceToken: startedInstance
             )
         )
         let refreshSucceeded = await inFlightRefresh.value
+        let result = await start.value
+
         XCTAssertTrue(refreshSucceeded)
+        guard case .opened(let startedSession) = result else {
+            return XCTFail("Expected the start to proceed during refresh")
+        }
+        XCTAssertEqual(startedSession.instanceToken, startedInstance)
+        XCTAssertEqual(manager.sessions.count, 2)
     }
 
     func testReconnectRequiresMatchingKindAndRepositoryConfirmation() async {
@@ -1872,7 +1845,7 @@ private final class WorkerSessionCommandRecorder {
 @MainActor
 private final class BlockingWorkerSessionCommandRecorder {
     private(set) var callCount = 0
-    private var continuation: CheckedContinuation<WorkerSessionCommandResult, Never>?
+    private var continuations: [CheckedContinuation<WorkerSessionCommandResult, Never>] = []
 
     func run(_ configuration: SSHLaunchConfiguration) async -> WorkerSessionCommandResult {
         if configuration.arguments.last?.contains("'update-status'") == true {
@@ -1887,7 +1860,7 @@ private final class BlockingWorkerSessionCommandRecorder {
         }
         callCount += 1
         let result = await withCheckedContinuation { continuation in
-            self.continuation = continuation
+            continuations.append(continuation)
         }
         if configuration.arguments.last?.contains("'chat-start-v1'") == true {
             return sessionManagerTestChatStartResult(from: result)
@@ -1896,7 +1869,6 @@ private final class BlockingWorkerSessionCommandRecorder {
     }
 
     func finish(with result: WorkerSessionCommandResult) {
-        continuation?.resume(returning: result)
-        continuation = nil
+        continuations.removeFirst().resume(returning: result)
     }
 }

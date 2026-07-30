@@ -1081,8 +1081,44 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
         PermissionResultAllow=PermissionResultAllow,
         PermissionResultDeny=PermissionResultDeny,
     )
+
+    new_adapter = module.ClaudeAdapter(
+        str(project),
+        THREAD_ID,
+        {
+            "_newSession": True,
+            "model": "fable",
+            "effort": "max",
+            "permissionMode": "default",
+        },
+    )
+    new_adapter._load_sdk = lambda: sdk
+    new_events: list[dict] = []
+
+    async def emit_new(event_type, payload, *, turn_id=None, item_id=None):
+        event = {
+            "type": event_type,
+            "payload": payload,
+            "turnId": turn_id,
+            "itemId": item_id,
+        }
+        new_events.append(event)
+        return event
+
+    assert await new_adapter.start(emit_new) == THREAD_ID
+    new_options = new_adapter.client.options.kwargs
+    assert new_options["session_id"] == THREAD_ID
+    assert new_options["model"] == "fable"
+    assert new_options["effort"] == "max"
+    assert "extra_args" not in new_options
+    assert "replay_user_messages" not in new_options
+    await new_adapter.close()
+    assert received.get_nowait() is None
+
     adapter = module.ClaudeAdapter(
-        str(project), THREAD_ID, {"permissionMode": "default"}
+        str(project),
+        THREAD_ID,
+        {"effort": "high", "permissionMode": "default"},
     )
     adapter._load_sdk = lambda: sdk
     events: list[dict] = []
@@ -1099,7 +1135,8 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
 
     assert await adapter.start(emit) == THREAD_ID
     assert adapter.client.options.kwargs["include_partial_messages"] is True
-    assert adapter.client.options.kwargs["replay_user_messages"] is True
+    assert adapter.client.options.kwargs["effort"] == "high"
+    assert "replay_user_messages" not in adapter.client.options.kwargs
     history, older = await adapter.history(None, 100)
     assert older is False
     assert history_calls == [(module.CLAUDE_HISTORY_PAGE_MESSAGES, 0)]
