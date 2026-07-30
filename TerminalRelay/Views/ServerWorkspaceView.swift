@@ -1,5 +1,19 @@
 import SwiftUI
 
+private enum WorkspacePalette {
+    static let canvas = Color(
+        red: 23.0 / 255.0,
+        green: 24.0 / 255.0,
+        blue: 24.0 / 255.0
+    )
+    static let panel = Color(
+        red: 43.0 / 255.0,
+        green: 43.0 / 255.0,
+        blue: 43.0 / 255.0
+    )
+    static let panelBorder = Color.white.opacity(0.055)
+}
+
 struct ProjectWorkspaceView: View {
     @EnvironmentObject private var sessionManager: SessionManager
     @EnvironmentObject private var projectStore: ProjectStore
@@ -89,18 +103,20 @@ struct ProjectWorkspaceView: View {
                         launchDefaults: launchDefaults
                     )
                     .id(selectedSession.terminalViewIdentity)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     readyState
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             if isShowingEnvironmentSidebar {
-                Divider()
                 environmentSidebar
             }
         }
-        .background(Color(nsColor: .windowBackgroundColor))
-        .navigationTitle(project.displayName)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(WorkspacePalette.canvas)
+        .navigationTitle(selectedSession?.displayTitle ?? project.displayName)
         .toolbar {
             ToolbarItem(placement: .automatic) {
                 Button {
@@ -134,101 +150,133 @@ struct ProjectWorkspaceView: View {
     }
 
     private var environmentSidebar: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text("Details")
-                    .font(.headline)
-                Spacer()
-                Button {
-                    Task {
-                        _ = await projectGitService.refresh(
-                            project: project,
-                            worker: worker,
-                            fetchRemote: true
-                        )
-                        projectGitService.refreshDeployment(project: project)
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack {
+                    Text("Environment")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button {
+                        Task {
+                            _ = await projectGitService.refresh(
+                                project: project,
+                                worker: worker,
+                                fetchRemote: true
+                            )
+                            projectGitService.refreshDeployment(project: project)
+                        }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 11, weight: .medium))
+                            .frame(width: 24, height: 24)
                     }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .disabled(projectGitService.isBusy(projectID: project.id))
+                    .help("Refresh origin and deployment status")
+                }
+                .padding(.leading, 13)
+                .padding(.trailing, 7)
+                .frame(height: 38)
+
+                environmentRow(
+                    title: "Changes",
+                    systemImage: "doc.badge.plus",
+                    detail: gitSnapshot.map { String($0.changedFileCount) } ?? "–"
+                )
+
+                Button(action: onShowWorkers) {
+                    environmentRow(
+                        title: worker.displayName,
+                        systemImage: "desktopcomputer",
+                        detail: nil,
+                        showsDisclosure: true
+                    )
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-                .disabled(projectGitService.isBusy(projectID: project.id))
-                .help("Refresh origin and deployment status")
-            }
-            .padding(.horizontal, 18)
-            .frame(height: 50)
+                .help("Manage workers")
 
-            Divider()
+                environmentRow(
+                    title: gitSnapshot?.currentBranch ?? "Reading branch…",
+                    systemImage: "arrow.triangle.branch",
+                    detail: nil,
+                    showsDisclosure: true
+                )
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    VStack(alignment: .leading, spacing: 5) {
-                        Button(action: onShowWorkers) {
-                            HStack(spacing: 8) {
-                                Image(systemName: "server.rack")
-                                    .foregroundStyle(.secondary)
-                                Text(worker.displayName)
-                                    .font(.callout.weight(.medium))
-                                Spacer()
-                                Image(systemName: "chevron.right")
-                                    .font(.caption2.weight(.semibold))
-                                    .foregroundStyle(.tertiary)
-                            }
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .help("Manage workers")
-
-                        Text(project.workingDirectory)
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundStyle(.tertiary)
-                            .lineLimit(2)
+                if isWritingCommitMessage {
+                    sidebarCommitComposer
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                } else {
+                    Button(action: commitButtonAction) {
+                        environmentRow(
+                            title: commitButtonTitle,
+                            systemImage: "point.topleft.down.curvedto.point.bottomright.up",
+                            detail: nil
+                        )
                     }
-
-                    Divider()
-
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("Git")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-
-                        gitChangeSummary
-                        branchStatus
-
-                        if isWritingCommitMessage {
-                            sidebarCommitComposer
-                        } else {
-                            Button(action: commitButtonAction) {
-                                Text(commitButtonTitle)
-                                    .frame(maxWidth: .infinity)
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.regular)
-                            .frame(minHeight: 34)
-                            .disabled(commitButtonDisabled)
-                            .help(commitButtonHelp)
-                        }
-
-                        if gitNoticeText != nil {
-                            sidebarGitNotice
-                        }
-                    }
-
-                    Divider()
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Deployment")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                        deploymentRow
-                    }
+                    .buttonStyle(.plain)
+                    .disabled(commitButtonDisabled)
+                    .help(commitButtonHelp)
                 }
-                .padding(16)
+
+                if gitNoticeText != nil {
+                    sidebarGitNotice
+                        .padding(.horizontal, 13)
+                        .padding(.vertical, 9)
+                }
+            }
+            .background(WorkspacePalette.panel)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(WorkspacePalette.panelBorder, lineWidth: 1)
+            }
+            .shadow(color: .black.opacity(0.18), radius: 16, y: 8)
+
+            Spacer(minLength: 0)
+        }
+        .padding(.top, 12)
+        .padding(.horizontal, 10)
+        .frame(width: 270)
+        .background(WorkspacePalette.canvas)
+    }
+
+    private func environmentRow(
+        title: String,
+        systemImage: String,
+        detail: String?,
+        showsDisclosure: Bool = false
+    ) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: systemImage)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
+
+            Text(title)
+                .font(.system(size: 12.5, weight: .medium))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+
+            Spacer(minLength: 6)
+
+            if let detail {
+                Text(detail)
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
+            if showsDisclosure {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(.tertiary)
             }
         }
-        .frame(width: 286)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.42))
+        .padding(.horizontal, 13)
+        .frame(height: 34)
+        .contentShape(Rectangle())
     }
 
     @ViewBuilder
@@ -729,7 +777,7 @@ struct ProjectWorkspaceView: View {
 }
 
 enum ProjectWorkspaceLayoutPolicy {
-    static let showsEnvironmentSidebarByDefault = false
+    static let showsEnvironmentSidebarByDefault = true
 }
 
 private struct AccountUsageCard: View {
@@ -1366,6 +1414,7 @@ private struct TerminalPane: View {
                         sessionProgressOverlay("Stopping remote session…")
                     }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                 AgentComposerView(
                     session: session,
@@ -1402,6 +1451,7 @@ private struct TerminalPane: View {
                         sessionProgressOverlay("Stopping remote session…")
                     }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                 AgentComposerView(
                     session: session,
@@ -1410,6 +1460,7 @@ private struct TerminalPane: View {
                 )
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onKeyPress(.escape, phases: [.down, .repeat]) { keyPress in
             guard session.usesNativeChat,
                   session.chatCoordinator?.store.state.activeTurnID != nil else {

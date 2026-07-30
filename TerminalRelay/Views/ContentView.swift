@@ -268,24 +268,24 @@ private extension View {
 }
 
 private enum SidebarPalette {
-    static let background = Color(red: 33.0 / 255.0, green: 33.0 / 255.0, blue: 33.0 / 255.0)
-    static let primary = Color(red: 222.0 / 255.0, green: 222.0 / 255.0, blue: 222.0 / 255.0)
-    static let secondary = Color(red: 116.0 / 255.0, green: 116.0 / 255.0, blue: 116.0 / 255.0)
-    static let tertiary = Color(red: 89.0 / 255.0, green: 89.0 / 255.0, blue: 89.0 / 255.0)
-    static let hover = Color(red: 41.0 / 255.0, green: 41.0 / 255.0, blue: 41.0 / 255.0)
-    static let selected = Color(red: 51.0 / 255.0, green: 51.0 / 255.0, blue: 51.0 / 255.0)
-    static let separator = Color(red: 52.0 / 255.0, green: 52.0 / 255.0, blue: 52.0 / 255.0)
-    static let footerSeparator = Color(red: 56.0 / 255.0, green: 56.0 / 255.0, blue: 56.0 / 255.0)
+    static let background = Color(red: 29.0 / 255.0, green: 29.0 / 255.0, blue: 29.0 / 255.0)
+    static let primary = Color(red: 211.0 / 255.0, green: 211.0 / 255.0, blue: 211.0 / 255.0)
+    static let secondary = Color(red: 137.0 / 255.0, green: 137.0 / 255.0, blue: 137.0 / 255.0)
+    static let tertiary = Color(red: 99.0 / 255.0, green: 99.0 / 255.0, blue: 99.0 / 255.0)
+    static let hover = Color(red: 37.0 / 255.0, green: 37.0 / 255.0, blue: 37.0 / 255.0)
+    static let selected = Color(red: 48.0 / 255.0, green: 48.0 / 255.0, blue: 48.0 / 255.0)
+    static let separator = Color(red: 43.0 / 255.0, green: 43.0 / 255.0, blue: 43.0 / 255.0)
+    static let footerSeparator = Color(red: 46.0 / 255.0, green: 46.0 / 255.0, blue: 46.0 / 255.0)
 }
 
 private enum SidebarRowGeometry {
-    static let horizontalMargin: CGFloat = 10
-    static let contentLeadingPadding: CGFloat = 6
-    static let contentTrailingPadding: CGFloat = 8
-    static let height: CGFloat = 35
-    static let iconSize: CGFloat = 13
-    static let iconFrameWidth: CGFloat = 14
-    static let iconSpacing: CGFloat = 9
+    static let horizontalMargin: CGFloat = 5
+    static let contentLeadingPadding: CGFloat = 8
+    static let contentTrailingPadding: CGFloat = 7
+    static let height: CGFloat = 30
+    static let iconSize: CGFloat = 12
+    static let iconFrameWidth: CGFloat = 13
+    static let iconSpacing: CGFloat = 7
     static let cornerRadius: CGFloat = 6
 }
 
@@ -493,13 +493,17 @@ struct ContentView: View {
     private var navigationContent: some View {
         NavigationSplitView {
             sidebar
-                .navigationSplitViewColumnWidth(min: 268, ideal: 268, max: 268)
+                .navigationSplitViewColumnWidth(min: 248, ideal: 248, max: 248)
                 .overlay(alignment: .topLeading) {
                     titlebarNavigationControls
                 }
         } detail: {
             detail
         }
+        .toolbarBackground(
+            Color(red: 24.0 / 255.0, green: 25.0 / 255.0, blue: 25.0 / 255.0),
+            for: .windowToolbar
+        )
         .environmentObject(accountAuthenticationService)
         .navigationSplitViewStyle(.balanced)
         .toolbar {
@@ -766,7 +770,7 @@ struct ContentView: View {
                 }
             } label: {
                 Text("Terminal Relay")
-                    .font(.system(size: 16, weight: .bold))
+                    .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(SidebarPalette.primary)
                 .contentShape(Rectangle())
             }
@@ -777,7 +781,7 @@ struct ContentView: View {
         }
         .padding(.leading, 10)
         .padding(.trailing, 8)
-        .frame(height: 42)
+        .frame(height: 38)
     }
 
     private var sidebarCreationButtons: some View {
@@ -835,8 +839,8 @@ struct ContentView: View {
         .padding(.horizontal, 9)
         .frame(height: 27)
         .background(SidebarPalette.hover, in: RoundedRectangle(cornerRadius: 6))
-        .padding(.horizontal, 10)
-        .padding(.bottom, 7)
+        .padding(.horizontal, 7)
+        .padding(.bottom, 6)
     }
 
     @ViewBuilder
@@ -867,8 +871,8 @@ struct ContentView: View {
         .font(.system(size: 13, weight: .medium))
         .foregroundStyle(SidebarPalette.secondary)
         .padding(.leading, 107)
-        .frame(height: 42)
-        .offset(y: -43)
+        .frame(height: 38)
+        .offset(y: -39)
     }
 
     private var sidebarFooter: some View {
@@ -888,8 +892,8 @@ struct ContentView: View {
                     navigate(to: .workers)
                 }
             }
-            .padding(.horizontal, 10)
-            .frame(height: 47)
+            .padding(.horizontal, 7)
+            .frame(height: 42)
         }
         .background(SidebarPalette.background)
     }

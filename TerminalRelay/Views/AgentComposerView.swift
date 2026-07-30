@@ -724,7 +724,7 @@ struct AgentComposerView: View {
 
     private var composerSurface: Color {
         session.usesNativeChat
-            ? Color(nsColor: .controlBackgroundColor)
+            ? Color(red: 43.0 / 255.0, green: 43.0 / 255.0, blue: 43.0 / 255.0)
             : Color(red: 0.165, green: 0.165, blue: 0.165)
     }
 
@@ -736,7 +736,7 @@ struct AgentComposerView: View {
 
     private var composerBackdrop: Color {
         session.usesNativeChat
-            ? Color(nsColor: .windowBackgroundColor)
+            ? Color(red: 23.0 / 255.0, green: 24.0 / 255.0, blue: 24.0 / 255.0)
             : Color(red: 0.071, green: 0.071, blue: 0.078)
     }
 

@@ -3,8 +3,8 @@ import XCTest
 @testable import TerminalRelay
 
 final class AgentComposerPolicyTests: XCTestCase {
-    func testProjectWorkspaceStartsWithTheDetailsSidebarCollapsed() {
-        XCTAssertFalse(
+    func testProjectWorkspaceStartsWithTheEnvironmentSidebarVisible() {
+        XCTAssertTrue(
             ProjectWorkspaceLayoutPolicy.showsEnvironmentSidebarByDefault
         )
     }

@@ -1747,7 +1747,11 @@ private struct FilePreviewSheet: View {
 private extension Color {
     static var chatCanvas: Color {
         #if os(macOS)
-        Color(nsColor: .windowBackgroundColor)
+        Color(
+            red: 23.0 / 255.0,
+            green: 24.0 / 255.0,
+            blue: 24.0 / 255.0
+        )
         #else
         Color(uiColor: .systemBackground)
         #endif
@@ -1755,7 +1759,11 @@ private extension Color {
 
     static var chatComposer: Color {
         #if os(macOS)
-        Color(nsColor: .controlBackgroundColor)
+        Color(
+            red: 43.0 / 255.0,
+            green: 43.0 / 255.0,
+            blue: 43.0 / 255.0
+        )
         #else
         Color(uiColor: .secondarySystemBackground)
         #endif
