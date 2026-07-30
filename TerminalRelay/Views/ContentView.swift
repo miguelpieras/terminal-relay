@@ -775,6 +775,7 @@ struct ContentView: View {
                 .contentShape(Rectangle())
             }
             .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
             .fixedSize()
 
             Spacer()
@@ -807,6 +808,7 @@ struct ContentView: View {
             .help("New parent folder")
             .accessibilityLabel("New Parent Folder")
         }
+        .padding(.bottom, 5)
     }
 
     private var sidebarProjectFilter: some View {
