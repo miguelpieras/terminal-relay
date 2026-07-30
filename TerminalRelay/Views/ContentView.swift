@@ -494,9 +494,6 @@ struct ContentView: View {
         NavigationSplitView {
             sidebar
                 .navigationSplitViewColumnWidth(min: 248, ideal: 248, max: 248)
-                .overlay(alignment: .topLeading) {
-                    titlebarNavigationControls
-                }
         } detail: {
             detail
         }
@@ -507,6 +504,20 @@ struct ContentView: View {
         .environmentObject(accountAuthenticationService)
         .navigationSplitViewStyle(.balanced)
         .toolbar {
+            ToolbarItemGroup(placement: .navigation) {
+                Button(action: navigateBack) {
+                    Label("Back", systemImage: "arrow.left")
+                }
+                .disabled(navigationIndex <= 0)
+                .help("Back")
+
+                Button(action: navigateForward) {
+                    Label("Forward", systemImage: "arrow.right")
+                }
+                .disabled(navigationIndex < 0 || navigationIndex >= navigationHistory.count - 1)
+                .help("Forward")
+            }
+
             if let project = projectForActions {
                 ToolbarItem(placement: .primaryAction) {
                     Menu {
@@ -851,30 +862,6 @@ struct ContentView: View {
         Button("New Parent Folder", systemImage: "folder.badge.plus") {
             beginCreatingSidebarFolder()
         }
-    }
-
-    private var titlebarNavigationControls: some View {
-        HStack(spacing: 0) {
-            Button(action: navigateBack) {
-                Image(systemName: "chevron.left")
-                    .frame(width: 24, height: 28)
-            }
-            .disabled(navigationIndex <= 0)
-            .help("Back")
-
-            Button(action: navigateForward) {
-                Image(systemName: "chevron.right")
-                    .frame(width: 24, height: 28)
-            }
-            .disabled(navigationIndex < 0 || navigationIndex >= navigationHistory.count - 1)
-            .help("Forward")
-        }
-        .buttonStyle(.plain)
-        .font(.system(size: 13, weight: .medium))
-        .foregroundStyle(SidebarPalette.secondary)
-        .padding(.leading, 107)
-        .frame(height: 38)
-        .offset(y: -39)
     }
 
     private var sidebarFooter: some View {
