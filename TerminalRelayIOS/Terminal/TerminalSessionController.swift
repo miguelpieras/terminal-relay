@@ -137,21 +137,6 @@ final class TerminalSessionController: ObservableObject, RelayTerminalIO {
         }
     }
 
-    /// Configures the terminal fallback to resume the provider conversation
-    /// released by native chat. This is only valid before the PTY view binds,
-    /// which prevents a fallback race from launching a fresh conversation.
-    @discardableResult
-    func configureForChatFallback(providerThreadID: String) -> Bool {
-        guard ChatWireValidation.isCanonicalUUID(providerThreadID),
-              !didStartInitialConnection,
-              connection == nil,
-              instanceToken == nil else {
-            return false
-        }
-        self.providerThreadID = providerThreadID
-        return true
-    }
-
     private func startSessionAndConnect() async {
         if let instanceToken {
             connectToInstance(instanceToken)

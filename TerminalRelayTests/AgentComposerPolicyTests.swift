@@ -3,6 +3,12 @@ import XCTest
 @testable import TerminalRelay
 
 final class AgentComposerPolicyTests: XCTestCase {
+    func testProjectWorkspaceStartsWithTheDetailsSidebarCollapsed() {
+        XCTAssertFalse(
+            ProjectWorkspaceLayoutPolicy.showsEnvironmentSidebarByDefault
+        )
+    }
+
     func testNativeChatSendPolicyCoversEveryBlockingState() {
         XCTAssertTrue(
             canSend(draft: "Ship it")
@@ -21,6 +27,9 @@ final class AgentComposerPolicyTests: XCTestCase {
         )
         XCTAssertFalse(
             canSend(draft: "Ship it", hasUploadingAttachments: true)
+        )
+        XCTAssertFalse(
+            canSend(draft: "Ship it", isSubmitting: true)
         )
         XCTAssertFalse(
             canSend(
@@ -57,6 +66,114 @@ final class AgentComposerPolicyTests: XCTestCase {
         )
     }
 
+    func testComposerEscapePolicyRequiresTwoDeliberateEscapesForTheActiveTurn() {
+        var policy = ComposerEscapePolicy()
+
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-1", timestamp: 1, isRepeat: false),
+            .armed
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-1", timestamp: 1.1, isRepeat: true),
+            .ignored
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-1", timestamp: 1.2, isRepeat: false),
+            .interrupt
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-1", timestamp: 1.3, isRepeat: false),
+            .armed
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-1", timestamp: 1.4, isRepeat: false),
+            .interrupt
+        )
+    }
+
+    func testComposerEscapePolicyRearmsForTimeoutAndTheNextTurn() {
+        var policy = ComposerEscapePolicy(maximumInterval: 0.8, minimumInterval: 0.05)
+
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-1", timestamp: 1, isRepeat: false),
+            .armed
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-1", timestamp: 1.01, isRepeat: false),
+            .ignored
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-1", timestamp: 2, isRepeat: false),
+            .armed
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-2", timestamp: 2.2, isRepeat: false),
+            .armed
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: nil, timestamp: 2.4, isRepeat: false),
+            .ignored
+        )
+    }
+
+    func testComposerRestorationRequiresTheExactFailedSubmission() {
+        let attachment = ChatAttachmentReference(
+            id: "attachment-1",
+            path: "/tmp/example.png",
+            displayName: "Example",
+            mediaType: "image/png"
+        )
+
+        XCTAssertTrue(
+            AgentComposerRestorationPolicy.shouldRestore(
+                submittedPrompt: "Review this",
+                submittedAttachments: [attachment],
+                restoredDraft: "Review this",
+                restoredAttachments: [attachment]
+            )
+        )
+        XCTAssertFalse(
+            AgentComposerRestorationPolicy.shouldRestore(
+                submittedPrompt: "Review this",
+                submittedAttachments: [attachment],
+                restoredDraft: "A different failed message",
+                restoredAttachments: [attachment]
+            )
+        )
+        XCTAssertFalse(
+            AgentComposerRestorationPolicy.shouldRestore(
+                submittedPrompt: "Review this",
+                submittedAttachments: [attachment],
+                restoredDraft: "Review this",
+                restoredAttachments: []
+            )
+        )
+    }
+
+    func testNativeSubmissionLatchReleasesForAuthoritativeTurnOrConnectionLoss() {
+        XCTAssertTrue(
+            AgentComposerSubmissionPolicy.shouldReleaseSendLatch(
+                connectionState: .streaming,
+                turnState: .running,
+                activeTurnID: "turn-1"
+            )
+        )
+        XCTAssertTrue(
+            AgentComposerSubmissionPolicy.shouldReleaseSendLatch(
+                connectionState: .offlineAgentRunning,
+                turnState: .idle,
+                activeTurnID: nil
+            )
+        )
+        XCTAssertFalse(
+            AgentComposerSubmissionPolicy.shouldReleaseSendLatch(
+                connectionState: .streaming,
+                turnState: .idle,
+                activeTurnID: nil
+            )
+        )
+    }
+
     private func canSend(
         status: TerminalSessionStatus = .running,
         usesNativeChat: Bool = true,
@@ -64,7 +181,8 @@ final class AgentComposerPolicyTests: XCTestCase {
         draft: String,
         hasUploadingAttachments: Bool = false,
         hasFailedAttachments: Bool = false,
-        hasUploadedAttachments: Bool = false
+        hasUploadedAttachments: Bool = false,
+        isSubmitting: Bool = false
     ) -> Bool {
         AgentComposerSendPolicy.canSend(
             status: status,
@@ -73,7 +191,8 @@ final class AgentComposerPolicyTests: XCTestCase {
             draft: draft,
             hasUploadingAttachments: hasUploadingAttachments,
             hasFailedAttachments: hasFailedAttachments,
-            hasUploadedAttachments: hasUploadedAttachments
+            hasUploadedAttachments: hasUploadedAttachments,
+            isSubmitting: isSubmitting
         )
     }
 }

@@ -432,7 +432,7 @@ struct ContentView: View {
                 )
             }
             .confirmationDialog(
-                "Archive Codex thread?",
+                "Archive conversation?",
                 isPresented: isShowingLiveThreadArchiveConfirmation,
                 titleVisibility: .visible
             ) {
@@ -447,7 +447,7 @@ struct ContentView: View {
                 }
             } message: {
                 Text(
-                    "Terminal Relay will verify the live task, stop that exact worker session, and only then archive its Codex thread."
+                    "This stops the current task and archives its conversation."
                 )
             }
     }
@@ -1310,9 +1310,17 @@ struct ContentView: View {
     }
 
     private func presentArchiveConfirmation(_ sessionID: UUID) {
-        let sessionIDs = selectedSessionIDs.contains(sessionID)
+        let candidateIDs = selectedSessionIDs.contains(sessionID)
             ? selectedSessionIDs
             : Set([sessionID])
+        let sessionIDs = Set(
+            candidateIDs.filter { candidateID in
+                sessionManager.sessions.first(where: {
+                    $0.id == candidateID
+                })?.usesNativeChat == false
+            }
+        )
+        guard !sessionIDs.isEmpty else { return }
         sessionArchiveRequest = SessionArchiveRequest(sessionIDs: sessionIDs)
     }
 
@@ -1777,7 +1785,7 @@ private struct ProjectSidebarSection: View {
                         }
                         .buttonStyle(.plain)
                         .help("Open \(kind == .claude ? "Claude Code" : kind.displayName) in \(project.displayName)")
-                        .accessibilityLabel("Open \(kind.displayName) terminal")
+                        .accessibilityLabel("Open \(kind.displayName)")
                     }
                 }
 
@@ -1791,7 +1799,7 @@ private struct ProjectSidebarSection: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .help(isCollapsed ? "Show project terminals" : "Hide project terminals")
+                .help(isCollapsed ? "Show project sessions" : "Hide project sessions")
                 .accessibilityLabel(
                     isCollapsed ? "Expand \(project.displayName)" : "Collapse \(project.displayName)"
                 )
@@ -1849,9 +1857,13 @@ private struct ProjectSidebarSection: View {
                             session: session,
                             isSelected: selectedSessionID == session.id
                                 || selectedSessionIDs.contains(session.id),
-                            archiveCount: selectedSessionIDs.contains(session.id)
-                                ? max(1, selectedSessionIDs.count)
-                                : 1,
+                            archiveCount: session.usesNativeChat
+                                ? 1
+                                : (
+                                    selectedSessionIDs.contains(session.id)
+                                        ? max(1, selectedSessionIDs.count)
+                                        : 1
+                                ),
                             onSelect: {
                                 onSelectSession(
                                     session.id,
@@ -1859,7 +1871,15 @@ private struct ProjectSidebarSection: View {
                                 )
                             },
                             onArchive: {
-                                onArchiveSession(session.id)
+                                if session.usesNativeChat {
+                                    if session.status.occupiesSlot, session.threadID != nil {
+                                        onArchiveLiveThread(session)
+                                    } else {
+                                        sessionManager.close(sessionID: session.id)
+                                    }
+                                } else {
+                                    onArchiveSession(session.id)
+                                }
                             },
                             acceptsDrop: { item in
                                 guard case .session(let movingSessionID) = item,
@@ -1891,23 +1911,21 @@ private struct ProjectSidebarSection: View {
                                 action: onNewParentFolder
                             )
                             Divider()
-                            Group {
-                                if session.status.isLocallyAttached {
-                                    Button("Disconnect") {
-                                        sessionManager.disconnect(sessionID: session.id)
-                                    }
-                                } else if session.status.canReconnect {
-                                    Button("Reconnect") {
-                                        onSelectSession(session.id, false)
-                                    }
-                                } else {
-                                    Button("Close Session") {
-                                        sessionManager.close(sessionID: session.id)
+                            if !session.status.isLocallyAttached {
+                                Group {
+                                    if session.status.canReconnect {
+                                        Button("Reconnect") {
+                                            onSelectSession(session.id, false)
+                                        }
+                                    } else {
+                                        Button("Close Session") {
+                                            sessionManager.close(sessionID: session.id)
+                                        }
                                     }
                                 }
+                                .disabled(session.status == .stopping)
+                                Divider()
                             }
-                            .disabled(session.status == .stopping)
-                            Divider()
                             Button("Copy Thread ID", systemImage: "number") {
                                 if let threadID = session.threadID {
                                     copyToPasteboard(threadID)
@@ -1922,14 +1940,15 @@ private struct ProjectSidebarSection: View {
                             }
                             .disabled(localProjectURL == nil)
                             Divider()
-                            Button("Archive Terminal", role: .destructive) {
-                                onArchiveSession(session.id)
-                            }
-                            if session.threadID != nil {
+                            if session.usesNativeChat, session.threadID != nil {
                                 Button("Archive Conversation", role: .destructive) {
                                     onArchiveLiveThread(session)
                                 }
                                 .disabled(!session.status.occupiesSlot)
+                            } else {
+                                Button("Archive Terminal", role: .destructive) {
+                                    onArchiveSession(session.id)
+                                }
                             }
                         }
                     }
@@ -2219,7 +2238,11 @@ private struct ProjectSessionRow: View {
                     .frame(width: 19, height: 25)
                     .contentShape(Rectangle())
                     .sidebarDragSource(.session(session.id))
-                    .help("Drag to reorder terminal")
+                    .help(
+                        session.usesNativeChat
+                            ? "Drag to reorder conversation"
+                            : "Drag to reorder terminal"
+                    )
                     .accessibilityHidden(true)
 
                 Button(action: onArchive) {
@@ -2233,8 +2256,12 @@ private struct ProjectSessionRow: View {
                 .disabled(!isHovering || session.status == .stopping)
                 .help(
                     archiveCount == 1
-                        ? "Archive terminal"
-                        : "Archive \(archiveCount) selected terminals"
+                        ? (session.usesNativeChat ? "Archive conversation" : "Archive terminal")
+                        : (
+                            session.usesNativeChat
+                                ? "Archive selected conversations"
+                                : "Archive \(archiveCount) selected terminals"
+                        )
                 )
             }
             .padding(.trailing, 8)

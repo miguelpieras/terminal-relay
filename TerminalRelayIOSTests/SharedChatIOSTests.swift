@@ -7,6 +7,21 @@ final class SharedChatIOSTests: XCTestCase {
     private let threadID = "00000000-0000-4000-8000-000000000002"
     private let generation = "00000000-0000-4000-8000-000000000003"
 
+    func testSharedInteractiveControlsUse44PointIOSPolicyWithCompactVisualPadding() {
+        XCTAssertTrue(ChatInteractionTargetLayout.appliesMinimumDimension)
+        XCTAssertEqual(ChatInteractionTargetLayout.minimumIOSDimension, 44)
+        XCTAssertEqual(ChatInteractionTargetLayout.jumpButtonDimension, 44)
+        XCTAssertEqual(
+            ChatInteractionTargetLayout.jumpButtonDimension
+                + (2 * ChatInteractionTargetLayout.jumpButtonOuterPadding),
+            60,
+            "The larger hit target must preserve the existing overlay footprint."
+        )
+        XCTAssertEqual(ChatInteractionTargetLayout.codeHeaderVerticalPadding, 0)
+        XCTAssertEqual(ChatInteractionTargetLayout.compactControlVerticalPadding, 0)
+        XCTAssertEqual(ChatInteractionTargetLayout.attachmentChipVerticalPadding, 0)
+    }
+
     func testSharedStreamingCodecAndReducerRunOnIOS() throws {
         let hello = event(
             "session.hello",
@@ -41,6 +56,57 @@ final class SharedChatIOSTests: XCTestCase {
         XCTAssertEqual(store.state.connectionState, .streaming)
         XCTAssertEqual(store.state.lastAppliedSequence, 1)
         XCTAssertEqual(store.state.messages.map(\.text), ["Hello from native chat"])
+    }
+
+    func testSharedIdleResumeSnapshotInfersActiveTurnOnIOS() throws {
+        let activeTurnID = "10000000-0000-4000-8000-000000000010"
+        let store = ConversationStore()
+        let snapshot = ConversationSnapshot(
+            snapshotGeneration: generation,
+            baseSequence: 1,
+            items: [
+                .message(
+                    ChatMessage(
+                        id: "assistant-stream",
+                        turnID: activeTurnID,
+                        role: .assistant,
+                        text: "Partial response",
+                        isStreaming: true
+                    )
+                ),
+            ],
+            connectionState: .streaming,
+            turnState: .idle
+        )
+
+        try store.apply(
+            event(
+                "conversation.snapshot",
+                sequence: 1,
+                payload: try JSONValue.encoded(snapshot)
+            )
+        )
+
+        XCTAssertEqual(store.state.turnState, .running)
+        XCTAssertEqual(store.state.activeTurnID, activeTurnID)
+
+        let preItemStore = ConversationStore()
+        let preItemSnapshot = ConversationSnapshot(
+            snapshotGeneration: generation,
+            baseSequence: 1,
+            connectionState: .streaming,
+            turnState: .unknown("streaming"),
+            activeTurnID: activeTurnID
+        )
+        try preItemStore.apply(
+            event(
+                "conversation.snapshot",
+                sequence: 1,
+                payload: try JSONValue.encoded(preItemSnapshot)
+            )
+        )
+        XCTAssertEqual(preItemStore.state.turnState, .running)
+        XCTAssertEqual(preItemStore.state.activeTurnID, activeTurnID)
     }
 
     func testSharedSafeLinkPolicyRunsOnIOS() throws {
@@ -82,6 +148,84 @@ final class SharedChatIOSTests: XCTestCase {
                 canSend: false
             ),
             .ignore
+        )
+    }
+
+    func testSharedDoubleEscapePolicyRunsOnIOS() {
+        var policy = ComposerEscapePolicy()
+
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-ios", timestamp: 20, isRepeat: false),
+            .armed
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-ios", timestamp: 20.1, isRepeat: true),
+            .ignored
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-ios", timestamp: 20.02, isRepeat: false),
+            .ignored
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-ios", timestamp: 20.4, isRepeat: false),
+            .interrupt
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-ios", timestamp: 20.42, isRepeat: false),
+            .ignored
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-ios", timestamp: 20.6, isRepeat: false),
+            .armed
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-ios", timestamp: 20.9, isRepeat: false),
+            .interrupt
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: nil, timestamp: 21, isRepeat: false),
+            .ignored
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-next", timestamp: 22, isRepeat: false),
+            .armed
+        )
+    }
+
+    func testMobileComposerLaunchPolicyUsesProviderModelsAndSupportedEfforts() {
+        XCTAssertEqual(
+            MobileComposerLaunchPolicy.models(for: .codex).map(\.id),
+            ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+        )
+        XCTAssertEqual(
+            MobileComposerLaunchPolicy.models(for: .claude).map(\.id),
+            ["fable", "opus", "sonnet"]
+        )
+        XCTAssertTrue(
+            MobileComposerLaunchPolicy.availableEfforts(
+                provider: .codex,
+                model: "gpt-5.6-sol"
+            ).contains(.ultra)
+        )
+        XCTAssertFalse(
+            MobileComposerLaunchPolicy.availableEfforts(
+                provider: .codex,
+                model: "gpt-5.6-luna"
+            ).contains(.ultra)
+        )
+        XCTAssertEqual(
+            MobileComposerLaunchPolicy.normalizedEffort(
+                .ultra,
+                provider: .codex,
+                model: "gpt-5.6-luna"
+            ),
+            .max
+        )
+        XCTAssertFalse(
+            MobileComposerLaunchPolicy.availableEfforts(
+                provider: .claude,
+                model: "opus"
+            ).contains(.ultra)
         )
     }
 

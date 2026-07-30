@@ -12,8 +12,8 @@ apps connect directly over SSH.
 
 - Shared native streaming chat on macOS, iPhone, and iPad, including Markdown,
   code, tables, safe links, tool progress, diffs, approvals, and questions.
-- Persistent Codex and Claude conversations with multi-device handoff and a
-  capability-gated interactive terminal fallback.
+- Persistent Codex and Claude conversations with multi-device handoff and
+  fail-closed native-chat capability checks.
 - Inactive and archived Codex and Claude conversations can be searched, resumed
   exactly, renamed, archived, and restored from macOS, iPhone, and iPad.
 - Every managed agent session includes a worker-local MCP for safe project and
@@ -77,11 +77,10 @@ Then use the apps:
 4. Control-click on Mac, or use swipe and context actions on iPhone and iPad,
    to rename or archive an inactive conversation. Expand **Archived Threads**
    to restore one.
-5. Use **Disconnect** when you only want to leave the current device. Use
-   **Stop Agent** to end that exact worker agent for every attached device.
-   **Open Terminal Fallback** performs a controlled same-thread migration when
-   native chat is unavailable or an expert recovery needs the provider TUI.
-   Archiving a live conversation stops that exact relay instance first.
+5. Close the conversation to leave the current device without ending the
+   worker agent. While a turn is running, the composer's Send control becomes
+   Stop; with a hardware keyboard, pressing Escape twice also stops only that
+   turn. Archiving a live conversation ends that exact relay instance first.
 
 Claude list, metadata read, and rename use the official Claude Agent SDK;
 resume uses Claude Code's exact provider session UUID. Terminal Relay archive
@@ -137,12 +136,13 @@ worker-local `terminal-relay-chat` broker owns each live provider conversation,
 listens only on a mode-`0600` Unix socket, and keeps a bounded in-memory replay
 window. It has no TCP listener or transcript database.
 
-The same clients retain the existing PTY/SwiftTerm path for older workers,
-already-running terminal sessions, and explicit fallback. The helper supports
-concurrent Codex and Claude agents, permits multiple client attachments, and
-preserves exact restart intent across worker reboots. Disconnecting a client
-leaves the remote agent running; **Stop Agent** ends only the selected relay
-UUID.
+The same clients can still display already-running legacy PTY/SwiftTerm
+sessions, but native-chat creation and resumption never fall back to a raw
+terminal. If the worker does not advertise native chat, the request fails
+closed until the worker is updated. The helper supports concurrent Codex and
+Claude agents, permits multiple client attachments, and preserves exact
+restart intent across worker reboots. Closing a client leaves the remote agent
+running.
 
 Codex's worker-local app server and the official Claude Agent SDK provide
 paginated catalogs of persisted conversations. The apps keep each provider
@@ -175,7 +175,7 @@ macOS app ───────┐
                  ├─ direct SSH ─ worker ─ chat broker ─ Codex / Claude
 iPhone/iPad app ┘              ├ repositories in /workspace
                                ├ local thread MCP (stdio only)
-                               └ terminal fallback (PTY/tmux)
+                               └ existing legacy PTY sessions
 ```
 
 ## Requirements

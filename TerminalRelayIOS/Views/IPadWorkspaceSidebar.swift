@@ -134,12 +134,12 @@ struct IPadWorkspaceSidebar: View {
                 ContentUnavailableView.search(text: searchText)
                     .listRowBackground(Color.clear)
             } else {
-                Section("Projects & Terminals") {
+                Section("Projects & Conversations") {
                     ForEach(filteredProjects) { project in
                         projectRow(project)
 
                         ForEach(project.sessions) { session in
-                            terminalRow(session, project: project)
+                            conversationRow(session, project: project)
                         }
 
                         ForEach(project.threads) { thread in
@@ -162,7 +162,7 @@ struct IPadWorkspaceSidebar: View {
         .listStyle(.sidebar)
         .navigationTitle("Terminal Relay")
         .navigationSplitViewColumnWidth(min: 230, ideal: 260, max: 280)
-        .searchable(text: $searchText, prompt: "Projects or terminals")
+        .searchable(text: $searchText, prompt: "Projects or conversations")
         .refreshable {
             await model.refreshProjectCatalogs()
             await model.refreshAllThreads()
@@ -226,7 +226,7 @@ struct IPadWorkspaceSidebar: View {
         )
     }
 
-    private func terminalRow(
+    private func conversationRow(
         _ session: WorkerSessionSnapshot,
         project: IPadSidebarProject
     ) -> some View {
@@ -244,7 +244,7 @@ struct IPadWorkspaceSidebar: View {
                     .frame(width: 18)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(session.title ?? "\(session.kind.displayName) terminal")
+                    Text(session.title ?? "\(session.kind.displayName) conversation")
                         .font(.subheadline)
                         .foregroundStyle(.primary)
                         .lineLimit(2)

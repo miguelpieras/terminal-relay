@@ -116,7 +116,10 @@ Timestamps are Unix milliseconds and are presentation metadata, never
 identities. Optional identity fields are omitted or `null` until the provider
 supplies them. Unknown top-level fields are ignored. An unknown non-interactive
 event becomes a generic expandable item. An unknown interaction that could
-block a provider turn emits `session.terminalFallbackRequired`.
+block a provider turn emits the legacy
+`session.terminalFallbackRequired` compatibility event. Current clients render
+it as an unsupported native-chat interaction and never offer or start a raw
+terminal.
 
 ## Client commands
 
@@ -144,7 +147,8 @@ protocol error.
 The v1 event set is:
 
 - `session.hello`, `session.state`, `session.heartbeat`,
-  `session.terminalFallbackRequired`, `session.ended`
+  `session.terminalFallbackRequired` (unsupported-interaction compatibility
+  notice; no terminal migration), `session.ended`
 - `ack`, `error`
 - `conversation.snapshot`, `history.page`
 - `message.started`, `message.delta`, `message.completed`

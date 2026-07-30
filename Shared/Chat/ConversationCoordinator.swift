@@ -39,6 +39,7 @@ enum ConversationCoordinatorError: LocalizedError, Equatable {
     case promptTooLarge
     case tooManyAttachments
     case attachmentPathTooLarge
+    case turnAlreadyActive
     case noActiveTurn
     case interactionUnavailable
 
@@ -54,6 +55,8 @@ enum ConversationCoordinatorError: LocalizedError, Equatable {
             "A turn can include at most 32 attachments."
         case .attachmentPathTooLarge:
             "An attachment path is too long to send safely."
+        case .turnAlreadyActive:
+            "Wait for the current turn to finish before sending another message."
         case .noActiveTurn:
             "There is no active turn to stop."
         case .interactionUnavailable:
@@ -64,6 +67,16 @@ enum ConversationCoordinatorError: LocalizedError, Equatable {
 
 @MainActor
 final class ConversationCoordinator {
+    private struct PendingTurn {
+        let text: String
+        let attachments: [ChatAttachmentReference]
+    }
+
+    private struct PendingInterrupt {
+        let requestID: String
+        let turnID: String
+    }
+
     let store: ConversationStore
     let identity: ChatConversationIdentity
 
@@ -77,6 +90,9 @@ final class ConversationCoordinator {
     private var isAttached = false
     private var needsFreshSnapshot = false
     private var pendingInteractionByCommand: [String: String] = [:]
+    private var pendingTurnByCommand: [String: PendingTurn] = [:]
+    private var unconfirmedTurnByCommand: [String: PendingTurn] = [:]
+    private var pendingInterrupt: PendingInterrupt?
     private var isStopping = false
     private var stopRequestID: String?
     private var stopWasConfirmed = false
@@ -139,6 +155,7 @@ final class ConversationCoordinator {
         retryTask = nil
         lifecycleTask?.cancel()
         lifecycleTask = nil
+        resetReconnectScopedState()
         if isAttached {
             try? await sendCommand(.detach)
         }
@@ -153,6 +170,7 @@ final class ConversationCoordinator {
         let previousLifecycleTask = lifecycleTask
         previousLifecycleTask?.cancel()
         lifecycleTask = nil
+        resetReconnectScopedState()
         store.setConnectionState(.connecting)
         retryTask = Task { [weak self] in
             guard let self else { return }
@@ -177,6 +195,9 @@ final class ConversationCoordinator {
     func send(text: String, attachments: [ChatAttachmentReference] = []) async {
         do {
             try validatePrompt(text, attachments: attachments)
+            guard !store.state.turnState.isActive, pendingTurnByCommand.isEmpty else {
+                throw ConversationCoordinatorError.turnAlreadyActive
+            }
             let requestID = UUID().uuidString.lowercased()
             let envelope = try ChatCommand.startTurn(
                 text: text,
@@ -186,13 +207,21 @@ final class ConversationCoordinator {
 
             store.clearComposer()
             store.addOptimisticUserMessage(requestID: requestID, text: text)
+            pendingTurnByCommand[requestID] = PendingTurn(
+                text: text,
+                attachments: attachments
+            )
             do {
                 try await transport.send(envelope)
             } catch {
+                let failedTurn = pendingTurnByCommand.removeValue(forKey: requestID)
+                    ?? unconfirmedTurnByCommand.removeValue(forKey: requestID)
                 store.removeOptimisticUserMessage(requestID: requestID)
-                if store.draft.isEmpty {
-                    store.draft = text
-                    store.attachments = attachments
+                if let failedTurn {
+                    store.restoreFailedSubmission(
+                        text: failedTurn.text,
+                        attachments: failedTurn.attachments
+                    )
                 }
                 throw error
             }
@@ -209,9 +238,23 @@ final class ConversationCoordinator {
             )
             return
         }
+        guard pendingInterrupt?.turnID != turnID else { return }
+        let requestID = UUID().uuidString.lowercased()
+        pendingInterrupt = PendingInterrupt(requestID: requestID, turnID: turnID)
         do {
-            try await sendCommand(.interrupt(turnID: turnID))
+            guard identity.isValid else {
+                throw ConversationCoordinatorError.invalidIdentity
+            }
+            try await transport.send(
+                ChatCommand.interrupt(turnID: turnID).envelope(
+                    identity: identity,
+                    requestID: requestID
+                )
+            )
         } catch {
+            if pendingInterrupt?.requestID == requestID {
+                pendingInterrupt = nil
+            }
             store.setConnectionState(store.state.connectionState, message: sanitizedMessage(for: error))
         }
     }
@@ -355,7 +398,7 @@ final class ConversationCoordinator {
             if !stopWasConfirmed {
                 store.setConnectionState(
                     .offlineAgentRunning,
-                    message: "Stop was sent, but the worker did not confirm it. Reconnect before trying again."
+                    message: "Stop was sent, but the worker did not confirm it. Retry before trying again."
                 )
                 return
             }
@@ -402,6 +445,7 @@ final class ConversationCoordinator {
                         }
                     case .disconnected(let failure):
                         isAttached = false
+                        resetReconnectScopedState()
                         if let failure, !failure.isRecoverable {
                             shouldStayConnected = false
                             store.setConnectionState(.failed, message: failure.message)
@@ -413,6 +457,7 @@ final class ConversationCoordinator {
                 }
             } catch {
                 isAttached = false
+                resetReconnectScopedState()
                 await transport.disconnect()
                 store.setConnectionState(.offlineAgentRunning, message: sanitizedMessage(for: error))
             }
@@ -422,7 +467,7 @@ final class ConversationCoordinator {
             guard retryCount <= retryPolicy.maximumAutomaticRetries else {
                 store.setConnectionState(
                     .offlineAgentRunning,
-                    message: "The agent is still running. Tap Reconnect to try again."
+                    message: "The agent is still running. Tap Retry to reconnect."
                 )
                 shouldStayConnected = false
                 return
@@ -444,9 +489,26 @@ final class ConversationCoordinator {
     private func apply(_ envelope: ChatEnvelope) async -> Bool {
         do {
             try store.apply(envelope)
+            if envelope.type == ChatEventKind.conversationSnapshot.rawValue {
+                reconcileSnapshotTransients()
+            } else if envelope.type == ChatEventKind.turnStarted.rawValue {
+                releasePendingTurnLatchPreservingRestoration()
+            }
+            if let pendingInterrupt,
+               store.state.activeTurnID != pendingInterrupt.turnID {
+                self.pendingInterrupt = nil
+            }
             if envelope.type == ChatEventKind.acknowledgement.rawValue
                 || envelope.type == ChatEventKind.error.rawValue {
                 let requestID = envelope.requestID ?? envelope.payload["requestId"]?.stringValue
+                if envelope.type == ChatEventKind.error.rawValue,
+                   requestID == pendingInterrupt?.requestID {
+                    pendingInterrupt = nil
+                }
+                resolvePendingTurn(
+                    requestID,
+                    isError: envelope.type == ChatEventKind.error.rawValue
+                )
                 resolvePendingCommand(
                     requestID,
                     isError: envelope.type == ChatEventKind.error.rawValue
@@ -478,6 +540,7 @@ final class ConversationCoordinator {
         } catch ConversationReducerError.sequenceGap,
                 ConversationReducerError.snapshotGenerationChanged {
             needsFreshSnapshot = true
+            resetReconnectScopedState()
             store.setConnectionState(.connecting)
             isAttached = false
             await transport.disconnect()
@@ -505,6 +568,42 @@ final class ConversationCoordinator {
             pendingInteractionByCommand.removeValue(forKey: requestID)
             store.setInteractionResponding(interactionID, isResponding: false)
         }
+    }
+
+    private func resolvePendingTurn(_ requestID: String?, isError: Bool) {
+        guard let requestID else {
+            return
+        }
+        let pending = pendingTurnByCommand.removeValue(forKey: requestID)
+            ?? unconfirmedTurnByCommand.removeValue(forKey: requestID)
+        guard let pending, isError else { return }
+        store.removeOptimisticUserMessage(requestID: requestID)
+        store.restoreFailedSubmission(
+            text: pending.text,
+            attachments: pending.attachments
+        )
+    }
+
+    private func resetReconnectScopedState() {
+        releasePendingTurnLatchPreservingRestoration()
+        pendingInteractionByCommand.removeAll()
+        pendingInterrupt = nil
+        store.resetReconnectTransients()
+    }
+
+    private func reconcileSnapshotTransients() {
+        pendingInteractionByCommand.removeAll()
+        pendingInterrupt = nil
+        if store.state.turnState.isActive {
+            releasePendingTurnLatchPreservingRestoration()
+        }
+    }
+
+    private func releasePendingTurnLatchPreservingRestoration() {
+        unconfirmedTurnByCommand.merge(pendingTurnByCommand) { current, _ in
+            current
+        }
+        pendingTurnByCommand.removeAll()
     }
 
     private func validatePrompt(

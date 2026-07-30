@@ -6,6 +6,7 @@ struct AgentComposerView: View {
     @ObservedObject var session: TerminalSession
 
     let worker: ServerProfile
+    let onNativeEscape: (Bool) -> Void
 
     @AppStorage(AgentLaunchDefaults.StorageKey.codexModel)
     private var codexModel = AgentLaunchDefaults.standard.codexModel
@@ -26,6 +27,8 @@ struct AgentComposerView: View {
     @State private var isEditorFocused = false
     @State private var isShowingModelPanel = false
     @State private var selectedModelSection: ModelPanelSection?
+    @State private var pendingNativeSubmissions: [PendingNativeSubmission] = []
+    @State private var nativeSubmissionInFlightID: UUID?
     @StateObject private var modelPanelClickMonitor = ModelPanelClickMonitor()
 
     private static let codexModels = [
@@ -47,7 +50,8 @@ struct AgentComposerView: View {
             draft: draft,
             hasUploadingAttachments: attachments.contains(where: \.isUploading),
             hasFailedAttachments: attachments.contains { $0.errorMessage != nil },
-            hasUploadedAttachments: attachments.contains(where: \.isUploaded)
+            hasUploadedAttachments: attachments.contains(where: \.isUploaded),
+            isSubmitting: nativeSubmissionInFlightID != nil
         )
     }
 
@@ -66,12 +70,12 @@ struct AgentComposerView: View {
                     text: $draft,
                     onSubmit: send,
                     onPasteImages: addImages,
-                    onEscape: interruptOrEscape,
+                    onEscape: handleEscape,
                     onFocusChange: { isEditorFocused = $0 }
                 )
 
                 if draft.isEmpty, !isEditorFocused {
-                    Text("Do anything")
+                    Text("Ask anything")
                         .font(.system(size: 14))
                         .foregroundStyle(.tertiary)
                         .padding(.leading, 10)
@@ -95,9 +99,9 @@ struct AgentComposerView: View {
             }
 
             HStack(spacing: 10) {
-                Spacer(minLength: 8)
-
                 modelControls
+
+                Spacer(minLength: 8)
 
                 if session.isWorking {
                     Button {
@@ -111,8 +115,10 @@ struct AgentComposerView: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Stop current turn")
-                    .accessibilityHint("Interrupts only the current agent turn.")
-                    .help("Interrupt current work")
+                    .accessibilityHint(
+                        "Stops only the current turn. Press Escape twice to use the keyboard."
+                    )
+                    .help("Stop current work (Escape twice)")
                 } else {
                     Button(action: send) {
                         Image(systemName: "arrow.up")
@@ -135,6 +141,7 @@ struct AgentComposerView: View {
         .padding(.leading, 12)
         .padding(.trailing, 10)
         .padding(.bottom, 5)
+        .frame(maxWidth: session.usesNativeChat ? 760 : .infinity)
         .background {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(composerSurface)
@@ -145,9 +152,20 @@ struct AgentComposerView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 6)
-        .background(composerBackdrop)
+        .frame(maxWidth: .infinity)
+        .background(session.usesNativeChat ? Color.clear : composerBackdrop)
+        .background {
+            if let store = session.chatCoordinator?.store,
+               !pendingNativeSubmissions.isEmpty {
+                NativeComposerStoreObserver(store: store) { snapshot in
+                    reconcileNativeSubmission(with: snapshot)
+                }
+            }
+        }
         .onExitCommand {
-            interruptOrEscape()
+            if !session.usesNativeChat || !session.isWorking {
+                handleEscape(isRepeat: false)
+            }
         }
         .onAppear {
             modelPanelClickMonitor.start {
@@ -557,10 +575,13 @@ struct AgentComposerView: View {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         let remotePaths = attachments.compactMap(\.remotePath)
         if session.usesNativeChat {
+            guard let coordinator = session.chatCoordinator else { return }
             var prompt = text
             if prompt.isEmpty, !remotePaths.isEmpty {
                 prompt = "Please review the attached \(remotePaths.count == 1 ? "image" : "images")."
             }
+            let submittedDraft = draft
+            let submittedAttachments = attachments
             let structuredAttachments: [ChatAttachmentReference] = attachments.compactMap {
                 attachment in
                 guard let path = attachment.remotePath else { return nil }
@@ -571,13 +592,42 @@ struct AgentComposerView: View {
                 )
             }
             synchronizeNativeChatLaunchOptions()
-            session.sendPrompt(
-                prompt,
-                attachments: structuredAttachments
+            let submission = PendingNativeSubmission(
+                id: UUID(),
+                prompt: prompt,
+                draft: submittedDraft,
+                attachments: submittedAttachments,
+                structuredAttachments: structuredAttachments
             )
+            coordinator.store.clearComposer()
+            pendingNativeSubmissions.append(submission)
+            if pendingNativeSubmissions.count > 32 {
+                pendingNativeSubmissions.removeFirst(
+                    pendingNativeSubmissions.count - 32
+                )
+            }
+            nativeSubmissionInFlightID = submission.id
             draft = ""
             attachments.removeAll()
             pasteNotice = nil
+            Task {
+                await coordinator.send(
+                    text: prompt,
+                    attachments: structuredAttachments
+                )
+                guard pendingNativeSubmissions.contains(where: { $0.id == submission.id }) else {
+                    return
+                }
+                reconcileNativeSubmission(
+                    with: NativeComposerStoreSnapshot(
+                        draft: coordinator.store.draft,
+                        attachments: coordinator.store.attachments,
+                        connectionState: coordinator.store.state.connectionState,
+                        turnState: coordinator.store.state.turnState,
+                        activeTurnID: coordinator.store.state.activeTurnID
+                    )
+                )
+            }
             return
         }
 
@@ -596,6 +646,56 @@ struct AgentComposerView: View {
         pasteNotice = nil
     }
 
+    private func reconcileNativeSubmission(
+        with snapshot: NativeComposerStoreSnapshot
+    ) {
+        let matchingIndex = pendingNativeSubmissions.firstIndex {
+            $0.id == nativeSubmissionInFlightID
+                && AgentComposerRestorationPolicy.shouldRestore(
+                    submittedPrompt: $0.prompt,
+                    submittedAttachments: $0.structuredAttachments,
+                    restoredDraft: snapshot.draft,
+                    restoredAttachments: snapshot.attachments
+                )
+        } ?? pendingNativeSubmissions.firstIndex {
+            AgentComposerRestorationPolicy.shouldRestore(
+                submittedPrompt: $0.prompt,
+                submittedAttachments: $0.structuredAttachments,
+                restoredDraft: snapshot.draft,
+                restoredAttachments: snapshot.attachments
+            )
+        }
+
+        if let matchingIndex {
+            let submission = pendingNativeSubmissions.remove(at: matchingIndex)
+            session.chatCoordinator?.store.clearComposer()
+            if nativeSubmissionInFlightID == submission.id {
+                nativeSubmissionInFlightID = nil
+            }
+            if draft.isEmpty {
+                draft = submission.draft
+            } else if !submission.draft.isEmpty, draft != submission.draft {
+                draft = "\(submission.draft)\n\n\(draft)"
+            }
+            let existingAttachmentIDs = Set(attachments.map(\.id))
+            attachments.insert(
+                contentsOf: submission.attachments.filter {
+                    !existingAttachmentIDs.contains($0.id)
+                },
+                at: 0
+            )
+            return
+        }
+
+        if AgentComposerSubmissionPolicy.shouldReleaseSendLatch(
+            connectionState: snapshot.connectionState,
+            turnState: snapshot.turnState,
+            activeTurnID: snapshot.activeTurnID
+        ) {
+            nativeSubmissionInFlightID = nil
+        }
+    }
+
     private func synchronizeNativeChatLaunchOptions() {
         guard session.usesNativeChat else { return }
         session.updateChatLaunchOptions(
@@ -605,14 +705,19 @@ struct AgentComposerView: View {
         )
     }
 
-    private func interruptOrEscape() {
+    private func handleEscape(isRepeat: Bool) {
         if session.usesNativeChat {
             if session.isWorking {
-                session.interrupt()
-            } else if isShowingModelPanel {
-                closeModelPanel()
+                if isShowingModelPanel, !isRepeat {
+                    closeModelPanel()
+                }
+                onNativeEscape(isRepeat)
+            } else {
+                if isShowingModelPanel, !isRepeat {
+                    closeModelPanel()
+                }
             }
-        } else {
+        } else if !isRepeat {
             session.sendEscape()
         }
     }
@@ -625,7 +730,7 @@ struct AgentComposerView: View {
 
     private var composerBorder: Color {
         session.usesNativeChat
-            ? Color(nsColor: .separatorColor)
+            ? Color.primary.opacity(0.10)
             : Color.white.opacity(0.08)
     }
 
@@ -637,24 +742,26 @@ struct AgentComposerView: View {
 
     private var sendButtonForeground: Color {
         if session.usesNativeChat {
-            return canSend ? .white : .secondary
+            return canSend ? Color(nsColor: .windowBackgroundColor) : .secondary
         }
         return Color.black.opacity(canSend ? 0.9 : 0.62)
     }
 
     private var sendButtonBackground: Color {
         if session.usesNativeChat {
-            return canSend ? .accentColor : Color.primary.opacity(0.08)
+            return Color.primary.opacity(canSend ? 0.9 : 0.08)
         }
         return Color.white.opacity(canSend ? 0.92 : 0.58)
     }
 
     private var stopButtonForeground: Color {
-        session.usesNativeChat ? .red : Color.black.opacity(0.72)
+        session.usesNativeChat
+            ? Color(nsColor: .windowBackgroundColor)
+            : Color.black.opacity(0.72)
     }
 
     private var stopButtonBackground: Color {
-        session.usesNativeChat ? Color.red.opacity(0.12) : Color.white.opacity(0.58)
+        session.usesNativeChat ? Color.primary.opacity(0.9) : Color.white.opacity(0.58)
     }
 
     private func sendCommand(_ command: String) {
@@ -822,6 +929,51 @@ private struct ComposerAttachment: Identifiable {
     }
 }
 
+private struct PendingNativeSubmission {
+    let id: UUID
+    let prompt: String
+    let draft: String
+    let attachments: [ComposerAttachment]
+    let structuredAttachments: [ChatAttachmentReference]
+}
+
+private struct NativeComposerStoreSnapshot: Equatable {
+    let draft: String
+    let attachments: [ChatAttachmentReference]
+    let connectionState: ChatConnectionState
+    let turnState: TurnState
+    let activeTurnID: String?
+}
+
+private struct NativeComposerStoreObserver: View {
+    @ObservedObject var store: ConversationStore
+
+    let onSnapshot: (NativeComposerStoreSnapshot) -> Void
+
+    private var snapshot: NativeComposerStoreSnapshot {
+        NativeComposerStoreSnapshot(
+            draft: store.draft,
+            attachments: store.attachments,
+            connectionState: store.state.connectionState,
+            turnState: store.state.turnState,
+            activeTurnID: store.state.activeTurnID
+        )
+    }
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+            .onAppear {
+                onSnapshot(snapshot)
+            }
+            .onChange(of: snapshot) { _, snapshot in
+                onSnapshot(snapshot)
+            }
+    }
+}
+
 private struct ClipboardImage {
     let pngData: Data
     let preview: NSImage
@@ -872,14 +1024,46 @@ enum AgentComposerSendPolicy {
         draft: String,
         hasUploadingAttachments: Bool,
         hasFailedAttachments: Bool,
-        hasUploadedAttachments: Bool
+        hasUploadedAttachments: Bool,
+        isSubmitting: Bool = false
     ) -> Bool {
         status == .running
             && (!usesNativeChat || !isWorking)
+            && !isSubmitting
             && !hasUploadingAttachments
             && !hasFailedAttachments
             && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 || hasUploadedAttachments)
+    }
+}
+
+enum AgentComposerRestorationPolicy {
+    static func shouldRestore(
+        submittedPrompt: String,
+        submittedAttachments: [ChatAttachmentReference],
+        restoredDraft: String,
+        restoredAttachments: [ChatAttachmentReference]
+    ) -> Bool {
+        restoredDraft == submittedPrompt
+            && restoredAttachments == submittedAttachments
+    }
+}
+
+enum AgentComposerSubmissionPolicy {
+    static func shouldReleaseSendLatch(
+        connectionState: ChatConnectionState,
+        turnState: TurnState,
+        activeTurnID: String?
+    ) -> Bool {
+        if activeTurnID != nil || turnState.isActive {
+            return true
+        }
+        switch connectionState {
+        case .offlineAgentRunning, .failed, .stopped, .unsupportedWorker:
+            return true
+        case .connecting, .streaming, .awaitingApproval, .interrupted, .unknown:
+            return false
+        }
     }
 }
 
@@ -909,7 +1093,7 @@ private struct PromptEditor: NSViewRepresentable {
 
     let onSubmit: () -> Void
     let onPasteImages: ([ClipboardImage]) -> Void
-    let onEscape: () -> Void
+    let onEscape: (Bool) -> Void
     let onFocusChange: (Bool) -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -925,6 +1109,7 @@ private struct PromptEditor: NSViewRepresentable {
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticTextReplacementEnabled = false
         textView.font = .systemFont(ofSize: 14)
+        textView.insertionPointColor = .secondaryLabelColor
         textView.textContainerInset = NSSize(width: 5, height: 5)
         textView.minSize = NSSize(width: 0, height: 44)
         textView.maxSize = NSSize(
@@ -965,6 +1150,7 @@ private struct PromptEditor: NSViewRepresentable {
         if textView.string != text {
             textView.string = text
         }
+        textView.insertionPointColor = .secondaryLabelColor
         textView.onSubmit = onSubmit
         textView.onPasteImages = onPasteImages
         textView.onEscape = onEscape
@@ -988,7 +1174,7 @@ private struct PromptEditor: NSViewRepresentable {
 private final class ComposerTextView: NSTextView {
     var onSubmit: (() -> Void)?
     var onPasteImages: (([ClipboardImage]) -> Void)?
-    var onEscape: (() -> Void)?
+    var onEscape: ((Bool) -> Void)?
     var onFocusChange: ((Bool) -> Void)?
 
     override func keyDown(with event: NSEvent) {
@@ -997,7 +1183,7 @@ private final class ComposerTextView: NSTextView {
             modifiers: event.modifierFlags
         ) {
         case .escape:
-            onEscape?()
+            onEscape?(event.isARepeat)
         case .submit:
             onSubmit?()
         case .insertNewline, .system:

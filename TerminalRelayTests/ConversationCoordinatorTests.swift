@@ -108,6 +108,316 @@ final class ConversationCoordinatorTests: XCTestCase {
         XCTAssertEqual(store.state.lastErrorMessage, ConversationCoordinatorError.promptTooLarge.localizedDescription)
     }
 
+    func testInferredResumedTurnRejectsNewSendLocallyAndPreservesDraft() async throws {
+        let activeTurnID = "10000000-0000-4000-8000-000000000003"
+        let snapshot = try ChatTestFixtures.snapshotEvent(
+            baseSequence: 1,
+            items: [
+                .message(
+                    ChatMessage(
+                        id: "assistant-stream",
+                        turnID: activeTurnID,
+                        role: .assistant,
+                        text: "In progress",
+                        isStreaming: true
+                    )
+                ),
+            ],
+            turnState: .idle
+        )
+        let transport = ChatFixtureTransport(initialEvents: [snapshot])
+        let store = ConversationStore()
+        let coordinator = makeCoordinator(store: store, transport: transport)
+        coordinator.start()
+        await waitUntil { store.state.activeTurnID == activeTurnID }
+
+        store.draft = "Do this after the current turn"
+        await coordinator.sendDraft()
+
+        let starts = await transport.sentEnvelopes().filter { $0.type == "turn.start" }
+        XCTAssertTrue(starts.isEmpty)
+        XCTAssertEqual(store.draft, "Do this after the current turn")
+        XCTAssertEqual(store.state.turnState, .running)
+        XCTAssertEqual(
+            store.state.lastErrorMessage,
+            ConversationCoordinatorError.turnAlreadyActive.localizedDescription
+        )
+    }
+
+    func testTurnActiveRaceRestoresRejectedDraftAndReconcilesAuthoritativeStreamingTurn() async throws {
+        let activeTurnID = "10000000-0000-4000-8000-000000000004"
+        let transport = ChatFixtureTransport(
+            initialEvents: [Self.hello(sequence: 1)]
+        ) { command in
+            guard command.type == "turn.start" else {
+                return []
+            }
+            return [
+                ChatTestFixtures.event(
+                    "message.started",
+                    sequence: 2,
+                    itemID: "assistant-stream",
+                    turnID: activeTurnID,
+                    payload: .object([
+                        "role": .string("assistant"),
+                        "text": .string("Still working"),
+                    ])
+                ),
+            ]
+        }
+        let store = ConversationStore()
+        let coordinator = makeCoordinator(store: store, transport: transport)
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+
+        store.draft = "Keep this prompt"
+        store.attachments = [
+            ChatAttachmentReference(
+                id: "failed-attachment",
+                path: "/workspace/example/failed.png",
+                displayName: "failed.png"
+            ),
+        ]
+        await coordinator.sendDraft()
+        let sentAfterStart = await transport.sentEnvelopes()
+        let startRequestID = try XCTUnwrap(sentAfterStart
+            .last { $0.type == "turn.start" }?
+            .requestID)
+        store.draft = "Newer draft"
+        store.attachments = [
+            ChatAttachmentReference(
+                id: "new-attachment",
+                path: "/workspace/example/new.png",
+                displayName: "new.png"
+            ),
+        ]
+        await transport.yield(
+            .envelope(
+                ChatTestFixtures.event(
+                    "error",
+                    sequence: 3,
+                    payload: .object([
+                        "requestId": .string(startRequestID),
+                        "code": .string("turnActive"),
+                        "message": .string("A provider turn is already active."),
+                    ])
+                )
+            )
+        )
+        await waitUntil { store.state.activeTurnID == activeTurnID }
+
+        XCTAssertEqual(store.draft, "Keep this prompt\n\nNewer draft")
+        XCTAssertEqual(
+            store.attachments.map(\.id),
+            ["failed-attachment", "new-attachment"]
+        )
+        XCTAssertEqual(store.state.turnState, .running)
+        XCTAssertFalse(store.state.messages.contains { $0.isOptimistic })
+        let starts = await transport.sentEnvelopes().filter { $0.type == "turn.start" }
+        XCTAssertEqual(starts.count, 1)
+    }
+
+    func testPendingTurnStartRejectsConcurrentSendAndPreservesNewDraft() async throws {
+        let transport = makeConnectedTransport()
+        let store = ConversationStore()
+        let coordinator = makeCoordinator(store: store, transport: transport)
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+
+        store.draft = "First prompt"
+        await coordinator.sendDraft()
+        store.draft = "Second prompt"
+        await coordinator.sendDraft()
+
+        let starts = await transport.sentEnvelopes().filter { $0.type == "turn.start" }
+        XCTAssertEqual(starts.count, 1)
+        XCTAssertEqual(starts.first?.payload["text"]?.stringValue, "First prompt")
+        XCTAssertEqual(store.draft, "Second prompt")
+        XCTAssertEqual(
+            store.state.lastErrorMessage,
+            ConversationCoordinatorError.turnAlreadyActive.localizedDescription
+        )
+
+        let firstRequestID = try XCTUnwrap(starts.first?.requestID)
+        await transport.yield(
+            .envelope(
+                ChatTestFixtures.event(
+                    "ack",
+                    sequence: 2,
+                    payload: .object([
+                        "requestId": .string(firstRequestID),
+                    ])
+                )
+            )
+        )
+        await waitUntil { store.state.lastAppliedSequence == 2 }
+        await coordinator.sendDraft()
+
+        let startsAfterAcknowledgement = await transport.sentEnvelopes()
+            .filter { $0.type == "turn.start" }
+        XCTAssertEqual(startsAfterAcknowledgement.count, 2)
+        XCTAssertEqual(
+            startsAfterAcknowledgement.last?.payload["text"]?.stringValue,
+            "Second prompt"
+        )
+        XCTAssertTrue(store.draft.isEmpty)
+    }
+
+    func testAuthoritativeTurnStartedReconcilesMissedStartAcknowledgement() async {
+        let transport = makeConnectedTransport()
+        let store = ConversationStore()
+        let coordinator = makeCoordinator(store: store, transport: transport)
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+
+        store.draft = "First prompt"
+        await coordinator.sendDraft()
+        await transport.yield(
+            .envelope(
+                ChatTestFixtures.event(
+                    "turn.started",
+                    sequence: 2,
+                    turnID: "turn-authoritative",
+                    payload: .object(["turnId": .string("turn-authoritative")])
+                )
+            )
+        )
+        await transport.yield(
+            .envelope(
+                ChatTestFixtures.event(
+                    "turn.completed",
+                    sequence: 3,
+                    turnID: "turn-authoritative"
+                )
+            )
+        )
+        await waitUntil { store.state.turnState == .completed }
+
+        store.draft = "Second prompt"
+        await coordinator.sendDraft()
+
+        let starts = await transport.sentEnvelopes().filter { $0.type == "turn.start" }
+        XCTAssertEqual(starts.count, 2)
+        XCTAssertEqual(starts.last?.payload["text"]?.stringValue, "Second prompt")
+    }
+
+    func testIdleSnapshotAfterNewStartDoesNotUnlatchSecondSend() async throws {
+        let transport = makeConnectedTransport()
+        let store = ConversationStore()
+        let coordinator = makeCoordinator(store: store, transport: transport)
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+
+        store.draft = "First prompt"
+        await coordinator.sendDraft()
+        await transport.yield(
+            .envelope(
+                try ChatTestFixtures.snapshotEvent(
+                    baseSequence: 2,
+                    turnState: .idle
+                )
+            )
+        )
+        await waitUntil { store.state.lastAppliedSequence == 2 }
+
+        store.draft = "Second prompt"
+        await coordinator.sendDraft()
+
+        let starts = await transport.sentEnvelopes().filter { $0.type == "turn.start" }
+        XCTAssertEqual(starts.count, 1)
+        XCTAssertEqual(starts.first?.payload["text"]?.stringValue, "First prompt")
+        XCTAssertEqual(store.draft, "Second prompt")
+        XCTAssertEqual(
+            store.state.lastErrorMessage,
+            ConversationCoordinatorError.turnAlreadyActive.localizedDescription
+        )
+    }
+
+    func testAttachAcknowledgementPreservesLateStartErrorRestoration() async throws {
+        let transport = makeConnectedTransport()
+        let store = ConversationStore()
+        let coordinator = makeCoordinator(store: store, transport: transport)
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+
+        store.draft = "Failed prompt"
+        await coordinator.sendDraft()
+        let commands = await transport.sentEnvelopes()
+        let startRequestID = try XCTUnwrap(
+            commands.last { $0.type == "turn.start" }?.requestID
+        )
+        let attachRequestID = try XCTUnwrap(
+            commands.last { $0.type == "session.attach" }?.requestID
+        )
+        store.draft = "Newer draft"
+
+        await transport.yield(
+            .envelope(
+                ChatTestFixtures.event(
+                    "turn.started",
+                    sequence: 2,
+                    turnID: "turn-from-another-client",
+                    payload: .object(["turnId": .string("turn-from-another-client")])
+                )
+            )
+        )
+        await transport.yield(
+            .envelope(
+                ChatTestFixtures.event(
+                    "ack",
+                    sequence: 3,
+                    payload: .object([
+                        "requestId": .string(attachRequestID),
+                        "commandType": .string("session.attach"),
+                    ])
+                )
+            )
+        )
+        await transport.yield(
+            .envelope(
+                ChatTestFixtures.event(
+                    "error",
+                    sequence: 4,
+                    payload: .object([
+                        "requestId": .string(startRequestID),
+                        "code": .string("turnActive"),
+                        "message": .string("A provider turn is already active."),
+                    ])
+                )
+            )
+        )
+        await waitUntil { store.state.lastAppliedSequence == 4 }
+
+        XCTAssertEqual(store.draft, "Failed prompt\n\nNewer draft")
+        XCTAssertFalse(store.state.messages.contains { $0.isOptimistic })
+    }
+
+    func testCloseAndReopenBeforeStartAcknowledgementDoesNotKeepSendLatched() async {
+        let transport = makeConnectedTransport()
+        let store = ConversationStore()
+        let coordinator = makeCoordinator(store: store, transport: transport)
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+
+        store.draft = "Before close"
+        await coordinator.sendDraft()
+        await coordinator.detach()
+        coordinator.start()
+        await waitUntil {
+            await transport.sentEnvelopes().filter { $0.type == "session.attach" }.count == 2
+        }
+
+        store.draft = "After reopen"
+        await coordinator.sendDraft()
+
+        let starts = await transport.sentEnvelopes().filter { $0.type == "turn.start" }
+        XCTAssertEqual(starts.count, 2)
+        XCTAssertEqual(starts.map { $0.payload["text"]?.stringValue }, [
+            "Before close",
+            "After reopen",
+        ])
+    }
+
     func testInterruptUsesExactActiveTurnAndRejectsStaleSecondTap() async throws {
         let transport = makeConnectedTransport()
         let store = ConversationStore()
@@ -131,6 +441,16 @@ final class ConversationCoordinatorTests: XCTestCase {
         XCTAssertEqual(interrupt?.turnID, "turn-exact")
         XCTAssertEqual(interrupt?.payload["turnId"]?.stringValue, "turn-exact")
 
+        await coordinator.interrupt()
+        let interruptCountBeforeEvent = await transport.sentEnvelopes()
+            .filter { $0.type == "turn.interrupt" }
+            .count
+        XCTAssertEqual(
+            interruptCountBeforeEvent,
+            1,
+            "Repeated stop actions must not send another interrupt while the turn is still active."
+        )
+
         await transport.yield(
             .envelope(
                 ChatTestFixtures.event(
@@ -147,6 +467,55 @@ final class ConversationCoordinatorTests: XCTestCase {
             .filter { $0.type == "turn.interrupt" }
             .count
         XCTAssertEqual(interruptCountAfterStaleTap, count)
+    }
+
+    func testRejectedInterruptUnlatchesSameTurnForRetry() async throws {
+        let transport = makeConnectedTransport()
+        let store = ConversationStore()
+        let coordinator = makeCoordinator(store: store, transport: transport)
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+        await transport.yield(
+            .envelope(
+                ChatTestFixtures.event(
+                    "turn.started",
+                    sequence: 2,
+                    turnID: "turn-retry",
+                    payload: .object(["turnId": .string("turn-retry")])
+                )
+            )
+        )
+        await waitUntil { store.state.activeTurnID == "turn-retry" }
+
+        await coordinator.interrupt()
+        let firstInterrupt = await transport.sentEnvelopes()
+            .last { $0.type == "turn.interrupt" }
+        let firstRequestID = try XCTUnwrap(firstInterrupt?.requestID)
+
+        await transport.yield(
+            .envelope(
+                ChatTestFixtures.event(
+                    "error",
+                    sequence: 3,
+                    payload: .object([
+                        "requestId": .string(firstRequestID),
+                        "code": .string("interruptRejected"),
+                        "message": .string("The interrupt was rejected."),
+                    ])
+                )
+            )
+        )
+        await waitUntil {
+            store.state.lastErrorMessage == "The interrupt was rejected."
+        }
+
+        await coordinator.interrupt()
+
+        let interrupts = await transport.sentEnvelopes()
+            .filter { $0.type == "turn.interrupt" }
+        XCTAssertEqual(interrupts.count, 2)
+        XCTAssertEqual(interrupts.map(\.turnID), ["turn-retry", "turn-retry"])
+        XCTAssertNotEqual(interrupts.first?.requestID, interrupts.last?.requestID)
     }
 
     func testDestructiveApprovalNeedsConfirmationAndRepeatTapsStayDisabledThroughAck() async {
@@ -367,6 +736,130 @@ final class ConversationCoordinatorTests: XCTestCase {
         XCTAssertFalse(store.questionText.values.contains("ephemeral-secret"))
     }
 
+    func testDetachResetsInteractionAndHistoryLatches() async throws {
+        let transport = makeConnectedTransport()
+        let store = ConversationStore()
+        let coordinator = makeCoordinator(store: store, transport: transport)
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+        let approval = ChatTestFixtures.pendingApproval()
+        store.replaceWithSnapshot(
+            ConversationSnapshot(
+                snapshotGeneration: ChatTestFixtures.generation,
+                baseSequence: 1,
+                approvals: [approval],
+                connectionState: .streaming,
+                hasOlderHistory: true,
+                oldestItemID: "oldest"
+            )
+        )
+
+        await coordinator.respond(to: approval.id, decisionID: "deny")
+        await coordinator.loadOlderHistory()
+        let commandsBeforeDetach = await transport.sentEnvelopes()
+        let firstResponseID = try XCTUnwrap(
+            commandsBeforeDetach
+                .last { $0.type == "approval.respond" }?
+                .requestID
+        )
+        XCTAssertTrue(store.respondingInteractionIDs.contains(approval.id))
+        XCTAssertTrue(store.isLoadingOlderHistory)
+
+        await coordinator.detach()
+        XCTAssertTrue(store.respondingInteractionIDs.isEmpty)
+        XCTAssertFalse(store.isLoadingOlderHistory)
+
+        coordinator.start()
+        await waitUntil {
+            await transport.sentEnvelopes().filter { $0.type == "session.attach" }.count == 2
+        }
+        await coordinator.respond(to: approval.id, decisionID: "deny")
+        await coordinator.loadOlderHistory()
+        let commandsBeforeSnapshot = await transport.sentEnvelopes()
+        let secondResponseID = try XCTUnwrap(
+            commandsBeforeSnapshot
+                .last { $0.type == "approval.respond" }?
+                .requestID
+        )
+        XCTAssertTrue(store.respondingInteractionIDs.contains(approval.id))
+        XCTAssertTrue(store.isLoadingOlderHistory)
+
+        let commands = await transport.sentEnvelopes()
+        XCTAssertEqual(commands.filter { $0.type == "approval.respond" }.count, 2)
+        XCTAssertEqual(commands.filter { $0.type == "history.load" }.count, 2)
+        XCTAssertNotEqual(firstResponseID, secondResponseID)
+    }
+
+    func testFreshSnapshotResetsReconnectLatchesAndIgnoresStaleResponseErrors() async throws {
+        let transport = makeConnectedTransport()
+        let store = ConversationStore()
+        let coordinator = makeCoordinator(store: store, transport: transport)
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+        let approval = ChatTestFixtures.pendingApproval()
+        store.replaceWithSnapshot(
+            ConversationSnapshot(
+                snapshotGeneration: ChatTestFixtures.generation,
+                baseSequence: 1,
+                approvals: [approval],
+                connectionState: .streaming,
+                hasOlderHistory: true,
+                oldestItemID: "oldest"
+            )
+        )
+
+        await coordinator.respond(to: approval.id, decisionID: "deny")
+        await coordinator.loadOlderHistory()
+        let commandsBeforeSnapshot = await transport.sentEnvelopes()
+        let staleResponseID = try XCTUnwrap(
+            commandsBeforeSnapshot
+                .last { $0.type == "approval.respond" }?
+                .requestID
+        )
+        XCTAssertTrue(store.respondingInteractionIDs.contains(approval.id))
+        XCTAssertTrue(store.isLoadingOlderHistory)
+
+        await transport.yield(
+            .envelope(
+                try ChatTestFixtures.snapshotEvent(
+                    baseSequence: 2,
+                    approvals: [approval],
+                    hasOlderHistory: true
+                )
+            )
+        )
+        await waitUntil { store.state.lastAppliedSequence == 2 }
+        XCTAssertTrue(store.respondingInteractionIDs.isEmpty)
+        XCTAssertFalse(store.isLoadingOlderHistory)
+
+        await coordinator.respond(to: approval.id, decisionID: "deny")
+        await coordinator.loadOlderHistory()
+        XCTAssertTrue(store.respondingInteractionIDs.contains(approval.id))
+        XCTAssertTrue(store.isLoadingOlderHistory)
+
+        await transport.yield(
+            .envelope(
+                ChatTestFixtures.event(
+                    "error",
+                    sequence: 3,
+                    payload: .object([
+                        "requestId": .string(staleResponseID),
+                        "code": .string("staleResponse"),
+                        "message": .string("The pre-snapshot response was not accepted."),
+                    ])
+                )
+            )
+        )
+        await waitUntil { store.state.lastAppliedSequence == 3 }
+        XCTAssertTrue(
+            store.respondingInteractionIDs.contains(approval.id),
+            "An error for the pre-snapshot command must not unlock the new response."
+        )
+        let commands = await transport.sentEnvelopes()
+        XCTAssertEqual(commands.filter { $0.type == "approval.respond" }.count, 2)
+        XCTAssertEqual(commands.filter { $0.type == "history.load" }.count, 2)
+    }
+
     func testExplicitRetryReconnectsWithTheLastAppliedCursor() async {
         let transport = makeConnectedTransport()
         let store = ConversationStore()
@@ -374,6 +867,10 @@ final class ConversationCoordinatorTests: XCTestCase {
         coordinator.start()
         await waitUntil { store.state.connectionState == .streaming }
 
+        store.draft = "Before disconnect"
+        await coordinator.sendDraft()
+        store.setInteractionResponding("stale-interaction", isResponding: true)
+        store.beginLoadingOlderHistory()
         await transport.yield(
             .disconnected(
                 ChatTransportFailure(
@@ -384,9 +881,12 @@ final class ConversationCoordinatorTests: XCTestCase {
             )
         )
         await waitUntil { store.state.connectionState == .offlineAgentRunning }
+        XCTAssertTrue(store.respondingInteractionIDs.isEmpty)
+        XCTAssertFalse(store.isLoadingOlderHistory)
 
         coordinator.retry()
         XCTAssertEqual(store.state.connectionState, .connecting)
+        XCTAssertNil(store.state.lastErrorMessage)
         await waitUntil {
             await transport.sentEnvelopes().filter { $0.type == "session.attach" }.count == 2
         }
@@ -397,6 +897,12 @@ final class ConversationCoordinatorTests: XCTestCase {
             attachCommands.last?.payload["snapshotGeneration"]?.stringValue,
             ChatTestFixtures.generation
         )
+
+        store.draft = "After reconnect"
+        await coordinator.sendDraft()
+        let starts = await transport.sentEnvelopes().filter { $0.type == "turn.start" }
+        XCTAssertEqual(starts.count, 2)
+        XCTAssertEqual(starts.last?.payload["text"]?.stringValue, "After reconnect")
         await coordinator.detach()
     }
 

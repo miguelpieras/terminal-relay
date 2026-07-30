@@ -148,12 +148,12 @@ check; existing terminal sessions remain usable.
 For a chat that already exists, compare only its provider, repository, exact
 relay UUID, and `chat` presentation in the normal `status` response. Do not
 print the broker's NDJSON stream, provider app-server traffic, SDK message
-objects, or transcript files. A local app disconnect should leave that status
-row present with zero attached clients. **Stop Agent** should remove only the
-row with the matching relay UUID.
+objects, or transcript files. Closing the local conversation should leave that
+status row present with zero attached clients. Ending the conversation from
+project management should remove only the row with the matching relay UUID.
 
-If the app reports a sequence gap, leave the agent running and use
-**Reconnect** once. The client reattaches with its last cursor; the broker
+If the app reports a sequence gap, leave the agent running and use **Retry**
+once. The client reattaches with its last cursor; the broker
 replays its bounded window or rebuilds an authoritative snapshot from the
 provider. Persistent protocol errors should be reproduced with the app's
 sanitized `terminal-session` logs and the focused local suites:
@@ -163,11 +163,11 @@ sanitized `terminal-session` logs and the focused local suites:
 ./Server/Tests/terminal-relay-chat-session-tests.py
 ```
 
-**Open Terminal Fallback** is an explicit same-thread migration. If stopping
-the exact chat relay or releasing its provider lock fails, the operation must
-fail closed and must not open a PTY. Retry the migration or stop that exact
-agent before starting a terminal session; never bypass the lock or run both
-modes against the same provider thread.
+If native chat is unavailable, Terminal Relay fails closed and does not open a
+PTY. Update the worker runtime, refresh its capabilities, and retry the native
+conversation. Already-running legacy terminal sessions remain separate; never
+start a terminal against the same provider thread to bypass a native-chat
+failure or provider lock.
 
 ## Thread catalog or built-in MCP is unavailable
 

@@ -632,57 +632,6 @@ final class SessionManager: ObservableObject {
         return await stopAgent(sessionID: sessionID, on: worker, using: service)
     }
 
-    @discardableResult
-    func openTerminalFallbackAfterRefresh(
-        sessionID: UUID,
-        project: ProjectProfile,
-        on worker: ServerProfile,
-        projects: [ProjectProfile],
-        launchDefaults: AgentLaunchDefaults,
-        using service: WorkerSessionService
-    ) async -> TerminalSession? {
-        guard let session = sessions.first(where: { $0.id == sessionID }),
-              session.projectID == project.id,
-              session.projectName == project.displayName,
-              session.serverKey == worker.concurrencyKey,
-              session.presentation == .chat,
-              let threadID = session.threadID,
-              await refresh(
-                  worker: worker,
-                  projects: projects,
-                  launchDefaults: launchDefaults,
-                  using: service
-              ),
-              await stopAgent(
-                  sessionID: sessionID,
-                  on: worker,
-                  using: service
-              ),
-              let snapshot = await service.resumeThread(
-                  kind: session.kind,
-                  repositoryName: project.displayName,
-                  threadID: threadID,
-                  launchDefaults: launchDefaults,
-                  preferredPresentation: .terminal,
-                  on: worker
-              ),
-              snapshot.presentation == .terminal else {
-            return nil
-        }
-
-        guard let result = openConfirmedRemote(
-            project: project,
-            on: worker,
-            snapshot: snapshot,
-            selectResult: true,
-            launchDefaults: launchDefaults
-        ), let terminalSession = result.localSession else {
-            return nil
-        }
-        removeSession(id: sessionID)
-        return terminalSession
-    }
-
     private func append(_ session: TerminalSession) {
         sessions.append(session)
         observe(session)

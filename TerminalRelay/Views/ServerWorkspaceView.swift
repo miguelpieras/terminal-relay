@@ -27,7 +27,8 @@ struct ProjectWorkspaceView: View {
     @State private var isShowingCodexResets = false
     @State private var isWritingCommitMessage = false
     @State private var commitMessage = ""
-    @State private var isShowingEnvironmentSidebar = !ScreenshotDemoMode.isEnabled
+    @State private var isShowingEnvironmentSidebar =
+        ProjectWorkspaceLayoutPolicy.showsEnvironmentSidebarByDefault
 
     private var launchDefaults: AgentLaunchDefaults {
         AgentLaunchDefaults(
@@ -63,17 +64,19 @@ struct ProjectWorkspaceView: View {
     var body: some View {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
-                if let warning = workerSessionService.updateWarning(for: worker.id) {
+                if selectedSession == nil,
+                   let warning = workerSessionService.updateWarning(for: worker.id) {
                     workerUpdateWarningBanner(warning)
                     Divider()
                 }
 
-                if let error = workerSessionService.error(for: worker.id) {
+                if selectedSession == nil,
+                   let error = workerSessionService.error(for: worker.id) {
                     workerSessionErrorBanner(error)
                     Divider()
                 }
 
-                if let conflictingOccupant {
+                if selectedSession == nil, let conflictingOccupant {
                     conflictBanner(conflictingOccupant)
                     Divider()
                 }
@@ -726,6 +729,10 @@ struct ProjectWorkspaceView: View {
 
 }
 
+enum ProjectWorkspaceLayoutPolicy {
+    static let showsEnvironmentSidebarByDefault = false
+}
+
 private struct AccountUsageCard: View {
     let worker: ServerProfile
     let kind: AgentKind
@@ -1271,94 +1278,74 @@ private struct TerminalPane: View {
     let worker: ServerProfile
     let launchDefaults: AgentLaunchDefaults
 
-    @State private var isConfirmingStop = false
-    @State private var isConfirmingTerminalFallback = false
-    @State private var isOpeningTerminalFallback = false
+    @State private var nativeEscapePolicy = ComposerEscapePolicy()
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 9) {
-                Label(session.accountLabel, systemImage: "person.crop.circle")
-                Text("·")
-                    .foregroundStyle(.tertiary)
-                Text(session.status.label)
-                    .foregroundStyle(.secondary)
-
-                if let terminalTitle = session.terminalTitle, !terminalTitle.isEmpty {
+            if !session.usesNativeChat {
+                HStack(spacing: 9) {
+                    Label(session.accountLabel, systemImage: "person.crop.circle")
                     Text("·")
                         .foregroundStyle(.tertiary)
-                    Text(terminalTitle)
+                    Text(session.status.label)
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
 
-                if let clientCount = session.remoteAttachedClientCount {
-                    Text("·")
-                        .foregroundStyle(.tertiary)
-                    Text("\(clientCount) \(clientCount == 1 ? "client" : "clients")")
-                        .foregroundStyle(.secondary)
-                }
+                    if let terminalTitle = session.terminalTitle, !terminalTitle.isEmpty {
+                        Text("·")
+                            .foregroundStyle(.tertiary)
+                        Text(terminalTitle)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
 
-                Spacer()
+                    if let clientCount = session.remoteAttachedClientCount {
+                        Text("·")
+                            .foregroundStyle(.tertiary)
+                        Text("\(clientCount) \(clientCount == 1 ? "client" : "clients")")
+                            .foregroundStyle(.secondary)
+                    }
 
-                if session.status.isLocallyAttached {
-                    Button("Disconnect") {
-                        sessionManager.disconnect(sessionID: session.id)
-                    }
-                    .buttonStyle(.borderless)
-                } else if session.status.canReconnect {
-                    Button("Reconnect") {
-                        reconnect()
-                    }
-                    .buttonStyle(.borderless)
-                } else if !session.status.occupiesSlot {
-                    Button("Close") {
-                        sessionManager.close(sessionID: session.id)
-                    }
-                    .buttonStyle(.borderless)
-                }
+                    Spacer()
 
-                if session.status.occupiesSlot {
-                    Button("Stop Agent…", role: .destructive) {
-                        isConfirmingStop = true
+                    if session.status.canReconnect {
+                        Button("Reconnect") {
+                            reconnect()
+                        }
+                        .buttonStyle(.borderless)
+                    } else if !session.status.occupiesSlot {
+                        Button("Close") {
+                            sessionManager.close(sessionID: session.id)
+                        }
+                        .buttonStyle(.borderless)
                     }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.red)
-                    .disabled(session.status == .stopping)
                 }
+                .font(.caption)
+                .padding(.horizontal, 12)
+                .frame(height: 34)
+                .background(Color(nsColor: .controlBackgroundColor))
             }
-            .font(.caption)
-            .padding(.horizontal, 12)
-            .frame(height: 34)
-            .background(Color(nsColor: .controlBackgroundColor))
 
             if session.usesNativeChat, let coordinator = session.chatCoordinator {
                 ZStack {
                     ConversationView(
                         coordinator: coordinator,
                         showsComposer: false,
-                        startsCoordinator: false,
-                        onOpenTerminalFallback: {
-                            isConfirmingTerminalFallback = true
-                        }
+                        startsCoordinator: false
                     )
                     .onAppear {
                         session.startIfNeeded()
                         coordinator.start()
                     }
 
-                    if isOpeningTerminalFallback || session.status == .stopping {
-                        sessionProgressOverlay(
-                            isOpeningTerminalFallback
-                                ? "Opening terminal fallback…"
-                                : "Stopping remote session…"
-                        )
+                    if session.status == .stopping {
+                        sessionProgressOverlay("Stopping remote session…")
                     }
                 }
 
                 AgentComposerView(
                     session: session,
-                    worker: worker
+                    worker: worker,
+                    onNativeEscape: handleNativeEscape
                 )
             } else {
                 ZStack {
@@ -1393,35 +1380,18 @@ private struct TerminalPane: View {
 
                 AgentComposerView(
                     session: session,
-                    worker: worker
+                    worker: worker,
+                    onNativeEscape: { _ in }
                 )
             }
         }
-        .alert("Stop \(session.kind.displayName) agent?", isPresented: $isConfirmingStop) {
-            Button("Cancel", role: .cancel) {}
-            Button("Stop Agent", role: .destructive) {
-                Task {
-                    _ = await sessionManager.stopAgentAfterRefresh(
-                        sessionID: session.id,
-                        on: worker,
-                        projects: projectStore.projects,
-                        launchDefaults: launchDefaults,
-                        using: workerSessionService
-                    )
-                }
+        .onKeyPress(.escape, phases: [.down, .repeat]) { keyPress in
+            guard session.usesNativeChat,
+                  session.chatCoordinator?.store.state.activeTurnID != nil else {
+                return .ignored
             }
-        } message: {
-            Text("This ends the persistent remote agent for \(project.displayName). Disconnect instead if you want it to keep running.")
-        }
-        .alert("Open terminal fallback?", isPresented: $isConfirmingTerminalFallback) {
-            Button("Cancel", role: .cancel) {}
-            Button("Open Terminal") {
-                openTerminalFallback()
-            }
-        } message: {
-            Text(
-                "Terminal Relay will stop native chat, verify the provider thread is released, and reopen this same conversation in its terminal interface. Both modes will never run at the same time."
-            )
+            handleNativeEscape(isRepeat: keyPress.phase.contains(.repeat))
+            return .handled
         }
     }
 
@@ -1450,19 +1420,17 @@ private struct TerminalPane: View {
         }
     }
 
-    private func openTerminalFallback() {
-        guard !isOpeningTerminalFallback else { return }
-        isOpeningTerminalFallback = true
-        Task {
-            _ = await sessionManager.openTerminalFallbackAfterRefresh(
-                sessionID: session.id,
-                project: project,
-                on: worker,
-                projects: projectStore.projects,
-                launchDefaults: launchDefaults,
-                using: workerSessionService
-            )
-            isOpeningTerminalFallback = false
+    private func handleNativeEscape(isRepeat: Bool) {
+        switch nativeEscapePolicy.action(
+            activeTurnID: session.chatCoordinator?.store.state.activeTurnID,
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            isRepeat: isRepeat
+        ) {
+        case .ignored, .armed:
+            break
+        case .interrupt:
+            session.interrupt()
         }
     }
+
 }

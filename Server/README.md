@@ -226,10 +226,10 @@ listener or transcript database. See
 limits, replay behavior, interaction mapping, and repository-preview boundary.
 
 If either adapter is unavailable or an older worker does not advertise chat,
-the clients retain the existing PTY terminal path. Moving an active chat to
-that fallback first interrupts or finishes the turn, stops the exact chat
-relay, and resumes the same provider thread only after its lock is released.
-The two modes never run concurrently against one provider thread.
+new and resumed native conversations fail closed until the worker is updated.
+The clients can still display an already-running legacy PTY session, but they
+never migrate an active chat into one or run both modes against one provider
+thread.
 
 ## Install or update the session runtime
 

@@ -383,25 +383,14 @@ final class WorkerSessionServiceTests: XCTestCase {
         )
     }
 
-    func testStartReturnsAndStoresTheExactSessionSnapshot() async {
+    func testStartFailsClosedWhenNativeChatIsUnavailable() async {
         let worker = makeWorker()
-        let instanceToken = "01234567-89ab-" + "4def-8abc-0123456789ab"
         let recorder = WorkerSessionCommandRecorder(
             results: [
                 WorkerSessionCommandResult(
                     exitCode: 64,
                     standardOutput: Data(),
                     standardError: Data("unsupported command".utf8)
-                ),
-                WorkerSessionCommandResult(
-                    exitCode: 0,
-                    standardOutput: Data(
-                        """
-                        __TERMINAL_RELAY_SESSION_V1__
-                        session|codex|terminal-relay|0|\(instanceToken)
-                        """.utf8
-                    ),
-                    standardError: Data()
                 )
             ]
         )
@@ -416,17 +405,8 @@ final class WorkerSessionServiceTests: XCTestCase {
             on: worker
         )
 
-        XCTAssertEqual(
-            snapshot,
-            WorkerSessionSnapshot(
-                kind: .codex,
-                repositoryName: "terminal-relay",
-                attachedClientCount: 0,
-                instanceToken: instanceToken
-            )
-        )
-        XCTAssertEqual(service.response(for: worker.id)?.sessions.first, snapshot)
-        XCTAssertEqual(service.response(for: worker.id)?.sessions.count, 1)
+        XCTAssertNil(snapshot)
+        XCTAssertNil(service.response(for: worker.id))
         XCTAssertEqual(
             recorder.configurations,
             [
@@ -434,34 +414,79 @@ final class WorkerSessionServiceTests: XCTestCase {
                     for: worker,
                     kind: .codex,
                     repositoryName: "terminal-relay"
-                ),
-                SSHCommandBuilder.workerSessionStartConfiguration(
-                    for: worker,
-                    kind: .codex,
-                    repositoryName: "terminal-relay",
-                    launchDefaults: .standard
                 )
             ]
         )
         XCTAssertFalse(service.isStarting(worker: worker, kind: .codex))
-        XCTAssertNil(service.error(for: worker.id))
+        XCTAssertEqual(
+            service.error(for: worker.id),
+            "Native chat is unavailable on this worker. Update it and try again."
+        )
     }
 
-    func testStartRejectsAResponseForAnyOtherSession() async {
+    func testStartTreatsCapabilityConnectionFailureAsRetryableStartFailure() async {
         let worker = makeWorker()
         let recorder = WorkerSessionCommandRecorder(
             results: [
                 WorkerSessionCommandResult(
-                    exitCode: 64,
+                    exitCode: 255,
                     standardOutput: Data(),
-                    standardError: Data("unsupported command".utf8)
+                    standardError: Data("connection interrupted".utf8)
+                )
+            ]
+        )
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+
+        let snapshot = await service.start(
+            kind: .codex,
+            repositoryName: "terminal-relay",
+            launchDefaults: .standard,
+            on: worker
+        )
+
+        XCTAssertNil(snapshot)
+        XCTAssertEqual(
+            service.error(for: worker.id),
+            "The worker could not start this agent."
+        )
+        XCTAssertNil(service.updateWarning(for: worker.id))
+        XCTAssertEqual(
+            recorder.configurations,
+            [
+                SSHCommandBuilder.workerChatCapabilitiesConfiguration(
+                    for: worker,
+                    kind: .codex,
+                    repositoryName: "terminal-relay"
+                )
+            ]
+        )
+    }
+
+    func testStartRejectsAnInvalidNativeChatResponse() async {
+        let worker = makeWorker()
+        let capabilities =
+            #"{"protocolVersion":1,"features":["streaming"],"supportsHistory":true,"supportsFilePreview":true,"supportsApprovals":true,"supportsQuestions":true,"supportsAttachments":false}"#
+        let recorder = WorkerSessionCommandRecorder(
+            results: [
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data(
+                        """
+                        \(WorkerChatProtocol.marker)
+                        {"provider":"codex","available":true,"capabilities":\(capabilities),"reason":null}
+
+                        """.utf8
+                    ),
+                    standardError: Data()
                 ),
                 WorkerSessionCommandResult(
                     exitCode: 0,
                     standardOutput: Data(
                         """
-                        __TERMINAL_RELAY_SESSION_V1__
-                        session|codex|another-repository|0|01234567-89ab-4def-8abc-0123456789ab
+                        \(WorkerSessionProtocol.marker)
+                        session|codex|terminal-relay|0|01234567-89ab-4def-8abc-0123456789ab
                         """.utf8
                     ),
                     standardError: Data()
@@ -685,19 +710,28 @@ final class WorkerSessionServiceTests: XCTestCase {
         let worker = makeWorker()
         let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         let instanceID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        let capabilities =
+            #"{"protocolVersion":1,"features":["streaming"],"supportsHistory":true,"supportsFilePreview":true,"supportsApprovals":true,"supportsQuestions":true,"supportsAttachments":false}"#
         let recorder = WorkerSessionCommandRecorder(
             results: [
                 WorkerSessionCommandResult(
-                    exitCode: 64,
-                    standardOutput: Data(),
-                    standardError: Data("unsupported command".utf8)
+                    exitCode: 0,
+                    standardOutput: Data(
+                        """
+                        \(WorkerChatProtocol.marker)
+                        {"provider":"codex","available":true,"capabilities":\(capabilities),"reason":null}
+
+                        """.utf8
+                    ),
+                    standardError: Data()
                 ),
                 WorkerSessionCommandResult(
                     exitCode: 0,
                     standardOutput: Data(
                         """
-                        \(WorkerSessionProtocol.marker)
-                        session|codex|terminal-relay|0|\(instanceID)|200||0|\(threadID)
+                        \(WorkerChatProtocol.marker)
+                        {"relayId":"\(instanceID)","provider":"codex","providerThreadId":"\(threadID)","capabilities":\(capabilities),"launchOptions":{"model":"gpt-example"}}
+
                         """.utf8
                     ),
                     standardError: Data()
@@ -739,13 +773,97 @@ final class WorkerSessionServiceTests: XCTestCase {
         )
         XCTAssertEqual(
             recorder.configurations.dropFirst().first,
-            SSHCommandBuilder.workerThreadResumeConfiguration(
+            SSHCommandBuilder.workerChatStartConfiguration(
                 for: worker,
                 kind: .codex,
                 repositoryName: "terminal-relay",
                 threadID: threadID,
                 launchDefaults: .standard
             )
+        )
+    }
+
+    func testResumeThreadFailsClosedWhenNativeChatIsUnavailable() async {
+        let worker = makeWorker()
+        let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let recorder = WorkerSessionCommandRecorder(
+            results: [
+                WorkerSessionCommandResult(
+                    exitCode: 64,
+                    standardOutput: Data(),
+                    standardError: Data("unsupported command".utf8)
+                )
+            ]
+        )
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+
+        let snapshot = await service.resumeThread(
+            kind: .codex,
+            repositoryName: "terminal-relay",
+            threadID: threadID,
+            launchDefaults: .standard,
+            on: worker
+        )
+
+        XCTAssertNil(snapshot)
+        XCTAssertNil(service.response(for: worker.id))
+        XCTAssertEqual(
+            service.error(for: worker.id),
+            "Native chat is unavailable on this worker. Update it and try again."
+        )
+        XCTAssertEqual(
+            recorder.configurations,
+            [
+                SSHCommandBuilder.workerChatCapabilitiesConfiguration(
+                    for: worker,
+                    kind: .codex,
+                    repositoryName: "terminal-relay"
+                )
+            ]
+        )
+    }
+
+    func testResumeThreadTreatsCapabilityConnectionFailureAsRetryableThreadFailure() async {
+        let worker = makeWorker()
+        let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let recorder = WorkerSessionCommandRecorder(
+            results: [
+                WorkerSessionCommandResult(
+                    exitCode: 255,
+                    standardOutput: Data(),
+                    standardError: Data("connection interrupted".utf8)
+                )
+            ]
+        )
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+
+        let snapshot = await service.resumeThread(
+            kind: .codex,
+            repositoryName: "terminal-relay",
+            threadID: threadID,
+            launchDefaults: .standard,
+            on: worker
+        )
+
+        XCTAssertNil(snapshot)
+        XCTAssertEqual(
+            service.error(for: worker.id),
+            "The worker could not complete that thread action."
+        )
+        XCTAssertNil(service.updateWarning(for: worker.id))
+        XCTAssertEqual(
+            recorder.configurations,
+            [
+                SSHCommandBuilder.workerChatCapabilitiesConfiguration(
+                    for: worker,
+                    kind: .codex,
+                    repositoryName: "terminal-relay"
+                )
+            ]
         )
     }
 

@@ -743,10 +743,16 @@ final class SessionManagerTests: XCTestCase {
             recorder.configurations,
             [
                 SSHCommandBuilder.workerSessionStatusConfiguration(for: server),
-                SSHCommandBuilder.workerSessionStartConfiguration(
+                SSHCommandBuilder.workerChatCapabilitiesConfiguration(
+                    for: server,
+                    kind: .codex,
+                    repositoryName: project.displayName
+                ),
+                SSHCommandBuilder.workerChatStartConfiguration(
                     for: server,
                     kind: .codex,
                     repositoryName: project.displayName,
+                    threadID: nil,
                     launchDefaults: .standard
                 )
             ]
@@ -796,13 +802,14 @@ final class SessionManagerTests: XCTestCase {
             manager.sessions.first(where: { $0.instanceToken == statusToken })?.status,
             .remoteRunning
         )
-        XCTAssertEqual(recorder.configurations.count, 2)
+        XCTAssertEqual(recorder.configurations.count, 3)
         XCTAssertEqual(
             recorder.configurations.last,
-            SSHCommandBuilder.workerSessionStartConfiguration(
+            SSHCommandBuilder.workerChatStartConfiguration(
                 for: server,
                 kind: .claude,
                 repositoryName: project.displayName,
+                threadID: nil,
                 launchDefaults: .standard
             )
         )
@@ -848,10 +855,16 @@ final class SessionManagerTests: XCTestCase {
             recorder.configurations,
             [
                 SSHCommandBuilder.workerSessionStatusConfiguration(for: server),
-                SSHCommandBuilder.workerSessionStartConfiguration(
+                SSHCommandBuilder.workerChatCapabilitiesConfiguration(
+                    for: server,
+                    kind: .codex,
+                    repositoryName: project.displayName
+                ),
+                SSHCommandBuilder.workerChatStartConfiguration(
                     for: server,
                     kind: .codex,
                     repositoryName: project.displayName,
+                    threadID: nil,
                     launchDefaults: .standard
                 )
             ]
@@ -1617,174 +1630,6 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertTrue(recorder.configurations.isEmpty)
     }
 
-    func testTerminalFallbackStopsExactChatBeforeResumingTheSameProviderThread() async {
-        let server = makeServer(name: "Worker 1", host: "worker-1")
-        let project = makeProject(name: "Terminal Relay", server: server)
-        let manager = SessionManager()
-        let chatRelayID = "01234567-89ab-4def-8abc-0123456789ab"
-        let terminalRelayID = "11111111-2222-4333-8444-555555555555"
-        let threadID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
-        let chatSnapshot = WorkerSessionSnapshot(
-            kind: .codex,
-            repositoryName: project.displayName,
-            attachedClientCount: 1,
-            instanceToken: chatRelayID,
-            threadID: threadID,
-            presentation: .chat
-        )
-        manager.reconcile(
-            worker: server,
-            projects: [project],
-            response: WorkerSessionResponse(
-                projects: [project.displayName],
-                sessions: [chatSnapshot]
-            ),
-            launchDefaults: .standard
-        )
-        let chatSession = try! XCTUnwrap(
-            manager.activeSession(projectID: project.id, kind: .codex)
-        )
-        let recorder = WorkerSessionCommandRecorder(
-            results: [
-                Self.statusResult(snapshot: chatSnapshot),
-                WorkerSessionCommandResult(
-                    exitCode: 0,
-                    standardOutput: Data(),
-                    standardError: Data()
-                ),
-                Self.statusResult(
-                    snapshot: WorkerSessionSnapshot(
-                        kind: .codex,
-                        repositoryName: project.displayName,
-                        attachedClientCount: 0,
-                        instanceToken: terminalRelayID,
-                        threadID: threadID,
-                        presentation: .terminal
-                    )
-                ),
-                Self.emptyThreadCatalogResult(),
-                Self.emptyThreadCatalogResult(),
-            ]
-        )
-        let service = WorkerSessionService { configuration in
-            await recorder.run(configuration)
-        }
-
-        let terminalSession = await manager.openTerminalFallbackAfterRefresh(
-            sessionID: chatSession.id,
-            project: project,
-            on: server,
-            projects: [project],
-            launchDefaults: .standard,
-            using: service
-        )
-
-        XCTAssertEqual(terminalSession?.presentation, .terminal)
-        XCTAssertEqual(terminalSession?.threadID, threadID)
-        XCTAssertEqual(terminalSession?.instanceToken, terminalRelayID)
-        XCTAssertFalse(terminalSession?.usesNativeChat ?? true)
-        XCTAssertEqual(manager.sessions(forProjectID: project.id).count, 1)
-        XCTAssertEqual(manager.selectedSessionID, terminalSession?.id)
-        XCTAssertFalse(manager.sessions.contains { $0.instanceToken == chatRelayID })
-        XCTAssertEqual(
-            recorder.configurations,
-            [
-                SSHCommandBuilder.workerSessionStatusConfiguration(for: server),
-                SSHCommandBuilder.workerChatStopConfiguration(
-                    for: server,
-                    kind: .codex,
-                    repositoryName: project.displayName,
-                    instanceToken: chatRelayID
-                ),
-                SSHCommandBuilder.workerThreadResumeConfiguration(
-                    for: server,
-                    kind: .codex,
-                    repositoryName: project.displayName,
-                    threadID: threadID,
-                    launchDefaults: .standard
-                ),
-                SSHCommandBuilder.workerThreadListConfiguration(
-                    for: server,
-                    kind: .codex,
-                    repositoryName: project.displayName,
-                    archived: false,
-                    cursor: nil
-                ),
-                SSHCommandBuilder.workerThreadListConfiguration(
-                    for: server,
-                    kind: .claude,
-                    repositoryName: project.displayName,
-                    archived: false,
-                    cursor: nil
-                ),
-            ]
-        )
-    }
-
-    func testTerminalFallbackFailsClosedWhenExactChatStopFails() async {
-        let server = makeServer(name: "Worker 1", host: "worker-1")
-        let project = makeProject(name: "Terminal Relay", server: server)
-        let manager = SessionManager()
-        let relayID = "01234567-89ab-4def-8abc-0123456789ab"
-        let chatSnapshot = WorkerSessionSnapshot(
-            kind: .claude,
-            repositoryName: project.displayName,
-            attachedClientCount: 1,
-            instanceToken: relayID,
-            threadID: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
-            presentation: .chat
-        )
-        manager.reconcile(
-            worker: server,
-            projects: [project],
-            response: WorkerSessionResponse(
-                projects: [project.displayName],
-                sessions: [chatSnapshot]
-            ),
-            launchDefaults: .standard
-        )
-        let chatSession = try! XCTUnwrap(
-            manager.activeSession(projectID: project.id, kind: .claude)
-        )
-        let recorder = WorkerSessionCommandRecorder(
-            results: [
-                Self.statusResult(snapshot: chatSnapshot),
-                WorkerSessionCommandResult(
-                    exitCode: 1,
-                    standardOutput: Data(),
-                    standardError: Data("safe failure".utf8)
-                ),
-            ]
-        )
-        let service = WorkerSessionService { configuration in
-            await recorder.run(configuration)
-        }
-
-        let fallback = await manager.openTerminalFallbackAfterRefresh(
-            sessionID: chatSession.id,
-            project: project,
-            on: server,
-            projects: [project],
-            launchDefaults: .standard,
-            using: service
-        )
-
-        XCTAssertNil(fallback)
-        XCTAssertTrue(manager.activeSession(projectID: project.id, kind: .claude) === chatSession)
-        XCTAssertEqual(chatSession.status, .remoteRunning)
-        XCTAssertEqual(manager.sessions.count, 1)
-        XCTAssertEqual(recorder.configurations.count, 2)
-        XCTAssertEqual(
-            recorder.configurations.last,
-            SSHCommandBuilder.workerChatStopConfiguration(
-                for: server,
-                kind: .claude,
-                repositoryName: project.displayName,
-                instanceToken: relayID
-            )
-        )
-    }
-
     func testSidebarSessionOrderPersistsByRemoteInstanceToken() {
         let suiteName = "TerminalRelayTests.SessionManager.SidebarOrder.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -1948,6 +1793,53 @@ private extension SessionManager {
     }
 }
 
+private func sessionManagerTestChatCapabilitiesResult(
+    for configuration: SSHLaunchConfiguration
+) -> WorkerSessionCommandResult {
+    let command = configuration.arguments.last ?? ""
+    let kind: AgentKind = command.contains("'chat-capabilities-v1' 'claude'")
+        ? .claude
+        : .codex
+    let capabilities =
+        #"{"protocolVersion":1,"features":["streaming"],"supportsHistory":true,"supportsFilePreview":true,"supportsApprovals":true,"supportsQuestions":true,"supportsAttachments":false}"#
+    return WorkerSessionCommandResult(
+        exitCode: 0,
+        standardOutput: Data(
+            """
+            \(WorkerChatProtocol.marker)
+            {"provider":"\(kind.rawValue)","available":true,"capabilities":\(capabilities),"reason":null}
+
+            """.utf8
+        ),
+        standardError: Data()
+    )
+}
+
+private func sessionManagerTestChatStartResult(
+    from result: WorkerSessionCommandResult
+) -> WorkerSessionCommandResult {
+    guard result.exitCode == 0,
+          let response = try? WorkerSessionProtocol.parse(result.standardOutput),
+          response.sessions.count == 1,
+          let snapshot = response.sessions.first else {
+        return result
+    }
+    let capabilities =
+        #"{"protocolVersion":1,"features":["streaming"],"supportsHistory":true,"supportsFilePreview":true,"supportsApprovals":true,"supportsQuestions":true,"supportsAttachments":false}"#
+    let threadID = snapshot.threadID ?? snapshot.instanceToken
+    return WorkerSessionCommandResult(
+        exitCode: 0,
+        standardOutput: Data(
+            """
+            \(WorkerChatProtocol.marker)
+            {"relayId":"\(snapshot.instanceToken)","provider":"\(snapshot.kind.rawValue)","providerThreadId":"\(threadID)","capabilities":\(capabilities),"launchOptions":{}}
+
+            """.utf8
+        ),
+        standardError: Data()
+    )
+}
+
 @MainActor
 private final class WorkerSessionCommandRecorder {
     private(set) var configurations: [SSHLaunchConfiguration] = []
@@ -1958,8 +1850,7 @@ private final class WorkerSessionCommandRecorder {
     }
 
     func run(_ configuration: SSHLaunchConfiguration) async -> WorkerSessionCommandResult {
-        if configuration.arguments.last?.contains("'update-status'") == true
-            || configuration.arguments.last?.contains("'chat-capabilities-v1'") == true {
+        if configuration.arguments.last?.contains("'update-status'") == true {
             return WorkerSessionCommandResult(
                 exitCode: 64,
                 standardOutput: Data(),
@@ -1967,7 +1858,14 @@ private final class WorkerSessionCommandRecorder {
             )
         }
         configurations.append(configuration)
-        return results.removeFirst()
+        if configuration.arguments.last?.contains("'chat-capabilities-v1'") == true {
+            return sessionManagerTestChatCapabilitiesResult(for: configuration)
+        }
+        let result = results.removeFirst()
+        if configuration.arguments.last?.contains("'chat-start-v1'") == true {
+            return sessionManagerTestChatStartResult(from: result)
+        }
+        return result
     }
 }
 
@@ -1977,18 +1875,24 @@ private final class BlockingWorkerSessionCommandRecorder {
     private var continuation: CheckedContinuation<WorkerSessionCommandResult, Never>?
 
     func run(_ configuration: SSHLaunchConfiguration) async -> WorkerSessionCommandResult {
-        if configuration.arguments.last?.contains("'update-status'") == true
-            || configuration.arguments.last?.contains("'chat-capabilities-v1'") == true {
+        if configuration.arguments.last?.contains("'update-status'") == true {
             return WorkerSessionCommandResult(
                 exitCode: 64,
                 standardOutput: Data(),
                 standardError: Data()
             )
         }
+        if configuration.arguments.last?.contains("'chat-capabilities-v1'") == true {
+            return sessionManagerTestChatCapabilitiesResult(for: configuration)
+        }
         callCount += 1
-        return await withCheckedContinuation { continuation in
+        let result = await withCheckedContinuation { continuation in
             self.continuation = continuation
         }
+        if configuration.arguments.last?.contains("'chat-start-v1'") == true {
+            return sessionManagerTestChatStartResult(from: result)
+        }
+        return result
     }
 
     func finish(with result: WorkerSessionCommandResult) {

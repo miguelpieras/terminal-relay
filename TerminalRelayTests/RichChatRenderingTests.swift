@@ -2,6 +2,16 @@ import XCTest
 @testable import TerminalRelay
 
 final class RichChatRenderingTests: XCTestCase {
+    func testSharedInteractionTargetPolicyPreservesCompactMacLayout() {
+        XCTAssertEqual(ChatInteractionTargetLayout.minimumIOSDimension, 44)
+        XCTAssertFalse(ChatInteractionTargetLayout.appliesMinimumDimension)
+        XCTAssertEqual(ChatInteractionTargetLayout.jumpButtonDimension, 28)
+        XCTAssertEqual(ChatInteractionTargetLayout.jumpButtonOuterPadding, 16)
+        XCTAssertEqual(ChatInteractionTargetLayout.codeHeaderVerticalPadding, 9)
+        XCTAssertEqual(ChatInteractionTargetLayout.compactControlVerticalPadding, 3)
+        XCTAssertEqual(ChatInteractionTargetLayout.attachmentChipVerticalPadding, 6)
+    }
+
     func testViewportPolicyAnchorsInitialSnapshotOnceAndPreservesReadingPosition() {
         var policy = ConversationViewportPolicy()
         XCTAssertFalse(policy.acceptsBottomMeasurements)
@@ -82,6 +92,95 @@ final class RichChatRenderingTests: XCTestCase {
                 canSend: false
             ),
             .ignore
+        )
+    }
+
+    func testDoubleEscapePolicyIsTurnAwareAndSuppressesDuplicates() {
+        var policy = ComposerEscapePolicy()
+
+        XCTAssertEqual(
+            policy.action(activeTurnID: nil, timestamp: 10, isRepeat: false),
+            .ignored
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-1", timestamp: 11, isRepeat: false),
+            .armed
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-1", timestamp: 11.2, isRepeat: true),
+            .ignored
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-1", timestamp: 11.02, isRepeat: false),
+            .ignored,
+            "A duplicate delivery from the same physical press must not interrupt."
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-1", timestamp: 11.3, isRepeat: false),
+            .interrupt
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-1", timestamp: 11.32, isRepeat: false),
+            .ignored,
+            "Duplicate delivery immediately after dispatch must not rearm."
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-1", timestamp: 11.5, isRepeat: false),
+            .armed,
+            "A rejected interrupt can be retried with a fresh deliberate sequence."
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-1", timestamp: 11.8, isRepeat: false),
+            .interrupt
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-2", timestamp: 12, isRepeat: false),
+            .armed,
+            "A different active turn starts a fresh double-Escape sequence."
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-2", timestamp: 12.9, isRepeat: false),
+            .armed,
+            "An expired sequence rearms instead of interrupting."
+        )
+        XCTAssertEqual(
+            policy.action(activeTurnID: "turn-2", timestamp: 13.1, isRepeat: false),
+            .interrupt
+        )
+    }
+
+    func testEscapeRouterConsumesOnlyActiveTurnEscapesAndRoutesOneInterruptPerSequence() {
+        var router = ComposerEscapeRouter()
+
+        XCTAssertEqual(
+            router.route(activeTurnID: nil, timestamp: 30, isRepeat: false),
+            .passThrough
+        )
+        XCTAssertEqual(
+            router.route(activeTurnID: "turn-1", timestamp: 31, isRepeat: false),
+            .consume
+        )
+        XCTAssertEqual(
+            router.route(activeTurnID: "turn-1", timestamp: 31.01, isRepeat: false),
+            .consume,
+            "Duplicate ancestor delivery remains consumed without interrupting."
+        )
+        XCTAssertEqual(
+            router.route(activeTurnID: "turn-1", timestamp: 31.3, isRepeat: false),
+            .interrupt
+        )
+        XCTAssertEqual(
+            router.route(activeTurnID: "turn-1", timestamp: 31.31, isRepeat: false),
+            .consume
+        )
+        XCTAssertEqual(
+            router.route(activeTurnID: "turn-1", timestamp: 31.6, isRepeat: false),
+            .consume
+        )
+        XCTAssertEqual(
+            router.route(activeTurnID: "turn-1", timestamp: 31.9, isRepeat: false),
+            .interrupt,
+            "The same active turn can retry after a rejected interrupt."
         )
     }
 

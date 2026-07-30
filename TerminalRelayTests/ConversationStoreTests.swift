@@ -81,6 +81,98 @@ final class ConversationStoreTests: XCTestCase {
         XCTAssertEqual(store.state.oldestItemID, "message-1")
     }
 
+    func testIdleResumeSnapshotInfersActiveTurnFromStreamingItemOnly() throws {
+        let activeTurnID = "10000000-0000-4000-8000-000000000001"
+        let streamingItem = ConversationItem.message(
+            ChatMessage(
+                id: "assistant-stream",
+                turnID: activeTurnID,
+                role: .assistant,
+                text: "Partial response",
+                isStreaming: true
+            )
+        )
+        let store = ConversationStore()
+
+        try store.apply(
+            ChatTestFixtures.snapshotEvent(
+                baseSequence: 1,
+                items: [streamingItem],
+                turnState: .idle
+            )
+        )
+
+        XCTAssertEqual(store.state.turnState, .running)
+        XCTAssertEqual(store.state.activeTurnID, activeTurnID)
+
+        let completedStore = ConversationStore()
+        try completedStore.apply(
+            ChatTestFixtures.snapshotEvent(
+                baseSequence: 1,
+                items: [streamingItem],
+                turnState: .completed
+            )
+        )
+        XCTAssertEqual(completedStore.state.turnState, .completed)
+        XCTAssertNil(completedStore.state.activeTurnID)
+        XCTAssertFalse(completedStore.state.messages[0].isStreaming)
+    }
+
+    func testStreamingSnapshotWireStateIsAnActiveTurnBeforeItemsArrive() throws {
+        let activeTurnID = "10000000-0000-4000-8000-000000000011"
+        let store = ConversationStore()
+
+        try store.apply(
+            ChatTestFixtures.snapshotEvent(
+                baseSequence: 1,
+                turnState: .unknown("streaming"),
+                activeTurnID: activeTurnID
+            )
+        )
+
+        XCTAssertEqual(store.state.turnState, .running)
+        XCTAssertEqual(store.state.activeTurnID, activeTurnID)
+    }
+
+    func testTurnActiveErrorReconcilesStreamingTurnAndRemovesRejectedOptimisticMessage() throws {
+        let activeTurnID = "10000000-0000-4000-8000-000000000002"
+        let requestID = "20000000-0000-4000-8000-000000000001"
+        let store = ConversationStore(
+            state: ConversationState(
+                items: [
+                    .message(
+                        ChatMessage(
+                            id: "assistant-stream",
+                            turnID: activeTurnID,
+                            role: .assistant,
+                            text: "Still working",
+                            isStreaming: true
+                        )
+                    ),
+                ],
+                connectionState: .streaming,
+                turnState: .idle
+            )
+        )
+        store.addOptimisticUserMessage(requestID: requestID, text: "Start another turn")
+
+        try store.apply(
+            ChatTestFixtures.event(
+                "error",
+                sequence: 1,
+                payload: .object([
+                    "requestId": .string(requestID),
+                    "code": .string("turnActive"),
+                    "message": .string("A provider turn is already active."),
+                ])
+            )
+        )
+
+        XCTAssertEqual(store.state.turnState, .running)
+        XCTAssertEqual(store.state.activeTurnID, activeTurnID)
+        XCTAssertFalse(store.state.messages.contains { $0.id == "client:\(requestID)" })
+    }
+
     func testCoalescesRapidDeltasAndCompletionReplacesAuthoritatively() throws {
         let store = ConversationStore(streamingPublishNanoseconds: 1_000_000_000)
         try store.apply(
@@ -116,6 +208,97 @@ final class ConversationStoreTests: XCTestCase {
         )
         XCTAssertEqual(store.state.messages.first?.text, "authoritative")
         XCTAssertFalse(store.state.messages.first?.isStreaming ?? true)
+    }
+
+    func testInterruptedTurnFinishesStreamingItemsAndExpiresInteractions() throws {
+        let turnID = "10000000-0000-4000-8000-000000000021"
+        let approval = ApprovalRequest(
+            id: "approval-1",
+            turnID: turnID,
+            providerConnectionGeneration: "generation-1",
+            providerRequestID: .string("request-1"),
+            title: "Run command",
+            reason: nil,
+            context: nil,
+            decisions: [ApprovalDecision(id: "deny", label: "Deny")],
+            status: .pending,
+            occurredAt: nil
+        )
+        let question = QuestionRequest(
+            id: "question-1",
+            turnID: turnID,
+            providerConnectionGeneration: "generation-1",
+            providerRequestID: .string("request-2"),
+            prompt: "Continue?",
+            kind: .singleChoice,
+            options: [QuestionOption(id: "yes", label: "Yes")],
+            status: .pending
+        )
+        let store = ConversationStore(
+            state: ConversationState(
+                items: [
+                    .message(
+                        ChatMessage(
+                            id: "message-1",
+                            turnID: turnID,
+                            role: .assistant,
+                            text: "Partial",
+                            isStreaming: true
+                        )
+                    ),
+                    .reasoning(
+                        ChatReasoning(
+                            id: "reasoning-1",
+                            turnID: turnID,
+                            text: "Thinking",
+                            isStreaming: true,
+                            occurredAt: nil
+                        )
+                    ),
+                    .tool(
+                        ToolActivity(
+                            id: "tool-1",
+                            turnID: turnID,
+                            kind: .shell,
+                            title: "Run command",
+                            status: .running,
+                            input: nil,
+                            output: nil,
+                            errorMessage: nil,
+                            durationMilliseconds: nil,
+                            exitCode: nil,
+                            occurredAt: nil,
+                            isTruncated: false,
+                            originalByteCount: nil
+                        )
+                    ),
+                ],
+                approvals: [approval],
+                questions: [question],
+                connectionState: .streaming,
+                turnState: .running,
+                activeTurnID: turnID
+            )
+        )
+
+        try store.apply(
+            ChatTestFixtures.event(
+                "turn.interrupted",
+                sequence: 1,
+                turnID: turnID
+            )
+        )
+
+        XCTAssertFalse(store.state.messages[0].isStreaming)
+        guard case .reasoning(let reasoning) = store.state.items[1] else {
+            return XCTFail("Expected reasoning item")
+        }
+        XCTAssertFalse(reasoning.isStreaming)
+        XCTAssertEqual(store.state.tools[0].status, .cancelled)
+        XCTAssertEqual(store.state.approvals[0].status, .expired)
+        XCTAssertEqual(store.state.questions[0].status, .expired)
+        XCTAssertEqual(store.state.turnState, .interrupted)
+        XCTAssertNil(store.state.activeTurnID)
     }
 
     func testDuplicateIsHarmlessAndGapRequestsRecovery() throws {
@@ -230,11 +413,31 @@ final class ConversationStoreTests: XCTestCase {
                 ])
             )
         )
-        XCTAssertEqual(store.state.terminalFallbackReason, "Use terminal")
+        XCTAssertEqual(
+            store.state.lastErrorMessage,
+            "This agent interaction is not supported in native chat."
+        )
+        XCTAssertEqual(store.state.connectionState, .failed)
         XCTAssertFalse(store.state.items.contains { item in
             if case .generic = item { return true }
             return false
         })
+
+        let fallbackStore = ConversationStore(
+            state: ConversationState(connectionState: .streaming)
+        )
+        try fallbackStore.apply(
+            ChatTestFixtures.event(
+                "session.terminalFallbackRequired",
+                sequence: 1,
+                payload: .object(["message": .string("Open a terminal")])
+            )
+        )
+        XCTAssertEqual(fallbackStore.state.connectionState, .failed)
+        XCTAssertEqual(
+            fallbackStore.state.lastErrorMessage,
+            "This agent interaction is not supported in native chat."
+        )
     }
 
     func testHistoryPagePrependsWithoutDuplicates() throws {

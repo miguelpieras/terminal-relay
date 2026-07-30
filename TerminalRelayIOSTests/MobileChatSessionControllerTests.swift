@@ -24,11 +24,11 @@ final class MobileChatSessionControllerTests: XCTestCase {
 
         controller.start()
 
-        XCTAssertEqual(controller.phase, .terminalFallback(reason: nil))
+        XCTAssertEqual(controller.phase, .terminal)
         XCTAssertEqual(recorder.commands, [])
     }
 
-    func testUnavailableWorkerFallsBackWithoutStartingAnAgent() async {
+    func testUnavailableWorkerFailsClosedWithoutStartingAnAgent() async {
         let recorder = CommandRecorder(
             capabilityData: capabilityData(available: false),
             startData: startData()
@@ -38,16 +38,17 @@ final class MobileChatSessionControllerTests: XCTestCase {
         controller.start()
         await waitForSettledPhase(controller)
 
-        guard case .terminalFallback(let reason) = controller.phase else {
-            return XCTFail("Expected terminal fallback")
+        guard case .failed(let message) = controller.phase else {
+            return XCTFail("Expected native chat to fail closed")
         }
-        XCTAssertNotNil(reason)
+        XCTAssertTrue(message.contains("Native chat is not available"))
+        XCTAssertFalse(message.localizedCaseInsensitiveContains("terminal"))
         XCTAssertEqual(recorder.commands.count, 1)
         XCTAssertTrue(recorder.commands[0].contains("chat-capabilities-v1"))
         XCTAssertFalse(recorder.commands[0].contains("chat-start-v1"))
     }
 
-    func testLegacyWorkerWithoutCapabilityMarkerFallsBackWithoutStartingAgent() async {
+    func testLegacyWorkerWithoutCapabilityMarkerFailsClosedWithoutStartingAgent() async {
         let recorder = CommandRecorder(
             capabilityData: Data("legacy worker output".utf8),
             startData: startData()
@@ -57,10 +58,11 @@ final class MobileChatSessionControllerTests: XCTestCase {
         controller.start()
         await waitForSettledPhase(controller)
 
-        guard case .terminalFallback(let reason) = controller.phase else {
-            return XCTFail("Expected legacy terminal fallback")
+        guard case .failed(let message) = controller.phase else {
+            return XCTFail("Expected legacy worker to fail closed")
         }
-        XCTAssertTrue(reason?.contains("Update this worker") == true)
+        XCTAssertTrue(message.contains("Update the worker"))
+        XCTAssertFalse(message.localizedCaseInsensitiveContains("terminal"))
         XCTAssertEqual(recorder.commands.count, 1)
         XCTAssertFalse(recorder.commands[0].contains("chat-start-v1"))
     }
@@ -226,173 +228,6 @@ final class MobileChatSessionControllerTests: XCTestCase {
         XCTAssertEqual(envelopes.last?.type, "session.detach")
     }
 
-    func testStopUsesExactRelayAndDoesNotStartTerminal() async throws {
-        let recorder = CommandRecorder(
-            capabilityData: capabilityData(available: true),
-            startData: startData()
-        )
-        let controller = makeNewController(recorder: recorder)
-        controller.start()
-        await waitForPhase(.chat, controller: controller)
-        await waitForEnvelopeCount(1, recorder: recorder)
-
-        try await controller.stopChat()
-
-        XCTAssertEqual(controller.phase, .stopped)
-        XCTAssertEqual(
-            recorder.commands.last,
-            "'/usr/local/bin/terminal-relay-session' 'chat-stop-v1' 'codex' 'example' '\(relayID)'"
-        )
-    }
-
-    func testTerminalFallbackStopsChatAndPreservesProviderThreadForResume() async throws {
-        let recorder = CommandRecorder(
-            capabilityData: capabilityData(available: true),
-            startData: startData()
-        )
-        let controller = makeNewController(recorder: recorder)
-        controller.start()
-        await waitForPhase(.chat, controller: controller)
-
-        var configuredThreadID: String?
-        try await controller.openTerminalFallback {
-            configuredThreadID = $0
-            return true
-        }
-
-        XCTAssertEqual(controller.phase, .terminalFallback(reason: nil))
-        XCTAssertEqual(controller.terminalProviderThreadID, threadID)
-        XCTAssertEqual(configuredThreadID, threadID)
-        XCTAssertEqual(
-            try TerminalSessionCommandPolicy.launchCommand(
-                kind: .codex,
-                repositoryName: "example",
-                providerThreadID: configuredThreadID,
-                launchArguments: []
-            ),
-            "'/usr/local/bin/terminal-relay-session' 'thread-resume-v2' 'codex' 'example' '\(threadID)'"
-        )
-        XCTAssertTrue(recorder.commands.last?.contains("chat-stop-v1") == true)
-    }
-
-    func testFailedStopKeepsChatReconnectableAndDoesNotEnterTerminal() async {
-        let recorder = CommandRecorder(
-            capabilityData: capabilityData(available: true),
-            startData: startData(),
-            failuresRemaining: 1,
-            failureCommandSubstring: "chat-stop-v1"
-        )
-        let controller = makeNewController(recorder: recorder)
-        controller.start()
-        await waitForPhase(.chat, controller: controller)
-        await waitForEnvelopeCount(1, recorder: recorder)
-
-        do {
-            try await controller.openTerminalFallback { _ in
-                XCTFail("Terminal must not bind when exact stop fails")
-                return true
-            }
-            XCTFail("Expected the exact stop to fail")
-        } catch {
-            XCTAssertEqual(error as? MobileChatSessionError, .stopFailed)
-        }
-        await waitForEnvelopeCount(3, recorder: recorder)
-
-        XCTAssertEqual(controller.phase, .chat)
-        XCTAssertEqual(controller.terminalProviderThreadID, threadID)
-        let envelopes = await recorder.transport.sentEnvelopes()
-        XCTAssertEqual(
-            envelopes.map(\.type),
-            ["session.attach", "session.detach", "session.attach"]
-        )
-    }
-
-    func testTerminalFallbackConfigurationFailureNeverBindsTerminal() async {
-        let recorder = CommandRecorder(
-            capabilityData: capabilityData(available: true),
-            startData: startData()
-        )
-        let controller = makeNewController(recorder: recorder)
-        controller.start()
-        await waitForPhase(.chat, controller: controller)
-
-        do {
-            try await controller.openTerminalFallback { _ in false }
-            XCTFail("Expected fallback configuration to fail closed")
-        } catch {
-            XCTAssertEqual(
-                error as? MobileChatSessionError,
-                .terminalFallbackUnavailable
-            )
-        }
-
-        guard case .failed(let message) = controller.phase else {
-            return XCTFail("The stopped chat must not bind an unconfigured terminal")
-        }
-        XCTAssertFalse(message.isEmpty)
-        XCTAssertTrue(recorder.commands.last?.contains("chat-stop-v1") == true)
-    }
-
-    func testRepeatedTerminalFallbackTapSendsOneExactStop() async throws {
-        let recorder = CommandRecorder(
-            capabilityData: capabilityData(available: true),
-            startData: startData(),
-            stopDelayNanoseconds: 100_000_000
-        )
-        let controller = makeNewController(recorder: recorder)
-        controller.start()
-        await waitForPhase(.chat, controller: controller)
-
-        let first = Task {
-            try await controller.openTerminalFallback { _ in true }
-        }
-        await waitForCommand("chat-stop-v1", recorder: recorder)
-
-        do {
-            try await controller.openTerminalFallback { _ in true }
-            XCTFail("A repeated fallback tap must not start another transition")
-        } catch {
-            XCTAssertEqual(error as? MobileChatSessionError, .sessionNotReady)
-        }
-        try await first.value
-
-        XCTAssertEqual(
-            recorder.commands.filter { $0.contains("chat-stop-v1") }.count,
-            1
-        )
-        XCTAssertEqual(controller.phase, .terminalFallback(reason: nil))
-    }
-
-    func testRepeatedStopTapSendsOneExactStop() async throws {
-        let recorder = CommandRecorder(
-            capabilityData: capabilityData(available: true),
-            startData: startData(),
-            stopDelayNanoseconds: 100_000_000
-        )
-        let controller = makeNewController(recorder: recorder)
-        controller.start()
-        await waitForPhase(.chat, controller: controller)
-
-        let first = Task {
-            try await controller.stopChat()
-        }
-        await waitForCommand("chat-stop-v1", recorder: recorder)
-
-        do {
-            try await controller.stopChat()
-            XCTFail("A repeated stop tap must not issue another command")
-        } catch {
-            XCTAssertEqual(error as? MobileChatSessionError, .sessionNotReady)
-        }
-        try await first.value
-
-        XCTAssertEqual(
-            recorder.commands.filter { $0.contains("chat-stop-v1") }.count,
-            1
-        )
-        XCTAssertEqual(controller.phase, .stopped)
-    }
-
     func testPreparationFailureIsSanitizedAndRetryable() async {
         let recorder = CommandRecorder(
             capabilityData: capabilityData(available: true),
@@ -498,18 +333,6 @@ final class MobileChatSessionControllerTests: XCTestCase {
         XCTFail("Timed out waiting for transport envelopes")
     }
 
-    private func waitForCommand(
-        _ fragment: String,
-        recorder: CommandRecorder
-    ) async {
-        for _ in 0..<200 {
-            if recorder.commands.contains(where: { $0.contains(fragment) }) {
-                return
-            }
-            try? await Task.sleep(nanoseconds: 1_000_000)
-        }
-        XCTFail("Timed out waiting for command containing \(fragment)")
-    }
 }
 
 @MainActor
@@ -519,21 +342,15 @@ private final class CommandRecorder {
     private let capabilityData: Data
     private let startData: Data
     private var failuresRemaining: Int
-    private let failureCommandSubstring: String?
-    private let stopDelayNanoseconds: UInt64
 
     init(
         capabilityData: Data,
         startData: Data,
-        failuresRemaining: Int = 0,
-        failureCommandSubstring: String? = nil,
-        stopDelayNanoseconds: UInt64 = 0
+        failuresRemaining: Int = 0
     ) {
         self.capabilityData = capabilityData
         self.startData = startData
         self.failuresRemaining = failuresRemaining
-        self.failureCommandSubstring = failureCommandSubstring
-        self.stopDelayNanoseconds = stopDelayNanoseconds
     }
 
     var dependencies: MobileChatSessionDependencies {
@@ -541,8 +358,7 @@ private final class CommandRecorder {
             execute: { [weak self] command in
                 guard let self else { return Data() }
                 commands.append(command)
-                if failuresRemaining > 0,
-                   failureCommandSubstring.map(command.contains) != false {
+                if failuresRemaining > 0 {
                     failuresRemaining -= 1
                     throw SSHTransportError.connection("private-worker.example.com")
                 }
@@ -551,12 +367,6 @@ private final class CommandRecorder {
                 }
                 if command.contains("chat-start-v1") {
                     return startData
-                }
-                if command.contains("chat-stop-v1"),
-                   stopDelayNanoseconds > 0 {
-                    try await Task.sleep(
-                        nanoseconds: stopDelayNanoseconds
-                    )
                 }
                 return Data()
             },

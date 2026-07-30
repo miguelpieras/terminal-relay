@@ -96,7 +96,7 @@ enum TurnState: Equatable, Sendable {
     init(rawValue: String) {
         switch rawValue {
         case "idle": self = .idle
-        case "running": self = .running
+        case "running", "streaming": self = .running
         case "awaitingApproval": self = .awaitingApproval
         case "completed": self = .completed
         case "failed": self = .failed

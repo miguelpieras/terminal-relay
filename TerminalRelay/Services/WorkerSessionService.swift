@@ -18,6 +18,7 @@ enum WorkerSessionServiceError: LocalizedError, Equatable {
     case startFailed
     case stopFailed
     case threadFailed
+    case nativeChatUnavailable
     case runtimeUpdating
 
     var errorDescription: String? {
@@ -30,8 +31,10 @@ enum WorkerSessionServiceError: LocalizedError, Equatable {
             "The worker could not stop this agent."
         case .threadFailed:
             "The worker could not complete that thread action."
+        case .nativeChatUnavailable:
+            "Native chat is unavailable on this worker. Update it and try again."
         case .runtimeUpdating:
-            "This worker is updating to a compatible runtime. Existing terminals remain connected; try again shortly."
+            "This worker is updating to a compatible runtime. Existing conversations remain connected; try again shortly."
         }
     }
 }
@@ -43,7 +46,11 @@ private enum WorkerUpdateStatusFetchResult {
 
 private enum WorkerChatNegotiation {
     case available
-    case terminalFallback
+    case unsupported
+}
+
+private enum WorkerChatNegotiationError: Error {
+    case transientFailure
 }
 
 @MainActor
@@ -352,18 +359,19 @@ final class WorkerSessionService: ObservableObject {
             )
         )
         guard result.exitCode == 0 else {
-            return .terminalFallback
+            if result.exitCode == 64 {
+                return .unsupported
+            }
+            throw WorkerChatNegotiationError.transientFailure
         }
         do {
             let response = try WorkerChatProtocol.parseCapabilities(
                 result.standardOutput,
                 expectedKind: kind
             )
-            return response.isAvailable ? .available : .terminalFallback
-        } catch WorkerChatProtocolError.missingMarker {
-            return .terminalFallback
+            return response.isAvailable ? .available : .unsupported
         } catch {
-            throw WorkerSessionServiceError.startFailed
+            throw WorkerChatNegotiationError.transientFailure
         }
     }
 
@@ -405,15 +413,8 @@ final class WorkerSessionService: ObservableObject {
                         launchDefaults: launchDefaults
                     )
                 )
-            case .terminalFallback:
-                result = try await runCommand(
-                    SSHCommandBuilder.workerSessionStartConfiguration(
-                        for: worker,
-                        kind: kind,
-                        repositoryName: repositoryName,
-                        launchDefaults: launchDefaults
-                    )
-                )
+            case .unsupported:
+                throw WorkerSessionServiceError.nativeChatUnavailable
             }
             guard result.exitCode == 0 else {
                 workerSessionLogger.error(
@@ -422,38 +423,29 @@ final class WorkerSessionService: ObservableObject {
                 throw WorkerSessionServiceError.startFailed
             }
 
-            let response: WorkerSessionResponse
-            let snapshot: WorkerSessionSnapshot
+            let chat: WorkerChatStartResponse
             switch negotiation {
             case .available:
-                let chat = try WorkerChatProtocol.parseStart(
+                chat = try WorkerChatProtocol.parseStart(
                     result.standardOutput,
                     expectedKind: kind
                 )
-                snapshot = WorkerSessionSnapshot(
-                    kind: kind,
-                    repositoryName: repositoryName,
-                    attachedClientCount: 0,
-                    instanceToken: chat.relayID,
-                    reportedWorking: false,
-                    threadID: chat.providerThreadID,
-                    presentation: .chat
-                )
-                response = WorkerSessionResponse(
-                    projects: [repositoryName],
-                    sessions: [snapshot]
-                )
-            case .terminalFallback:
-                response = try WorkerSessionProtocol.parse(result.standardOutput)
-                guard response.sessions.count == 1,
-                      let terminalSnapshot = response.sessions.first,
-                      terminalSnapshot.kind == kind,
-                      terminalSnapshot.repositoryName == repositoryName,
-                      terminalSnapshot.presentation == .terminal else {
-                    throw WorkerSessionServiceError.startFailed
-                }
-                snapshot = terminalSnapshot
+            case .unsupported:
+                throw WorkerSessionServiceError.nativeChatUnavailable
             }
+            let snapshot = WorkerSessionSnapshot(
+                kind: kind,
+                repositoryName: repositoryName,
+                attachedClientCount: 0,
+                instanceToken: chat.relayID,
+                reportedWorking: false,
+                threadID: chat.providerThreadID,
+                presentation: .chat
+            )
+            let response = WorkerSessionResponse(
+                projects: [repositoryName],
+                sessions: [snapshot]
+            )
 
             let previousResponse = responses[worker.id]
             let projects = Set(previousResponse?.projects ?? [])
@@ -688,7 +680,6 @@ final class WorkerSessionService: ObservableObject {
         repositoryName: String,
         threadID: String,
         launchDefaults: AgentLaunchDefaults,
-        preferredPresentation: WorkerSessionPresentation = .chat,
         on worker: ServerProfile
     ) async -> WorkerSessionSnapshot? {
         guard requireCapability("threads-v2", worker: worker) else { return nil }
@@ -697,17 +688,11 @@ final class WorkerSessionService: ObservableObject {
             return nil
         }
         do {
-            let negotiation: WorkerChatNegotiation
-            switch preferredPresentation {
-            case .chat:
-                negotiation = try await negotiateChat(
-                    kind: kind,
-                    repositoryName: repositoryName,
-                    on: worker
-                )
-            case .terminal:
-                negotiation = .terminalFallback
-            }
+            let negotiation = try await negotiateChat(
+                kind: kind,
+                repositoryName: repositoryName,
+                on: worker
+            )
             let result: WorkerSessionCommandResult
             switch negotiation {
             case .available:
@@ -720,51 +705,34 @@ final class WorkerSessionService: ObservableObject {
                         launchDefaults: launchDefaults
                     )
                 )
-            case .terminalFallback:
-                result = try await runCommand(
-                    SSHCommandBuilder.workerThreadResumeConfiguration(
-                        for: worker,
-                        kind: kind,
-                        repositoryName: repositoryName,
-                        threadID: threadID,
-                        launchDefaults: launchDefaults
-                    )
-                )
+            case .unsupported:
+                throw WorkerSessionServiceError.nativeChatUnavailable
             }
             guard result.exitCode == 0 else {
                 throw WorkerSessionServiceError.threadFailed
             }
-            let snapshot: WorkerSessionSnapshot
+            let chat: WorkerChatStartResponse
             switch negotiation {
             case .available:
-                let chat = try WorkerChatProtocol.parseStart(
+                chat = try WorkerChatProtocol.parseStart(
                     result.standardOutput,
                     expectedKind: kind
                 )
                 guard chat.providerThreadID == threadID else {
                     throw WorkerSessionServiceError.threadFailed
                 }
-                snapshot = WorkerSessionSnapshot(
-                    kind: kind,
-                    repositoryName: repositoryName,
-                    attachedClientCount: 0,
-                    instanceToken: chat.relayID,
-                    reportedWorking: false,
-                    threadID: chat.providerThreadID,
-                    presentation: .chat
-                )
-            case .terminalFallback:
-                let response = try WorkerSessionProtocol.parse(result.standardOutput)
-                guard response.sessions.count == 1,
-                      let terminalSnapshot = response.sessions.first,
-                      terminalSnapshot.kind == kind,
-                      terminalSnapshot.repositoryName == repositoryName,
-                      terminalSnapshot.threadID == threadID,
-                      terminalSnapshot.presentation == .terminal else {
-                    throw WorkerSessionServiceError.threadFailed
-                }
-                snapshot = terminalSnapshot
+            case .unsupported:
+                throw WorkerSessionServiceError.nativeChatUnavailable
             }
+            let snapshot = WorkerSessionSnapshot(
+                kind: kind,
+                repositoryName: repositoryName,
+                attachedClientCount: 0,
+                instanceToken: chat.relayID,
+                reportedWorking: false,
+                threadID: chat.providerThreadID,
+                presentation: .chat
+            )
             let current = responses[worker.id] ?? WorkerSessionResponse(
                 projects: [repositoryName],
                 sessions: []
@@ -790,7 +758,7 @@ final class WorkerSessionService: ObservableObject {
             )
             return snapshot
         } catch {
-            errors[worker.id] = WorkerSessionServiceError.threadFailed.localizedDescription
+            errors[worker.id] = message(for: error, fallback: .threadFailed)
             return nil
         }
     }

@@ -16,7 +16,6 @@ struct ConversationState: Equatable, Sendable {
     var oldestItemID: String?
     var didTruncateHistory = false
     var lastErrorMessage: String?
-    var terminalFallbackReason: String?
     var filePreview: ChatFilePreview?
 
     var messages: [ChatMessage] {
@@ -64,6 +63,44 @@ enum ConversationReducerError: LocalizedError, Equatable {
     }
 }
 
+private func reconciledSnapshotTurn(
+    turnState: TurnState,
+    activeTurnID: String?,
+    items: [ConversationItem]
+) -> (state: TurnState, activeTurnID: String?) {
+    let canInfer: Bool
+    switch turnState {
+    case .idle, .unknown:
+        canInfer = true
+    default:
+        canInfer = false
+    }
+    guard canInfer, let inferredTurnID = inFlightTurnID(in: items) else {
+        return (turnState, activeTurnID)
+    }
+    return (.running, inferredTurnID)
+}
+
+private func inFlightTurnID(in items: [ConversationItem]) -> String? {
+    for item in items.reversed() {
+        let candidate: String?
+        switch item {
+        case .message(let message) where message.isStreaming:
+            candidate = message.turnID
+        case .reasoning(let reasoning) where reasoning.isStreaming:
+            candidate = reasoning.turnID
+        case .tool(let tool) where tool.status == .pending || tool.status == .running:
+            candidate = tool.turnID
+        default:
+            candidate = nil
+        }
+        if let candidate, !candidate.isEmpty {
+            return candidate
+        }
+    }
+    return nil
+}
+
 struct ConversationReducer {
     let maximumRetainedItems: Int
     let maximumRetainedContentBytes: Int
@@ -109,8 +146,8 @@ struct ConversationReducer {
         guard let kind else {
             if envelope.payload["interactive"]?.boolValue == true
                 || envelope.payload["blocking"]?.boolValue == true {
-                state.terminalFallbackReason = envelope.payload["message"]?.stringValue
-                    ?? "The agent requested an interaction that native chat cannot show yet."
+                state.lastErrorMessage = "This agent interaction is not supported in native chat."
+                state.connectionState = .failed
                 return
             }
             applyUnknown(envelope, to: &state)
@@ -129,8 +166,8 @@ struct ConversationReducer {
         case .sessionHeartbeat, .acknowledgement:
             break
         case .terminalFallbackRequired:
-            state.terminalFallbackReason = envelope.payload["message"]?.stringValue
-                ?? "This interaction needs the terminal fallback."
+            state.lastErrorMessage = "This agent interaction is not supported in native chat."
+            state.connectionState = .failed
         case .sessionEnded:
             state.connectionState = .stopped
             state.turnState = .stopped
@@ -138,6 +175,22 @@ struct ConversationReducer {
         case .error:
             state.lastErrorMessage = envelope.payload["message"]?.stringValue
                 ?? "The worker could not complete that chat action."
+            if envelope.payload["code"]?.stringValue == "turnActive" {
+                if let requestID = envelope.requestID
+                    ?? envelope.payload["requestId"]?.stringValue {
+                    state.items.removeAll { item in
+                        guard case .message(let message) = item else { return false }
+                        return message.isOptimistic && message.id == "client:\(requestID)"
+                    }
+                }
+                let reconciled = reconciledSnapshotTurn(
+                    turnState: state.turnState,
+                    activeTurnID: state.activeTurnID,
+                    items: state.items
+                )
+                state.turnState = reconciled.state
+                state.activeTurnID = reconciled.activeTurnID
+            }
             if envelope.payload["fatal"]?.boolValue == true {
                 state.connectionState = .failed
             }
@@ -171,16 +224,31 @@ struct ConversationReducer {
             state.connectionState = .streaming
             state.lastErrorMessage = nil
         case .turnCompleted:
+            finishTurnItems(
+                turnID: terminalTurnID(from: envelope, fallback: state.activeTurnID),
+                toolStatus: .completed,
+                in: &state
+            )
             state.turnState = .completed
             state.activeTurnID = nil
             state.connectionState = .streaming
         case .turnFailed:
+            finishTurnItems(
+                turnID: terminalTurnID(from: envelope, fallback: state.activeTurnID),
+                toolStatus: .failed,
+                in: &state
+            )
             state.turnState = .failed
             state.activeTurnID = nil
             state.connectionState = .streaming
             state.lastErrorMessage = envelope.payload["message"]?.stringValue
                 ?? "The agent could not finish this turn."
         case .turnInterrupted:
+            finishTurnItems(
+                turnID: terminalTurnID(from: envelope, fallback: state.activeTurnID),
+                toolStatus: .cancelled,
+                in: &state
+            )
             state.turnState = .interrupted
             state.activeTurnID = nil
             state.connectionState = .interrupted
@@ -204,14 +272,24 @@ struct ConversationReducer {
         state.approvals = stableDeduplicated(snapshot.approvals)
         state.questions = stableDeduplicated(snapshot.questions)
         state.connectionState = snapshot.connectionState
-        state.turnState = snapshot.turnState
-        state.activeTurnID = snapshot.activeTurnID
+        let reconciledTurn = reconciledSnapshotTurn(
+            turnState: snapshot.turnState,
+            activeTurnID: snapshot.activeTurnID,
+            items: state.items
+        )
+        state.turnState = reconciledTurn.state
+        state.activeTurnID = reconciledTurn.activeTurnID
+        if state.activeTurnID == nil, !state.turnState.isActive {
+            finishInactiveSnapshotItems(
+                toolStatus: snapshotToolStatus(for: state.turnState),
+                in: &state
+            )
+        }
         state.capabilities = snapshot.capabilities
         state.usage = snapshot.usage
         state.hasOlderHistory = snapshot.hasOlderHistory
         state.oldestItemID = snapshot.oldestItemID
         state.lastErrorMessage = nil
-        state.terminalFallbackReason = nil
         enforceMemoryBounds(on: &state)
     }
 
@@ -227,6 +305,7 @@ struct ConversationReducer {
         } else {
             state.connectionState = .streaming
         }
+        state.lastErrorMessage = nil
     }
 
     private func applyHistoryPage(_ envelope: ChatEnvelope, to state: inout ConversationState) throws {
@@ -643,6 +722,84 @@ struct ConversationReducer {
         }
     }
 
+    private func terminalTurnID(from envelope: ChatEnvelope, fallback: String?) -> String? {
+        envelope.turnID ?? envelope.payload["turnId"]?.stringValue ?? fallback
+    }
+
+    private func finishTurnItems(
+        turnID: String?,
+        toolStatus: ToolActivityStatus,
+        in state: inout ConversationState
+    ) {
+        guard let turnID, !turnID.isEmpty else { return }
+
+        for index in state.items.indices {
+            switch state.items[index] {
+            case .message(var message)
+                where message.turnID == turnID && message.isStreaming:
+                message.complete(text: nil)
+                state.items[index] = .message(message)
+            case .reasoning(var reasoning)
+                where reasoning.turnID == turnID && reasoning.isStreaming:
+                reasoning.isStreaming = false
+                state.items[index] = .reasoning(reasoning)
+            case .tool(var tool)
+                where tool.turnID == turnID
+                    && (tool.status == .pending || tool.status == .running):
+                tool.status = toolStatus
+                state.items[index] = .tool(tool)
+            default:
+                break
+            }
+        }
+
+        for index in state.approvals.indices
+        where state.approvals[index].turnID == turnID
+            && state.approvals[index].status == .pending {
+            state.approvals[index].status = .expired
+        }
+        for index in state.questions.indices
+        where state.questions[index].turnID == turnID
+            && state.questions[index].status == .pending {
+            state.questions[index].status = .expired
+        }
+    }
+
+    private func snapshotToolStatus(for turnState: TurnState) -> ToolActivityStatus {
+        switch turnState {
+        case .completed:
+            .completed
+        case .failed:
+            .failed
+        case .idle, .interrupted, .stopped, .unknown:
+            .cancelled
+        case .running, .awaitingApproval:
+            .running
+        }
+    }
+
+    private func finishInactiveSnapshotItems(
+        toolStatus: ToolActivityStatus,
+        in state: inout ConversationState
+    ) {
+        for index in state.items.indices {
+            switch state.items[index] {
+            case .message(var message) where message.isStreaming:
+                message.complete(text: nil)
+                state.items[index] = .message(message)
+            case .reasoning(var reasoning) where reasoning.isStreaming:
+                reasoning.isStreaming = false
+                state.items[index] = .reasoning(reasoning)
+            case .tool(var tool)
+                where tool.status == .pending || tool.status == .running:
+                tool.status = toolStatus
+                state.items[index] = .tool(tool)
+            default:
+                break
+            }
+        }
+    }
+
     private func resolvedItemID(_ envelope: ChatEnvelope) -> String? {
         envelope.itemID
             ?? envelope.payload["itemId"]?.stringValue
@@ -736,6 +893,9 @@ final class ConversationStore: ObservableObject {
     func apply(_ envelope: ChatEnvelope) throws {
         let previousItemCount = workingState.items.count
         try reducer.reduce(envelope, into: &workingState)
+        if envelope.type == ChatEventKind.conversationSnapshot.rawValue {
+            resetReconnectTransients()
+        }
         clearStaleDestructiveApprovalConfirmation()
 
         let isStreamingDelta = envelope.type == ChatEventKind.messageDelta.rawValue
@@ -756,6 +916,11 @@ final class ConversationStore: ObservableObject {
     }
 
     func replaceWithSnapshot(_ snapshot: ConversationSnapshot) {
+        let reconciledTurn = reconciledSnapshotTurn(
+            turnState: snapshot.turnState,
+            activeTurnID: snapshot.activeTurnID,
+            items: snapshot.items
+        )
         workingState = ConversationState(
             snapshotGeneration: snapshot.snapshotGeneration,
             lastAppliedSequence: snapshot.baseSequence,
@@ -763,13 +928,14 @@ final class ConversationStore: ObservableObject {
             approvals: snapshot.approvals,
             questions: snapshot.questions,
             connectionState: snapshot.connectionState,
-            turnState: snapshot.turnState,
-            activeTurnID: snapshot.activeTurnID,
+            turnState: reconciledTurn.state,
+            activeTurnID: reconciledTurn.activeTurnID,
             capabilities: snapshot.capabilities,
             usage: snapshot.usage,
             hasOlderHistory: snapshot.hasOlderHistory,
             oldestItemID: snapshot.oldestItemID
         )
+        resetReconnectTransients()
         clearStaleDestructiveApprovalConfirmation()
         publishImmediately()
     }
@@ -802,6 +968,8 @@ final class ConversationStore: ObservableObject {
         workingState.connectionState = connectionState
         if let message {
             workingState.lastErrorMessage = message
+        } else if connectionState == .connecting {
+            workingState.lastErrorMessage = nil
         }
         publishImmediately()
     }
@@ -821,6 +989,12 @@ final class ConversationStore: ObservableObject {
     }
 
     func endLoadingOlderHistory() {
+        isLoadingOlderHistory = false
+    }
+
+    func resetReconnectTransients() {
+        pendingDestructiveApprovalConfirmation = nil
+        respondingInteractionIDs.removeAll()
         isLoadingOlderHistory = false
     }
 
@@ -927,6 +1101,25 @@ final class ConversationStore: ObservableObject {
     func clearComposer() {
         draft = ""
         attachments.removeAll()
+    }
+
+    func restoreFailedSubmission(
+        text: String,
+        attachments failedAttachments: [ChatAttachmentReference]
+    ) {
+        if draft.isEmpty {
+            draft = text
+        } else if !text.isEmpty, draft != text {
+            draft = "\(text)\n\n\(draft)"
+        }
+
+        let existingAttachmentIDs = Set(attachments.map(\.id))
+        attachments.insert(
+            contentsOf: failedAttachments.filter {
+                !existingAttachmentIDs.contains($0.id)
+            },
+            at: 0
+        )
     }
 
     private func clearStaleDestructiveApprovalConfirmation() {

@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 
 enum ConversationViewportAction: Equatable {
@@ -58,38 +59,34 @@ struct ConversationView: View {
     let isReadOnly: Bool
     let showsComposer: Bool
     let startsCoordinator: Bool
-    let onOpenTerminalFallback: (() -> Void)?
 
     @Environment(\.openURL) private var openURL
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var isConfirmingSessionEnd = false
+    #if os(iOS)
+    @State private var escapeRouter = ComposerEscapeRouter()
+    #endif
     @State private var viewportPolicy = ConversationViewportPolicy()
 
     init(
         coordinator: ConversationCoordinator,
         isReadOnly: Bool = false,
         showsComposer: Bool = true,
-        startsCoordinator: Bool = true,
-        onOpenTerminalFallback: (() -> Void)? = nil
+        startsCoordinator: Bool = true
     ) {
         self.coordinator = coordinator
         _store = ObservedObject(wrappedValue: coordinator.store)
         self.isReadOnly = isReadOnly
         self.showsComposer = showsComposer
         self.startsCoordinator = startsCoordinator
-        self.onOpenTerminalFallback = onOpenTerminalFallback
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            conversationStatusBar
-            if !isReadOnly {
-                conversationNotices
-            }
-            Divider()
             transcript
+            if !isReadOnly {
+                compactNotice
+            }
             if !isReadOnly, showsComposer {
-                Divider()
                 composer
             }
         }
@@ -104,6 +101,26 @@ struct ConversationView: View {
                 await coordinator.detach()
             }
         }
+        #if os(iOS)
+        .onKeyPress(.escape, phases: [.down, .repeat]) { keyPress in
+            guard !isReadOnly, showsComposer else { return .ignored }
+            switch escapeRouter.route(
+                activeTurnID: store.state.activeTurnID,
+                timestamp: ProcessInfo.processInfo.systemUptime,
+                isRepeat: keyPress.phase.contains(.repeat)
+            ) {
+            case .passThrough:
+                return .ignored
+            case .consume:
+                return .handled
+            case .interrupt:
+                Task {
+                    await coordinator.interrupt()
+                }
+                return .handled
+            }
+        }
+        #endif
         .sheet(
             item: Binding(
                 get: { store.state.filePreview },
@@ -116,110 +133,14 @@ struct ConversationView: View {
                 store.dismissFilePreview()
             }
         }
-        .confirmationDialog(
-            "End this agent session?",
-            isPresented: $isConfirmingSessionEnd,
-            titleVisibility: .visible
-        ) {
-            Button("End Session", role: .destructive) {
-                Task {
-                    await coordinator.stop()
-                }
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("This stops the exact worker agent for everyone attached to this conversation.")
-        }
-    }
-
-    private var conversationStatusBar: some View {
-        HStack(spacing: 10) {
-            connectionIndicator
-
-            if let usage = store.state.usage,
-               let contextTokens = usage.contextTokens,
-               let contextLimit = usage.contextLimit,
-               contextLimit > 0 {
-                Text("\(contextTokens.formatted()) / \(contextLimit.formatted()) context")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .accessibilityLabel("\(contextTokens) of \(contextLimit) context tokens used")
-            }
-
-            Spacer()
-
-            if store.state.turnState.isActive, !isReadOnly {
-                Button {
-                    Task {
-                        await coordinator.interrupt()
-                    }
-                } label: {
-                    Label("Stop", systemImage: "stop.fill")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .keyboardShortcut(".", modifiers: .command)
-                .accessibilityHint("Interrupts only the current agent turn.")
-            }
-
-            if !isReadOnly {
-                Menu {
-                    Button("Reconnect", systemImage: "arrow.clockwise") {
-                        coordinator.retry()
-                    }
-                    if let onOpenTerminalFallback {
-                        Button("Open Terminal Fallback", systemImage: "terminal") {
-                            onOpenTerminalFallback()
-                        }
-                    }
-                    Divider()
-                    Button("End Session", systemImage: "xmark.circle", role: .destructive) {
-                        isConfirmingSessionEnd = true
-                    }
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                        .imageScale(.large)
-                }
-                .menuStyle(.button)
-                .buttonStyle(.plain)
-                .accessibilityLabel("Conversation actions")
-            }
-        }
-        .frame(maxWidth: 900)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 9)
-        .frame(maxWidth: .infinity)
-        .background(.bar)
-    }
-
-    @ViewBuilder
-    private var connectionIndicator: some View {
-        HStack(spacing: 7) {
-            Image(systemName: connectionSymbol)
-                .foregroundStyle(connectionColor)
-                .symbolEffect(
-                    .pulse,
-                    options: reduceMotion ? .nonRepeating : .repeating,
-                    isActive: store.state.connectionState == .connecting
-                )
-            Text(connectionLabel)
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.secondary)
-        }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Chat status: \(connectionLabel)")
     }
 
     private var transcript: some View {
         GeometryReader { geometry in
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 18) {
+                    LazyVStack(alignment: .leading, spacing: 14) {
                         historyControl
-
-                        if store.state.didTruncateHistory {
-                            historyTruncationNotice
-                        }
 
                         ForEach(store.state.items) { item in
                             timelineView(for: item)
@@ -264,9 +185,10 @@ struct ConversationView: View {
                                 }
                             }
                     }
-                    .frame(maxWidth: 820, alignment: .leading)
+                    .frame(maxWidth: 760, alignment: .leading)
                     .padding(.horizontal, horizontalTranscriptPadding)
-                    .padding(.vertical, 22)
+                    .padding(.top, 22)
+                    .padding(.bottom, 16)
                     .frame(maxWidth: .infinity)
                 }
                 .coordinateSpace(name: "conversation-scroll")
@@ -295,16 +217,27 @@ struct ConversationView: View {
                             store.jumpToLatest()
                             scrollToBottom(proxy)
                         } label: {
-                            Label(
-                                store.unreadCount > 0
-                                    ? "\(store.unreadCount) new"
-                                    : "Latest",
-                                systemImage: "arrow.down"
-                            )
+                            Image(systemName: "arrow.down")
+                                .font(.caption.weight(.semibold))
+                                .frame(width: 28, height: 28)
+                                .background(.regularMaterial, in: Circle())
+                                .overlay {
+                                    Circle()
+                                        .strokeBorder(Color.secondary.opacity(0.16))
+                                }
+                                .frame(
+                                    width: ChatInteractionTargetLayout.jumpButtonDimension,
+                                    height: ChatInteractionTargetLayout.jumpButtonDimension
+                                )
+                                .contentShape(Rectangle())
                         }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
-                        .padding(16)
+                        .buttonStyle(.plain)
+                        .padding(ChatInteractionTargetLayout.jumpButtonOuterPadding)
+                        .accessibilityLabel(
+                            store.unreadCount > 0
+                                ? "\(store.unreadCount) new messages. Jump to latest"
+                                : "Jump to latest"
+                        )
                         .accessibilityHint("Moves to the newest conversation update.")
                         .transition(.scale.combined(with: .opacity))
                     }
@@ -331,10 +264,13 @@ struct ConversationView: View {
                         ProgressView()
                             .controlSize(.small)
                     } else {
-                        Label("Load earlier messages", systemImage: "clock.arrow.circlepath")
+                        Text(store.state.didTruncateHistory ? "Load earlier content" : "Load earlier")
                     }
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(.plain)
+                .chatMinimumInteractionTarget()
+                .font(.caption)
+                .foregroundStyle(.secondary)
                 .controlSize(.small)
                 .disabled(store.isLoadingOlderHistory || isReadOnly)
                 .accessibilityHint("Loads up to 50 earlier messages without moving your reading position.")
@@ -342,17 +278,6 @@ struct ConversationView: View {
             }
             .id("history:\(store.state.oldestItemID ?? "start")")
         }
-    }
-
-    private var historyTruncationNotice: some View {
-        Label(
-            "Older content was released from memory. Load earlier messages to restore it.",
-            systemImage: "ellipsis.circle"
-        )
-        .font(.caption)
-        .foregroundStyle(.secondary)
-        .frame(maxWidth: .infinity, alignment: .center)
-        .accessibilityElement(children: .combine)
     }
 
     @ViewBuilder
@@ -382,88 +307,70 @@ struct ConversationView: View {
     }
 
     private var emptyConversation: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 8) {
             if store.state.connectionState == .connecting {
                 ProgressView()
-                    .controlSize(.large)
-                Text("Connecting to the agent…")
-            } else {
-                Image(systemName: "bubble.left.and.bubble.right")
-                    .font(.system(size: 28))
+                    .controlSize(.small)
+                Text("Connecting…")
                     .foregroundStyle(.secondary)
-                Text(isReadOnly ? "No demo messages" : "Start a conversation")
-                    .font(.headline)
-                if !isReadOnly {
-                    Text("Messages stream here while tools and approvals stay organized inline.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                }
+            } else {
+                Text(isReadOnly ? "No messages" : "What can I help you build?")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
             }
         }
         .frame(maxWidth: .infinity)
-        .padding(.vertical, 64)
+        .padding(.vertical, 52)
         .accessibilityElement(children: .combine)
     }
 
     @ViewBuilder
-    private var conversationNotices: some View {
-        if let errorMessage = store.state.lastErrorMessage {
-            HStack(spacing: 8) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.orange)
-                Text(errorMessage)
-                    .font(.caption)
+    private var compactNotice: some View {
+        if let notice = compactNoticeContent {
+            HStack(spacing: 6) {
+                if notice.isProgress {
+                    ProgressView()
+                        .controlSize(.mini)
+                } else {
+                    Image(systemName: "exclamationmark.circle")
+                }
+                Text(notice.message)
                     .lineLimit(2)
-                Spacer()
-                if store.state.connectionState == .failed
-                    || store.state.connectionState == .offlineAgentRunning {
-                    Button("Reconnect") {
+                if notice.canRetry {
+                    Button("Retry") {
                         coordinator.retry()
                     }
                     .buttonStyle(.plain)
-                    .font(.caption.weight(.semibold))
+                    .fontWeight(.semibold)
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
                 }
-                Button {
-                    store.clearLastError()
-                } label: {
-                    Image(systemName: "xmark")
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Dismiss error")
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-            .background(Color.orange.opacity(0.08))
-        }
-
-        if let fallbackReason = store.state.terminalFallbackReason {
-            HStack(spacing: 10) {
-                Image(systemName: "terminal")
-                Text(fallbackReason)
-                    .font(.caption)
-                Spacer()
-                if let onOpenTerminalFallback {
-                    Button("Open Terminal") {
-                        onOpenTerminalFallback()
+                if store.state.lastErrorMessage != nil {
+                    Button {
+                        store.clearLastError()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .frame(width: 44, height: 44)
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Dismiss message")
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-            .background(Color.secondary.opacity(0.06))
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.horizontal, horizontalTranscriptPadding)
+            .padding(.vertical, 2)
         }
     }
 
     private var composer: some View {
         ConversationComposer(store: store, coordinator: coordinator)
-            .frame(maxWidth: 900)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .frame(maxWidth: 760)
+            .padding(.horizontal, horizontalTranscriptPadding)
+            .padding(.top, 6)
+            .padding(.bottom, 12)
             .frame(maxWidth: .infinity)
-            .background(.bar)
     }
 
     private var horizontalTranscriptPadding: CGFloat {
@@ -483,41 +390,26 @@ struct ConversationView: View {
         )
     }
 
-    private var connectionLabel: String {
-        switch store.state.connectionState {
-        case .connecting: "Connecting"
-        case .streaming:
-            store.state.turnState.isActive ? "Agent working" : "Connected"
-        case .awaitingApproval: "Waiting for you"
-        case .offlineAgentRunning: "Offline · agent running"
-        case .interrupted: "Interrupted"
-        case .stopped: "Session ended"
-        case .unsupportedWorker: "Terminal required"
-        case .failed: "Connection failed"
-        case .unknown: "Updating"
+    private var compactNoticeContent: (message: String, canRetry: Bool, isProgress: Bool)? {
+        if let message = store.state.lastErrorMessage {
+            let canRetry = store.state.connectionState == .failed
+                || store.state.connectionState == .offlineAgentRunning
+                || store.state.connectionState == .unsupportedWorker
+            return (message, canRetry, false)
         }
-    }
-
-    private var connectionSymbol: String {
         switch store.state.connectionState {
-        case .connecting: "arrow.triangle.2.circlepath"
-        case .streaming: store.state.turnState.isActive ? "sparkles" : "checkmark.circle.fill"
-        case .awaitingApproval: "person.crop.circle.badge.questionmark"
-        case .offlineAgentRunning: "wifi.slash"
-        case .interrupted: "stop.circle"
-        case .stopped: "checkmark.circle"
-        case .unsupportedWorker: "terminal"
-        case .failed: "exclamationmark.triangle.fill"
-        case .unknown: "circle.dotted"
-        }
-    }
-
-    private var connectionColor: Color {
-        switch store.state.connectionState {
-        case .streaming: .green
-        case .awaitingApproval: .orange
-        case .failed: .red
-        default: .secondary
+        case .connecting where !store.state.items.isEmpty:
+            return ("Connecting…", false, true)
+        case .offlineAgentRunning:
+            return ("Connection interrupted.", true, false)
+        case .unsupportedWorker:
+            return ("Native chat is unavailable on this worker.", true, false)
+        case .failed:
+            return ("Unable to connect.", true, false)
+        case .stopped:
+            return ("Session ended.", false, false)
+        default:
+            return nil
         }
     }
 
@@ -591,7 +483,7 @@ private struct ChatMessageView: View {
             .background {
                 if message.role == .user {
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .fill(Color.accentColor.opacity(0.12))
+                        .fill(Color.secondary.opacity(0.12))
                 }
             }
             .frame(maxWidth: message.role == .user ? 640 : .infinity, alignment: message.role == .user ? .trailing : .leading)
@@ -638,12 +530,10 @@ private struct ChatMessageView: View {
 }
 
 private struct StreamingIndicator: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
     var body: some View {
-        HStack(spacing: 5) {
-            Image(systemName: "sparkle")
-                .symbolEffect(.pulse, options: reduceMotion ? .nonRepeating : .repeating)
+        HStack(spacing: 6) {
+            ProgressView()
+                .controlSize(.mini)
             Text("Working")
         }
         .font(.caption)
@@ -679,7 +569,7 @@ private struct ToolActivityCard: View {
     @ObservedObject var store: ConversationStore
 
     private var isExpanded: Bool {
-        store.expandedItemIDs.contains(tool.id) || tool.status == .running || tool.status == .failed
+        store.expandedItemIDs.contains(tool.id)
     }
 
     var body: some View {
@@ -769,6 +659,7 @@ private struct ToolSection: View {
                 }
                 .buttonStyle(.plain)
                 .font(.caption)
+                .chatMinimumInteractionTarget(includesWidth: true)
                 .accessibilityLabel(store.copiedItemID == itemID ? "\(title) copied" : "Copy \(title.lowercased())")
             }
             CodeBlockView(
@@ -843,9 +734,10 @@ private struct PlanCard: View {
     let plan: ChatPlan
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Label(plan.title ?? "Plan", systemImage: "checklist")
-                .font(.headline)
+        VStack(alignment: .leading, spacing: 6) {
+            Text(plan.title ?? "Plan")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
             ForEach(plan.steps) { step in
                 Label(
                     step.title,
@@ -856,9 +748,7 @@ private struct PlanCard: View {
                 .accessibilityLabel("\(step.isCompleted ? "Completed" : "Pending"): \(step.title)")
             }
         }
-        .padding(13)
-        .background(Color.secondary.opacity(0.055))
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .padding(.vertical, 2)
         .accessibilityElement(children: .contain)
     }
 }
@@ -921,13 +811,14 @@ private struct DisclosureCard<Content: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Button(action: toggle) {
-                HStack(spacing: 10) {
+                HStack(spacing: 7) {
                     Image(systemName: symbol)
                         .foregroundStyle(statusColor)
-                        .frame(width: 20)
+                        .font(.caption)
+                        .frame(width: 16)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(title)
-                            .font(.callout.weight(.semibold))
+                            .font(.subheadline)
                             .foregroundStyle(.primary)
                             .lineLimit(2)
                         if let subtitle {
@@ -938,28 +829,24 @@ private struct DisclosureCard<Content: View>: View {
                     }
                     Spacer()
                     Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                        .font(.caption.weight(.semibold))
+                        .font(.caption2.weight(.semibold))
                         .foregroundStyle(.secondary)
                 }
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .padding(12)
+            .chatMinimumInteractionTarget()
+            .padding(.vertical, ChatInteractionTargetLayout.compactControlVerticalPadding)
             .accessibilityLabel("\(title), \(isExpanded ? "expanded" : "collapsed")")
             .accessibilityHint(isExpanded ? "Collapses details." : "Expands details.")
 
             if isExpanded {
-                Divider()
                 content()
-                    .padding(12)
+                    .padding(.leading, 23)
+                    .padding(.top, 8)
+                    .padding(.bottom, 4)
                     .transition(.opacity)
             }
-        }
-        .background(Color.secondary.opacity(0.055))
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(Color.secondary.opacity(0.13))
         }
     }
 }
@@ -1050,6 +937,7 @@ private struct ApprovalCard: View {
             }
         }
         .buttonStyle(.borderedProminent)
+        .chatMinimumInteractionTarget()
         .tint(decision.id.lowercased().contains("deny") ? Color.red : Color.accentColor)
         .disabled(isResponding)
         .accessibilityHint(
@@ -1094,6 +982,118 @@ enum ComposerInputPolicy {
     ) -> ComposerReturnAction {
         guard commandKeyPressed else { return .insertNewline }
         return canSend ? .send : .ignore
+    }
+}
+
+enum ComposerEscapeAction: Equatable {
+    case ignored
+    case armed
+    case interrupt
+}
+
+struct ComposerEscapePolicy: Equatable, Sendable {
+    let maximumInterval: TimeInterval
+    let minimumInterval: TimeInterval
+
+    private var trackedTurnID: String?
+    private var firstEscapeTimestamp: TimeInterval?
+    private var lastInterruptTimestamp: TimeInterval?
+
+    init(
+        maximumInterval: TimeInterval = 0.8,
+        minimumInterval: TimeInterval = 0.05
+    ) {
+        self.maximumInterval = maximumInterval
+        self.minimumInterval = minimumInterval
+    }
+
+    mutating func action(
+        activeTurnID: String?,
+        timestamp: TimeInterval,
+        isRepeat: Bool
+    ) -> ComposerEscapeAction {
+        guard let activeTurnID, timestamp.isFinite else {
+            reset()
+            return .ignored
+        }
+
+        if trackedTurnID != activeTurnID {
+            trackedTurnID = activeTurnID
+            firstEscapeTimestamp = nil
+            lastInterruptTimestamp = nil
+        }
+
+        guard !isRepeat else {
+            return .ignored
+        }
+
+        if let lastInterruptTimestamp {
+            let interval = timestamp - lastInterruptTimestamp
+            if interval >= 0, interval < minimumInterval {
+                return .ignored
+            }
+            self.lastInterruptTimestamp = nil
+        }
+
+        guard let firstEscapeTimestamp else {
+            self.firstEscapeTimestamp = timestamp
+            return .armed
+        }
+
+        let interval = timestamp - firstEscapeTimestamp
+        if interval < 0 || interval > maximumInterval {
+            self.firstEscapeTimestamp = timestamp
+            return .armed
+        }
+        guard interval >= minimumInterval else {
+            return .ignored
+        }
+
+        self.firstEscapeTimestamp = nil
+        lastInterruptTimestamp = timestamp
+        return .interrupt
+    }
+
+    private mutating func reset() {
+        trackedTurnID = nil
+        firstEscapeTimestamp = nil
+        lastInterruptTimestamp = nil
+    }
+}
+
+enum ComposerEscapeRoute: Equatable {
+    case passThrough
+    case consume
+    case interrupt
+}
+
+struct ComposerEscapeRouter: Equatable, Sendable {
+    private var policy = ComposerEscapePolicy()
+
+    mutating func route(
+        activeTurnID: String?,
+        timestamp: TimeInterval,
+        isRepeat: Bool
+    ) -> ComposerEscapeRoute {
+        guard activeTurnID != nil else {
+            _ = policy.action(
+                activeTurnID: nil,
+                timestamp: timestamp,
+                isRepeat: isRepeat
+            )
+            return .passThrough
+        }
+
+        switch policy.action(
+            activeTurnID: activeTurnID,
+            timestamp: timestamp,
+            isRepeat: isRepeat
+        ) {
+        case .ignored, .armed:
+            return .consume
+        case .interrupt:
+            return .interrupt
+        }
     }
 }
 
@@ -1207,6 +1207,7 @@ private struct QuestionCard: View {
                     }
                 }
                 .buttonStyle(.borderedProminent)
+                .chatMinimumInteractionTarget()
                 .disabled(!canSubmit || isResponding)
                 .accessibilityHint("Submits this answer once.")
             }
@@ -1290,6 +1291,7 @@ private struct QuestionCard: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .chatMinimumInteractionTarget()
                         .accessibilityLabel(
                             "\(option.label), \(selectedOptions.contains(option.id) ? "selected" : "not selected")"
                         )
@@ -1326,11 +1328,94 @@ private struct QuestionCard: View {
     }
 }
 
+#if os(iOS)
+struct MobileComposerModelOption: Equatable, Identifiable {
+    let id: String
+    let name: String
+    let supportsUltra: Bool
+}
+
+enum MobileComposerLaunchPolicy {
+    static let codexModels = [
+        MobileComposerModelOption(
+            id: "gpt-5.6-sol",
+            name: "5.6 Sol",
+            supportsUltra: true
+        ),
+        MobileComposerModelOption(
+            id: "gpt-5.6-terra",
+            name: "5.6 Terra",
+            supportsUltra: true
+        ),
+        MobileComposerModelOption(
+            id: "gpt-5.6-luna",
+            name: "5.6 Luna",
+            supportsUltra: false
+        ),
+    ]
+
+    static let claudeModels = [
+        MobileComposerModelOption(
+            id: "fable",
+            name: "Fable",
+            supportsUltra: false
+        ),
+        MobileComposerModelOption(
+            id: "opus",
+            name: "Opus",
+            supportsUltra: false
+        ),
+        MobileComposerModelOption(
+            id: "sonnet",
+            name: "Sonnet",
+            supportsUltra: false
+        ),
+    ]
+
+    static func models(for provider: ChatProvider) -> [MobileComposerModelOption] {
+        provider == .codex ? codexModels : claudeModels
+    }
+
+    static func availableEfforts(
+        provider: ChatProvider,
+        model: String
+    ) -> [AgentReasoningEffort] {
+        let supportsUltra = models(for: provider)
+            .first(where: { $0.id == model })?
+            .supportsUltra == true
+        return AgentReasoningEffort.allCases.filter {
+            $0 != .ultra || supportsUltra
+        }
+    }
+
+    static func normalizedEffort(
+        _ effort: AgentReasoningEffort,
+        provider: ChatProvider,
+        model: String
+    ) -> AgentReasoningEffort {
+        availableEfforts(provider: provider, model: model).contains(effort)
+            ? effort
+            : .max
+    }
+}
+#endif
+
 private struct ConversationComposer: View {
     @ObservedObject var store: ConversationStore
     let coordinator: ConversationCoordinator
 
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    #if os(iOS)
+    @AppStorage(AgentLaunchDefaults.StorageKey.codexModel)
+    private var codexModel = AgentLaunchDefaults.standard.codexModel
+    @AppStorage(AgentLaunchDefaults.StorageKey.codexReasoningEffort)
+    private var codexReasoningEffort = AgentLaunchDefaults.standard.codexReasoningEffort
+    @AppStorage(AgentLaunchDefaults.StorageKey.claudeModel)
+    private var claudeModel = AgentLaunchDefaults.standard.claudeModel
+    @AppStorage(AgentLaunchDefaults.StorageKey.claudeReasoningEffort)
+    private var claudeReasoningEffort = AgentLaunchDefaults.standard.claudeReasoningEffort
+    #endif
 
     private var canSend: Bool {
         !store.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -1355,11 +1440,12 @@ private struct ConversationComposer: View {
                                     Image(systemName: "xmark.circle.fill")
                                 }
                                 .buttonStyle(.plain)
+                                .chatMinimumInteractionTarget(includesWidth: true)
                                 .accessibilityLabel("Remove \(attachment.displayName)")
                             }
                             .font(.caption)
                             .padding(.horizontal, 9)
-                            .padding(.vertical, 6)
+                            .padding(.vertical, ChatInteractionTargetLayout.attachmentChipVerticalPadding)
                             .background(Color.secondary.opacity(0.09), in: Capsule())
                         }
                     }
@@ -1367,81 +1453,258 @@ private struct ConversationComposer: View {
                 .scrollIndicators(.hidden)
             }
 
-            HStack(alignment: .bottom, spacing: 10) {
-                ZStack(alignment: .topLeading) {
-                    if store.draft.isEmpty {
-                        Text("Message the agent")
-                            .foregroundStyle(.tertiary)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 9)
-                            .allowsHitTesting(false)
-                    }
-                    TextEditor(text: $store.draft)
-                        .font(.body)
-                        .scrollContentBackground(.hidden)
-                        .frame(
-                            minHeight: dynamicTypeSize.isAccessibilitySize ? 74 : 42,
-                            maxHeight: 150
-                        )
-                        .fixedSize(horizontal: false, vertical: true)
-                        .accessibilityLabel("Message")
-                        .accessibilityHint("Command Return sends. Return inserts a new line.")
-                        .onKeyPress(.return, phases: .down) { keyPress in
-                            switch ComposerInputPolicy.returnAction(
-                                commandKeyPressed: keyPress.modifiers.contains(.command),
-                                canSend: canSend
-                            ) {
-                            case .insertNewline:
-                                return .ignored
-                            case .send:
-                                Task {
-                                    await coordinator.sendDraft()
-                                }
-                                return .handled
-                            case .ignore:
-                                return .handled
-                            }
-                        }
-                }
-
-                if store.state.turnState.isActive {
-                    Button {
-                        Task {
-                            await coordinator.interrupt()
-                        }
-                    } label: {
-                        Image(systemName: "stop.fill")
-                            .frame(width: 30, height: 30)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.secondary)
-                    .accessibilityLabel("Stop current turn")
-                } else {
-                    Button {
-                        Task {
-                            await coordinator.sendDraft()
-                        }
-                    } label: {
-                        Image(systemName: "arrow.up")
-                            .font(.body.weight(.bold))
-                            .frame(width: 30, height: 30)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!canSend)
-                    .accessibilityLabel("Send message")
-                    .accessibilityHint("Sends the message and any ready attachments.")
-                }
-            }
+            composerInput
             .padding(.leading, 8)
             .padding(.trailing, 6)
             .padding(.vertical, 5)
-            .background(Color.chatComposer, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .background(Color.chatComposer, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
             .overlay {
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .strokeBorder(Color.secondary.opacity(0.16))
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .strokeBorder(Color.secondary.opacity(0.12))
             }
         }
+        #if os(iOS)
+        .onAppear {
+            synchronizeMobileLaunchOptions()
+        }
+        #endif
     }
+
+    @ViewBuilder
+    private var composerInput: some View {
+        #if os(iOS)
+        VStack(alignment: .leading, spacing: 0) {
+            promptEditor
+            HStack(spacing: 4) {
+                mobileModelControl
+                mobileEffortControl
+                Spacer(minLength: 8)
+                turnActionButton
+            }
+        }
+        #else
+        HStack(alignment: .bottom, spacing: 10) {
+            promptEditor
+            turnActionButton
+        }
+        #endif
+    }
+
+    private var promptEditor: some View {
+        ZStack(alignment: .topLeading) {
+            if store.draft.isEmpty {
+                Text("Ask anything")
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 9)
+                    .allowsHitTesting(false)
+            }
+            TextEditor(text: $store.draft)
+                .font(.body)
+                .tint(.primary)
+                .scrollContentBackground(.hidden)
+                .frame(
+                    minHeight: dynamicTypeSize.isAccessibilitySize ? 74 : 42,
+                    maxHeight: 150
+                )
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityLabel("Message")
+                .accessibilityHint("Command Return sends. Return inserts a new line.")
+                .onKeyPress(.return, phases: .down) { keyPress in
+                    switch ComposerInputPolicy.returnAction(
+                        commandKeyPressed: keyPress.modifiers.contains(.command),
+                        canSend: canSend
+                    ) {
+                    case .insertNewline:
+                        return .ignored
+                    case .send:
+                        Task {
+                            await coordinator.sendDraft()
+                        }
+                        return .handled
+                    case .ignore:
+                        return .handled
+                    }
+                }
+        }
+    }
+
+    @ViewBuilder
+    private var turnActionButton: some View {
+        if store.state.turnState.isActive {
+            Button {
+                Task {
+                    await coordinator.interrupt()
+                }
+            } label: {
+                Image(systemName: "stop.fill")
+                    .font(.caption2.weight(.bold))
+                    .frame(width: 30, height: 30)
+                    .background(Color.primary, in: Circle())
+                    .foregroundStyle(Color.chatButtonForeground)
+                    .frame(width: actionHitTargetSize, height: actionHitTargetSize)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Stop current turn")
+            .accessibilityHint("Stops the current turn. Press Escape twice to stop from the keyboard.")
+        } else {
+            Button {
+                Task {
+                    await coordinator.sendDraft()
+                }
+            } label: {
+                Image(systemName: "arrow.up")
+                    .font(.callout.weight(.bold))
+                    .frame(width: 30, height: 30)
+                    .background(
+                        canSend ? Color.primary : Color.secondary.opacity(0.14),
+                        in: Circle()
+                    )
+                    .foregroundStyle(
+                        canSend ? Color.chatButtonForeground : Color.secondary
+                    )
+                    .frame(width: actionHitTargetSize, height: actionHitTargetSize)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!canSend)
+            .accessibilityLabel("Send message")
+            .accessibilityHint("Sends the message and any ready attachments.")
+        }
+    }
+
+    private var actionHitTargetSize: CGFloat {
+        #if os(iOS)
+        44
+        #else
+        30
+        #endif
+    }
+
+    #if os(iOS)
+    private var mobileModelControl: some View {
+        Menu {
+            ForEach(
+                MobileComposerLaunchPolicy.models(for: coordinator.identity.provider)
+            ) { model in
+                Button {
+                    selectMobileModel(model.id)
+                } label: {
+                    if selectedMobileModel == model.id {
+                        Label(model.name, systemImage: "checkmark")
+                    } else {
+                        Text(model.name)
+                    }
+                }
+            }
+        } label: {
+            compactMenuLabel(mobileModelDisplayName)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Model")
+        .accessibilityValue(mobileModelDisplayName)
+    }
+
+    private var mobileEffortControl: some View {
+        Menu {
+            ForEach(availableMobileEfforts) { effort in
+                Button {
+                    selectMobileEffort(effort)
+                } label: {
+                    if selectedMobileEffort == effort {
+                        Label(effort.displayName, systemImage: "checkmark")
+                    } else {
+                        Text(effort.displayName)
+                    }
+                }
+            }
+        } label: {
+            compactMenuLabel(selectedMobileEffort.displayName)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Reasoning effort")
+        .accessibilityValue(selectedMobileEffort.displayName)
+    }
+
+    private func compactMenuLabel(_ title: String) -> some View {
+        HStack(spacing: 3) {
+            Text(title)
+                .lineLimit(1)
+            Image(systemName: "chevron.down")
+                .font(.system(size: 8, weight: .semibold))
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .frame(minHeight: 44)
+        .contentShape(Rectangle())
+    }
+
+    private var selectedMobileModel: String {
+        coordinator.identity.provider == .codex ? codexModel : claudeModel
+    }
+
+    private var selectedMobileEffort: AgentReasoningEffort {
+        let effort = coordinator.identity.provider == .codex
+            ? codexReasoningEffort
+            : claudeReasoningEffort
+        return MobileComposerLaunchPolicy.normalizedEffort(
+            effort,
+            provider: coordinator.identity.provider,
+            model: selectedMobileModel
+        )
+    }
+
+    private var availableMobileEfforts: [AgentReasoningEffort] {
+        MobileComposerLaunchPolicy.availableEfforts(
+            provider: coordinator.identity.provider,
+            model: selectedMobileModel
+        )
+    }
+
+    private var mobileModelDisplayName: String {
+        MobileComposerLaunchPolicy.models(for: coordinator.identity.provider)
+            .first(where: { $0.id == selectedMobileModel })?
+            .name
+            ?? selectedMobileModel
+    }
+
+    private func selectMobileModel(_ model: String) {
+        if coordinator.identity.provider == .codex {
+            codexModel = model
+            codexReasoningEffort = MobileComposerLaunchPolicy.normalizedEffort(
+                codexReasoningEffort,
+                provider: .codex,
+                model: model
+            )
+        } else {
+            claudeModel = model
+            claudeReasoningEffort = MobileComposerLaunchPolicy.normalizedEffort(
+                claudeReasoningEffort,
+                provider: .claude,
+                model: model
+            )
+        }
+        synchronizeMobileLaunchOptions()
+    }
+
+    private func selectMobileEffort(_ effort: AgentReasoningEffort) {
+        if coordinator.identity.provider == .codex {
+            codexReasoningEffort = effort
+        } else {
+            claudeReasoningEffort = effort
+        }
+        synchronizeMobileLaunchOptions()
+    }
+
+    private func synchronizeMobileLaunchOptions() {
+        coordinator.updateLaunchOptions(
+            model: selectedMobileModel,
+            reasoningEffort: selectedMobileEffort.rawValue,
+            fastMode: nil
+        )
+    }
+    #endif
 }
 
 private struct FilePreviewSheet: View {
@@ -1492,9 +1755,17 @@ private extension Color {
 
     static var chatComposer: Color {
         #if os(macOS)
-        Color(nsColor: .textBackgroundColor).opacity(0.82)
+        Color(nsColor: .controlBackgroundColor)
         #else
         Color(uiColor: .secondarySystemBackground)
+        #endif
+    }
+
+    static var chatButtonForeground: Color {
+        #if os(macOS)
+        Color(nsColor: .windowBackgroundColor)
+        #else
+        Color(uiColor: .systemBackground)
         #endif
     }
 }

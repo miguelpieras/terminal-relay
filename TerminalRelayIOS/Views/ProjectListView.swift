@@ -368,7 +368,7 @@ struct ProjectDetailView: View {
     let repositoryName: String
     @ObservedObject var model: WorkerSessionModel
     @State private var stopRequest: StopRequest?
-    @State private var showsNewTerminalOptions = false
+    @State private var showsNewConversationOptions = false
     @State private var showsArchivedThreads = false
     @State private var threadPendingRename: WorkerThreadSnapshot?
     @State private var threadName = ""
@@ -406,16 +406,16 @@ struct ProjectDetailView: View {
         List {
             if sessions.isEmpty && dormantThreads.isEmpty {
                 ContentUnavailableView {
-                    Label("No Threads", systemImage: "terminal")
+                    Label("No Conversations", systemImage: "bubble.left.and.bubble.right")
                 } description: {
-                    Text("Start a terminal or create a Codex thread for this project.")
+                    Text("Start a conversation or create a Codex thread for this project.")
                 }
                 .listRowBackground(Color.clear)
             }
             if !sessions.isEmpty {
-                Section("Active Terminals") {
+                Section("Active Conversations") {
                     ForEach(sessions) { session in
-                        terminalRow(session)
+                        conversationRow(session)
                     }
                 }
             }
@@ -460,19 +460,19 @@ struct ProjectDetailView: View {
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button {
-                    showsNewTerminalOptions = true
+                    showsNewConversationOptions = true
                 } label: {
-                    Label("New Terminal", systemImage: "plus")
+                    Label("New Conversation", systemImage: "plus")
                 }
                 .keyboardShortcut("n", modifiers: .command)
             }
         }
         .confirmationDialog(
-            "New Terminal",
-            isPresented: $showsNewTerminalOptions,
+            "New Conversation",
+            isPresented: $showsNewConversationOptions,
             titleVisibility: .visible
         ) {
-            Button("New Codex Thread") {
+            Button("Create Codex Thread") {
                 Task {
                     await model.createThread(
                         workerID: workerID,
@@ -481,16 +481,16 @@ struct ProjectDetailView: View {
                 }
             }
             ForEach(AgentKind.allCases) { kind in
-                Button(kind.displayName) {
-                    model.startTerminal(kind: kind, repositoryName: repositoryName)
+                Button("Start \(kind.displayName) Conversation") {
+                    model.startConversation(kind: kind, repositoryName: repositoryName)
                 }
             }
         }
         .alert(item: $stopRequest) { request in
             Alert(
-                title: Text("Stop Terminal?"),
-                message: Text("This ends the agent running in \(request.repositoryName) for every attached client. Disconnect if you only want to leave this device."),
-                primaryButton: .destructive(Text("Stop Terminal")) {
+                title: Text("End Conversation?"),
+                message: Text("This ends the agent running in \(request.repositoryName) for every attached client. Closing the conversation leaves it running."),
+                primaryButton: .destructive(Text("End Conversation")) {
                     Task {
                         await model.stop(
                             kind: request.kind,
@@ -531,14 +531,14 @@ struct ProjectDetailView: View {
     }
 
     @ViewBuilder
-    private func terminalRow(_ session: WorkerSessionSnapshot) -> some View {
+    private func conversationRow(_ session: WorkerSessionSnapshot) -> some View {
         Button {
             model.openTerminal(session)
         } label: {
             HStack(spacing: 12) {
                 AgentTaskIcon(kind: session.kind)
 
-                Text(session.title ?? "Untitled terminal")
+                Text(session.title ?? "Untitled conversation")
                     .font(.body.weight(.medium))
                     .foregroundStyle(.primary)
                     .lineLimit(2)
@@ -568,7 +568,7 @@ struct ProjectDetailView: View {
                     instanceToken: session.instanceToken
                 )
             } label: {
-                Label("Stop", systemImage: "stop.fill")
+                Label("End", systemImage: "stop.fill")
             }
         }
         .contextMenu {
@@ -579,7 +579,7 @@ struct ProjectDetailView: View {
                     instanceToken: session.instanceToken
                 )
             } label: {
-                Label("Stop Terminal", systemImage: "stop.fill")
+                Label("End Conversation", systemImage: "stop.fill")
             }
         }
     }

@@ -79,6 +79,8 @@ final class WorkerSessionModel: ObservableObject {
     private var runtimeUpdateTasks: [UUID: Task<Void, Never>] = [:]
     private var refreshToken = UUID()
     private static let readStateKey = "workerSessionReadActivity.v1"
+    private static let connectionFailureMessage =
+        "Could not reach this worker. Check that it is online, then try again."
 
     init(
         profileStore: WorkerProfileStore = WorkerProfileStore(),
@@ -360,7 +362,7 @@ final class WorkerSessionModel: ObservableObject {
             errorMessage = nil
         } catch {
             guard refreshToken == token else { return }
-            errorMessage = error.localizedDescription
+            errorMessage = Self.connectionFailureMessage
         }
     }
 
@@ -417,14 +419,14 @@ final class WorkerSessionModel: ObservableObject {
         }
         guard info.supports(capability) else {
             errorMessage =
-                "This worker is updating to add the required capability. Existing terminals are unchanged."
+                "This worker is updating to add the required capability. Existing conversations are unchanged."
             beginRuntimeUpdate(profile: worker)
             return false
         }
         return true
     }
 
-    func startTerminal(kind: AgentKind, repositoryName: String) {
+    func startConversation(kind: AgentKind, repositoryName: String) {
         if let profile, !requireCapability("agent-sessions", on: profile) {
             return
         }
@@ -435,7 +437,8 @@ final class WorkerSessionModel: ObservableObject {
         let route = TerminalRoute(
             kind: kind,
             repositoryName: repositoryName,
-            instanceToken: nil
+            instanceToken: nil,
+            presentation: .chat
         )
         lastOpenedTerminalRoute = route
         terminalRoute = route
@@ -535,7 +538,8 @@ final class WorkerSessionModel: ObservableObject {
                 kind: thread.kind,
                 repositoryName: thread.repositoryName,
                 instanceToken: nil,
-                providerThreadID: thread.threadID
+                providerThreadID: thread.threadID,
+                presentation: .chat
             )
             lastOpenedTerminalRoute = route
             terminalRoute = route
@@ -550,7 +554,8 @@ final class WorkerSessionModel: ObservableObject {
             kind: thread.kind,
             repositoryName: thread.repositoryName,
             instanceToken: nil,
-            providerThreadID: thread.threadID
+            providerThreadID: thread.threadID,
+            presentation: .chat
         )
         lastOpenedTerminalRoute = route
         terminalRoute = route
@@ -878,7 +883,7 @@ final class WorkerSessionModel: ObservableObject {
                 resources: currentOverview?.resources,
                 accounts: currentOverview?.accounts ?? [:],
                 accountErrors: currentOverview?.accountErrors ?? [],
-                connectionError: error.localizedDescription,
+                connectionError: connectionFailureMessage,
                 updateStatus: currentOverview?.updateStatus,
                 runtimeInfo: currentOverview?.runtimeInfo,
                 runtimeUpdateStatus: currentOverview?.runtimeUpdateStatus
@@ -957,7 +962,7 @@ final class WorkerSessionModel: ObservableObject {
                 resources: nil,
                 accounts: [:],
                 accountErrors: Set(AgentKind.allCases),
-                connectionError: error.localizedDescription,
+                connectionError: connectionFailureMessage,
                 updateStatus: parseUpdateStatus(results.5),
                 runtimeInfo: try? WorkerRuntimeInfoProtocol.parse(results.6.get()),
                 runtimeUpdateStatus: try? WorkerRuntimeUpdateStatusProtocol.parse(

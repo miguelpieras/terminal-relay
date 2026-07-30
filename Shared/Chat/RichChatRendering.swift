@@ -9,6 +9,53 @@ import AppKit
 import UIKit
 #endif
 
+enum ChatInteractionTargetLayout {
+    static let minimumIOSDimension: CGFloat = 44
+
+    static var appliesMinimumDimension: Bool {
+        #if os(iOS)
+        true
+        #else
+        false
+        #endif
+    }
+
+    static var jumpButtonDimension: CGFloat {
+        appliesMinimumDimension ? minimumIOSDimension : 28
+    }
+
+    static var jumpButtonOuterPadding: CGFloat {
+        appliesMinimumDimension ? 8 : 16
+    }
+
+    static var codeHeaderVerticalPadding: CGFloat {
+        appliesMinimumDimension ? 0 : 9
+    }
+
+    static var compactControlVerticalPadding: CGFloat {
+        appliesMinimumDimension ? 0 : 3
+    }
+
+    static var attachmentChipVerticalPadding: CGFloat {
+        appliesMinimumDimension ? 0 : 6
+    }
+}
+
+extension View {
+    @ViewBuilder
+    func chatMinimumInteractionTarget(includesWidth: Bool = false) -> some View {
+        #if os(iOS)
+        frame(
+            minWidth: includesWidth ? ChatInteractionTargetLayout.minimumIOSDimension : nil,
+            minHeight: ChatInteractionTargetLayout.minimumIOSDimension
+        )
+        .contentShape(Rectangle())
+        #else
+        self
+        #endif
+    }
+}
+
 enum ChatURLPolicy {
     static let repositoryScheme = "terminal-relay-file"
 
@@ -286,21 +333,29 @@ private struct MarkdownImageCollector: MarkupWalker {
 private struct TerminalRelayImageRenderer: MarkdownImageRenderer {
     let onOpenExternal: (URL) -> Void
 
+    @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
-        Button {
-            if case .external(let url) = ChatURLPolicy.classify(configuration.url) {
+        let label = Label(
+            configuration.alternativeText ?? "External image",
+            systemImage: "photo.badge.arrow.down"
+        )
+        .font(.callout)
+        .foregroundStyle(.secondary)
+
+        switch ChatURLPolicy.classify(configuration.url) {
+        case .external(let url):
+            Button {
                 onOpenExternal(url)
+            } label: {
+                label
             }
-        } label: {
-            Label(
-                configuration.alternativeText ?? "External image",
-                systemImage: "photo.badge.arrow.down"
-            )
-            .font(.callout)
-            .foregroundStyle(.secondary)
+            .buttonStyle(.plain)
+            .chatMinimumInteractionTarget()
+            .accessibilityHint("Opens the image in your browser. It is not loaded inside Terminal Relay.")
+        case .repository, .blocked:
+            label
+                .accessibilityHint("This image link is blocked.")
         }
-        .buttonStyle(.plain)
-        .accessibilityHint("Opens the image in your browser. It is not loaded inside Terminal Relay.")
     }
 }
 
@@ -308,33 +363,33 @@ private struct TerminalRelayLinkRenderer: MarkdownLinkRenderer {
     let onOpenExternal: (URL) -> Void
     let onOpenRepository: (ChatRepositoryLink) -> Void
 
+    @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
-        Button {
-            switch ChatURLPolicy.classify(configuration.url) {
-            case .external(let url):
+        switch ChatURLPolicy.classify(configuration.url) {
+        case .external(let url):
+            Button {
                 onOpenExternal(url)
-            case .repository(let link):
-                onOpenRepository(link)
-            case .blocked:
-                break
+            } label: {
+                configuration.label
             }
-        } label: {
-            configuration.label
-        }
-        .buttonStyle(.plain)
-        .foregroundStyle(.tint)
-        .underline()
-        .accessibilityHint(accessibilityHint(for: configuration.url))
-    }
-
-    private func accessibilityHint(for url: URL) -> String {
-        switch ChatURLPolicy.classify(url) {
-        case .external:
-            "Opens in your browser."
-        case .repository:
-            "Opens a read-only repository preview."
+            .buttonStyle(.plain)
+            .foregroundStyle(.tint)
+            .underline()
+            .accessibilityHint("Opens in your browser.")
+        case .repository(let link):
+            Button {
+                onOpenRepository(link)
+            } label: {
+                configuration.label
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.tint)
+            .underline()
+            .accessibilityHint("Opens a read-only repository preview.")
         case .blocked:
-            "This link is blocked."
+            configuration.label
+                .foregroundStyle(.secondary)
+                .accessibilityHint("This link is blocked.")
         }
     }
 }
@@ -545,6 +600,7 @@ struct CodeBlockView: View {
                     }
                     .buttonStyle(.plain)
                     .font(.caption.weight(.medium))
+                    .chatMinimumInteractionTarget(includesWidth: true)
                     .accessibilityLabel(isExpanded ? "Collapse code block" : "Expand code block")
                 }
                 Button {
@@ -559,10 +615,11 @@ struct CodeBlockView: View {
                 }
                 .buttonStyle(.plain)
                 .font(.caption.weight(.medium))
+                .chatMinimumInteractionTarget(includesWidth: true)
                 .accessibilityLabel(didCopy ? "Code copied" : "Copy code")
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 9)
+            .padding(.vertical, ChatInteractionTargetLayout.codeHeaderVerticalPadding)
 
             Divider()
 

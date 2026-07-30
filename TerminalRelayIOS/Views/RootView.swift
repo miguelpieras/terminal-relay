@@ -79,7 +79,8 @@ struct RootView: View {
                         exitDemo()
                     }
                 }
-                if let warning = workerUpdateWarning {
+                if model.terminalRoute == nil,
+                   let warning = workerUpdateWarning {
                     WorkerUpdateWarningBanner(
                         workerName: warning.profile.displayName,
                         message: warning.message
@@ -264,7 +265,9 @@ struct RootView: View {
                     ContentUnavailableView(
                         "Select a Project",
                         systemImage: "folder",
-                        description: Text("Choose a project to see its terminals.")
+                        description: Text(
+                            "Choose a project to see its conversations and threads."
+                        )
                     )
                 }
             case .workers:
@@ -490,7 +493,6 @@ struct RootView: View {
     }
 
     private func enterDemo() {
-        projectNavigationID = UUID()
         model.enterDemo()
         selectedTab = .projects
         selectedProject = ProjectSelection(
@@ -602,7 +604,10 @@ private struct WorkerCompactRow: View {
             if let snapshot {
                 HStack(spacing: 14) {
                     Label("\(snapshot.projects.count)", systemImage: "folder")
-                    Label("\(snapshot.sessions.count)", systemImage: "terminal")
+                    Label(
+                        "\(snapshot.sessions.count)",
+                        systemImage: "bubble.left.and.bubble.right"
+                    )
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -699,7 +704,7 @@ private struct WorkerOverviewRow: View {
                     )
                     Label(
                         "\(snapshot.sessions.count) active \(snapshot.sessions.count == 1 ? "task" : "tasks")",
-                        systemImage: "terminal"
+                        systemImage: "bubble.left.and.bubble.right"
                     )
                 }
                 .font(.caption)
