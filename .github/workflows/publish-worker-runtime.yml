@@ -129,17 +129,6 @@ jobs:
               raise SystemExit("staged worker runtime feed is inconsistent")
           PYTHON
 
-      - name: Configure GitHub Pages workflow source
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh api \
-            --method PUT \
-            "repos/$GITHUB_REPOSITORY/pages" \
-            --input - <<'JSON'
-          {"build_type":"workflow"}
-          JSON
-
       - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
 
       - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
