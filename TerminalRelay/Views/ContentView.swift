@@ -1068,6 +1068,9 @@ struct ContentView: View {
                 on: worker,
                 kind: kind,
                 launchDefaults: launchDefaults,
+                onPendingSession: { session in
+                    handleOpenResult(.opened(session), for: project)
+                },
                 using: workerSessionService
             ) else { return }
             handleOpenResult(result, for: project)
@@ -2214,7 +2217,14 @@ private struct ProjectSessionRow: View {
 
                     Spacer(minLength: 5)
 
-                    if session.isWorking {
+                    if session.isLaunchPending {
+                        ProgressView()
+                            .controlSize(.mini)
+                            .tint(SidebarPalette.secondary)
+                            .frame(width: 12, height: 12)
+                            .help("Starting")
+                            .accessibilityLabel("\(session.kind.displayName), starting")
+                    } else if session.isWorking {
                         ProgressView()
                             .controlSize(.mini)
                             .tint(SidebarPalette.secondary)
@@ -2296,6 +2306,7 @@ private struct ProjectSessionRow: View {
     }
 
     private var sessionStateLabel: String {
+        if session.isLaunchPending { return "Starting" }
         if session.isWorking { return "Working" }
         if session.status == .running { return "Ready" }
         return session.status.label

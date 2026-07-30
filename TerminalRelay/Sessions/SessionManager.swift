@@ -184,10 +184,26 @@ final class SessionManager: ObservableObject {
         on server: ServerProfile,
         kind: AgentKind,
         launchDefaults: AgentLaunchDefaults,
+        onPendingSession: ((TerminalSession) -> Void)? = nil,
         using service: WorkerSessionService
     ) async -> SessionOpenResult? {
-        let openSelectionRevision = claimOpenSelectionIntent()
         guard project.serverID == server.id else { return nil }
+
+        invalidatePendingOpenSelection()
+        let pendingSession = TerminalSession(
+            project: project,
+            server: server,
+            kind: kind,
+            sequenceNumber: nextSequenceNumber(projectID: project.id, kind: kind),
+            instanceToken: UUID().uuidString.lowercased(),
+            presentation: .chat,
+            launchState: .starting,
+            launchDefaults: launchDefaults
+        )
+        append(pendingSession)
+        selectedSessionID = pendingSession.id
+        onPendingSession?(pendingSession)
+        let openSelectionRevision = selectionRevision
 
         guard let snapshot = await service.start(
             kind: kind,
@@ -197,18 +213,26 @@ final class SessionManager: ObservableObject {
         ),
         snapshot.kind == kind,
         snapshot.repositoryName == project.displayName else {
+            pendingSession.markLaunchFailed(
+                service.error(for: server.id)
+                    ?? "The worker could not start this agent."
+            )
             return nil
         }
 
         let shouldSelectResult = selectionRevision == openSelectionRevision
-        let result = openConfirmedRemote(
+            && selectedSessionID == pendingSession.id
+        guard let session = replacePendingSession(
+            pendingSession,
             project: project,
             on: server,
             snapshot: snapshot,
-            selectResult: shouldSelectResult,
             launchDefaults: launchDefaults
-        )
-        return shouldSelectResult ? result : nil
+        ) else {
+            pendingSession.markLaunchFailed("The worker returned an invalid agent session.")
+            return nil
+        }
+        return shouldSelectResult ? .opened(session) : nil
     }
 
     @discardableResult
@@ -415,6 +439,61 @@ final class SessionManager: ObservableObject {
         if selectReplacement {
             selectedSessionID = replacement.id
         }
+        return replacement
+    }
+
+    private func replacePendingSession(
+        _ pendingSession: TerminalSession,
+        project: ProjectProfile,
+        on server: ServerProfile,
+        snapshot: WorkerSessionSnapshot,
+        launchDefaults: AgentLaunchDefaults
+    ) -> TerminalSession? {
+        guard pendingSession.isLaunchPending,
+              project.serverID == server.id,
+              pendingSession.projectID == project.id,
+              pendingSession.serverKey == server.concurrencyKey,
+              pendingSession.kind == snapshot.kind,
+              snapshot.repositoryName == project.displayName,
+              snapshot.presentation == .chat,
+              let instanceID = UUID(uuidString: snapshot.instanceToken),
+              instanceID.uuidString.lowercased() == snapshot.instanceToken,
+              !sessions.contains(where: {
+                  $0 !== pendingSession
+                      && $0.serverKey == server.concurrencyKey
+                      && $0.instanceToken == snapshot.instanceToken
+              }),
+              let index = sessions.firstIndex(where: { $0 === pendingSession }) else {
+            return nil
+        }
+
+        remoteSessions[
+            RemoteSessionKey(
+                serverKey: server.concurrencyKey,
+                instanceToken: snapshot.instanceToken
+            )
+        ] = snapshot
+        let replacement = TerminalSession(
+            project: project,
+            server: server,
+            kind: snapshot.kind,
+            sequenceNumber: pendingSession.sequenceNumber,
+            instanceToken: snapshot.instanceToken,
+            id: pendingSession.id,
+            terminalViewIdentity: pendingSession.terminalViewIdentity,
+            startedAt: pendingSession.startedAt,
+            initialStatus: .connecting,
+            terminalTitle: snapshot.title,
+            threadID: snapshot.threadID,
+            remoteAttachedClientCount: snapshot.attachedClientCount,
+            presentation: snapshot.presentation,
+            launchDefaults: launchDefaults
+        )
+        sessionObservers[pendingSession.id] = nil
+        taskCompletionObservers[pendingSession.id] = nil
+        sessions[index] = replacement
+        observe(replacement)
+        replacement.applyRemoteSnapshot(snapshot)
         return replacement
     }
 

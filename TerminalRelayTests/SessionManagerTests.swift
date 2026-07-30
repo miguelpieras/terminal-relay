@@ -751,6 +751,62 @@ final class SessionManagerTests: XCTestCase {
         )
     }
 
+    func testNewSessionShowsPendingPanelBeforeWorkerReturnsAndKeepsUIIdentity() async {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let manager = SessionManager()
+        let recorder = BlockingWorkerSessionCommandRecorder()
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+        var callbackSession: TerminalSession?
+
+        let start = Task {
+            await manager.openNewSession(
+                project: project,
+                on: server,
+                kind: .claude,
+                launchDefaults: .standard,
+                onPendingSession: { callbackSession = $0 },
+                using: service
+            )
+        }
+        while recorder.callCount == 0 {
+            await Task.yield()
+        }
+
+        let pendingSession = try! XCTUnwrap(manager.sessions.last)
+        XCTAssertTrue(callbackSession === pendingSession)
+        XCTAssertTrue(pendingSession.isLaunchPending)
+        XCTAssertNil(pendingSession.launchFailureMessage)
+        XCTAssertEqual(pendingSession.status, .connecting)
+        XCTAssertEqual(manager.selectedSessionID, pendingSession.id)
+        let pendingID = pendingSession.id
+        let pendingTerminalIdentity = pendingSession.terminalViewIdentity
+
+        let instanceToken = "01234567-89ab-" + "4def-8abc-0123456789ab"
+        recorder.finish(
+            with: Self.statusResult(
+                kind: .claude,
+                repositoryName: project.displayName,
+                instanceToken: instanceToken
+            )
+        )
+        let result = await start.value
+
+        guard case .opened(let session) = result else {
+            return XCTFail("Expected the pending session to finish opening")
+        }
+        XCTAssertFalse(session === pendingSession)
+        XCTAssertEqual(session.id, pendingID)
+        XCTAssertEqual(session.terminalViewIdentity, pendingTerminalIdentity)
+        XCTAssertEqual(session.instanceToken, instanceToken)
+        XCTAssertFalse(session.isLaunchPending)
+        XCTAssertNil(session.launchFailureMessage)
+        XCTAssertEqual(manager.selectedSessionID, session.id)
+        XCTAssertTrue(manager.sessions.last === session)
+    }
+
     func testNewSessionDoesNotReplaceKnownSameRepositorySession() async {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let project = makeProject(name: "Terminal Relay", server: server)
@@ -1115,6 +1171,7 @@ final class SessionManagerTests: XCTestCase {
         while newerRecorder.callCount == 0 {
             await Task.yield()
         }
+        let newerPendingID = manager.selectedSessionID
 
         let olderInstance = "22222222-3333-" + "4444-8555-666666666666"
         olderRecorder.finish(
@@ -1127,7 +1184,8 @@ final class SessionManagerTests: XCTestCase {
         let olderResult = await olderStart.value
 
         XCTAssertNil(olderResult)
-        XCTAssertEqual(manager.selectedSessionID, selected.id)
+        XCTAssertNotEqual(newerPendingID, selected.id)
+        XCTAssertEqual(manager.selectedSessionID, newerPendingID)
         XCTAssertEqual(
             manager.sessions.first(where: { $0.instanceToken == olderInstance })?.projectID,
             olderProject.id
@@ -1179,6 +1237,7 @@ final class SessionManagerTests: XCTestCase {
         while recorder.callCount == 0 {
             await Task.yield()
         }
+        let pendingSessionID = manager.selectedSessionID
 
         manager.invalidatePendingOpenSelection()
         let startedInstance = "22222222-3333-" + "4444-8555-666666666666"
@@ -1192,7 +1251,8 @@ final class SessionManagerTests: XCTestCase {
         let result = await start.value
 
         XCTAssertNil(result)
-        XCTAssertEqual(manager.selectedSessionID, selected.id)
+        XCTAssertNotEqual(pendingSessionID, selected.id)
+        XCTAssertEqual(manager.selectedSessionID, pendingSessionID)
         XCTAssertEqual(
             manager.sessions.first(where: { $0.instanceToken == startedInstance })?.projectID,
             startingProject.id
@@ -1247,7 +1307,7 @@ final class SessionManagerTests: XCTestCase {
         )
     }
 
-    func testFailedStartDoesNotReplaceAReconnectableSession() async {
+    func testFailedStartKeepsReconnectableSessionAndShowsFailurePanel() async {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let project = makeProject(name: "Terminal Relay", server: server)
         let manager = SessionManager()
@@ -1283,7 +1343,16 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertTrue(session.status.canReconnect)
         XCTAssertEqual(session.status.label, "Disconnected (255)")
         XCTAssertEqual(session.terminalViewIdentity, originalTerminalIdentity)
-        XCTAssertEqual(manager.sessions.count, 1)
+        XCTAssertEqual(manager.sessions.count, 2)
+        let failedSession = try! XCTUnwrap(manager.sessions.last)
+        XCTAssertFalse(failedSession === session)
+        XCTAssertEqual(failedSession.status, .exited(nil))
+        XCTAssertFalse(failedSession.isLaunchPending)
+        XCTAssertEqual(
+            failedSession.launchFailureMessage,
+            "The worker could not start this agent."
+        )
+        XCTAssertEqual(manager.selectedSessionID, failedSession.id)
         XCTAssertNotNil(service.error(for: server.id))
     }
 

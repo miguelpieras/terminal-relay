@@ -1324,7 +1324,34 @@ private struct TerminalPane: View {
                 .background(Color(nsColor: .controlBackgroundColor))
             }
 
-            if session.usesNativeChat, let coordinator = session.chatCoordinator {
+            if session.isLaunchPending {
+                VStack(spacing: 12) {
+                    ProgressView()
+                        .controlSize(.large)
+                    Text("Starting \(agentProductName)…")
+                        .font(.headline)
+                    Text("Connecting to \(worker.displayName)")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Starting \(agentProductName)")
+            } else if let failureMessage = session.launchFailureMessage {
+                ContentUnavailableView {
+                    Label(
+                        "\(agentProductName) didn’t start",
+                        systemImage: "exclamationmark.triangle"
+                    )
+                } description: {
+                    Text(failureMessage)
+                } actions: {
+                    Button("Close") {
+                        sessionManager.close(sessionID: session.id)
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            } else if session.usesNativeChat, let coordinator = session.chatCoordinator {
                 ZStack {
                     ConversationView(
                         coordinator: coordinator,
@@ -1333,7 +1360,6 @@ private struct TerminalPane: View {
                     )
                     .onAppear {
                         session.startIfNeeded()
-                        coordinator.start()
                     }
 
                     if session.status == .stopping {
@@ -1392,6 +1418,10 @@ private struct TerminalPane: View {
             handleNativeEscape(isRepeat: keyPress.phase.contains(.repeat))
             return .handled
         }
+    }
+
+    private var agentProductName: String {
+        session.kind == .claude ? "Claude Code" : session.kind.displayName
     }
 
     private func sessionProgressOverlay(_ message: String) -> some View {

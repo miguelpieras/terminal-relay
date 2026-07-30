@@ -52,6 +52,12 @@ enum TerminalSessionStatus: Equatable {
     }
 }
 
+enum TerminalSessionLaunchState: Equatable {
+    case ready
+    case starting
+    case failed(String)
+}
+
 private struct CodexTerminalTitle {
     private static let runStates = Set(["Ready", "Working", "Thinking", "Waiting", "Starting"])
 
@@ -126,7 +132,7 @@ private func progressReport(fromOSC9Payload payload: ArraySlice<UInt8>) -> Termi
 @MainActor
 final class TerminalSession: NSObject, ObservableObject, Identifiable {
     let id: UUID
-    let terminalViewIdentity = UUID()
+    let terminalViewIdentity: UUID
     let projectID: UUID
     let projectName: String
     let workingDirectory: String
@@ -147,6 +153,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
     @Published private(set) var isWorking = false
     @Published private(set) var taskCompletionCount = 0
     @Published private(set) var remoteAttachedClientCount: Int?
+    @Published private(set) var launchState: TerminalSessionLaunchState
 
     private let configuration: SSHLaunchConfiguration
     private var hasStarted = false
@@ -169,15 +176,18 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         sequenceNumber: Int,
         instanceToken: String,
         id: UUID = UUID(),
+        terminalViewIdentity: UUID = UUID(),
         startedAt: Date = Date(),
         initialStatus: TerminalSessionStatus = .connecting,
         terminalTitle: String? = nil,
         threadID: String? = nil,
         remoteAttachedClientCount: Int? = nil,
         presentation: WorkerSessionPresentation = .terminal,
+        launchState: TerminalSessionLaunchState = .ready,
         launchDefaults: AgentLaunchDefaults = .standard
     ) {
         self.id = id
+        self.terminalViewIdentity = terminalViewIdentity
         self.projectID = project.id
         self.projectName = project.displayName
         self.workingDirectory = project.workingDirectory
@@ -190,8 +200,10 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         self.instanceToken = instanceToken
         self.presentation = presentation
         self.status = initialStatus
+        self.launchState = launchState
         self.terminalTitle = nil
-        self.threadID = threadID ?? (kind == .claude ? instanceToken : nil)
+        self.threadID = threadID
+            ?? (kind == .claude && launchState == .ready ? instanceToken : nil)
         self.remoteAttachedClientCount = remoteAttachedClientCount
         switch presentation {
         case .terminal:
@@ -277,6 +289,15 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         presentation == .chat && chatCoordinator != nil
     }
 
+    var isLaunchPending: Bool {
+        launchState == .starting
+    }
+
+    var launchFailureMessage: String? {
+        guard case .failed(let message) = launchState else { return nil }
+        return message
+    }
+
     var displayTitle: String {
         guard let terminalTitle else {
             return "\(kind.displayName) \(sequenceNumber)"
@@ -297,6 +318,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
     func startIfNeeded() {
         guard !hasStarted,
               !hasFinished,
+              launchState == .ready,
               status != .stopping,
               !isExited else { return }
         hasStarted = true
@@ -569,6 +591,14 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
                 await chatCoordinator.detach()
             }
         }
+        updateWorkingState()
+    }
+
+    func markLaunchFailed(_ message: String) {
+        guard launchState == .starting else { return }
+        launchState = .failed(message)
+        status = .exited(nil)
+        hasFinished = true
         updateWorkingState()
     }
 
