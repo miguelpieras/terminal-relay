@@ -107,4 +107,11 @@ assert manifest["protocol"] == {"minimum": 1, "maximum": 2}
 assert len(manifest["files"]) >= 10
 PYTHON
 
+if ! /usr/bin/grep -Eq \
+    '^ReadWritePaths=.*(^| )/usr/local/libexec( |$)' \
+    "$repository_root/Server/terminal-relay-runtime-update.service"; then
+    echo "The runtime updater cannot install its command gateway payload." >&2
+    exit 1
+fi
+
 echo "Worker runtime update tests passed."
