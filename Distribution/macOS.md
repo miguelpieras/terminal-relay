@@ -33,6 +33,21 @@ git tag v1.1
 git push origin v1.1
 ```
 
+When a tested worker-only correction must ship without inventing a new macOS
+client version, dispatch the protected runtime publisher from current `main`:
+
+```bash
+gh workflow run publish-worker-runtime.yml --ref main
+```
+
+`Publish Worker Runtime` uses the same `macos-release` signing key and canonical
+payload builder, preserves the currently published Sparkle appcast and client
+archive, deploys only the new stable worker manifest/signature/archive, and
+verifies the public signature and archive digest over HTTPS. It does not create
+a tag, GitHub Release, Sparkle client update, or App Store upload. Normal client
+releases continue to publish their matching runtime first through
+`release-macos.yml`.
+
 The release workflow uses the protected `macos-release` GitHub environment and
 these encrypted environment secrets:
 

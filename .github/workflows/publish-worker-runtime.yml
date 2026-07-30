@@ -1,0 +1,228 @@
+name: Publish Worker Runtime
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: terminal-relay-worker-runtime-stable
+  cancel-in-progress: false
+
+jobs:
+  build-runtime:
+    runs-on: macos-26
+    timeout-minutes: 20
+    environment: macos-release
+    permissions:
+      contents: read
+      pages: write
+    outputs:
+      runtime-version: ${{ steps.runtime.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Validate current main commit
+        run: |
+          [[ "$GITHUB_REF" == "refs/heads/main" ]]
+          git fetch --quiet origin main
+          [[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]]
+
+      - name: Check public repository
+        run: ./Scripts/check-public-repo.sh
+
+      - name: Install OpenSSL
+        run: brew install openssl@3
+
+      - name: Prepare worker runtime signing key
+        id: runtime-key
+        env:
+          WORKER_RUNTIME_SIGNING_KEY: ${{ secrets.WORKER_RUNTIME_SIGNING_KEY }}
+        run: |
+          key_path="$RUNNER_TEMP/worker-runtime-signing.pem"
+          printf '%s' "$WORKER_RUNTIME_SIGNING_KEY" > "$key_path"
+          chmod 600 "$key_path"
+          /opt/homebrew/opt/openssl@3/bin/openssl pkey \
+            -in "$key_path" \
+            -pubout \
+            -out "$RUNNER_TEMP/worker-runtime-public.pem"
+          cmp -s \
+            "$RUNNER_TEMP/worker-runtime-public.pem" \
+            Server/terminal-relay-runtime-update.pub
+          echo "path=$key_path" >> "$GITHUB_OUTPUT"
+
+      - name: Build signed worker runtime
+        id: runtime
+        env:
+          WORKER_RUNTIME_SIGNING_KEY_PATH: ${{ steps.runtime-key.outputs.path }}
+          OPENSSL_BIN: /opt/homebrew/opt/openssl@3/bin/openssl
+        run: |
+          runtime_version="$(git show -s --format=%ct HEAD)"
+          release_version=$(
+            awk '/MARKETING_VERSION:/ { gsub(/"/, "", $2); print $2; exit }' project.yml
+          )
+          output_directory="$GITHUB_WORKSPACE/build/worker-runtime"
+          ./Scripts/build-worker-runtime.sh \
+            "$runtime_version" \
+            "$release_version" \
+            "$output_directory"
+          echo "version=$runtime_version" >> "$GITHUB_OUTPUT"
+
+      - name: Preserve client feed and stage runtime feed
+        env:
+          RUNTIME_VERSION: ${{ steps.runtime.outputs.version }}
+        run: |
+          pages_directory="$GITHUB_WORKSPACE/build/worker-runtime-pages"
+          runtime_directory="$GITHUB_WORKSPACE/build/worker-runtime"
+          mkdir -p "$pages_directory/worker-runtime/$RUNTIME_VERSION"
+          cp -R docs/. "$pages_directory/"
+          cp "$runtime_directory/manifest.json" \
+            "$pages_directory/worker-runtime/manifest.json"
+          cp "$runtime_directory/manifest.sig" \
+            "$pages_directory/worker-runtime/manifest.sig"
+          cp "$runtime_directory/runtime.tar.gz" \
+            "$pages_directory/worker-runtime/$RUNTIME_VERSION/runtime.tar.gz"
+          /usr/bin/python3 - "$pages_directory" "$RUNTIME_VERSION" <<'PYTHON'
+          import hashlib
+          import json
+          import pathlib
+          import re
+          import sys
+          import xml.etree.ElementTree as ET
+
+          pages = pathlib.Path(sys.argv[1])
+          version = int(sys.argv[2])
+          appcast = pages / "appcast.xml"
+          if not appcast.is_file():
+              raise SystemExit("published Sparkle appcast is missing")
+          root = ET.parse(appcast).getroot()
+          urls = [
+              item.attrib.get("url", "")
+              for item in root.iter()
+              if item.tag.endswith("enclosure")
+          ]
+          expected_prefix = "https://miguelpieras.github.io/terminal-relay/"
+          if not urls or any(not url.startswith(expected_prefix) for url in urls):
+              raise SystemExit("published Sparkle archive URL is invalid")
+          for url in urls:
+              name = url.removeprefix(expected_prefix)
+              if not re.fullmatch(r"Terminal-Relay-[0-9]+(?:\.[0-9]+){1,2}\.zip", name):
+                  raise SystemExit("published Sparkle archive name is invalid")
+              if not (pages / name).is_file():
+                  raise SystemExit("published Sparkle archive is missing")
+          manifest_path = pages / "worker-runtime" / "manifest.json"
+          archive_path = pages / "worker-runtime" / str(version) / "runtime.tar.gz"
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          if (
+              manifest.get("runtimeVersion") != version
+              or manifest.get("archiveURL")
+              != (
+                  "https://miguelpieras.github.io/terminal-relay/"
+                  f"worker-runtime/{version}/runtime.tar.gz"
+              )
+              or manifest.get("archiveSHA256")
+              != hashlib.sha256(archive_path.read_bytes()).hexdigest()
+          ):
+              raise SystemExit("staged worker runtime feed is inconsistent")
+          PYTHON
+
+      - name: Configure GitHub Pages workflow source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api \
+            --method PUT \
+            "repos/$GITHUB_REPOSITORY/pages" \
+            --input - <<'JSON'
+          {"build_type":"workflow"}
+          JSON
+
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+
+      - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+        with:
+          path: build/worker-runtime-pages
+
+  deploy-pages:
+    needs: build-runtime
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+
+    steps:
+      - name: Deploy signed worker runtime
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify published signature and archive
+        env:
+          RUNTIME_VERSION: ${{ needs.build-runtime.outputs.runtime-version }}
+        run: |
+          temporary_directory="$(mktemp -d)"
+          trap 'rm -rf "$temporary_directory"' EXIT
+          feed_root="https://miguelpieras.github.io/terminal-relay/worker-runtime"
+          for name in manifest.json manifest.sig; do
+            curl \
+              --proto '=https' \
+              --tlsv1.2 \
+              --fail \
+              --location \
+              --silent \
+              --show-error \
+              --retry 12 \
+              --retry-all-errors \
+              --retry-delay 5 \
+              --max-time 15 \
+              "$feed_root/$name" \
+              --output "$temporary_directory/$name"
+          done
+          curl \
+            --proto '=https' \
+            --tlsv1.2 \
+            --fail \
+            --location \
+            --silent \
+            --show-error \
+            --retry 12 \
+            --retry-all-errors \
+            --retry-delay 5 \
+            --max-time 30 \
+            "$feed_root/$RUNTIME_VERSION/runtime.tar.gz" \
+            --output "$temporary_directory/runtime.tar.gz"
+          openssl pkeyutl \
+            -verify \
+            -pubin \
+            -inkey Server/terminal-relay-runtime-update.pub \
+            -rawin \
+            -in "$temporary_directory/manifest.json" \
+            -sigfile "$temporary_directory/manifest.sig"
+          /usr/bin/python3 - "$temporary_directory" "$RUNTIME_VERSION" <<'PYTHON'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          version = int(sys.argv[2])
+          manifest = json.loads(
+              (root / "manifest.json").read_text(encoding="utf-8")
+          )
+          archive = (root / "runtime.tar.gz").read_bytes()
+          if (
+              manifest.get("runtimeVersion") != version
+              or manifest.get("archiveSHA256")
+              != hashlib.sha256(archive).hexdigest()
+          ):
+              raise SystemExit("published worker runtime feed is inconsistent")
+          PYTHON
