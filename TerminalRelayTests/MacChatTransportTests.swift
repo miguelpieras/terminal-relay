@@ -154,6 +154,45 @@ final class MacChatTransportTests: XCTestCase {
         await transport.disconnect()
     }
 
+    func testCancelledConsumerCanReconnectWithFreshEventStream() async throws {
+        let transport = MacChatTransport(
+            configuration: SSHLaunchConfiguration(executable: "/bin/cat", arguments: [])
+        )
+        let firstEvents = await transport.events()
+        try await transport.connect()
+        let firstEventReceived = expectation(description: "first event received")
+        let firstConsumer = Task {
+            var iterator = firstEvents.makeAsyncIterator()
+            let received = await iterator.next()
+            firstEventReceived.fulfill()
+            _ = await iterator.next()
+            return received
+        }
+        let first = event(
+            type: "session.hello",
+            eventID: "66666666-6666-6666-6666-666666666666",
+            sequence: 1
+        )
+        try await transport.send(first)
+        await fulfillment(of: [firstEventReceived], timeout: 2)
+        firstConsumer.cancel()
+        let firstReceived = await firstConsumer.value
+        XCTAssertEqual(firstReceived, .envelope(first))
+        await transport.disconnect()
+
+        let secondEvents = await transport.events()
+        try await transport.connect()
+        let second = event(
+            type: "session.hello",
+            eventID: "77777777-7777-7777-7777-777777777777",
+            sequence: 2
+        )
+        try await transport.send(second)
+        let secondReceived = await collect(secondEvents, count: 1)
+        XCTAssertEqual(secondReceived, [.envelope(second)])
+        await transport.disconnect()
+    }
+
     private func event(
         type: String,
         eventID: String,

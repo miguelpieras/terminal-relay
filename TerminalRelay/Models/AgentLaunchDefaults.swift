@@ -89,6 +89,25 @@ struct AgentLaunchDefaults: Equatable {
         }
     }
 
+    func chatArguments(for kind: AgentKind) -> [String] {
+        let model: String
+        let effort: AgentReasoningEffort
+        switch kind {
+        case .codex:
+            model = codexModel
+            effort = codexReasoningEffort
+        case .claude:
+            model = claudeModel
+            effort = claudeReasoningEffort
+        }
+
+        var arguments = ["--model", model, "--effort", effort.rawValue]
+        if fullAccessEnabled {
+            arguments.append("--full-access")
+        }
+        return arguments
+    }
+
     func summary(for kind: AgentKind) -> String {
         switch kind {
         case .codex:

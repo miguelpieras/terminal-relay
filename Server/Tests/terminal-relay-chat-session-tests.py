@@ -157,7 +157,15 @@ except BlockingIOError:
             assert capability_value["capabilities"]["supportsAttachments"] is True
 
             start = helper(
-                "chat-start-v1", "codex", "example-repository", check=False
+                "chat-start-v1",
+                "codex",
+                "example-repository",
+                "--model",
+                "gpt-5.6-sol",
+                "--effort",
+                "max",
+                "--full-access",
+                check=False,
             )
             assert start.returncode == 0, start.stderr
             start_lines = start.stdout.splitlines()
@@ -168,7 +176,17 @@ except BlockingIOError:
             uuid.UUID(relay_id)
             uuid.UUID(thread_id)
             assert start_value["provider"] == "codex"
-            assert start_value["launchOptions"]["permissionMode"] == "default"
+            assert start_value["launchOptions"]["model"] == "gpt-5.6-sol"
+            assert start_value["launchOptions"]["effort"] == "max"
+            assert start_value["launchOptions"]["permissionMode"] == "bypassPermissions"
+            assert start_value["launchOptions"]["fullAccess"] is True
+            assert set(start_value["launchOptions"]) == {
+                "model",
+                "effort",
+                "permissionMode",
+                "fullAccess",
+                "fastMode",
+            }
 
             status = helper("status").stdout.splitlines()
             record = next(line for line in status if f"|{relay_id}|" in line)

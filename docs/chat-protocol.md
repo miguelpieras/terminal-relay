@@ -192,8 +192,9 @@ reconciles the turn and emits a fresh snapshot.
 
 The broker performs `initialize`, waits for the result, then sends
 `initialized`. Initialization enables the experimental API and disables
-attestation requests. Bindings and fixtures are checked against the managed
-worker's Codex v2 schema rather than copied from Happy.
+attestation requests through `initialize.params.capabilities`. Bindings and
+fixtures are checked against the managed worker's Codex v2 schema rather than
+copied from Happy.
 
 `thread/read(includeTurns: true)` supplies bounded history.
 `thread/resume` supplies the subscription snapshot; notifications arriving

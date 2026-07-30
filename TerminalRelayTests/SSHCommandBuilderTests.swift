@@ -304,7 +304,7 @@ final class SSHCommandBuilderTests: XCTestCase {
                     "codex",
                     "terminal-relay",
                     threadID,
-                ] + defaults.arguments(for: .codex)
+                ] + defaults.chatArguments(for: .codex)
             ).map(SSHCommandBuilder.shellQuote).joined(separator: " ")
         )
         let attach = SSHCommandBuilder.workerChatAttachConfiguration(
@@ -349,7 +349,7 @@ final class SSHCommandBuilderTests: XCTestCase {
                     "chat-start-v1",
                     "claude",
                     "terminal-relay",
-                ] + AgentLaunchDefaults.standard.arguments(for: .claude)
+                ] + AgentLaunchDefaults.standard.chatArguments(for: .claude)
             ).map(SSHCommandBuilder.shellQuote).joined(separator: " ")
         )
     }
@@ -426,6 +426,17 @@ final class SSHCommandBuilderTests: XCTestCase {
         XCTAssertTrue(
             AgentLaunchDefaults.standard.arguments(for: .claude)
                 .contains("--dangerously-skip-permissions")
+        )
+    }
+
+    func testNativeChatDefaultsUseOnlyNegotiatedOptions() {
+        XCTAssertEqual(
+            AgentLaunchDefaults.standard.chatArguments(for: .codex),
+            ["--model", "gpt-5.6-sol", "--effort", "max", "--full-access"]
+        )
+        XCTAssertEqual(
+            AgentLaunchDefaults.standard.chatArguments(for: .claude),
+            ["--model", "fable", "--effort", "max", "--full-access"]
         )
     }
 

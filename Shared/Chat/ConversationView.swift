@@ -57,6 +57,7 @@ struct ConversationView: View {
     let coordinator: ConversationCoordinator
     let isReadOnly: Bool
     let showsComposer: Bool
+    let startsCoordinator: Bool
     let onOpenTerminalFallback: (() -> Void)?
 
     @Environment(\.openURL) private var openURL
@@ -68,12 +69,14 @@ struct ConversationView: View {
         coordinator: ConversationCoordinator,
         isReadOnly: Bool = false,
         showsComposer: Bool = true,
+        startsCoordinator: Bool = true,
         onOpenTerminalFallback: (() -> Void)? = nil
     ) {
         self.coordinator = coordinator
         _store = ObservedObject(wrappedValue: coordinator.store)
         self.isReadOnly = isReadOnly
         self.showsComposer = showsComposer
+        self.startsCoordinator = startsCoordinator
         self.onOpenTerminalFallback = onOpenTerminalFallback
     }
 
@@ -92,7 +95,9 @@ struct ConversationView: View {
         }
         .background(Color.chatCanvas)
         .task {
-            coordinator.start()
+            if startsCoordinator {
+                coordinator.start()
+            }
         }
         .onDisappear {
             Task {

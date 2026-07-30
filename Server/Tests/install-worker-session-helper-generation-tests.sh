@@ -29,6 +29,8 @@ trap cleanup EXIT
 /usr/bin/awk '
     /^quote_remote\(\)/ { copying = 1 }
     /^validate_ssh_target / { copying = 0 }
+    /^render_runtime_control_script\(\)/ { copying = 1 }
+    /^runtime_control_script=/ { copying = 0 }
     copying { print }
 ' "$installer" > "$temporary_helpers"
 # shellcheck disable=SC1090
@@ -38,6 +40,7 @@ install_script="$(/usr/bin/sed -n "/<<'REMOTE_INSTALL'/,/^REMOTE_INSTALL$/p" "$i
     | /usr/bin/sed '1d;$d')"
 rollback_script="$(/usr/bin/sed -n "/<<'REMOTE_ROLLBACK'/,/^REMOTE_ROLLBACK$/p" "$installer" \
     | /usr/bin/sed '1d;$d')"
+runtime_control_script="$(render_runtime_control_script)"
 
 # shellcheck disable=SC2016
 [[ "$install_script" == *'case "$helper_staged" in'* \
@@ -60,6 +63,13 @@ rollback_script="$(/usr/bin/sed -n "/<<'REMOTE_ROLLBACK'/,/^REMOTE_ROLLBACK$/p" 
     && "$rollback_script" == *'"$service_initial_active"'* \
     && "$rollback_script" == *'systemctl daemon-reload'* ]] \
     || { echo "Rollback renderer expanded or lost literal remote variables." >&2; exit 1; }
+# shellcheck disable=SC2016
+[[ "$runtime_control_script" == *'temporary_directory="$(/usr/bin/mktemp -d '* \
+    && "$runtime_control_script" == *'case "$temporary_directory" in'* \
+    && "$runtime_control_script" == *'"$temporary_directory/runtime-manifest.json"'* \
+    && "$runtime_control_script" == *'systemctl enable --now'* ]] \
+    || { echo "Runtime-control renderer expanded or lost literal remote variables." >&2; exit 1; }
+/bin/bash -n <<< "$runtime_control_script"
 [[ "$(< "$restore_unit")" == *'ExecStart=/usr/local/bin/terminal-relay-session restore'* \
     && "$(< "$restore_unit")" == *'WantedBy=multi-user.target'* \
     && "$(< "$restore_unit")" == *'User=%i'* \

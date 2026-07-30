@@ -993,7 +993,8 @@ runtime_version="$(git -C "$repository_root" show -s --format=%ct HEAD)"
 "$script_directory/write-installed-runtime-manifest.sh" \
     "$runtime_version" \
     "$runtime_manifest_file"
-runtime_control_script="$(/bin/cat <<'REMOTE_RUNTIME_CONTROLS'
+render_runtime_control_script() {
+    /bin/cat <<'REMOTE_RUNTIME_CONTROLS'
 set -euo pipefail
 temporary_directory="$(/usr/bin/mktemp -d /tmp/terminal-relay-runtime-controls.XXXXXX)"
 cleanup() {
@@ -1056,7 +1057,8 @@ done
     terminal-relay-runtime-update.timer \
     terminal-relay-runtime-update.path
 REMOTE_RUNTIME_CONTROLS
-)"
+}
+runtime_control_script="$(render_runtime_control_script)"
 runtime_control_command="$(build_locked_remote_command \
     "$admin_uid" "$runtime_control_script" terminal-relay-runtime-controls)"
 set +e

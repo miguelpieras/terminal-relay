@@ -72,6 +72,7 @@ final class ConversationCoordinator {
     private let retryPolicy: ChatRetryPolicy
     private let stopPolicy: ChatStopPolicy
     private var lifecycleTask: Task<Void, Never>?
+    private var retryTask: Task<Void, Never>?
     private var shouldStayConnected = false
     private var isAttached = false
     private var needsFreshSnapshot = false
@@ -99,10 +100,11 @@ final class ConversationCoordinator {
 
     deinit {
         lifecycleTask?.cancel()
+        retryTask?.cancel()
     }
 
     func start() {
-        guard lifecycleTask == nil else { return }
+        guard lifecycleTask == nil, retryTask == nil else { return }
         guard identity.isValid else {
             store.setConnectionState(
                 .failed,
@@ -133,6 +135,8 @@ final class ConversationCoordinator {
 
     func detach() async {
         shouldStayConnected = false
+        retryTask?.cancel()
+        retryTask = nil
         lifecycleTask?.cancel()
         lifecycleTask = nil
         if isAttached {
@@ -144,14 +148,22 @@ final class ConversationCoordinator {
     }
 
     func retry() {
+        guard retryTask == nil else { return }
         shouldStayConnected = false
-        lifecycleTask?.cancel()
+        let previousLifecycleTask = lifecycleTask
+        previousLifecycleTask?.cancel()
         lifecycleTask = nil
-        Task { [weak self] in
+        store.setConnectionState(.connecting)
+        retryTask = Task { [weak self] in
             guard let self else { return }
+            _ = await previousLifecycleTask?.value
             await transport.disconnect()
+            guard !Task.isCancelled else {
+                retryTask = nil
+                return
+            }
             shouldStayConnected = true
-            store.setConnectionState(.connecting)
+            retryTask = nil
             start()
         }
     }
@@ -352,6 +364,8 @@ final class ConversationCoordinator {
             return
         }
         shouldStayConnected = false
+        retryTask?.cancel()
+        retryTask = nil
         lifecycleTask?.cancel()
         lifecycleTask = nil
         isAttached = false
@@ -399,6 +413,7 @@ final class ConversationCoordinator {
                 }
             } catch {
                 isAttached = false
+                await transport.disconnect()
                 store.setConnectionState(.offlineAgentRunning, message: sanitizedMessage(for: error))
             }
 

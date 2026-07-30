@@ -248,7 +248,6 @@ def validate_launch_arguments(arguments: list[str]) -> dict[str, Any]:
         "permissionMode": "default",
         "fullAccess": False,
         "fastMode": False,
-        "providerArguments": [],
     }
     index = 0
     while index < len(arguments):
@@ -319,8 +318,7 @@ def validate_launch_arguments(arguments: list[str]) -> dict[str, Any]:
         elif argument in {"--model", "--effort", "--permission-mode", "--sandbox"}:
             pass
         else:
-            # Keep provider arguments visible in the negotiated response but do
-            # not pass unknown switches through to a shell or SDK.
+            # Do not pass unknown switches through to a shell or SDK.
             raise ChatError(
                 "invalidOptions",
                 f"The provider launch option is unsupported: {argument}",
@@ -357,6 +355,7 @@ def chat_capabilities(provider: str) -> dict[str, Any]:
         pass
     else:
         raise ChatError("unsupportedProvider", "The provider is unsupported.", exit_code=64)
+    common["features"].sort()
     return common
 
 
@@ -1020,8 +1019,10 @@ class CodexAdapter(ProviderAdapter):
                     "title": "Terminal Relay",
                     "version": "1.0.0",
                 },
-                "experimentalApi": True,
-                "requestAttestation": False,
+                "capabilities": {
+                    "experimentalApi": True,
+                    "requestAttestation": False,
+                },
             },
         )
         if not isinstance(initialized, dict):
@@ -1203,8 +1204,10 @@ class CodexAdapter(ProviderAdapter):
                             "title": "Terminal Relay",
                             "version": "1.0.0",
                         },
-                        "experimentalApi": True,
-                        "requestAttestation": False,
+                        "capabilities": {
+                            "experimentalApi": True,
+                            "requestAttestation": False,
+                        },
                     },
                     buffered,
                 )
@@ -3320,8 +3323,13 @@ class ChatBroker:
         snapshot = self.event("conversation.snapshot", payload)
         return snapshot, encode_record(snapshot)
 
-    async def rebuild_snapshot(self) -> None:
-        history, has_older = await self.provider.history(None, MAX_HISTORY_ITEMS)
+    async def rebuild_snapshot(self, *, load_provider_history: bool = True) -> None:
+        if load_provider_history:
+            history, has_older = await self.provider.history(
+                None, MAX_HISTORY_ITEMS
+            )
+        else:
+            history, has_older = [], False
         self.snapshot_generation = new_uuid()
         self.items.clear()
         for item in history:
@@ -3398,6 +3406,10 @@ class ChatBroker:
             if not stat.S_ISSOCK(socket_stat.st_mode) or socket_stat.st_uid != os.getuid():
                 raise ChatError("unsafeState", "The chat socket path is unsafe.")
             os.unlink(self.socket_path)
+        load_provider_history = (
+            self.provider_thread_id is not None
+            and not self.launch_options.get("_newSession")
+        )
         if self.provider_thread_id is not None:
             self._acquire_provider_lock()
         self.rebuilding_snapshot = True
@@ -3407,7 +3419,7 @@ class ChatBroker:
         )
         if self.provider_lock_descriptor is None:
             self._acquire_provider_lock()
-        await self.rebuild_snapshot()
+        await self.rebuild_snapshot(load_provider_history=load_provider_history)
         self.connection_state = "streaming"
         self._write_state("ready")
         self.server = await asyncio.start_unix_server(

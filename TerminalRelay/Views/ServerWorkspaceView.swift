@@ -1337,10 +1337,15 @@ private struct TerminalPane: View {
                     ConversationView(
                         coordinator: coordinator,
                         showsComposer: false,
+                        startsCoordinator: false,
                         onOpenTerminalFallback: {
                             isConfirmingTerminalFallback = true
                         }
                     )
+                    .onAppear {
+                        session.startIfNeeded()
+                        coordinator.start()
+                    }
 
                     if isOpeningTerminalFallback || session.status == .stopping {
                         sessionProgressOverlay(

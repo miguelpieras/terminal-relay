@@ -386,6 +386,7 @@ final class ConversationCoordinatorTests: XCTestCase {
         await waitUntil { store.state.connectionState == .offlineAgentRunning }
 
         coordinator.retry()
+        XCTAssertEqual(store.state.connectionState, .connecting)
         await waitUntil {
             await transport.sentEnvelopes().filter { $0.type == "session.attach" }.count == 2
         }

@@ -429,6 +429,30 @@ async def exercise_protocol(module, root: pathlib.Path) -> None:
     replacement.stop_event.set()
     await asyncio.wait_for(replacement_task, 5)
 
+    # A new provider thread has no materialized history until its first user
+    # message. Starting the broker must not issue an impossible history read.
+    class NewThreadProvider(module.FakeProvider):
+        async def history(self, before_item_id, limit):
+            del before_item_id, limit
+            raise AssertionError("new provider history must not be read")
+
+    third_relay = "88888888-8888-4888-8888-888888888888"
+    new_provider = NewThreadProvider(str(project), None, {})
+    new_broker = module.ChatBroker(
+        "codex",
+        "example-repository",
+        str(project),
+        str(runtime),
+        third_relay,
+        new_provider,
+        {},
+    )
+    new_broker_task = asyncio.create_task(new_broker.run())
+    await wait_ready(new_broker)
+    assert new_broker.provider_thread_id is not None
+    new_broker.stop_event.set()
+    await asyncio.wait_for(new_broker_task, 5)
+
 
 class FakeCodexWebSocket:
     def __init__(self, *, thread_turns=None, disconnect_turn_start=False):
@@ -447,8 +471,11 @@ class FakeCodexWebSocket:
         method = value.get("method")
         request_id = value.get("id")
         if method == "initialize":
-            assert value["params"]["experimentalApi"] is True
-            assert value["params"]["requestAttestation"] is False
+            assert set(value["params"]) == {"clientInfo", "capabilities"}
+            assert value["params"]["capabilities"] == {
+                "experimentalApi": True,
+                "requestAttestation": False,
+            }
             self.initialize_answered = True
             self.incoming.put({"id": request_id, "result": {"serverInfo": {}}})
         elif method == "initialized":
@@ -1427,8 +1454,16 @@ async def exercise_claude_reconnect(module, root: pathlib.Path) -> None:
 
 
 def exercise_validation(module) -> None:
-    assert module.chat_capabilities("codex")["supportsAttachments"] is True
-    assert module.chat_capabilities("claude")["supportsAttachments"] is True
+    codex_capabilities = module.chat_capabilities("codex")
+    claude_capabilities = module.chat_capabilities("claude")
+    assert codex_capabilities["supportsAttachments"] is True
+    assert claude_capabilities["supportsAttachments"] is True
+    assert codex_capabilities["features"] == sorted(
+        set(codex_capabilities["features"])
+    )
+    assert claude_capabilities["features"] == sorted(
+        set(claude_capabilities["features"])
+    )
     normalized = module.validate_launch_arguments(
         [
             "--model",

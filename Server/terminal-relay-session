@@ -1774,7 +1774,7 @@ chat_start_v1() {
         fi
         printf ' --codex-socket %q' "$codex_app_server_socket"
         for argument in "$@"; do
-            printf ' --launch-argument %q' "$argument"
+            printf ' --launch-argument=%q' "$argument"
         done
         if [[ $test_mode -eq 1 && "${TERMINAL_RELAY_TEST_CHAT_FAKE:-0}" == "1" ]]; then
             printf ' --fake'

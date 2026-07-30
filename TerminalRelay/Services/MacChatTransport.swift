@@ -13,8 +13,8 @@ actor MacChatTransport: ChatTransport {
 
     private let configuration: SSHLaunchConfiguration
     private let connection: MacChatProcessConnection
-    private let eventStream: AsyncStream<ChatTransportEvent>
-    private let eventContinuation: AsyncStream<ChatTransportEvent>.Continuation
+    private var eventStream: AsyncStream<ChatTransportEvent>?
+    private var eventContinuation: AsyncStream<ChatTransportEvent>.Continuation?
 
     private var decoder = ChatNDJSONDecoder()
     private var runID: UUID?
@@ -31,9 +31,6 @@ actor MacChatTransport: ChatTransport {
     ) {
         self.configuration = configuration
         self.connection = connection
-        let pair = AsyncStream.makeStream(of: ChatTransportEvent.self)
-        eventStream = pair.stream
-        eventContinuation = pair.continuation
     }
 
     func connect() async throws {
@@ -121,7 +118,13 @@ actor MacChatTransport: ChatTransport {
     }
 
     func events() async -> AsyncStream<ChatTransportEvent> {
-        eventStream
+        if let eventStream {
+            return eventStream
+        }
+        let pair = AsyncStream.makeStream(of: ChatTransportEvent.self)
+        eventStream = pair.stream
+        eventContinuation = pair.continuation
+        return pair.stream
     }
 
     private func receive(_ event: ProcessEvent, runID: UUID) {
@@ -140,7 +143,7 @@ actor MacChatTransport: ChatTransport {
 
         do {
             for envelope in try decoder.append(data) {
-                eventContinuation.yield(.envelope(envelope))
+                eventContinuation?.yield(.envelope(envelope))
             }
         } catch {
             failProtocol(error, runID: runID)
@@ -177,8 +180,11 @@ actor MacChatTransport: ChatTransport {
         diagnostic.removeAll(keepingCapacity: false)
         if !requestedDisconnect, !deliveredDisconnect {
             deliveredDisconnect = true
-            eventContinuation.yield(.disconnected(failure))
+            eventContinuation?.yield(.disconnected(failure))
         }
+        eventContinuation?.finish()
+        eventContinuation = nil
+        eventStream = nil
         let continuations = disconnectContinuations
         disconnectContinuations.removeAll(keepingCapacity: false)
         continuations.forEach { $0.resume() }
@@ -189,7 +195,7 @@ actor MacChatTransport: ChatTransport {
         terminalFailure = Self.protocolFailure(for: error)
         if !deliveredDisconnect {
             deliveredDisconnect = true
-            eventContinuation.yield(.disconnected(terminalFailure))
+            eventContinuation?.yield(.disconnected(terminalFailure))
         }
         connection.disconnect()
     }

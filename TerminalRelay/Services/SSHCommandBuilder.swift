@@ -145,7 +145,7 @@ enum SSHCommandBuilder {
         if let threadID {
             arguments.append(threadID)
         }
-        arguments += launchDefaults.arguments(for: kind)
+        arguments += launchDefaults.chatArguments(for: kind)
         return workerSessionConfiguration(for: server, arguments: arguments)
     }
 
