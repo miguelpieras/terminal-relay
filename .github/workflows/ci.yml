@@ -31,6 +31,8 @@ jobs:
           ./Server/Tests/terminal-relay-mcp-tests.sh
           ./Server/Tests/install-worker-session-helper-generation-tests.sh
           ./Server/Tests/worker-lifecycle-tests.sh
+          ./Server/Tests/worker-runtime-update-tests.sh
+          ./Server/Tests/stable-runtime-preflight-tests.sh
 
       - name: Generate Xcode project
         run: xcodegen generate

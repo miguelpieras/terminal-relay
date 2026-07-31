@@ -163,6 +163,14 @@ root-owned path trigger; it cannot select a URL, version, file, systemd unit, or
 network command. `terminal-relay-runtime-update.path` converts the trigger into
 the same serialized root service.
 
+Every change to `Server/worker-runtime-files.txt` or one of its payloads on
+`main` automatically runs the signed stable publication workflow. Production
+bootstrap, fleet reconciliation, App Review provisioning, and helper-only
+installation first verify the published signature, runtime version, allowlist
+metadata, and every local payload digest. They stop without modifying a worker
+while publication is pending, so an operator checkout cannot move a production
+worker ahead of the stable feed.
+
 The root updater accepts no arguments. It downloads only the compiled-in feed,
 uses bounded HTTPS timeouts and retries, verifies the Ed25519 manifest
 signature, rejects non-monotonic versions or any payload outside the exact

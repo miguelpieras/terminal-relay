@@ -22,6 +22,7 @@ echo "Running worker tests"
 "$repository_root/Server/Tests/install-worker-session-helper-generation-tests.sh"
 "$repository_root/Server/Tests/worker-lifecycle-tests.sh"
 "$repository_root/Server/Tests/worker-runtime-update-tests.sh"
+"$repository_root/Server/Tests/stable-runtime-preflight-tests.sh"
 
 echo "Regenerating Terminal Relay.xcodeproj"
 xcodegen generate

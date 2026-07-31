@@ -59,6 +59,13 @@ one fleet reconciliation to add it to workers created by an older release:
 ./Scripts/manage-worker.sh reconcile all
 ```
 
+Changes to the canonical worker-runtime payload publish the signed stable feed
+automatically after they reach `main`. Bootstrap, reconciliation, App Review
+provisioning, and helper-only repair verify that the feed version and signed
+file digests match the checkout before changing a worker. If publication is
+still running, wait for **Publish Worker Runtime** to finish and retry; the
+production scripts never install a checkout ahead of the stable feed.
+
 For an application-only worker, re-run its original
 `./Scripts/bootstrap-worker.sh root@worker.example.com` command instead. After
 this one-time enablement, signed runtime updates are checked automatically and

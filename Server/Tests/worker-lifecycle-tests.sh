@@ -13,7 +13,10 @@ lifecycle="$repository_root/Scripts/manage-worker.sh"
 review_lifecycle="$repository_root/Scripts/manage-review-worker.sh"
 review_tests="$repository_root/Server/Tests/review-worker-tests.sh"
 bootstrap="$repository_root/Scripts/bootstrap-worker.sh"
+helper_installer="$repository_root/Scripts/install-worker-session-helper.sh"
 runtime_payload="$repository_root/Server/worker-runtime-files.txt"
+runtime_version="$repository_root/Scripts/worker-runtime-version.sh"
+stable_runtime_preflight="$repository_root/Scripts/verify-published-worker-runtime.sh"
 temporary_root="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
 temporary_directory="$(mktemp -d "$temporary_root/terminal-relay-lifecycle-tests.XXXXXX")"
 
@@ -45,11 +48,16 @@ for file in \
     "$review_lifecycle" \
     "$review_tests" \
     "$runtime_payload" \
+    "$runtime_version" \
+    "$stable_runtime_preflight" \
+    "$helper_installer" \
     "$bootstrap"; do
     [[ -f "$file" && ! -L "$file" ]] || fail "missing or unsafe lifecycle file: $file"
 done
 [[ -x "$host_installer" && -x "$lifecycle" && -x "$review_lifecycle" \
-    && -x "$review_tests" && -x "$bootstrap" ]] \
+    && -x "$review_tests" && -x "$runtime_version" \
+    && -x "$stable_runtime_preflight" && -x "$helper_installer" \
+    && -x "$bootstrap" ]] \
     || fail "lifecycle commands are not executable"
 
 # shellcheck disable=SC1090
@@ -73,11 +81,13 @@ if [[ -f "$local_baseline" ]]; then
 fi
 
 bash -n "$host_installer" "$lifecycle" "$bootstrap" \
+    "$runtime_version" "$stable_runtime_preflight" \
     "$review_lifecycle" \
     "$application_installer" \
     "$agent_updater"
 if command -v shellcheck >/dev/null 2>&1; then
     shellcheck -x "$host_installer" "$lifecycle" "$bootstrap" \
+        "$runtime_version" "$stable_runtime_preflight" \
         "$review_lifecycle" \
         "$application_installer" \
         "$agent_updater"
@@ -107,6 +117,14 @@ grep -Fq 'terminal-relay-runtime-update.timer' "$runtime_payload" \
     || fail "bootstrap does not include automatic runtime updates"
 grep -Fq 'worker-runtime-files.txt' "$bootstrap" \
     || fail "bootstrap does not consume the canonical runtime payload list"
+grep -Fq 'verify-published-worker-runtime.sh' "$bootstrap" \
+    || fail "bootstrap does not require the matching signed stable runtime"
+grep -Fq 'verify-published-worker-runtime.sh' "$lifecycle" \
+    || fail "fleet verification does not require the matching signed stable runtime"
+grep -Fq 'verify-published-worker-runtime.sh' "$review_lifecycle" \
+    || fail "App Review provisioning does not require the matching signed stable runtime"
+grep -Fq 'verify-published-worker-runtime.sh' "$helper_installer" \
+    || fail "helper-only installation does not require the matching signed stable runtime"
 grep -Fq 'CODEX_NON_INTERACTIVE=1' "$agent_updater" \
     || fail "Codex automatic updates are not unattended"
 grep -Fq 'apt/latest latest main' "$application_installer" \

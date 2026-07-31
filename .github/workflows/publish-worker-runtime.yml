@@ -1,6 +1,29 @@
 name: Publish Worker Runtime
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/publish-worker-runtime.yml
+      - Scripts/build-worker-runtime.sh
+      - Scripts/worker-runtime-version.sh
+      - Server/worker-runtime-files.txt
+      - Server/terminal-relay-session
+      - Server/terminal-relay-mcp
+      - Server/terminal-relay-chat
+      - Server/terminal-relay-claude-sessions
+      - Server/claude-agent-sdk-requirements.txt
+      - Server/terminal-relay-session-restore@.service
+      - Server/terminal-relay-agent-update
+      - Server/terminal-relay-agent-update.service
+      - Server/terminal-relay-agent-update.timer
+      - Server/terminal-relay-runtime-update
+      - Server/terminal-relay-runtime-update.service
+      - Server/terminal-relay-runtime-update.timer
+      - Server/terminal-relay-runtime-update.path
+      - Server/terminal-relay-runtime-update.pub
+      - Server/terminal-relay-review-gateway
+      - Server/terminal-relay-mobile-gateway
   workflow_dispatch:
 
 permissions: {}
@@ -37,6 +60,11 @@ jobs:
       - name: Install OpenSSL
         run: brew install openssl@3
 
+      - name: Test worker runtime publication
+        run: |
+          ./Server/Tests/worker-runtime-update-tests.sh
+          ./Server/Tests/stable-runtime-preflight-tests.sh
+
       - name: Prepare worker runtime signing key
         id: runtime-key
         env:
@@ -60,7 +88,7 @@ jobs:
           WORKER_RUNTIME_SIGNING_KEY_PATH: ${{ steps.runtime-key.outputs.path }}
           OPENSSL_BIN: /opt/homebrew/opt/openssl@3/bin/openssl
         run: |
-          runtime_version="$(git show -s --format=%ct HEAD)"
+          runtime_version="$(./Scripts/worker-runtime-version.sh)"
           release_version=$(
             awk '/MARKETING_VERSION:/ { gsub(/"/, "", $2); print $2; exit }' project.yml
           )

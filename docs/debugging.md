@@ -104,7 +104,9 @@ ssh root@terminal-relay-worker-N \
 
 Do not replace the feed URL, public key, manifest, or installed-version state
 manually. Reconcile the exact worker from the current `main` checkout if the
-updater or key is missing.
+updater or key is missing. Reconciliation first requires the signed stable feed
+to match the checkout; if it reports that publication is pending, wait for the
+**Publish Worker Runtime** workflow to finish and retry.
 
 Compare the installed helper with the repository source:
 

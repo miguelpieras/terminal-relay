@@ -11,6 +11,7 @@ readonly REPOSITORY_ROOT
 readonly SERVER_DIRECTORY="$REPOSITORY_ROOT/Server"
 readonly BASELINE_FILE="${TERMINAL_RELAY_BASELINE_FILE:-$SERVER_DIRECTORY/worker-baseline.local.env}"
 readonly RUNTIME_PAYLOAD_LIST="$SERVER_DIRECTORY/worker-runtime-files.txt"
+readonly STABLE_RUNTIME_PREFLIGHT="$SCRIPT_DIRECTORY/verify-published-worker-runtime.sh"
 readonly -a INSTALLER_PAYLOAD_PATHS=(
     install-worker.sh
     worker-runtime-files.txt
@@ -224,6 +225,8 @@ for payload_path in "${INSTALLER_PAYLOAD_PATHS[@]}" "${runtime_payload_paths[@]}
     [[ -f "$SERVER_DIRECTORY/$payload_path" && ! -L "$SERVER_DIRECTORY/$payload_path" ]] \
         || die "missing or unsafe bootstrap payload: Server/$payload_path"
 done
+runtime_version="$("$STABLE_RUNTIME_PREFLIGHT")" \
+    || die "current runtime payload has not reached the signed stable feed"
 
 ssh_options=(-o ControlMaster=no -o ControlPath=none)
 [[ -z "$port" ]] || ssh_options+=(-p "$port")
@@ -252,8 +255,6 @@ temporary_root="$(cd "$temporary_root" && pwd -P)"
 temporary_directory=$(/usr/bin/mktemp -d "$temporary_root/terminal-relay-bootstrap.XXXXXX")
 /bin/cp "$BASELINE_FILE" "$temporary_directory/worker-baseline.env"
 /bin/chmod 0600 "$temporary_directory/worker-baseline.env"
-runtime_version="$(git -C "$REPOSITORY_ROOT" show -s --format=%ct HEAD)"
-[[ "$runtime_version" =~ ^[1-9][0-9]*$ ]] || die "could not derive the worker runtime version"
 "$SCRIPT_DIRECTORY/write-installed-runtime-manifest.sh" \
     "$runtime_version" \
     "$temporary_directory/runtime-manifest.json"

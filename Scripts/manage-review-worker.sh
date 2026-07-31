@@ -9,6 +9,7 @@ readonly server_directory="$repository_root/Server"
 readonly baseline_file="${TERMINAL_RELAY_BASELINE_FILE:-$server_directory/worker-baseline.local.env}"
 readonly pairing_model="$repository_root/TerminalRelay/Models/MobilePairingPayload.swift"
 readonly pairing_generator="$script_directory/generate-review-pairing.swift"
+readonly stable_runtime_preflight="$script_directory/verify-published-worker-runtime.sh"
 readonly keychain_service="com.mpieras.TerminalRelay.app-review-worker"
 readonly keychain_account="pairing-code"
 
@@ -352,7 +353,7 @@ prepare_ssh() {
 
 install_review_worker() {
     local payload="$temporary_directory/payload"
-    local runtime_version
+    local runtime_version="$1"
     local payload_name
 
     /bin/mkdir -p "$payload"
@@ -368,7 +369,6 @@ install_review_worker() {
         /bin/cp "$server_directory/$payload_name" "$payload/"
     done < <(/usr/bin/awk -F'|' '!/^#/ && NF { print $1 }' \
         "$server_directory/worker-runtime-files.txt")
-    runtime_version="$(git -C "$repository_root" show -s --format=%ct HEAD)"
     "$script_directory/write-installed-runtime-manifest.sh" \
         "$runtime_version" \
         "$payload/runtime-manifest.json"
@@ -438,7 +438,10 @@ confirm_billable_action() {
 provision() {
     local assume_yes="$1"
     local source_ipv4
+    local runtime_version
 
+    runtime_version="$("$stable_runtime_preflight")" \
+        || die "current runtime payload has not reached the signed stable feed"
     confirm_billable_action "$assume_yes"
     verify_provider_project
     source_ipv4="$(current_public_ipv4)"
@@ -446,7 +449,7 @@ provision() {
     ensure_provider_ssh_key
     ensure_review_server
     prepare_ssh
-    install_review_worker
+    install_review_worker "$runtime_version"
     ensure_review_firewall review
     log "Provisioned the isolated App Review worker with public key-only SSH."
     log "Authenticate dedicated reviewer accounts before creating the review invitation."

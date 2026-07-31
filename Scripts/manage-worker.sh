@@ -15,6 +15,7 @@ readonly CLAUDE_SESSIONS_SOURCE="$SERVER_DIRECTORY/terminal-relay-claude-session
 readonly CLAUDE_REQUIREMENTS_SOURCE="$SERVER_DIRECTORY/claude-agent-sdk-requirements.txt"
 readonly RUNTIME_UPDATER_SOURCE="$SERVER_DIRECTORY/terminal-relay-runtime-update"
 readonly RUNTIME_PUBLIC_KEY_SOURCE="$SERVER_DIRECTORY/terminal-relay-runtime-update.pub"
+readonly STABLE_RUNTIME_PREFLIGHT="$SCRIPT_DIRECTORY/verify-published-worker-runtime.sh"
 readonly NODE_EXPORTER_TEMPLATE="$SERVER_DIRECTORY/node-exporter.service.template"
 readonly BOOTSTRAP_SCRIPT="$SCRIPT_DIRECTORY/bootstrap-worker.sh"
 readonly SSH_CONFIG="$HOME/.ssh/config"
@@ -819,7 +820,8 @@ verify_application() {
         | /usr/bin/awk '{ print $1; exit }')"
     expected_runtime_public_key_digest="$(/usr/bin/shasum -a 256 "$RUNTIME_PUBLIC_KEY_SOURCE" \
         | /usr/bin/awk '{ print $1; exit }')"
-    expected_runtime_version="$(git -C "$REPOSITORY_ROOT" show -s --format=%ct HEAD)"
+    expected_runtime_version="$("$STABLE_RUNTIME_PREFLIGHT")" \
+        || die "current runtime payload has not reached the signed stable feed"
     output="$(/usr/bin/ssh \
         -o BatchMode=yes \
         -o ConnectTimeout=15 \

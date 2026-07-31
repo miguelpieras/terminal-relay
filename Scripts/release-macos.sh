@@ -8,6 +8,7 @@ release_notes_file="${RELEASE_NOTES_FILE:-}"
 development_team="${DEVELOPMENT_TEAM:-6EBZ756H9Q}"
 signing_identity="${DEVELOPER_ID_APPLICATION:-Developer ID Application}"
 bundle_version="${MACOS_BUNDLE_VERSION:-$(git -C "$repository_root" show -s --format=%ct HEAD)}"
+runtime_version="$("$script_directory/worker-runtime-version.sh")"
 appcast_url="https://miguelpieras.github.io/terminal-relay/appcast.xml"
 download_url_prefix="https://miguelpieras.github.io/terminal-relay/"
 derived_data="$repository_root/DerivedData"
@@ -144,7 +145,7 @@ esac
 /bin/rm -rf "$release_root"
 /bin/mkdir -p "$release_root"
 "$script_directory/build-worker-runtime.sh" \
-    "$bundle_version" \
+    "$runtime_version" \
     "$version" \
     "$worker_runtime_directory"
 if [[ -s "$downloaded_appcast" ]]; then
@@ -283,13 +284,13 @@ fi
     exit 1
 }
 /bin/mkdir -p "$pages_directory"
-/bin/mkdir -p "$pages_directory/worker-runtime/$bundle_version"
+/bin/mkdir -p "$pages_directory/worker-runtime/$runtime_version"
 /bin/cp "$worker_runtime_directory/manifest.json" \
     "$pages_directory/worker-runtime/manifest.json"
 /bin/cp "$worker_runtime_directory/manifest.sig" \
     "$pages_directory/worker-runtime/manifest.sig"
 /bin/cp "$worker_runtime_directory/runtime.tar.gz" \
-    "$pages_directory/worker-runtime/$bundle_version/runtime.tar.gz"
+    "$pages_directory/worker-runtime/$runtime_version/runtime.tar.gz"
 /bin/cp "$appcast_path" "$pages_directory/appcast.xml"
 /bin/cp "$update_archive" "$pages_directory/Terminal-Relay-${version}.zip"
 

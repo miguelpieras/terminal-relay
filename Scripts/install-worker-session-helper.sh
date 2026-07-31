@@ -9,6 +9,7 @@ source_mcp="$repository_root/Server/terminal-relay-mcp"
 source_claude_sessions="$repository_root/Server/terminal-relay-claude-sessions"
 source_claude_requirements="$repository_root/Server/claude-agent-sdk-requirements.txt"
 source_restore_unit="$repository_root/Server/terminal-relay-session-restore@.service"
+stable_runtime_preflight="$script_directory/verify-published-worker-runtime.sh"
 remote_lock_path="/run/lock/terminal-relay-session-helper.lock"
 
 usage() {
@@ -125,6 +126,10 @@ validate_ssh_target "admin" "$admin_target"
     'import pathlib, sys; compile(pathlib.Path(sys.argv[1]).read_text(), sys.argv[1], "exec")' \
     "$source_claude_sessions" \
     || { echo "Claude session adapter failed Python syntax validation." >&2; exit 65; }
+runtime_version="$("$stable_runtime_preflight")" || {
+    echo "Current runtime payload has not reached the signed stable feed." >&2
+    exit 65
+}
 
 probe_target() {
     local target="$1"
@@ -989,7 +994,6 @@ esac
 
 runtime_manifest_directory="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/terminal-relay-runtime-manifest.XXXXXX")"
 runtime_manifest_file="$runtime_manifest_directory/runtime-manifest.json"
-runtime_version="$(git -C "$repository_root" show -s --format=%ct HEAD)"
 "$script_directory/write-installed-runtime-manifest.sh" \
     "$runtime_version" \
     "$runtime_manifest_file"
