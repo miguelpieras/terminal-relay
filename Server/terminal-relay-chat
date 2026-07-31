@@ -1545,9 +1545,9 @@ class CodexAdapter(ProviderAdapter):
             if isinstance(item, dict)
             else params.get("itemId")
         )
-        if isinstance(turn_id, str) and UUID_PATTERN.fullmatch(turn_id):
-            self.active_turn = turn_id
         if method == "turn/started":
+            if isinstance(turn_id, str) and UUID_PATTERN.fullmatch(turn_id):
+                self.active_turn = turn_id
             await self.emit("turn.started", {"status": "streaming"}, turn_id=turn_id)
             return
         if method == "turn/completed":

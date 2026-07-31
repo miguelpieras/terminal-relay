@@ -891,6 +891,23 @@ async def exercise_codex_adapter(module, root: pathlib.Path) -> None:
         "choice": {"answers": ["A"]},
         "note": {"answers": ["Because"]},
     }
+
+    # Codex can deliver item and usage notifications for a turn after its
+    # completion notification. Those late records must not reactivate the
+    # finished turn or block the next message.
+    assert adapter.active_turn is None
+    next_request_id = "45454545-4545-4545-8545-454545454545"
+    next_result = await adapter.start_turn(
+        {
+            "requestId": next_request_id,
+            "payload": {
+                "text": "send after late events",
+                "attachments": [],
+                "options": {},
+            },
+        }
+    )
+    assert next_result["clientUserMessageId"] == next_request_id
     await adapter.close()
     assert transport.closed is True
 
