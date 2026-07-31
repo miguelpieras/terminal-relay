@@ -977,6 +977,8 @@ class UnixWebSocket:
         with contextlib.suppress(Exception):
             self._send_control(8)
         with contextlib.suppress(OSError):
+            self.socket.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(OSError):
             self.socket.close()
         self.socket = None
 

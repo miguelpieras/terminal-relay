@@ -10,6 +10,7 @@ import json
 import os
 import pathlib
 import queue
+import socket
 import stat
 import sys
 import tempfile
@@ -563,6 +564,30 @@ class FakeCodexWebSocket:
     def close(self) -> None:
         self.closed = True
         self.incoming.put(None)
+
+
+def exercise_unix_websocket_close(module) -> None:
+    class RecordingSocket:
+        def __init__(self):
+            self.shutdown_mode = None
+            self.closed = False
+
+        def sendall(self, _value: bytes) -> None:
+            return None
+
+        def shutdown(self, mode: int) -> None:
+            self.shutdown_mode = mode
+
+        def close(self) -> None:
+            self.closed = True
+
+    transport = RecordingSocket()
+    websocket = module.UnixWebSocket("/tmp/example-codex.sock")
+    websocket.socket = transport
+    websocket.close()
+    assert transport.shutdown_mode == socket.SHUT_RDWR
+    assert transport.closed is True
+    assert websocket.socket is None
 
 
 async def exercise_codex_adapter(module, root: pathlib.Path) -> None:
@@ -1606,6 +1631,7 @@ def exercise_validation(module) -> None:
 def run() -> None:
     module = load_broker()
     exercise_validation(module)
+    exercise_unix_websocket_close(module)
     with tempfile.TemporaryDirectory(
         prefix="tr-chat.", dir="/tmp"
     ) as root:
