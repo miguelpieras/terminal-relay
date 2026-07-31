@@ -49,7 +49,14 @@ enum SessionOpenResult {
 @MainActor
 final class SessionManager: ObservableObject {
     @Published private(set) var sessions: [TerminalSession] = []
-    @Published private(set) var selectedSessionID: UUID?
+    @Published private(set) var selectedSessionID: UUID? {
+        didSet {
+            if let selectedSessionID {
+                unreadSessionIDs.remove(selectedSessionID)
+            }
+        }
+    }
+    @Published private(set) var unreadSessionIDs: Set<UUID> = []
     @Published private var remoteSessions: [RemoteSessionKey: WorkerSessionSnapshot] = [:]
 
     private let defaults: UserDefaults
@@ -81,12 +88,16 @@ final class SessionManager: ObservableObject {
         on worker: ServerProfile
     ) {
         for fixture in fixtures {
-            _ = openConfirmedRemote(
+            let result = openConfirmedRemote(
                 project: fixture.project,
                 on: worker,
                 snapshot: fixture.snapshot,
                 selectResult: false
             )
+            if fixture.snapshot.title == "Review private pairing flow",
+               let session = result?.localSession {
+                unreadSessionIDs.insert(session.id)
+            }
         }
         selectSession(nil)
     }
@@ -722,12 +733,13 @@ final class SessionManager: ObservableObject {
         taskCompletionObservers[session.id] = session.$taskCompletionCount
             .dropFirst()
             .sink { [weak self, weak session] _ in
-                guard let self,
-                      let session,
-                      ApplicationSettings.showTaskCompletionNotifications(in: self.defaults) else {
-                    return
+                guard let self, let session else { return }
+                if self.selectedSessionID != session.id {
+                    self.unreadSessionIDs.insert(session.id)
                 }
-                self.taskCompletionHandler(session)
+                if ApplicationSettings.showTaskCompletionNotifications(in: self.defaults) {
+                    self.taskCompletionHandler(session)
+                }
             }
     }
 
@@ -738,6 +750,7 @@ final class SessionManager: ObservableObject {
         sessions.remove(at: index)
         sessionObservers[id] = nil
         taskCompletionObservers[id] = nil
+        unreadSessionIDs.remove(id)
         backgroundAttachmentAttemptedSessionIDs.remove(id)
         sidebarSessionInstanceTokensByProject[removedProjectID.uuidString]?.removeAll {
             $0 == removedInstanceToken

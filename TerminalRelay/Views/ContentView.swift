@@ -365,6 +365,7 @@ private enum SidebarPalette {
     static let selected = Color(red: 48.0 / 255.0, green: 48.0 / 255.0, blue: 48.0 / 255.0)
     static let separator = Color(red: 43.0 / 255.0, green: 43.0 / 255.0, blue: 43.0 / 255.0)
     static let footerSeparator = Color(red: 46.0 / 255.0, green: 46.0 / 255.0, blue: 46.0 / 255.0)
+    static let unread = Color(red: 132.0 / 255.0, green: 181.0 / 255.0, blue: 242.0 / 255.0)
 }
 
 private enum SidebarRowGeometry {
@@ -948,6 +949,7 @@ struct ContentView: View {
                     projectName: project.displayName,
                     isSelected: sessionManager.selectedSessionID == session.id
                         || selectedSessionIDs.contains(session.id),
+                    isUnread: sessionManager.unreadSessionIDs.contains(session.id),
                     archiveCount: 1,
                     allowsReordering: false,
                     onSelect: {
@@ -2292,6 +2294,7 @@ private struct ProjectSidebarSection: View {
                             session: session,
                             isSelected: selectedSessionID == session.id
                                 || selectedSessionIDs.contains(session.id),
+                            isUnread: sessionManager.unreadSessionIDs.contains(session.id),
                             archiveCount: session.usesNativeChat
                                 ? 1
                                 : (
@@ -2632,6 +2635,7 @@ private struct ProjectSessionRow: View {
     @ObservedObject var session: TerminalSession
     var projectName: String? = nil
     let isSelected: Bool
+    let isUnread: Bool
     let archiveCount: Int
     var allowsReordering = true
     let onSelect: () -> Void
@@ -2685,6 +2689,16 @@ private struct ProjectSessionRow: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .buttonStyle(.plain)
+
+            if isUnread && !session.isLaunchPending && !session.isWorking {
+                Circle()
+                    .fill(SidebarPalette.unread)
+                    .frame(width: 8, height: 8)
+                    .padding(.trailing, 12)
+                    .opacity(isHovering ? 0 : 1)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
 
             HStack(spacing: 1) {
                 if allowsReordering {
@@ -2750,7 +2764,7 @@ private struct ProjectSessionRow: View {
             },
             onDrop: onDrop
         )
-        .accessibilityLabel("\(session.displayTitle), \(sessionStateLabel.lowercased())")
+        .accessibilityLabel("\(session.displayTitle), \(accessibilityStateLabel.lowercased())")
     }
 
     private var sessionStateLabel: String {
@@ -2758,6 +2772,10 @@ private struct ProjectSessionRow: View {
         if session.isWorking { return "Working" }
         if session.status == .running { return "Ready" }
         return session.status.label
+    }
+
+    private var accessibilityStateLabel: String {
+        isUnread ? "\(sessionStateLabel), unread" : sessionStateLabel
     }
 
 }

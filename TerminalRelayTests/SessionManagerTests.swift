@@ -243,6 +243,49 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(session.displayTitle, "Build native macOS terminal hub")
     }
 
+    func testCompletedBackgroundSessionStaysUnreadUntilSelected() {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let sessionIdentifier = "01234567-89ab-4def-8abc-0123456789ab"
+        let manager = SessionManager(taskCompletionHandler: { _ in })
+
+        func reconcile(reportedWorking: Bool) {
+            manager.reconcile(
+                worker: server,
+                projects: [project],
+                response: WorkerSessionResponse(
+                    projects: [project.displayName],
+                    sessions: [
+                        WorkerSessionSnapshot(
+                            kind: .codex,
+                            repositoryName: project.displayName,
+                            attachedClientCount: 0,
+                            instanceToken: sessionIdentifier,
+                            title: "Investigate open incident",
+                            reportedWorking: reportedWorking
+                        )
+                    ]
+                ),
+                launchDefaults: .standard
+            )
+        }
+
+        reconcile(reportedWorking: true)
+        let session = manager.session(projectID: project.id, kind: .codex)!
+        reconcile(reportedWorking: false)
+
+        XCTAssertTrue(manager.unreadSessionIDs.contains(session.id))
+
+        manager.selectSession(session.id)
+
+        XCTAssertFalse(manager.unreadSessionIDs.contains(session.id))
+
+        reconcile(reportedWorking: true)
+        reconcile(reportedWorking: false)
+
+        XCTAssertFalse(manager.unreadSessionIDs.contains(session.id))
+    }
+
     func testUnnamedCodexThreadUsesReadableFallbackInsteadOfItsIdentifier() async {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let project = makeProject(name: "Terminal Relay", server: server)
