@@ -2154,7 +2154,7 @@ class CodexAdapter(ProviderAdapter):
         if self.thread_id and self.connection_ready.is_set():
             with contextlib.suppress(Exception):
                 await self.request(
-                    "thread/unsubscribe", {"threadId": self.thread_id}, timeout=5
+                    "thread/unsubscribe", {"threadId": self.thread_id}, timeout=1
                 )
         if self.reader_task:
             self.reader_task.cancel()

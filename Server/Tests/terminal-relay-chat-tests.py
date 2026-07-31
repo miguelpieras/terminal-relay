@@ -455,13 +455,20 @@ async def exercise_protocol(module, root: pathlib.Path) -> None:
 
 
 class FakeCodexWebSocket:
-    def __init__(self, *, thread_turns=None, disconnect_turn_start=False):
+    def __init__(
+        self,
+        *,
+        thread_turns=None,
+        disconnect_turn_start=False,
+        drop_unsubscribe=False,
+    ):
         self.incoming: queue.Queue = queue.Queue()
         self.sent: list[dict] = []
         self.initialize_answered = False
         self.closed = False
         self.thread_turns = thread_turns
         self.disconnect_turn_start = disconnect_turn_start
+        self.drop_unsubscribe = drop_unsubscribe
 
     def connect(self) -> None:
         return None
@@ -542,7 +549,9 @@ class FakeCodexWebSocket:
                         },
                     }
                 )
-        elif method in {"turn/interrupt", "thread/unsubscribe"}:
+        elif method == "turn/interrupt" or (
+            method == "thread/unsubscribe" and not self.drop_unsubscribe
+        ):
             self.incoming.put({"id": request_id, "result": {}})
 
     def receive_json(self) -> dict:
@@ -1013,6 +1022,31 @@ async def exercise_codex_reconnect(module, root: pathlib.Path) -> None:
         await asyncio.sleep(0.01)
     assert adapter.active_turn is None
     await adapter.close()
+
+
+async def exercise_codex_close_timeout(module, root: pathlib.Path) -> None:
+    project = root / "codex-close-timeout-project"
+    project.mkdir()
+    transport = FakeCodexWebSocket(drop_unsubscribe=True)
+    adapter = module.CodexAdapter(
+        str(project), THREAD_ID, {}, str(root / "codex-close-timeout.sock")
+    )
+    adapter.websocket = transport
+
+    async def emit(event_type, payload, *, turn_id=None, item_id=None):
+        return {
+            "type": event_type,
+            "payload": payload,
+            "turnId": turn_id,
+            "itemId": item_id,
+        }
+
+    await adapter.start(emit)
+    await asyncio.wait_for(adapter.close(), 2)
+    assert any(
+        value.get("method") == "thread/unsubscribe" for value in transport.sent
+    )
+    assert transport.closed is True
 
 
 async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
@@ -1579,6 +1613,7 @@ def run() -> None:
         asyncio.run(exercise_protocol(module, root_path))
         asyncio.run(exercise_codex_adapter(module, root_path))
         asyncio.run(exercise_codex_reconnect(module, root_path))
+        asyncio.run(exercise_codex_close_timeout(module, root_path))
         asyncio.run(exercise_claude_adapter(module, root_path))
         asyncio.run(exercise_claude_history_paging(module, root_path))
         asyncio.run(exercise_claude_reconnect(module, root_path))
