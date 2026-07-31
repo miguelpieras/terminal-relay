@@ -794,7 +794,7 @@ final class SessionManagerTests: XCTestCase {
         )
     }
 
-    func testNewSessionShowsPendingPanelBeforeWorkerReturnsAndKeepsUIIdentity() async {
+    func testNewSessionShowsPendingPanelAndRefreshesNativeChatWorkspace() async {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let project = makeProject(name: "Terminal Relay", server: server)
         let manager = SessionManager()
@@ -826,6 +826,7 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(manager.selectedSessionID, pendingSession.id)
         let pendingID = pendingSession.id
         let pendingTerminalIdentity = pendingSession.terminalViewIdentity
+        let pendingWorkspaceIdentity = pendingSession.workspaceViewIdentity
 
         let instanceToken = "01234567-89ab-" + "4def-8abc-0123456789ab"
         recorder.finish(
@@ -843,6 +844,7 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertFalse(session === pendingSession)
         XCTAssertEqual(session.id, pendingID)
         XCTAssertEqual(session.terminalViewIdentity, pendingTerminalIdentity)
+        XCTAssertNotEqual(session.workspaceViewIdentity, pendingWorkspaceIdentity)
         XCTAssertEqual(session.instanceToken, instanceToken)
         XCTAssertFalse(session.isLaunchPending)
         XCTAssertNil(session.launchFailureMessage)

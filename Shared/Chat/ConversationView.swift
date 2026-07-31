@@ -20,6 +20,7 @@ struct ConversationViewportPolicy: Equatable {
     }
 
     private var phase: Phase = .awaitingContent
+    private var lastBottomY: CGFloat?
     private(set) var isUserInteracting = false
     private(set) var followsLatest = true
 
@@ -63,6 +64,13 @@ struct ConversationViewportPolicy: Equatable {
     mutating func jumpToLatest() {
         isUserInteracting = false
         followsLatest = true
+    }
+
+    mutating func shouldFollowBottomChange(_ bottomY: CGFloat) -> Bool {
+        let previousBottomY = lastBottomY
+        lastBottomY = bottomY
+        guard shouldFollowLatestLayout, let previousBottomY else { return false }
+        return bottomY > previousBottomY + 1
     }
 }
 
@@ -219,14 +227,17 @@ struct ConversationView: View {
                 }
                 .coordinateSpace(name: "conversation-scroll")
                 .onPreferenceChange(ConversationBottomPreferenceKey.self) { bottomY in
+                    let shouldFollow = viewportPolicy.shouldFollowBottomChange(bottomY)
                     guard viewportPolicy.acceptsBottomMeasurements else { return }
                     let atBottom = bottomY <= geometry.size.height + 2
                     let nearBottom = bottomY <= geometry.size.height + 180
-                    isAtBottom = atBottom
+                    if isAtBottom != atBottom {
+                        isAtBottom = atBottom
+                    }
                     if nearBottom != store.isNearBottom {
                         store.setNearBottom(nearBottom)
                     }
-                    if !atBottom, viewportPolicy.shouldFollowLatestLayout {
+                    if !atBottom, shouldFollow {
                         scheduleFollowScroll(proxy)
                     }
                 }

@@ -293,6 +293,12 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         presentation == .chat && chatCoordinator != nil
     }
 
+    var workspaceViewIdentity: AnyHashable {
+        usesNativeChat
+            ? AnyHashable(ObjectIdentifier(self))
+            : AnyHashable(terminalViewIdentity)
+    }
+
     var isLaunchPending: Bool {
         launchState == .starting
     }

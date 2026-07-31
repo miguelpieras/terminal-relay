@@ -102,7 +102,7 @@ struct ProjectWorkspaceView: View {
                         worker: worker,
                         launchDefaults: launchDefaults
                     )
-                    .id(selectedSession.terminalViewIdentity)
+                    .id(selectedSession.workspaceViewIdentity)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     readyState
