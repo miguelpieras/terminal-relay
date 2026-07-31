@@ -346,6 +346,9 @@ final class SessionManager: ObservableObject {
             kind: snapshot.kind,
             sequenceNumber: nextSequenceNumber(projectID: project.id, kind: snapshot.kind),
             instanceToken: snapshot.instanceToken,
+            lastActivityAt: snapshot.lastActivityAt.map {
+                Date(timeIntervalSince1970: TimeInterval($0))
+            },
             terminalTitle: snapshot.title,
             threadID: snapshot.threadID,
             remoteAttachedClientCount: snapshot.attachedClientCount,
@@ -353,6 +356,7 @@ final class SessionManager: ObservableObject {
             launchDefaults: launchDefaults
         )
         append(session)
+        session.applyRemoteSnapshot(snapshot)
         if selectResult {
             selectedSessionID = session.id
         }
@@ -424,6 +428,7 @@ final class SessionManager: ObservableObject {
             instanceToken: launchIdentity,
             id: existing.id,
             startedAt: existing.startedAt,
+            lastActivityAt: existing.lastActivityAt,
             initialStatus: .connecting,
             terminalTitle: existing.terminalTitle,
             threadID: confirmedSnapshot.threadID ?? existing.threadID,
@@ -482,6 +487,7 @@ final class SessionManager: ObservableObject {
             id: pendingSession.id,
             terminalViewIdentity: pendingSession.terminalViewIdentity,
             startedAt: pendingSession.startedAt,
+            lastActivityAt: pendingSession.lastActivityAt,
             initialStatus: .connecting,
             terminalTitle: snapshot.title,
             threadID: snapshot.threadID,
@@ -611,6 +617,9 @@ final class SessionManager: ObservableObject {
                     kind: snapshot.kind,
                     sequenceNumber: nextSequenceNumber(projectID: project.id, kind: snapshot.kind),
                     instanceToken: snapshot.instanceToken,
+                    lastActivityAt: snapshot.lastActivityAt.map {
+                        Date(timeIntervalSince1970: TimeInterval($0))
+                    },
                     initialStatus: .remoteRunning,
                     terminalTitle: snapshot.title,
                     threadID: snapshot.threadID,

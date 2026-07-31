@@ -151,6 +151,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
     @Published private(set) var terminalTitle: String?
     @Published private(set) var threadID: String?
     @Published private(set) var isWorking = false
+    @Published private(set) var lastActivityAt: Date
     @Published private(set) var taskCompletionCount = 0
     @Published private(set) var remoteAttachedClientCount: Int?
     @Published private(set) var launchState: TerminalSessionLaunchState
@@ -178,6 +179,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         id: UUID = UUID(),
         terminalViewIdentity: UUID = UUID(),
         startedAt: Date = Date(),
+        lastActivityAt: Date? = nil,
         initialStatus: TerminalSessionStatus = .connecting,
         terminalTitle: String? = nil,
         threadID: String? = nil,
@@ -197,6 +199,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         self.accountLabel = server.accountLabel(for: kind)
         self.sequenceNumber = sequenceNumber
         self.startedAt = startedAt
+        self.lastActivityAt = lastActivityAt ?? startedAt
         self.instanceToken = instanceToken
         self.presentation = presentation
         self.status = initialStatus
@@ -251,6 +254,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
 
         if let terminalTitle {
             applyTerminalTitle(terminalTitle)
+            self.lastActivityAt = lastActivityAt ?? startedAt
         }
 
         if let chatCoordinator {
@@ -610,6 +614,12 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
             return
         }
         remoteAttachedClientCount = snapshot.attachedClientCount
+        if let timestamp = snapshot.lastActivityAt {
+            let reportedActivityAt = Date(timeIntervalSince1970: TimeInterval(timestamp))
+            if reportedActivityAt > lastActivityAt {
+                lastActivityAt = reportedActivityAt
+            }
+        }
         if let threadID = snapshot.threadID {
             self.threadID = threadID
         }
@@ -711,6 +721,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
     }
 
     private func applyTerminalTitle(_ title: String) {
+        let previousTitle = terminalTitle
         if kind == .codex {
             if let parsedThreadID = Self.threadID(in: title) {
                 threadID = parsedThreadID
@@ -722,6 +733,9 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
             titleIndicatesWorking = parsedTitle.isWorking
         } else if let displayableTitle = displayableClaudeTerminalTitle(title) {
             terminalTitle = displayableTitle
+        }
+        if terminalTitle != previousTitle {
+            lastActivityAt = Date()
         }
         updateWorkingState()
     }
@@ -738,12 +752,16 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
     }
 
     private func applyResolvedTerminalTitle(_ title: String) {
+        let previousTitle = terminalTitle
         if kind == .codex {
             if let displayableTitle = displayableTerminalTitle(title) {
                 terminalTitle = displayableTitle
             }
         } else if let displayableTitle = displayableClaudeTerminalTitle(title) {
             terminalTitle = displayableTitle
+        }
+        if terminalTitle != previousTitle {
+            lastActivityAt = Date()
         }
     }
 
@@ -765,6 +783,9 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
                status == .running || status == .remoteRunning {
                 taskCompletionCount += 1
             }
+            if wasWorking != isWorking {
+                lastActivityAt = Date()
+            }
             return
         }
         switch status {
@@ -784,6 +805,9 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
            !remoteStopRequested,
            status == .running || status == .remoteRunning {
            taskCompletionCount += 1
+        }
+        if wasWorking != isWorking {
+            lastActivityAt = Date()
         }
     }
 

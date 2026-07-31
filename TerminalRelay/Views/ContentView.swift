@@ -10,6 +10,90 @@ private enum SidebarDestination: Equatable {
     case editProject(UUID)
 }
 
+private enum SidebarGroupingPreference: String, CaseIterable, Identifiable {
+    case byProject
+    case inOneList
+
+    var id: Self { self }
+
+    var label: String {
+        switch self {
+        case .byProject: "By project"
+        case .inOneList: "In one list"
+        }
+    }
+}
+
+private enum SidebarSortPreference: String, CaseIterable, Identifiable {
+    case priority
+    case lastUpdated
+    case manual
+
+    var id: Self { self }
+
+    var label: String {
+        switch self {
+        case .priority: "Priority"
+        case .lastUpdated: "Last updated"
+        case .manual: "Manual order"
+        }
+    }
+}
+
+@MainActor
+private enum FlatSidebarItem {
+    case session(ProjectProfile, TerminalSession)
+    case thread(ProjectProfile, WorkerThreadSnapshot)
+
+    var id: String {
+        switch self {
+        case .session(let project, let session):
+            "session:\(project.id.uuidString):\(session.id.uuidString)"
+        case .thread(let project, let thread):
+            "thread:\(project.id.uuidString):\(thread.id)"
+        }
+    }
+
+    var project: ProjectProfile {
+        switch self {
+        case .session(let project, _), .thread(let project, _): project
+        }
+    }
+
+    var priority: Int {
+        switch self {
+        case .session(_, let session):
+            if session.isLaunchPending || session.isWorking { return 0 }
+            return session.status.occupiesSlot ? 1 : 3
+        case .thread(_, let thread):
+            switch thread.activityState {
+            case .externalActive: return 1
+            case .inactive: return 2
+            case .relayActive: return 1
+            case .unknown: return 3
+            }
+        }
+    }
+
+    var updatedAt: Date {
+        switch self {
+        case .session(_, let session): session.lastActivityAt
+        case .thread(_, let thread): Date(timeIntervalSince1970: TimeInterval(thread.updatedAt))
+        }
+    }
+
+    func matches(_ query: String) -> Bool {
+        if project.displayName.localizedCaseInsensitiveContains(query) { return true }
+        switch self {
+        case .session(_, let session):
+            return session.displayTitle.localizedCaseInsensitiveContains(query)
+        case .thread(_, let thread):
+            return (thread.title ?? "").localizedCaseInsensitiveContains(query)
+                || thread.threadID.localizedCaseInsensitiveContains(query)
+        }
+    }
+}
+
 private struct SessionArchiveRequest: Identifiable {
     let id = UUID()
     let sessionIDs: Set<UUID>
@@ -227,8 +311,13 @@ private struct SidebarDragSourceModifier: ViewModifier {
 }
 
 private extension View {
-    func sidebarDragSource(_ item: SidebarDragItem) -> some View {
-        modifier(SidebarDragSourceModifier(item: item))
+    @ViewBuilder
+    func sidebarDragSource(_ item: SidebarDragItem, enabled: Bool = true) -> some View {
+        if enabled {
+            modifier(SidebarDragSourceModifier(item: item))
+        } else {
+            self
+        }
     }
 
     func sidebarDropDestination(
@@ -310,6 +399,10 @@ struct ContentView: View {
     private var claudeReasoningEffort = AgentLaunchDefaults.standard.claudeReasoningEffort
     @AppStorage(AgentLaunchDefaults.StorageKey.fullAccessEnabled)
     private var fullAccessEnabled = AgentLaunchDefaults.standard.fullAccessEnabled
+    @AppStorage("sidebarGrouping.v1")
+    private var sidebarGroupingRawValue = SidebarGroupingPreference.byProject.rawValue
+    @AppStorage("sidebarSort.v1")
+    private var sidebarSortRawValue = SidebarSortPreference.priority.rawValue
 
     @State private var selectedProjectID: UUID?
     @State private var projectPendingDeletion: ProjectProfile?
@@ -335,11 +428,36 @@ struct ContentView: View {
         )
     }
 
+    private var sidebarGrouping: SidebarGroupingPreference {
+        SidebarGroupingPreference(rawValue: sidebarGroupingRawValue) ?? .byProject
+    }
+
+    private var sidebarSort: SidebarSortPreference {
+        SidebarSortPreference(rawValue: sidebarSortRawValue) ?? .priority
+    }
+
+    private func sidebarGroupingToggle(
+        _ preference: SidebarGroupingPreference
+    ) -> Binding<Bool> {
+        Binding(
+            get: { sidebarGrouping == preference },
+            set: { if $0 { sidebarGroupingRawValue = preference.rawValue } }
+        )
+    }
+
+    private func sidebarSortToggle(_ preference: SidebarSortPreference) -> Binding<Bool> {
+        Binding(
+            get: { sidebarSort == preference },
+            set: { if $0 { sidebarSortRawValue = preference.rawValue } }
+        )
+    }
+
     private var visibleProjects: [ProjectProfile] {
         let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return projectStore.sidebarProjects }
+        let projects = sortedProjects(projectStore.sidebarProjects)
+        guard !query.isEmpty else { return projects }
 
-        return projectStore.sidebarProjects.filter { project in
+        return projects.filter { project in
             if project.displayName.localizedCaseInsensitiveContains(query) {
                 return true
             }
@@ -359,6 +477,55 @@ struct ContentView: View {
             return (activeThreads + archivedThreads).contains {
                 ($0.title ?? "").localizedCaseInsensitiveContains(query)
             }
+        }
+    }
+
+    private var flatSidebarItems: [FlatSidebarItem] {
+        var items: [FlatSidebarItem] = []
+        for project in projectStore.sidebarProjects {
+            items.append(contentsOf: sortedSessions(
+                sessionManager.sidebarSessions(forProjectID: project.id)
+            ).map { .session(project, $0) })
+            items.append(contentsOf: sortedThreads(dormantThreads(for: project)).map {
+                .thread(project, $0)
+            })
+        }
+
+        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !query.isEmpty {
+            items = items.filter { $0.matches(query) }
+        }
+
+        return stablySorted(items) { lhs, rhs in
+            switch sidebarSort {
+            case .priority:
+                if lhs.priority != rhs.priority { return lhs.priority < rhs.priority }
+                if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+            case .lastUpdated:
+                if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+            case .manual:
+                return false
+            }
+            return lhs.id < rhs.id
+        }
+    }
+
+    private var flatEmptyProjects: [ProjectProfile] {
+        let projectsWithItems = Set(flatSidebarItems.map(\.project.id))
+        return visibleProjects.filter { project in
+            !projectsWithItems.contains(project.id)
+                && sessionManager.sessions(forProjectID: project.id).isEmpty
+                && dormantThreads(for: project).isEmpty
+        }
+    }
+
+    private var sidebarHasNoMatches: Bool {
+        guard !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+        switch sidebarGrouping {
+        case .byProject: return visibleProjects.isEmpty
+        case .inOneList: return flatSidebarItems.isEmpty && flatEmptyProjects.isEmpty
         }
     }
 
@@ -556,8 +723,9 @@ struct ContentView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     sidebarProjectList
+                        .id(sidebarGrouping)
 
-                    if !searchQuery.isEmpty && visibleProjects.isEmpty {
+                    if sidebarHasNoMatches {
                         Text("No matching projects")
                             .font(.system(size: 13.5))
                             .foregroundStyle(SidebarPalette.tertiary)
@@ -579,12 +747,150 @@ struct ContentView: View {
 
     @ViewBuilder
     private var sidebarProjectList: some View {
+        switch sidebarGrouping {
+        case .byProject:
+            groupedSidebarProjectList
+        case .inOneList:
+            flatSidebarProjectList
+        }
+    }
+
+    private func dormantThreads(for project: ProjectProfile) -> [WorkerThreadSnapshot] {
+        if ScreenshotDemoMode.isEnabled {
+            return ScreenshotDemoMode.fixture().threads.filter {
+                $0.repositoryName == project.displayName && !$0.isArchived
+            }
+        }
+        guard let worker = serverStore.server(id: project.serverID) else { return [] }
+        return workerSessionService.threads(
+            repositoryName: project.displayName,
+            archived: false,
+            on: worker
+        ).filter { $0.activityState != .relayActive }
+    }
+
+    private func archivedThreads(for project: ProjectProfile) -> [WorkerThreadSnapshot] {
+        if ScreenshotDemoMode.isEnabled {
+            return ScreenshotDemoMode.fixture().threads.filter {
+                $0.repositoryName == project.displayName && $0.isArchived
+            }
+        }
+        guard let worker = serverStore.server(id: project.serverID) else { return [] }
+        return workerSessionService.threads(
+            repositoryName: project.displayName,
+            archived: true,
+            on: worker
+        )
+    }
+
+    private func sortedProjects(_ projects: [ProjectProfile]) -> [ProjectProfile] {
+        guard sidebarSort != .manual else { return projects }
+        return stablySorted(projects) { lhs, rhs in
+            switch sidebarSort {
+            case .priority:
+                let lhsPriority = projectPriority(lhs)
+                let rhsPriority = projectPriority(rhs)
+                if lhsPriority != rhsPriority { return lhsPriority < rhsPriority }
+                let lhsUpdatedAt = projectUpdatedAt(lhs)
+                let rhsUpdatedAt = projectUpdatedAt(rhs)
+                if lhsUpdatedAt != rhsUpdatedAt { return lhsUpdatedAt > rhsUpdatedAt }
+            case .lastUpdated:
+                let lhsUpdatedAt = projectUpdatedAt(lhs)
+                let rhsUpdatedAt = projectUpdatedAt(rhs)
+                if lhsUpdatedAt != rhsUpdatedAt { return lhsUpdatedAt > rhsUpdatedAt }
+            case .manual:
+                return false
+            }
+            return lhs.displayName.localizedStandardCompare(rhs.displayName) == .orderedAscending
+        }
+    }
+
+    private func sortedSessions(_ sessions: [TerminalSession]) -> [TerminalSession] {
+        guard sidebarSort != .manual else { return sessions }
+        return stablySorted(sessions) { lhs, rhs in
+            switch sidebarSort {
+            case .priority:
+                let lhsPriority = sessionPriority(lhs)
+                let rhsPriority = sessionPriority(rhs)
+                if lhsPriority != rhsPriority { return lhsPriority < rhsPriority }
+                if lhs.lastActivityAt != rhs.lastActivityAt {
+                    return lhs.lastActivityAt > rhs.lastActivityAt
+                }
+            case .lastUpdated:
+                if lhs.lastActivityAt != rhs.lastActivityAt {
+                    return lhs.lastActivityAt > rhs.lastActivityAt
+                }
+            case .manual:
+                return false
+            }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
+    }
+
+    private func sortedThreads(_ threads: [WorkerThreadSnapshot]) -> [WorkerThreadSnapshot] {
+        guard sidebarSort != .manual else { return threads }
+        return stablySorted(threads) { lhs, rhs in
+            switch sidebarSort {
+            case .priority:
+                let lhsPriority = threadPriority(lhs)
+                let rhsPriority = threadPriority(rhs)
+                if lhsPriority != rhsPriority { return lhsPriority < rhsPriority }
+                if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+            case .lastUpdated:
+                if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+            case .manual:
+                return false
+            }
+            return lhs.id < rhs.id
+        }
+    }
+
+    private func projectPriority(_ project: ProjectProfile) -> Int {
+        let sessionPriorities = sessionManager.sessions(forProjectID: project.id).map(sessionPriority)
+        let threadPriorities = dormantThreads(for: project).map(threadPriority)
+        return (sessionPriorities + threadPriorities).min() ?? 4
+    }
+
+    private func projectUpdatedAt(_ project: ProjectProfile) -> Date {
+        let sessionDates = sessionManager.sessions(forProjectID: project.id).map(\.lastActivityAt)
+        let threadDates = dormantThreads(for: project).map {
+            Date(timeIntervalSince1970: TimeInterval($0.updatedAt))
+        }
+        return (sessionDates + threadDates).max() ?? .distantPast
+    }
+
+    private func sessionPriority(_ session: TerminalSession) -> Int {
+        if session.isLaunchPending || session.isWorking { return 0 }
+        return session.status.occupiesSlot ? 1 : 3
+    }
+
+    private func threadPriority(_ thread: WorkerThreadSnapshot) -> Int {
+        switch thread.activityState {
+        case .externalActive, .relayActive: return 1
+        case .inactive: return 2
+        case .unknown: return 3
+        }
+    }
+
+    private func stablySorted<Element>(
+        _ elements: [Element],
+        by areInIncreasingOrder: (Element, Element) -> Bool
+    ) -> [Element] {
+        elements.enumerated().sorted { lhs, rhs in
+            if areInIncreasingOrder(lhs.element, rhs.element) { return true }
+            if areInIncreasingOrder(rhs.element, lhs.element) { return false }
+            return lhs.offset < rhs.offset
+        }.map(\.element)
+    }
+
+    @ViewBuilder
+    private var groupedSidebarProjectList: some View {
         if !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             ForEach(visibleProjects) { project in
                 projectSidebarSection(project, folderID: nil)
             }
         } else {
-            ForEach(projectStore.rootProjects) { project in
+            ForEach(sortedProjects(projectStore.rootProjects)) { project in
                 projectSidebarSection(project, folderID: nil)
             }
 
@@ -596,6 +902,7 @@ struct ContentView: View {
                         toggleSidebarFolder(folder.id)
                     },
                     acceptsDrop: { item in
+                        guard sidebarSort == .manual else { return false }
                         switch item {
                         case .project:
                             return true
@@ -613,7 +920,7 @@ struct ContentView: View {
                         )
                     }
                 )
-                .sidebarDragSource(.folder(folder.id))
+                .sidebarDragSource(.folder(folder.id), enabled: sidebarSort == .manual)
                 .contextMenu {
                     sidebarCreationMenu
                     Divider()
@@ -623,11 +930,90 @@ struct ContentView: View {
                 }
 
                 if expandedSidebarFolderIDs.contains(folder.id) {
-                    ForEach(projectStore.projects(inSidebarFolder: folder.id)) { project in
+                    ForEach(sortedProjects(projectStore.projects(inSidebarFolder: folder.id))) { project in
                         projectSidebarSection(project, folderID: folder.id)
                     }
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private var flatSidebarProjectList: some View {
+        ForEach(flatSidebarItems, id: \.id) { item in
+            switch item {
+            case .session(let project, let session):
+                ProjectSessionRow(
+                    session: session,
+                    projectName: project.displayName,
+                    isSelected: sessionManager.selectedSessionID == session.id
+                        || selectedSessionIDs.contains(session.id),
+                    archiveCount: 1,
+                    allowsReordering: false,
+                    onSelect: {
+                        selectSession(
+                            session.id,
+                            for: project,
+                            usesCommandModifier: NSEvent.modifierFlags.contains(.command)
+                        )
+                    },
+                    onArchive: {
+                        if session.usesNativeChat {
+                            if session.status.occupiesSlot, let threadID = session.threadID {
+                                liveThreadArchiveRequest = LiveThreadArchiveRequest(
+                                    sessionID: session.id,
+                                    threadID: threadID
+                                )
+                            } else {
+                                sessionManager.close(sessionID: session.id)
+                            }
+                        } else {
+                            presentArchiveConfirmation(session.id)
+                        }
+                    },
+                    acceptsDrop: { _ in false },
+                    onDrop: { _, _ in false }
+                )
+                .contextMenu {
+                    Button("Open Project", systemImage: "folder") {
+                        navigate(to: .project(project.id))
+                    }
+                    Divider()
+                    Button(
+                        session.usesNativeChat ? "Archive Conversation" : "Archive Terminal",
+                        role: .destructive
+                    ) {
+                        if session.usesNativeChat, session.status.occupiesSlot,
+                           let threadID = session.threadID {
+                            liveThreadArchiveRequest = LiveThreadArchiveRequest(
+                                sessionID: session.id,
+                                threadID: threadID
+                            )
+                        } else if session.usesNativeChat {
+                            sessionManager.close(sessionID: session.id)
+                        } else {
+                            presentArchiveConfirmation(session.id)
+                        }
+                    }
+                }
+            case .thread(let project, let thread):
+                DormantThreadRow(
+                    thread: thread,
+                    projectName: project.displayName
+                ) {
+                    resumeThread(thread, for: project)
+                }
+            }
+        }
+
+        ForEach(flatEmptyProjects) { project in
+            FlatEmptyProjectRow(
+                project: project,
+                isSelected: currentDestination == .project(project.id),
+                onSelect: { navigate(to: .project(project.id)) },
+                onOpenTerminal: { openTerminal($0, for: project) }
+            )
+            .id("flat-empty:\(project.id.uuidString)")
         }
     }
 
@@ -636,30 +1022,12 @@ struct ContentView: View {
         folderID: UUID?
     ) -> some View {
         let worker = serverStore.server(id: project.serverID)
-        let demoThreads = ScreenshotDemoMode.isEnabled
-            ? ScreenshotDemoMode.fixture().threads.filter {
-                $0.repositoryName == project.displayName
-            }
-            : []
         return ProjectSidebarSection(
             project: project,
             searchQuery: searchQuery,
-            dormantThreads: ScreenshotDemoMode.isEnabled ? demoThreads.filter {
-                !$0.isArchived
-            } : worker.map {
-                workerSessionService.threads(
-                    repositoryName: project.displayName,
-                    archived: false,
-                    on: $0
-                ).filter { $0.activityState != .relayActive }
-            } ?? [],
-            archivedThreads: ScreenshotDemoMode.isEnabled ? demoThreads.filter(\.isArchived) : worker.map {
-                workerSessionService.threads(
-                    repositoryName: project.displayName,
-                    archived: true,
-                    on: $0
-                )
-            } ?? [],
+            sortPreference: sidebarSort,
+            dormantThreads: dormantThreads(for: project),
+            archivedThreads: archivedThreads(for: project),
             selectedSessionID: sessionManager.selectedSessionID,
             selectedSessionIDs: selectedSessionIDs,
             onSelectProject: {
@@ -711,16 +1079,7 @@ struct ContentView: View {
                 )
             },
             onResumeThread: { thread in
-                guard let worker,
-                      let result = await sessionManager.resumeThreadAfterRefresh(
-                          thread,
-                          project: project,
-                          on: worker,
-                          projects: projectStore.projects,
-                          launchDefaults: launchDefaults,
-                          using: workerSessionService
-                      ) else { return }
-                handleOpenResult(result, for: project)
+                await resumeThreadNow(thread, for: project)
             },
             onRenameThread: { thread, name in
                 guard let worker else { return }
@@ -752,7 +1111,8 @@ struct ContentView: View {
             onEdit: { navigate(to: .editProject(project.id)) },
             onRemove: { projectPendingDeletion = project },
             acceptsProjectDrop: { item in
-                guard case .project(let movingProjectID) = item,
+                guard sidebarSort == .manual,
+                      case .project(let movingProjectID) = item,
                       movingProjectID != project.id else {
                     return false
                 }
@@ -765,8 +1125,10 @@ struct ContentView: View {
                     before: project.id,
                     intoSidebarFolder: folderID
                 )
-            }
+            },
+            allowsManualReordering: sidebarSort == .manual
         )
+        .id("grouped:\(project.id.uuidString)")
     }
 
     @ViewBuilder
@@ -797,28 +1159,61 @@ struct ContentView: View {
     }
 
     private var sidebarCreationButtons: some View {
-        HStack(spacing: 0) {
-            SidebarActionButton(
-                title: "New project",
-                systemImage: "square.and.pencil",
-                action: addProject
-            )
-            .keyboardShortcut("n", modifiers: .command)
+        HStack(spacing: 6) {
+            Text("Projects")
+                .font(.system(size: 13.5, weight: .semibold))
+                .foregroundStyle(SidebarPalette.secondary)
 
-            Button {
-                beginCreatingSidebarFolder()
+            Spacer()
+
+            Menu {
+                Section("Organize sidebar") {
+                    ForEach(SidebarGroupingPreference.allCases) { preference in
+                        Toggle(
+                            preference.label,
+                            isOn: sidebarGroupingToggle(preference)
+                        )
+                    }
+                }
+
+                Section("Sort by") {
+                    ForEach(SidebarSortPreference.allCases) { preference in
+                        Toggle(
+                            preference.label,
+                            isOn: sidebarSortToggle(preference)
+                        )
+                    }
+                }
             } label: {
-                Image(systemName: "folder.badge.plus")
-                    .font(.system(size: 13))
-                    .foregroundStyle(SidebarPalette.primary)
-                    .frame(width: 30, height: SidebarRowGeometry.height)
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(SidebarPalette.secondary)
+                    .frame(width: 24, height: 26)
                     .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .padding(.trailing, SidebarRowGeometry.horizontalMargin)
-            .help("New parent folder")
-            .accessibilityLabel("New Parent Folder")
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Organize sidebar")
+            .accessibilityLabel("Organize Sidebar")
+
+            Menu {
+                sidebarCreationMenu
+            } label: {
+                Image(systemName: "plus")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(SidebarPalette.secondary)
+                    .frame(width: 24, height: 26)
+                    .contentShape(Rectangle())
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Add project or parent folder")
+            .accessibilityLabel("Add Project or Parent Folder")
         }
+        .padding(.horizontal, 10)
+        .frame(height: 30)
         .padding(.bottom, 5)
     }
 
@@ -859,6 +1254,7 @@ struct ContentView: View {
     @ViewBuilder
     private var sidebarCreationMenu: some View {
         Button("New Project", systemImage: "square.and.pencil", action: addProject)
+            .keyboardShortcut("n", modifiers: .command)
         Button("New Parent Folder", systemImage: "folder.badge.plus") {
             beginCreatingSidebarFolder()
         }
@@ -1068,6 +1464,26 @@ struct ContentView: View {
             ) else { return }
             handleOpenResult(result, for: project)
         }
+    }
+
+    private func resumeThread(_ thread: WorkerThreadSnapshot, for project: ProjectProfile) {
+        Task { await resumeThreadNow(thread, for: project) }
+    }
+
+    private func resumeThreadNow(
+        _ thread: WorkerThreadSnapshot,
+        for project: ProjectProfile
+    ) async {
+        guard let worker = serverStore.server(id: project.serverID),
+              let result = await sessionManager.resumeThreadAfterRefresh(
+                  thread,
+                  project: project,
+                  on: worker,
+                  projects: projectStore.projects,
+                  launchDefaults: launchDefaults,
+                  using: workerSessionService
+              ) else { return }
+        handleOpenResult(result, for: project)
     }
 
     private func handleOpenResult(
@@ -1522,40 +1938,6 @@ private struct ProjectRemovalConfirmation: View {
     }
 }
 
-private struct SidebarActionButton: View {
-    let title: String
-    let systemImage: String
-    let action: () -> Void
-
-    @State private var isHovering = false
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: SidebarRowGeometry.iconSpacing) {
-                Image(systemName: systemImage)
-                    .font(.system(size: SidebarRowGeometry.iconSize, weight: .regular))
-                    .frame(width: SidebarRowGeometry.iconFrameWidth)
-                Text(title)
-                    .font(.system(size: 14))
-                Spacer()
-            }
-            .foregroundStyle(SidebarPalette.primary)
-            .padding(.leading, SidebarRowGeometry.contentLeadingPadding)
-            .padding(.trailing, SidebarRowGeometry.contentTrailingPadding)
-            .frame(height: SidebarRowGeometry.height)
-            .background(
-                isHovering ? SidebarPalette.hover : Color.clear,
-                in: RoundedRectangle(cornerRadius: SidebarRowGeometry.cornerRadius)
-            )
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .padding(.horizontal, SidebarRowGeometry.horizontalMargin)
-        .frame(maxWidth: .infinity)
-        .onHover { isHovering = $0 }
-    }
-}
-
 private struct SidebarFooterButton: View {
     let title: String
     let systemImage: String
@@ -1645,6 +2027,7 @@ private struct ProjectSidebarSection: View {
 
     let project: ProjectProfile
     let searchQuery: String
+    let sortPreference: SidebarSortPreference
     let dormantThreads: [WorkerThreadSnapshot]
     let archivedThreads: [WorkerThreadSnapshot]
     let selectedSessionID: UUID?
@@ -1665,6 +2048,7 @@ private struct ProjectSidebarSection: View {
     let onRemove: () -> Void
     let acceptsProjectDrop: (SidebarDragItem) -> Bool
     let onDropProject: ([String], CGPoint) -> Bool
+    let allowsManualReordering: Bool
 
     @State private var isCollapsed = false
     @State private var isExpanded = false
@@ -1675,7 +2059,31 @@ private struct ProjectSidebarSection: View {
     @State private var threadName = ""
 
     private var allSessions: [TerminalSession] {
-        sessionManager.sidebarSessions(forProjectID: project.id)
+        let sessions = sessionManager.sidebarSessions(forProjectID: project.id)
+        guard sortPreference != .manual else { return sessions }
+        return sessions.enumerated().sorted { lhs, rhs in
+            let lhsPriority = sessionPriority(lhs.element)
+            let rhsPriority = sessionPriority(rhs.element)
+            switch sortPreference {
+            case .priority:
+                if lhsPriority != rhsPriority { return lhsPriority < rhsPriority }
+                if lhs.element.lastActivityAt != rhs.element.lastActivityAt {
+                    return lhs.element.lastActivityAt > rhs.element.lastActivityAt
+                }
+            case .lastUpdated:
+                if lhs.element.lastActivityAt != rhs.element.lastActivityAt {
+                    return lhs.element.lastActivityAt > rhs.element.lastActivityAt
+                }
+            case .manual:
+                break
+            }
+            return lhs.offset < rhs.offset
+        }.map(\.element)
+    }
+
+    private func sessionPriority(_ session: TerminalSession) -> Int {
+        if session.isLaunchPending || session.isWorking { return 0 }
+        return session.status.occupiesSlot ? 1 : 3
     }
 
     private var sessionsWithThreadIDs: [TerminalSession] {
@@ -1714,14 +2122,46 @@ private struct ProjectSidebarSection: View {
 
     private var matchingDormantThreads: [WorkerThreadSnapshot] {
         let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty,
-              !project.displayName.localizedCaseInsensitiveContains(query) else {
-            return dormantThreads
+        let matches: [WorkerThreadSnapshot]
+        if !query.isEmpty,
+           !project.displayName.localizedCaseInsensitiveContains(query) {
+            matches = dormantThreads.filter {
+                ($0.title ?? "").localizedCaseInsensitiveContains(query)
+                    || $0.threadID.localizedCaseInsensitiveContains(query)
+            }
+        } else {
+            matches = dormantThreads
         }
-        return dormantThreads.filter {
-            ($0.title ?? "").localizedCaseInsensitiveContains(query)
-                || $0.threadID.localizedCaseInsensitiveContains(query)
+        guard sortPreference != .manual else { return matches }
+        return matches.enumerated().sorted { lhs, rhs in
+            switch sortPreference {
+            case .priority:
+                let lhsActive = lhs.element.activityState == .externalActive
+                let rhsActive = rhs.element.activityState == .externalActive
+                if lhsActive != rhsActive { return lhsActive }
+                if lhs.element.updatedAt != rhs.element.updatedAt {
+                    return lhs.element.updatedAt > rhs.element.updatedAt
+                }
+            case .lastUpdated:
+                if lhs.element.updatedAt != rhs.element.updatedAt {
+                    return lhs.element.updatedAt > rhs.element.updatedAt
+                }
+            case .manual:
+                break
+            }
+            return lhs.offset < rhs.offset
+        }.map(\.element)
+    }
+
+    private var sortedArchivedThreads: [WorkerThreadSnapshot] {
+        guard sortPreference != .manual else { return matchingArchivedThreads }
+        return matchingArchivedThreads.enumerated().sorted { lhs, rhs in
+            if lhs.element.updatedAt != rhs.element.updatedAt {
+                return lhs.element.updatedAt > rhs.element.updatedAt
+            }
+            return lhs.offset < rhs.offset
         }
+        .map(\.element)
     }
 
     private var matchingArchivedThreads: [WorkerThreadSnapshot] {
@@ -1812,7 +2252,7 @@ private struct ProjectSidebarSection: View {
             .contentShape(Rectangle())
             .padding(.horizontal, SidebarRowGeometry.horizontalMargin)
             .onHover { isProjectHovering = $0 }
-            .sidebarDragSource(.project(project.id))
+            .sidebarDragSource(.project(project.id), enabled: allowsManualReordering)
             .sidebarDropDestination(
                 dropPosition: $projectDropPosition,
                 accepts: acceptsProjectDrop,
@@ -1859,6 +2299,7 @@ private struct ProjectSidebarSection: View {
                                         ? max(1, selectedSessionIDs.count)
                                         : 1
                                 ),
+                            allowsReordering: allowsManualReordering,
                             onSelect: {
                                 onSelectSession(
                                     session.id,
@@ -1973,14 +2414,14 @@ private struct ProjectSidebarSection: View {
                         }
                     }
 
-                    if !matchingArchivedThreads.isEmpty {
+                    if !sortedArchivedThreads.isEmpty {
                         Button {
                             showsArchivedThreads.toggle()
                         } label: {
                             Label(
                                 showsArchivedThreads
                                     ? "Hide archived threads"
-                                    : "Archived threads (\(matchingArchivedThreads.count))",
+                                    : "Archived threads (\(sortedArchivedThreads.count))",
                                 systemImage: "archivebox"
                             )
                         }
@@ -1991,7 +2432,7 @@ private struct ProjectSidebarSection: View {
                         .frame(height: 31)
 
                         if showsArchivedThreads || !searchQuery.isEmpty {
-                            ForEach(matchingArchivedThreads) { thread in
+                            ForEach(sortedArchivedThreads) { thread in
                                 DormantThreadRow(thread: thread, isArchived: true) {}
                                     .contextMenu {
                                         Button("Unarchive Thread") {
@@ -2125,6 +2566,7 @@ private struct ProjectSidebarSection: View {
 private struct DormantThreadRow: View {
     let thread: WorkerThreadSnapshot
     var isArchived = false
+    var projectName: String? = nil
     let onResume: () -> Void
 
     private var statusIcon: String {
@@ -2158,6 +2600,13 @@ private struct DormantThreadRow: View {
                     .foregroundStyle(SidebarPalette.secondary)
                     .lineLimit(1)
                 Spacer(minLength: 5)
+                if let projectName {
+                    Text(projectName)
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(SidebarPalette.tertiary)
+                        .lineLimit(1)
+                        .frame(maxWidth: 72, alignment: .trailing)
+                }
                 if thread.activityState == .externalActive {
                     Text("External")
                         .font(.system(size: 10, weight: .medium))
@@ -2181,8 +2630,10 @@ private struct DormantThreadRow: View {
 
 private struct ProjectSessionRow: View {
     @ObservedObject var session: TerminalSession
+    var projectName: String? = nil
     let isSelected: Bool
     let archiveCount: Int
+    var allowsReordering = true
     let onSelect: () -> Void
     let onArchive: () -> Void
     let acceptsDrop: (SidebarDragItem) -> Bool
@@ -2210,23 +2661,25 @@ private struct ProjectSessionRow: View {
 
                     Spacer(minLength: 5)
 
+                    if let projectName {
+                        Text(projectName)
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundStyle(SidebarPalette.tertiary)
+                            .lineLimit(1)
+                            .frame(maxWidth: 72, alignment: .trailing)
+                    }
+
                     if session.isLaunchPending {
-                        ProgressView()
-                            .controlSize(.mini)
-                            .tint(SidebarPalette.secondary)
-                            .frame(width: 12, height: 12)
+                        SidebarActivityIndicator()
                             .help("Starting")
                             .accessibilityLabel("\(session.kind.displayName), starting")
                     } else if session.isWorking {
-                        ProgressView()
-                            .controlSize(.mini)
-                            .tint(SidebarPalette.secondary)
-                            .frame(width: 12, height: 12)
+                        SidebarActivityIndicator()
                             .help("Working")
                             .accessibilityLabel("\(session.kind.displayName), working")
                     }
                 }
-                .padding(.trailing, 45)
+                .padding(.trailing, allowsReordering ? 45 : 25)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .contentShape(Rectangle())
             }
@@ -2234,18 +2687,20 @@ private struct ProjectSessionRow: View {
             .buttonStyle(.plain)
 
             HStack(spacing: 1) {
-                Image(systemName: "line.3.horizontal")
-                    .font(.system(size: 10.5, weight: .medium))
-                    .foregroundStyle(SidebarPalette.secondary)
-                    .frame(width: 19, height: 25)
-                    .contentShape(Rectangle())
-                    .sidebarDragSource(.session(session.id))
-                    .help(
-                        session.usesNativeChat
-                            ? "Drag to reorder conversation"
-                            : "Drag to reorder terminal"
-                    )
-                    .accessibilityHidden(true)
+                if allowsReordering {
+                    Image(systemName: "line.3.horizontal")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(SidebarPalette.secondary)
+                        .frame(width: 19, height: 25)
+                        .contentShape(Rectangle())
+                        .sidebarDragSource(.session(session.id))
+                        .help(
+                            session.usesNativeChat
+                                ? "Drag to reorder conversation"
+                                : "Drag to reorder terminal"
+                        )
+                        .accessibilityHidden(true)
+                }
 
                 Button(action: onArchive) {
                     Image(systemName: "archivebox")
@@ -2305,4 +2760,87 @@ private struct ProjectSessionRow: View {
         return session.status.label
     }
 
+}
+
+private struct SidebarActivityIndicator: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: reduceMotion)) { context in
+            let turns = context.date.timeIntervalSinceReferenceDate / 0.85
+            ZStack {
+                Circle()
+                    .stroke(SidebarPalette.tertiary.opacity(0.55), lineWidth: 1.5)
+
+                Circle()
+                    .trim(from: 0.06, to: 0.72)
+                    .stroke(
+                        SidebarPalette.primary,
+                        style: StrokeStyle(lineWidth: 1.5, lineCap: .round)
+                    )
+                    .rotationEffect(.degrees(reduceMotion ? 0 : turns * 360))
+            }
+        }
+        .frame(width: 12, height: 12)
+    }
+}
+
+private struct FlatEmptyProjectRow: View {
+    let project: ProjectProfile
+    let isSelected: Bool
+    let onSelect: () -> Void
+    let onOpenTerminal: (AgentKind) -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        HStack(spacing: SidebarRowGeometry.iconSpacing) {
+            Button(action: onSelect) {
+                HStack(spacing: SidebarRowGeometry.iconSpacing) {
+                    Image(systemName: "folder")
+                        .font(.system(size: SidebarRowGeometry.iconSize))
+                        .frame(width: SidebarRowGeometry.iconFrameWidth)
+                    Text(project.displayName)
+                        .font(.system(size: 14))
+                        .lineLimit(1)
+                    Spacer(minLength: 5)
+                    Text("No sessions")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(SidebarPalette.tertiary)
+                }
+                .foregroundStyle(SidebarPalette.secondary)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isHovering {
+                ForEach(AgentKind.allCases) { kind in
+                    Button {
+                        onOpenTerminal(kind)
+                    } label: {
+                        AgentBrandIcon(kind: kind, size: 13)
+                            .frame(width: 20, height: 24)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Open \(kind.displayName) in \(project.displayName)")
+                }
+            }
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 35)
+        .background(
+            isSelected
+                ? SidebarPalette.selected
+                : (isHovering ? SidebarPalette.hover : Color.clear),
+            in: RoundedRectangle(cornerRadius: 6)
+        )
+        .padding(.horizontal, 10)
+        .contentShape(Rectangle())
+        .onHover { isHovering = $0 }
+        .contextMenu {
+            Button("Open Codex") { onOpenTerminal(.codex) }
+            Button("Open Claude Code") { onOpenTerminal(.claude) }
+        }
+        .accessibilityLabel("\(project.displayName), no sessions")
+    }
 }
