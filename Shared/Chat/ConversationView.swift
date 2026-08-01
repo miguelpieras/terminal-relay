@@ -24,11 +24,15 @@ struct ConversationViewportPolicy: Equatable {
     private(set) var followsLatest = true
 
     var acceptsBottomMeasurements: Bool {
-        phase == .positioned
+        phase != .awaitingContent
     }
 
     var shouldFollowLatestLayout: Bool {
-        phase == .positioned && followsLatest && !isUserInteracting
+        phase != .awaitingContent && followsLatest && !isUserInteracting
+    }
+
+    var isInitialAnchorPending: Bool {
+        phase == .initialAnchorPending
     }
 
     mutating func actionForContentUpdate(
@@ -48,7 +52,8 @@ struct ConversationViewportPolicy: Equatable {
     }
 
     mutating func beginUserInteraction() {
-        guard phase == .positioned else { return }
+        guard phase != .awaitingContent else { return }
+        phase = .positioned
         isUserInteracting = true
         followsLatest = false
     }
@@ -80,6 +85,11 @@ private struct ConversationViewportUpdateToken: Equatable {
     }
 }
 
+private struct ConversationScrollMetrics: Equatable {
+    let isAtBottom: Bool
+    let isNearBottom: Bool
+}
+
 struct ConversationView: View {
     private static let eagerTranscriptTailLimit = 50
 
@@ -98,6 +108,7 @@ struct ConversationView: View {
     @State private var viewportPolicy = ConversationViewportPolicy()
     @State private var isAtBottom = true
     @State private var pendingFollowScroll: Task<Void, Never>?
+    @State private var initialAnchorTask: Task<Void, Never>?
     @State private var eagerTranscriptTailStartID: String?
 
     init(
@@ -130,8 +141,10 @@ struct ConversationView: View {
             }
         }
         .onDisappear {
-            Task {
-                await coordinator.detach()
+            if startsCoordinator {
+                Task {
+                    await coordinator.detach()
+                }
             }
         }
         #if os(iOS)
@@ -185,6 +198,7 @@ struct ConversationView: View {
                         // and compact it only while following the latest item.
                         // This prevents visible rows moving between stacks.
                         transcriptTail
+                            .id("chat-bottom")
                     }
                     .frame(maxWidth: 760, alignment: .leading)
                     .padding(.horizontal, horizontalTranscriptPadding)
@@ -192,26 +206,29 @@ struct ConversationView: View {
                     .padding(.bottom, 16)
                     .frame(maxWidth: .infinity)
                 }
-                .conversationScrollActivity { isActive in
+                .conversationScrollActivity { isActive, metrics in
+                    if let metrics {
+                        applyScrollMetrics(metrics, proxy: proxy)
+                    }
                     handleScrollActivity(isActive)
+                }
+                .conversationScrollGeometry { metrics in
+                    applyScrollMetrics(metrics, proxy: proxy)
                 }
                 .conversationDefaultScrollAnchor()
                 .coordinateSpace(name: "conversation-scroll")
                 .accessibilityIdentifier("conversation.transcript")
                 .accessibilityValue(isAtBottom ? "latest" : "history")
                 .onPreferenceChange(ConversationBottomPreferenceKey.self) { bottomY in
+                    if #available(iOS 18.0, macOS 15.0, *) { return }
                     guard viewportPolicy.acceptsBottomMeasurements else { return }
                     let atBottom = bottomY <= geometry.size.height + 2
                     let nearBottom = bottomY <= geometry.size.height + 180
-                    if isAtBottom != atBottom {
-                        isAtBottom = atBottom
-                    }
-                    if nearBottom != store.isNearBottom {
-                        store.setNearBottom(nearBottom)
-                    }
-                    if viewportPolicy.shouldCorrectBottomOffset(isAtBottom: atBottom) {
-                        scheduleFollowScroll(proxy)
-                    }
+                    applyBottomPosition(
+                        isAtBottom: atBottom,
+                        isNearBottom: nearBottom,
+                        proxy: proxy
+                    )
                 }
                 .onChange(of: viewportUpdateSignal, initial: true) { _, update in
                     handleViewportUpdate(update, proxy: proxy)
@@ -269,8 +286,18 @@ struct ConversationView: View {
                     value: store.isNearBottom
                 )
                 .onDisappear {
+                    initialAnchorTask?.cancel()
+                    initialAnchorTask = nil
                     pendingFollowScroll?.cancel()
                     pendingFollowScroll = nil
+                }
+            }
+            .overlay {
+                if isConversationEmpty || isPositioningRestoredConversation {
+                    emptyConversation
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color.chatCanvas)
+                        .allowsHitTesting(false)
                 }
             }
         }
@@ -334,10 +361,17 @@ struct ConversationView: View {
 
     private var emptyConversation: some View {
         VStack(spacing: 8) {
-            if store.state.connectionState == .connecting {
+            if isAwaitingInitialSnapshot || isPositioningRestoredConversation {
                 ProgressView()
                     .controlSize(.small)
-                Text("Connecting…")
+                Text(
+                    coordinator.identity.providerThreadID == nil
+                        ? "Starting conversation…"
+                        : "Loading conversation…"
+                )
+                    .font(.headline)
+                Text("Retrieving the latest history from your worker")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
                 Text(isReadOnly ? "No messages" : "What can I help you build?")
@@ -348,6 +382,27 @@ struct ConversationView: View {
         .frame(maxWidth: .infinity)
         .padding(.vertical, 52)
         .accessibilityElement(children: .combine)
+    }
+
+    private var isConversationEmpty: Bool {
+        store.state.items.isEmpty
+            && store.state.approvals.isEmpty
+            && store.state.questions.isEmpty
+    }
+
+    private var isAwaitingInitialSnapshot: Bool {
+        guard store.lastAppliedSequence == 0 else { return false }
+        switch store.state.connectionState {
+        case .failed, .offlineAgentRunning, .unsupportedWorker, .stopped:
+            return false
+        default:
+            return true
+        }
+    }
+
+    private var isPositioningRestoredConversation: Bool {
+        viewportPolicy.isInitialAnchorPending
+            && store.state.items.count > Self.eagerTranscriptTailLimit
     }
 
     @ViewBuilder
@@ -463,15 +518,8 @@ struct ConversationView: View {
                 .id("question:\(question.id)")
             }
 
-            if store.state.items.isEmpty,
-               store.state.approvals.isEmpty,
-               store.state.questions.isEmpty {
-                emptyConversation
-            }
-
             Color.clear
                 .frame(height: 1)
-                .id("chat-bottom")
                 .background {
                     GeometryReader { proxy in
                         Color.clear.preference(
@@ -537,17 +585,31 @@ struct ConversationView: View {
         case .preserve:
             compactEagerTranscriptTailIfNeeded(proxy)
         case .anchorInitialLatest:
-            Task { @MainActor in
-                // Wait for the transcript tail to install the bottom anchor,
-                // then repeat once after layout so a large snapshot cannot
-                // leave a resumed conversation at its oldest row.
+            initialAnchorTask?.cancel()
+            initialAnchorTask = Task { @MainActor in
                 await Task.yield()
-                pinToBottom(proxy)
-                await Task.yield()
-                pinToBottom(proxy)
-                viewportPolicy.completeInitialAnchor()
-                isAtBottom = true
-                store.setNearBottom(true)
+                if #available(iOS 18.0, macOS 15.0, *) {
+                    // Lazy rich rows can reveal their final height over several
+                    // layouts. Keep requesting the stable eager-tail target until
+                    // measured scroll geometry confirms the real bottom.
+                    while !Task.isCancelled,
+                          viewportPolicy.isInitialAnchorPending,
+                          viewportPolicy.shouldFollowLatestLayout {
+                        var transaction = Transaction()
+                        transaction.disablesAnimations = true
+                        withTransaction(transaction) {
+                            pinToBottom(proxy)
+                        }
+                        try? await Task.sleep(for: .milliseconds(16))
+                    }
+                } else if !Task.isCancelled,
+                          viewportPolicy.shouldFollowLatestLayout {
+                    pinToBottom(proxy)
+                    await Task.yield()
+                    pinToBottom(proxy)
+                    viewportPolicy.completeInitialAnchor()
+                }
+                initialAnchorTask = nil
             }
         }
     }
@@ -598,6 +660,38 @@ struct ConversationView: View {
         }
     }
 
+    private func applyScrollMetrics(
+        _ metrics: ConversationScrollMetrics,
+        proxy: ScrollViewProxy
+    ) {
+        guard viewportPolicy.acceptsBottomMeasurements else { return }
+        applyBottomPosition(
+            isAtBottom: metrics.isAtBottom,
+            isNearBottom: metrics.isNearBottom,
+            proxy: proxy
+        )
+    }
+
+    private func applyBottomPosition(
+        isAtBottom atBottom: Bool,
+        isNearBottom nearBottom: Bool,
+        proxy: ScrollViewProxy
+    ) {
+        if isAtBottom != atBottom {
+            isAtBottom = atBottom
+        }
+        if store.isNearBottom != nearBottom {
+            store.setNearBottom(nearBottom)
+        }
+        if atBottom {
+            viewportPolicy.completeInitialAnchor()
+        }
+        if !viewportPolicy.isInitialAnchorPending,
+           viewportPolicy.shouldCorrectBottomOffset(isAtBottom: atBottom) {
+            scheduleFollowScroll(proxy)
+        }
+    }
+
     private func scheduleFollowScroll(_ proxy: ScrollViewProxy) {
         guard pendingFollowScroll == nil else { return }
         pendingFollowScroll = Task { @MainActor in
@@ -606,12 +700,14 @@ struct ConversationView: View {
                 pendingFollowScroll = nil
                 return
             }
+            // Clear first so the preference update caused by this correction
+            // can enqueue the next frame if rich content is still settling.
+            pendingFollowScroll = nil
             var transaction = Transaction()
             transaction.disablesAnimations = true
             withTransaction(transaction) {
                 pinToBottom(proxy)
             }
-            pendingFollowScroll = nil
         }
     }
 }
@@ -637,15 +733,21 @@ private extension View {
 
     @ViewBuilder
     func conversationScrollActivity(
-        _ onChange: @escaping (Bool) -> Void
+        _ onChange: @escaping (Bool, ConversationScrollMetrics?) -> Void
     ) -> some View {
         if #available(iOS 18.0, macOS 15.0, *) {
-            onScrollPhaseChange { _, phase in
+            onScrollPhaseChange { _, phase, context in
+                let metrics = ConversationScrollMetrics(
+                    isAtBottom: context.geometry.contentSize.height
+                        - context.geometry.visibleRect.maxY <= 2,
+                    isNearBottom: context.geometry.contentSize.height
+                        - context.geometry.visibleRect.maxY <= 180
+                )
                 switch phase {
                 case .tracking, .interacting, .decelerating:
-                    onChange(true)
+                    onChange(true, metrics)
                 case .idle:
-                    onChange(false)
+                    onChange(false, metrics)
                 case .animating:
                     break
                 @unknown default:
@@ -653,7 +755,31 @@ private extension View {
                 }
             }
         } else {
-            background(ConversationScrollActivityObserver(onChange: onChange))
+            background(
+                ConversationScrollActivityObserver { isActive in
+                    onChange(isActive, nil)
+                }
+            )
+        }
+    }
+
+    @ViewBuilder
+    func conversationScrollGeometry(
+        _ onChange: @escaping (ConversationScrollMetrics) -> Void
+    ) -> some View {
+        if #available(iOS 18.0, macOS 15.0, *) {
+            onScrollGeometryChange(for: ConversationScrollMetrics.self) { geometry in
+                let distanceFromBottom = geometry.contentSize.height
+                    - geometry.visibleRect.maxY
+                return ConversationScrollMetrics(
+                    isAtBottom: distanceFromBottom <= 2,
+                    isNearBottom: distanceFromBottom <= 180
+                )
+            } action: { _, metrics in
+                onChange(metrics)
+            }
+        } else {
+            self
         }
     }
 }

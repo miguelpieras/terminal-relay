@@ -27,7 +27,11 @@ final class RichChatRenderingTests: XCTestCase {
             ),
             .anchorInitialLatest
         )
-        XCTAssertFalse(policy.acceptsBottomMeasurements)
+        XCTAssertTrue(policy.acceptsBottomMeasurements)
+        XCTAssertTrue(
+            policy.shouldCorrectBottomOffset(isAtBottom: false),
+            "Late rich-content layout must keep correcting the initial anchor."
+        )
         XCTAssertEqual(
             policy.actionForContentUpdate(
                 hasContent: true
@@ -54,7 +58,6 @@ final class RichChatRenderingTests: XCTestCase {
             policy.actionForContentUpdate(hasContent: true),
             .anchorInitialLatest
         )
-        policy.completeInitialAnchor()
 
         policy.beginUserInteraction()
         XCTAssertTrue(policy.isUserInteracting)
@@ -79,7 +82,7 @@ final class RichChatRenderingTests: XCTestCase {
             policy.actionForContentUpdate(hasContent: true),
             .anchorInitialLatest
         )
-        XCTAssertFalse(policy.shouldCorrectBottomOffset(isAtBottom: false))
+        XCTAssertTrue(policy.shouldCorrectBottomOffset(isAtBottom: false))
         policy.completeInitialAnchor()
 
         XCTAssertTrue(policy.shouldCorrectBottomOffset(isAtBottom: false))

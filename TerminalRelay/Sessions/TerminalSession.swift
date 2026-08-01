@@ -303,6 +303,10 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         launchState == .starting
     }
 
+    var isLoadingExistingConversation: Bool {
+        isLaunchPending && threadID != nil
+    }
+
     var launchFailureMessage: String? {
         guard case .failed(let message) = launchState else { return nil }
         return message

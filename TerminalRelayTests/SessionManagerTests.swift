@@ -852,6 +852,100 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertTrue(manager.sessions.last === session)
     }
 
+    func testResumingThreadShowsLoadingWorkspaceBeforeRemoteHistoryIsReady() async {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let manager = SessionManager()
+        let recorder = BlockingWorkerSessionCommandRecorder()
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+        let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let relayID = "01234567-89ab-4def-8abc-0123456789ab"
+        let thread = WorkerThreadSnapshot(
+            kind: .codex,
+            repositoryName: project.displayName,
+            threadID: threadID,
+            title: "Review initial loading",
+            updatedAt: 100,
+            isArchived: false,
+            activeInstanceToken: nil,
+            reportedWorking: nil,
+            capabilities: .dormant
+        )
+        var callbackSession: TerminalSession?
+
+        let resume = Task {
+            await manager.resumeThread(
+                thread,
+                project: project,
+                on: server,
+                launchDefaults: .standard,
+                onPendingSession: { callbackSession = $0 },
+                using: service
+            )
+        }
+        while recorder.callCount == 0 {
+            await Task.yield()
+        }
+
+        let pendingSession = try! XCTUnwrap(manager.sessions.last)
+        XCTAssertTrue(callbackSession === pendingSession)
+        XCTAssertTrue(pendingSession.isLoadingExistingConversation)
+        XCTAssertEqual(pendingSession.threadID, threadID)
+        XCTAssertEqual(pendingSession.displayTitle, "Review initial loading")
+        XCTAssertEqual(manager.selectedSessionID, pendingSession.id)
+        let pendingID = pendingSession.id
+
+        let duplicateResult = await manager.resumeThread(
+            thread,
+            project: project,
+            on: server,
+            launchDefaults: .standard,
+            using: service
+        )
+        guard case .selectedExisting(let duplicateSession) = duplicateResult else {
+            return XCTFail("Expected a repeated open to select the in-flight conversation")
+        }
+        XCTAssertTrue(duplicateSession === pendingSession)
+        XCTAssertEqual(recorder.callCount, 1)
+
+        recorder.finish(
+            with: Self.statusResult(
+                snapshot: WorkerSessionSnapshot(
+                    kind: .codex,
+                    repositoryName: project.displayName,
+                    attachedClientCount: 0,
+                    instanceToken: relayID,
+                    threadID: threadID,
+                    presentation: .chat
+                )
+            )
+        )
+        let result = await resume.value
+
+        guard case .opened(let session) = result else {
+            return XCTFail("Expected the pending conversation to finish loading")
+        }
+        XCTAssertEqual(session.id, pendingID)
+        XCTAssertEqual(session.instanceToken, relayID)
+        XCTAssertEqual(session.threadID, threadID)
+        XCTAssertEqual(session.displayTitle, "Review initial loading")
+        XCTAssertFalse(session.isLaunchPending)
+        XCTAssertEqual(
+            recorder.configurations,
+            [
+                SSHCommandBuilder.workerChatStartConfiguration(
+                    for: server,
+                    kind: .codex,
+                    repositoryName: project.displayName,
+                    threadID: threadID,
+                    launchDefaults: .standard
+                )
+            ]
+        )
+    }
+
     func testNewSessionDoesNotReplaceKnownSameRepositorySession() async {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let project = makeProject(name: "Terminal Relay", server: server)
@@ -1959,6 +2053,7 @@ private final class WorkerSessionCommandRecorder {
 @MainActor
 private final class BlockingWorkerSessionCommandRecorder {
     private(set) var callCount = 0
+    private(set) var configurations: [SSHLaunchConfiguration] = []
     private var continuations: [CheckedContinuation<WorkerSessionCommandResult, Never>] = []
 
     func run(_ configuration: SSHLaunchConfiguration) async -> WorkerSessionCommandResult {
@@ -1972,6 +2067,7 @@ private final class BlockingWorkerSessionCommandRecorder {
         if configuration.arguments.last?.contains("'chat-capabilities-v1'") == true {
             return sessionManagerTestChatCapabilitiesResult(for: configuration)
         }
+        configurations.append(configuration)
         callCount += 1
         let result = await withCheckedContinuation { continuation in
             continuations.append(continuation)

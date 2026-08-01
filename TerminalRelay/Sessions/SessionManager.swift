@@ -247,43 +247,78 @@ final class SessionManager: ObservableObject {
     }
 
     @discardableResult
-    func resumeThreadAfterRefresh(
+    func resumeThread(
         _ thread: WorkerThreadSnapshot,
         project: ProjectProfile,
         on server: ServerProfile,
-        projects: [ProjectProfile],
         launchDefaults: AgentLaunchDefaults,
+        onPendingSession: ((TerminalSession) -> Void)? = nil,
         using service: WorkerSessionService
     ) async -> SessionOpenResult? {
-        let openSelectionRevision = claimOpenSelectionIntent()
         guard thread.activityState == .inactive,
               thread.capabilities.resume,
               thread.repositoryName == project.displayName,
-              project.serverID == server.id,
-              await refresh(
-                  worker: server,
-                  projects: projects,
-                  launchDefaults: launchDefaults,
-                  using: service
-              ),
-              let snapshot = await service.resumeThread(
-                  kind: thread.kind,
-                  repositoryName: project.displayName,
-                  threadID: thread.threadID,
-                  launchDefaults: launchDefaults,
-                  on: server
-              ) else {
+              project.serverID == server.id else {
+            return nil
+        }
+
+        if let existingSession = sessions.first(where: {
+            $0.projectID == project.id
+                && $0.serverKey == server.concurrencyKey
+                && $0.kind == thread.kind
+                && $0.threadID == thread.threadID
+                && ($0.isLaunchPending || $0.status.occupiesSlot)
+        }) {
+            if selectedSessionID != existingSession.id {
+                selectSession(existingSession.id)
+            }
+            return .selectedExisting(existingSession)
+        }
+
+        invalidatePendingOpenSelection()
+        let pendingSession = TerminalSession(
+            project: project,
+            server: server,
+            kind: thread.kind,
+            sequenceNumber: nextSequenceNumber(projectID: project.id, kind: thread.kind),
+            instanceToken: UUID().uuidString.lowercased(),
+            terminalTitle: thread.title,
+            threadID: thread.threadID,
+            presentation: .chat,
+            launchState: .starting,
+            launchDefaults: launchDefaults
+        )
+        append(pendingSession)
+        selectedSessionID = pendingSession.id
+        onPendingSession?(pendingSession)
+        let openSelectionRevision = selectionRevision
+
+        guard let snapshot = await service.resumeThread(
+            kind: thread.kind,
+            repositoryName: project.displayName,
+            threadID: thread.threadID,
+            launchDefaults: launchDefaults,
+            on: server
+        ) else {
+            pendingSession.markLaunchFailed(
+                service.error(for: server.id)
+                    ?? "The worker could not load this conversation."
+            )
             return nil
         }
         let shouldSelectResult = selectionRevision == openSelectionRevision
-        let result = openConfirmedRemote(
+            && selectedSessionID == pendingSession.id
+        guard let session = replacePendingSession(
+            pendingSession,
             project: project,
             on: server,
             snapshot: snapshot,
-            selectResult: shouldSelectResult,
             launchDefaults: launchDefaults
-        )
-        return shouldSelectResult ? result : nil
+        ) else {
+            pendingSession.markLaunchFailed("The worker returned an invalid conversation.")
+            return nil
+        }
+        return shouldSelectResult ? .opened(session) : nil
     }
 
     func invalidatePendingOpenSelection() {
@@ -489,6 +524,11 @@ final class SessionManager: ObservableObject {
                 instanceToken: snapshot.instanceToken
             )
         ] = snapshot
+        let terminalTitle = snapshot.title.flatMap { title in
+            title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? nil
+                : title
+        } ?? pendingSession.terminalTitle
         let replacement = TerminalSession(
             project: project,
             server: server,
@@ -500,7 +540,7 @@ final class SessionManager: ObservableObject {
             startedAt: pendingSession.startedAt,
             lastActivityAt: pendingSession.lastActivityAt,
             initialStatus: .connecting,
-            terminalTitle: snapshot.title,
+            terminalTitle: terminalTitle,
             threadID: snapshot.threadID,
             remoteAttachedClientCount: snapshot.attachedClientCount,
             presentation: snapshot.presentation,
@@ -510,7 +550,6 @@ final class SessionManager: ObservableObject {
         taskCompletionObservers[pendingSession.id] = nil
         sessions[index] = replacement
         observe(replacement)
-        replacement.applyRemoteSnapshot(snapshot)
         return replacement
     }
 
@@ -774,11 +813,6 @@ final class SessionManager: ObservableObject {
             return
         }
         defaults.set(data, forKey: sidebarSessionOrderStorageKey)
-    }
-
-    private func claimOpenSelectionIntent() -> Int {
-        invalidatePendingOpenSelection()
-        return selectionRevision
     }
 
     private func confirmedRemoteSnapshot(

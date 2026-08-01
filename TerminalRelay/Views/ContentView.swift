@@ -1477,12 +1477,14 @@ struct ContentView: View {
         for project: ProjectProfile
     ) async {
         guard let worker = serverStore.server(id: project.serverID),
-              let result = await sessionManager.resumeThreadAfterRefresh(
+              let result = await sessionManager.resumeThread(
                   thread,
                   project: project,
                   on: worker,
-                  projects: projectStore.projects,
                   launchDefaults: launchDefaults,
+                  onPendingSession: { session in
+                      handleOpenResult(.opened(session), for: project)
+                  },
                   using: workerSessionService
               ) else { return }
         handleOpenResult(result, for: project)
@@ -2059,6 +2061,7 @@ private struct ProjectSidebarSection: View {
     @State private var showsArchivedThreads = false
     @State private var threadPendingRename: WorkerThreadSnapshot?
     @State private var threadName = ""
+    @State private var isLoadingThreads = true
 
     private var allSessions: [TerminalSession] {
         let sessions = sessionManager.sidebarSessions(forProjectID: project.id)
@@ -2282,12 +2285,25 @@ private struct ProjectSidebarSection: View {
 
             if !isCollapsed {
                 if matchingSessions.isEmpty && matchingDormantThreads.isEmpty {
-                    Text("No sessions")
-                        .font(.system(size: 14))
+                    if isLoadingThreads {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Loading conversations…")
+                        }
+                        .font(.system(size: 13))
                         .foregroundStyle(SidebarPalette.tertiary)
                         .padding(.leading, 40)
                         .padding(.trailing, 12)
                         .frame(height: 35, alignment: .leading)
+                    } else {
+                        Text("No sessions")
+                            .font(.system(size: 14))
+                            .foregroundStyle(SidebarPalette.tertiary)
+                            .padding(.leading, 40)
+                            .padding(.trailing, 12)
+                            .frame(height: 35, alignment: .leading)
+                    }
                 } else {
                     ForEach(visibleSessions) { session in
                         ProjectSessionRow(
@@ -2470,7 +2486,9 @@ private struct ProjectSidebarSection: View {
             }
         }
         .task(id: "\(project.serverID.uuidString):\(project.displayName)") {
+            isLoadingThreads = true
             await onRefreshThreads()
+            isLoadingThreads = false
         }
         .alert(
             "Rename Thread",

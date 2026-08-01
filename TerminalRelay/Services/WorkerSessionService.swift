@@ -44,15 +44,6 @@ private enum WorkerUpdateStatusFetchResult {
     case unavailable
 }
 
-private enum WorkerChatNegotiation {
-    case available
-    case unsupported
-}
-
-private enum WorkerChatNegotiationError: Error {
-    case transientFailure
-}
-
 @MainActor
 final class WorkerSessionService: ObservableObject {
     typealias CommandRunner = (SSHLaunchConfiguration) async throws -> WorkerSessionCommandResult
@@ -343,35 +334,6 @@ final class WorkerSessionService: ObservableObject {
         }
         if dismissedUpdateTimestamps[workerID] != status.timestamp {
             updateWarnings[workerID] = warning
-        }
-    }
-
-    private func negotiateChat(
-        kind: AgentKind,
-        repositoryName: String,
-        on worker: ServerProfile
-    ) async throws -> WorkerChatNegotiation {
-        let result = try await runCommand(
-            SSHCommandBuilder.workerChatCapabilitiesConfiguration(
-                for: worker,
-                kind: kind,
-                repositoryName: repositoryName
-            )
-        )
-        guard result.exitCode == 0 else {
-            if result.exitCode == 64 {
-                return .unsupported
-            }
-            throw WorkerChatNegotiationError.transientFailure
-        }
-        do {
-            let response = try WorkerChatProtocol.parseCapabilities(
-                result.standardOutput,
-                expectedKind: kind
-            )
-            return response.isAvailable ? .available : .unsupported
-        } catch {
-            throw WorkerChatNegotiationError.transientFailure
         }
     }
 
@@ -674,41 +636,27 @@ final class WorkerSessionService: ObservableObject {
             return nil
         }
         do {
-            let negotiation = try await negotiateChat(
-                kind: kind,
-                repositoryName: repositoryName,
-                on: worker
-            )
-            let result: WorkerSessionCommandResult
-            switch negotiation {
-            case .available:
-                result = try await runCommand(
-                    SSHCommandBuilder.workerChatStartConfiguration(
-                        for: worker,
-                        kind: kind,
-                        repositoryName: repositoryName,
-                        threadID: threadID,
-                        launchDefaults: launchDefaults
-                    )
+            let result = try await runCommand(
+                SSHCommandBuilder.workerChatStartConfiguration(
+                    for: worker,
+                    kind: kind,
+                    repositoryName: repositoryName,
+                    threadID: threadID,
+                    launchDefaults: launchDefaults
                 )
-            case .unsupported:
+            )
+            if result.exitCode == 64 {
                 throw WorkerSessionServiceError.nativeChatUnavailable
             }
             guard result.exitCode == 0 else {
                 throw WorkerSessionServiceError.threadFailed
             }
-            let chat: WorkerChatStartResponse
-            switch negotiation {
-            case .available:
-                chat = try WorkerChatProtocol.parseStart(
-                    result.standardOutput,
-                    expectedKind: kind
-                )
-                guard chat.providerThreadID == threadID else {
-                    throw WorkerSessionServiceError.threadFailed
-                }
-            case .unsupported:
-                throw WorkerSessionServiceError.nativeChatUnavailable
+            let chat = try WorkerChatProtocol.parseStart(
+                result.standardOutput,
+                expectedKind: kind
+            )
+            guard chat.providerThreadID == threadID else {
+                throw WorkerSessionServiceError.threadFailed
             }
             let snapshot = WorkerSessionSnapshot(
                 kind: kind,
@@ -737,11 +685,11 @@ final class WorkerSessionService: ObservableObject {
                     return $0.instanceToken < $1.instanceToken
                 }
             )
-            _ = await loadThreads(
-                repositoryName: repositoryName,
-                archived: false,
-                on: worker
+            mergeLiveSessionsIntoThreadCatalogs(
+                workerID: worker.id,
+                sessions: responses[worker.id]?.sessions ?? []
             )
+            errors[worker.id] = nil
             return snapshot
         } catch {
             errors[worker.id] = message(for: error, fallback: .threadFailed)

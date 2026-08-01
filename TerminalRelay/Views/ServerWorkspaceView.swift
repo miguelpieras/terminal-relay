@@ -1379,15 +1379,27 @@ private struct TerminalPane: View {
                 VStack(spacing: 12) {
                     ProgressView()
                         .controlSize(.large)
-                    Text("Starting \(agentProductName)…")
+                    Text(
+                        session.isLoadingExistingConversation
+                            ? "Loading conversation…"
+                            : "Starting \(agentProductName)…"
+                    )
                         .font(.headline)
-                    Text("Connecting to \(worker.displayName)")
+                    Text(
+                        session.isLoadingExistingConversation
+                            ? "Retrieving the latest history from \(worker.displayName)"
+                            : "Connecting to \(worker.displayName)"
+                    )
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .accessibilityElement(children: .combine)
-                .accessibilityLabel("Starting \(agentProductName)")
+                .accessibilityLabel(
+                    session.isLoadingExistingConversation
+                        ? "Loading conversation"
+                        : "Starting \(agentProductName)"
+                )
             } else if let failureMessage = session.launchFailureMessage {
                 ContentUnavailableView {
                     Label(

@@ -372,6 +372,8 @@ struct ProjectDetailView: View {
     @State private var showsArchivedThreads = false
     @State private var threadPendingRename: WorkerThreadSnapshot?
     @State private var threadName = ""
+    @State private var isLoadingConversations = true
+    @State private var conversationLoadGeneration = 0
 
     private var sessions: [WorkerSessionSnapshot] {
         guard model.profile?.id == workerID else { return [] }
@@ -405,12 +407,23 @@ struct ProjectDetailView: View {
     var body: some View {
         List {
             if sessions.isEmpty && dormantThreads.isEmpty {
-                ContentUnavailableView {
-                    Label("No Conversations", systemImage: "bubble.left.and.bubble.right")
-                } description: {
-                    Text("Start a conversation or create a Codex thread for this project.")
+                if isLoadingConversations {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        Text("Loading conversations…")
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .listRowBackground(Color.clear)
+                    .accessibilityElement(children: .combine)
+                } else {
+                    ContentUnavailableView {
+                        Label("No Conversations", systemImage: "bubble.left.and.bubble.right")
+                    } description: {
+                        Text("Start a conversation or create a Codex thread for this project.")
+                    }
+                    .listRowBackground(Color.clear)
                 }
-                .listRowBackground(Color.clear)
             }
             if !sessions.isEmpty {
                 Section("Active Conversations") {
@@ -444,18 +457,10 @@ struct ProjectDetailView: View {
             if model.profile?.id != workerID {
                 model.selectProfile(id: workerID)
             }
-            await model.refresh()
-            await model.refreshThreads(
-                workerID: workerID,
-                repositoryName: repositoryName
-            )
+            await refreshContent()
         }
         .refreshable {
-            await model.refresh()
-            await model.refreshThreads(
-                workerID: workerID,
-                repositoryName: repositoryName
-            )
+            await refreshContent()
         }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
@@ -528,6 +533,20 @@ struct ProjectDetailView: View {
         } message: {
             Text("This changes the provider thread name on this worker.")
         }
+    }
+
+    private func refreshContent() async {
+        conversationLoadGeneration &+= 1
+        let generation = conversationLoadGeneration
+        isLoadingConversations = true
+        async let overview: Void = model.refresh()
+        async let threads: Void = model.refreshThreads(
+            workerID: workerID,
+            repositoryName: repositoryName
+        )
+        _ = await (overview, threads)
+        guard generation == conversationLoadGeneration else { return }
+        isLoadingConversations = false
     }
 
     @ViewBuilder

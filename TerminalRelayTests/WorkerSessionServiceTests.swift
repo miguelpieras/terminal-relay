@@ -694,32 +694,11 @@ final class WorkerSessionServiceTests: XCTestCase {
                     standardOutput: Data(
                         """
                         \(WorkerChatProtocol.marker)
-                        {"provider":"codex","available":true,"capabilities":\(capabilities),"reason":null}
-
-                        """.utf8
-                    ),
-                    standardError: Data()
-                ),
-                WorkerSessionCommandResult(
-                    exitCode: 0,
-                    standardOutput: Data(
-                        """
-                        \(WorkerChatProtocol.marker)
                         {"relayId":"\(instanceID)","provider":"codex","providerThreadId":"\(threadID)","capabilities":\(capabilities),"launchOptions":{"model":"gpt-example"}}
 
                         """.utf8
                     ),
                     standardError: Data()
-                ),
-                threadResult(
-                    """
-                    {"threads":[{"provider":"codex","threadID":"\(threadID)","title":"Exact thread","updatedAt":200,"archived":false,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":null}
-                    """
-                ),
-                threadResult(
-                    """
-                    {"threads":[],"nextCursor":null}
-                    """
                 )
             ]
         )
@@ -739,22 +718,16 @@ final class WorkerSessionServiceTests: XCTestCase {
         XCTAssertEqual(snapshot?.instanceToken, instanceID)
         XCTAssertEqual(service.response(for: worker.id)?.sessions, [snapshot].compactMap { $0 })
         XCTAssertEqual(
-            recorder.configurations.first,
-            SSHCommandBuilder.workerChatCapabilitiesConfiguration(
-                for: worker,
-                kind: .codex,
-                repositoryName: "terminal-relay"
-            )
-        )
-        XCTAssertEqual(
-            recorder.configurations.dropFirst().first,
-            SSHCommandBuilder.workerChatStartConfiguration(
-                for: worker,
-                kind: .codex,
-                repositoryName: "terminal-relay",
-                threadID: threadID,
-                launchDefaults: .standard
-            )
+            recorder.configurations,
+            [
+                SSHCommandBuilder.workerChatStartConfiguration(
+                    for: worker,
+                    kind: .codex,
+                    repositoryName: "terminal-relay",
+                    threadID: threadID,
+                    launchDefaults: .standard
+                )
+            ]
         )
     }
 
@@ -791,16 +764,18 @@ final class WorkerSessionServiceTests: XCTestCase {
         XCTAssertEqual(
             recorder.configurations,
             [
-                SSHCommandBuilder.workerChatCapabilitiesConfiguration(
+                SSHCommandBuilder.workerChatStartConfiguration(
                     for: worker,
                     kind: .codex,
-                    repositoryName: "terminal-relay"
+                    repositoryName: "terminal-relay",
+                    threadID: threadID,
+                    launchDefaults: .standard
                 )
             ]
         )
     }
 
-    func testResumeThreadTreatsCapabilityConnectionFailureAsRetryableThreadFailure() async {
+    func testResumeThreadTreatsConnectionFailureAsRetryableThreadFailure() async {
         let worker = makeWorker()
         let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         let recorder = WorkerSessionCommandRecorder(
@@ -833,10 +808,12 @@ final class WorkerSessionServiceTests: XCTestCase {
         XCTAssertEqual(
             recorder.configurations,
             [
-                SSHCommandBuilder.workerChatCapabilitiesConfiguration(
+                SSHCommandBuilder.workerChatStartConfiguration(
                     for: worker,
                     kind: .codex,
-                    repositoryName: "terminal-relay"
+                    repositoryName: "terminal-relay",
+                    threadID: threadID,
+                    launchDefaults: .standard
                 )
             ]
         )
