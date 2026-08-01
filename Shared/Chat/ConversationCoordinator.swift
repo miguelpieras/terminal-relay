@@ -450,7 +450,7 @@ final class ConversationCoordinator {
                             shouldStayConnected = false
                             store.setConnectionState(.failed, message: failure.message)
                         } else {
-                            store.setConnectionState(.offlineAgentRunning, message: failure?.message)
+                            store.setConnectionState(.connecting)
                         }
                         break eventLoop
                     }
@@ -459,7 +459,7 @@ final class ConversationCoordinator {
                 isAttached = false
                 resetReconnectScopedState()
                 await transport.disconnect()
-                store.setConnectionState(.offlineAgentRunning, message: sanitizedMessage(for: error))
+                store.setConnectionState(.connecting)
             }
 
             guard shouldStayConnected, !Task.isCancelled else { return }

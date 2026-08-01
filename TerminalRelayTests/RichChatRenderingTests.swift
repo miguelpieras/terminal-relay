@@ -73,22 +73,24 @@ final class RichChatRenderingTests: XCTestCase {
         XCTAssertTrue(policy.shouldFollowLatestLayout)
     }
 
-    func testViewportPolicyFollowsContentGrowthOnlyOncePerBottomChange() {
+    func testViewportPolicyCorrectsLayoutUntilTheBottomIsReached() {
         var policy = ConversationViewportPolicy()
         XCTAssertEqual(
             policy.actionForContentUpdate(hasContent: true),
             .anchorInitialLatest
         )
-        XCTAssertFalse(policy.shouldFollowBottomChange(900))
+        XCTAssertFalse(policy.shouldCorrectBottomOffset(isAtBottom: false))
         policy.completeInitialAnchor()
 
-        XCTAssertTrue(policy.shouldFollowBottomChange(940))
-        XCTAssertFalse(
-            policy.shouldFollowBottomChange(200),
-            "The scroll caused by follow mode must not schedule itself again."
-        )
-        XCTAssertFalse(policy.shouldFollowBottomChange(200))
-        XCTAssertTrue(policy.shouldFollowBottomChange(240))
+        XCTAssertTrue(policy.shouldCorrectBottomOffset(isAtBottom: false))
+        XCTAssertFalse(policy.shouldCorrectBottomOffset(isAtBottom: true))
+
+        policy.beginUserInteraction()
+        policy.endUserInteraction(isAtBottom: false)
+        XCTAssertFalse(policy.shouldCorrectBottomOffset(isAtBottom: false))
+
+        policy.jumpToLatest()
+        XCTAssertTrue(policy.shouldCorrectBottomOffset(isAtBottom: false))
     }
 
     func testComposerReturnPolicyKeepsPlainReturnAsNewlineAndCommandReturnAsSend() {

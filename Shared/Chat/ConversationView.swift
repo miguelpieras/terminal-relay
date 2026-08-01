@@ -20,7 +20,6 @@ struct ConversationViewportPolicy: Equatable {
     }
 
     private var phase: Phase = .awaitingContent
-    private var lastBottomY: CGFloat?
     private(set) var isUserInteracting = false
     private(set) var followsLatest = true
 
@@ -66,11 +65,8 @@ struct ConversationViewportPolicy: Equatable {
         followsLatest = true
     }
 
-    mutating func shouldFollowBottomChange(_ bottomY: CGFloat) -> Bool {
-        let previousBottomY = lastBottomY
-        lastBottomY = bottomY
-        guard shouldFollowLatestLayout, let previousBottomY else { return false }
-        return bottomY > previousBottomY + 1
+    func shouldCorrectBottomOffset(isAtBottom: Bool) -> Bool {
+        !isAtBottom && shouldFollowLatestLayout
     }
 }
 
@@ -85,6 +81,8 @@ private struct ConversationViewportUpdateToken: Equatable {
 }
 
 struct ConversationView: View {
+    private static let eagerTranscriptTailLimit = 50
+
     @ObservedObject private var store: ConversationStore
 
     let coordinator: ConversationCoordinator
@@ -176,48 +174,14 @@ struct ConversationView: View {
                     LazyVStack(alignment: .leading, spacing: 14) {
                         historyControl
 
-                        ForEach(store.state.items) { item in
+                        ForEach(olderTranscriptItems) { item in
                             timelineView(for: item)
                                 .id(item.id)
                         }
 
-                        ForEach(store.state.approvals) { approval in
-                            ApprovalCard(
-                                approval: approval,
-                                store: store,
-                                coordinator: coordinator,
-                                isReadOnly: isReadOnly
-                            )
-                            .id("approval:\(approval.id)")
-                        }
-
-                        ForEach(store.state.questions) { question in
-                            QuestionCard(
-                                question: question,
-                                store: store,
-                                coordinator: coordinator,
-                                isReadOnly: isReadOnly
-                            )
-                            .id("question:\(question.id)")
-                        }
-
-                        if store.state.items.isEmpty,
-                           store.state.approvals.isEmpty,
-                           store.state.questions.isEmpty {
-                            emptyConversation
-                        }
-
-                        Color.clear
-                            .frame(height: 1)
-                            .id("chat-bottom")
-                            .background {
-                                GeometryReader { proxy in
-                                    Color.clear.preference(
-                                        key: ConversationBottomPreferenceKey.self,
-                                        value: proxy.frame(in: .named("conversation-scroll")).maxY
-                                    )
-                                }
-                            }
+                        // Keep changing rich content and the bottom marker in
+                        // one stable subtree while older history remains lazy.
+                        transcriptTail
                     }
                     .frame(maxWidth: 760, alignment: .leading)
                     .padding(.horizontal, horizontalTranscriptPadding)
@@ -225,9 +189,9 @@ struct ConversationView: View {
                     .padding(.bottom, 16)
                     .frame(maxWidth: .infinity)
                 }
+                .conversationDefaultScrollAnchor()
                 .coordinateSpace(name: "conversation-scroll")
                 .onPreferenceChange(ConversationBottomPreferenceKey.self) { bottomY in
-                    let shouldFollow = viewportPolicy.shouldFollowBottomChange(bottomY)
                     guard viewportPolicy.acceptsBottomMeasurements else { return }
                     let atBottom = bottomY <= geometry.size.height + 2
                     let nearBottom = bottomY <= geometry.size.height + 180
@@ -237,7 +201,7 @@ struct ConversationView: View {
                     if nearBottom != store.isNearBottom {
                         store.setNearBottom(nearBottom)
                     }
-                    if !atBottom, shouldFollow {
+                    if viewportPolicy.shouldCorrectBottomOffset(isAtBottom: atBottom) {
                         scheduleFollowScroll(proxy)
                     }
                 }
@@ -380,12 +344,7 @@ struct ConversationView: View {
     private var compactNotice: some View {
         if let notice = compactNoticeContent {
             HStack(spacing: 6) {
-                if notice.isProgress {
-                    ProgressView()
-                        .controlSize(.mini)
-                } else {
-                    Image(systemName: "exclamationmark.circle")
-                }
+                Image(systemName: "exclamationmark.circle")
                 Text(notice.message)
                     .lineLimit(2)
                 if notice.canRetry {
@@ -433,6 +392,63 @@ struct ConversationView: View {
         #endif
     }
 
+    private var olderTranscriptItems: ArraySlice<ConversationItem> {
+        store.state.items.dropLast(
+            min(store.state.items.count, Self.eagerTranscriptTailLimit)
+        )
+    }
+
+    private var recentTranscriptItems: ArraySlice<ConversationItem> {
+        store.state.items.suffix(Self.eagerTranscriptTailLimit)
+    }
+
+    private var transcriptTail: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            ForEach(recentTranscriptItems) { item in
+                timelineView(for: item)
+                    .id(item.id)
+            }
+
+            ForEach(store.state.approvals) { approval in
+                ApprovalCard(
+                    approval: approval,
+                    store: store,
+                    coordinator: coordinator,
+                    isReadOnly: isReadOnly
+                )
+                .id("approval:\(approval.id)")
+            }
+
+            ForEach(store.state.questions) { question in
+                QuestionCard(
+                    question: question,
+                    store: store,
+                    coordinator: coordinator,
+                    isReadOnly: isReadOnly
+                )
+                .id("question:\(question.id)")
+            }
+
+            if store.state.items.isEmpty,
+               store.state.approvals.isEmpty,
+               store.state.questions.isEmpty {
+                emptyConversation
+            }
+
+            Color.clear
+                .frame(height: 1)
+                .id("chat-bottom")
+                .background {
+                    GeometryReader { proxy in
+                        Color.clear.preference(
+                            key: ConversationBottomPreferenceKey.self,
+                            value: proxy.frame(in: .named("conversation-scroll")).maxY
+                        )
+                    }
+                }
+        }
+    }
+
     private var viewportUpdateSignal: ConversationViewportUpdateToken {
         ConversationViewportUpdateToken(
             lastItemID: store.state.items.last?.id,
@@ -441,24 +457,22 @@ struct ConversationView: View {
         )
     }
 
-    private var compactNoticeContent: (message: String, canRetry: Bool, isProgress: Bool)? {
+    private var compactNoticeContent: (message: String, canRetry: Bool)? {
         if let message = store.state.lastErrorMessage {
             let canRetry = store.state.connectionState == .failed
                 || store.state.connectionState == .offlineAgentRunning
                 || store.state.connectionState == .unsupportedWorker
-            return (message, canRetry, false)
+            return (message, canRetry)
         }
         switch store.state.connectionState {
-        case .connecting where !store.state.items.isEmpty:
-            return ("Connecting…", false, true)
         case .offlineAgentRunning:
-            return ("Connection interrupted.", true, false)
+            return ("Connection interrupted.", true)
         case .unsupportedWorker:
-            return ("Native chat is unavailable on this worker.", true, false)
+            return ("Native chat is unavailable on this worker.", true)
         case .failed:
-            return ("Unable to connect.", true, false)
+            return ("Unable to connect.", true)
         case .stopped:
-            return ("Session ended.", false, false)
+            return ("Session ended.", false)
         default:
             return nil
         }
@@ -466,12 +480,16 @@ struct ConversationView: View {
 
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
         if reduceMotion || store.state.turnState.isActive {
-            proxy.scrollTo("chat-bottom", anchor: .bottom)
+            pinToBottom(proxy)
         } else {
             withAnimation(.easeOut(duration: 0.18)) {
-                proxy.scrollTo("chat-bottom", anchor: .bottom)
+                pinToBottom(proxy)
             }
         }
+    }
+
+    private func pinToBottom(_ proxy: ScrollViewProxy) {
+        proxy.scrollTo("chat-bottom", anchor: .bottom)
     }
 
     private func handleViewportUpdate(
@@ -485,13 +503,13 @@ struct ConversationView: View {
             break
         case .anchorInitialLatest:
             Task { @MainActor in
-                // Wait for the lazy transcript to install the bottom anchor,
+                // Wait for the transcript tail to install the bottom anchor,
                 // then repeat once after layout so a large snapshot cannot
                 // leave a resumed conversation at its oldest row.
                 await Task.yield()
-                proxy.scrollTo("chat-bottom", anchor: .bottom)
+                pinToBottom(proxy)
                 await Task.yield()
-                proxy.scrollTo("chat-bottom", anchor: .bottom)
+                pinToBottom(proxy)
                 viewportPolicy.completeInitialAnchor()
                 isAtBottom = true
                 store.setNearBottom(true)
@@ -520,7 +538,7 @@ struct ConversationView: View {
             var transaction = Transaction()
             transaction.disablesAnimations = true
             withTransaction(transaction) {
-                proxy.scrollTo("chat-bottom", anchor: .bottom)
+                pinToBottom(proxy)
             }
             pendingFollowScroll = nil
         }
@@ -537,28 +555,24 @@ private struct ConversationBottomPreferenceKey: PreferenceKey {
 
 private extension View {
     @ViewBuilder
+    func conversationDefaultScrollAnchor() -> some View {
+        if #available(iOS 18.0, macOS 15.0, *) {
+            defaultScrollAnchor(.bottom)
+                .defaultScrollAnchor(.top, for: .alignment)
+        } else {
+            self
+        }
+    }
+
     func conversationScrollActivity(
         _ onChange: @escaping (Bool) -> Void
     ) -> some View {
-        if #available(iOS 18.0, macOS 15.0, *) {
-            onScrollPhaseChange { _, phase in
-                switch phase {
-                case .tracking, .interacting, .decelerating:
-                    onChange(true)
-                case .idle:
-                    onChange(false)
-                case .animating:
-                    break
-                }
-            }
-        } else {
-            background(ConversationLegacyScrollActivityObserver(onChange: onChange))
-        }
+        background(ConversationScrollActivityObserver(onChange: onChange))
     }
 }
 
 #if os(macOS)
-private struct ConversationLegacyScrollActivityObserver: NSViewRepresentable {
+private struct ConversationScrollActivityObserver: NSViewRepresentable {
     let onChange: (Bool) -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -665,7 +679,7 @@ private struct ConversationLegacyScrollActivityObserver: NSViewRepresentable {
     }
 }
 #elseif os(iOS)
-private struct ConversationLegacyScrollActivityObserver: UIViewRepresentable {
+private struct ConversationScrollActivityObserver: UIViewRepresentable {
     let onChange: (Bool) -> Void
 
     func makeCoordinator() -> Coordinator {

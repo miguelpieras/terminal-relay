@@ -906,6 +906,37 @@ final class ConversationCoordinatorTests: XCTestCase {
         await coordinator.detach()
     }
 
+    func testRecoverableDisconnectStaysQuietWhileAutomaticRetryIsPending() async {
+        let transport = makeConnectedTransport()
+        let store = ConversationStore()
+        let coordinator = ConversationCoordinator(
+            store: store,
+            transport: transport,
+            identity: ChatTestFixtures.identity,
+            retryPolicy: ChatRetryPolicy(
+                maximumAutomaticRetries: 1,
+                initialDelayNanoseconds: 500_000_000,
+                maximumDelayNanoseconds: 500_000_000
+            )
+        )
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+
+        await transport.yield(
+            .disconnected(
+                ChatTransportFailure(
+                    category: "network",
+                    message: "Connection was interrupted.",
+                    isRecoverable: true
+                )
+            )
+        )
+
+        await waitUntil { store.state.connectionState == .connecting }
+        XCTAssertNil(store.state.lastErrorMessage)
+        await coordinator.detach()
+    }
+
     func testHistoryPreviewAndRetryActionsSendTheirExactCommands() async {
         let transport = makeConnectedTransport()
         let store = ConversationStore()
