@@ -14,8 +14,8 @@ final class ConversationScrollingUITests: XCTestCase {
         app.launch()
 
         XCTAssertTrue(
-            app.staticTexts["Read-only local demo"].waitForExistence(timeout: 5),
-            "The local conversation fixture did not open."
+            app.buttons["Close conversation"].waitForExistence(timeout: 5),
+            "The conversation fixture did not open with the production interface."
         )
     }
 

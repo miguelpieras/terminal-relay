@@ -216,53 +216,6 @@ final class WorkerSessionModel: ObservableObject {
         threadCatalogs = [:]
     }
 
-    func enterDemo() {
-        refreshToken = UUID()
-        isLoading = false
-        isPairing = false
-        isDemoMode = true
-        profiles = [DemoWorkspace.worker]
-        profile = DemoWorkspace.worker
-        projects = DemoWorkspace.projects
-        sessions = DemoWorkspace.sessions
-        workerOverviews = [DemoWorkspace.worker.id: DemoWorkspace.overview]
-        threadCatalogs = [:]
-        loadDemoThreads()
-        workerLoadingIDs = []
-        projectLoadingIDs = []
-        publicKey = "ssh-ed25519 demo-device"
-        errorMessage = nil
-        terminalRoute = nil
-        lastOpenedTerminalRoute = nil
-    }
-
-    func exitDemo() {
-        refreshToken = UUID()
-        isLoading = false
-        isPairing = false
-        isDemoMode = false
-        profiles = profileStore.load()
-        profile = profileStore.selectedProfileID()
-            .flatMap { selectedID in profiles.first { $0.id == selectedID } }
-            ?? profiles.first
-        projects = []
-        sessions = []
-        workerOverviews = [:]
-        threadCatalogs = [:]
-        workerLoadingIDs = []
-        projectLoadingIDs = []
-        errorMessage = nil
-        terminalRoute = nil
-        lastOpenedTerminalRoute = nil
-
-        do {
-            publicKey = try identityStore.publicKeyForAuthorizedKeys()
-        } catch {
-            publicKey = ""
-            errorMessage = error.localizedDescription
-        }
-    }
-
     func updateWarning(for profileID: UUID) -> String? {
         if let message = workerOverviews[profileID]?.runtimeUpdateStatus?.message {
             return message

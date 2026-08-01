@@ -7,18 +7,15 @@ struct TerminalScreen: View {
     @StateObject private var controller: TerminalSessionController
     @StateObject private var chatController: MobileChatSessionController
     private let isDemo: Bool
-    private let onExitDemo: (() -> Void)?
     private let onClose: (() -> Void)?
 
     init(
         profile: WorkerProfile,
         route: TerminalRoute,
         isDemo: Bool = false,
-        onExitDemo: (() -> Void)? = nil,
         onClose: (() -> Void)? = nil
     ) {
         self.isDemo = isDemo
-        self.onExitDemo = onExitDemo
         self.onClose = onClose
         let opensExistingTerminal = route.presentation == .terminal
         _controller = StateObject(
@@ -48,52 +45,19 @@ struct TerminalScreen: View {
             }
             .navigationTitle(controller.repositoryName)
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar(
-                hidesEmbeddedDemoNavigation ? .hidden : .automatic,
-                for: .navigationBar
-            )
             .toolbar {
-                if isDemo {
-                    ToolbarItem(placement: .topBarLeading) {
-                        Label("Demo", systemImage: "play.circle.fill")
-                            .font(.caption)
-                            .foregroundStyle(.indigo)
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        close()
+                    } label: {
+                        Image(systemName: "xmark")
                     }
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button("Exit Demo") {
-                            if let onExitDemo {
-                                onExitDemo()
-                            } else {
-                                close()
-                            }
-                        }
-                    }
-                } else {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button {
-                            close()
-                        } label: {
-                            Image(systemName: "xmark")
-                        }
-                        .accessibilityLabel("Close conversation")
-                        .keyboardShortcut("w", modifiers: .command)
-                    }
+                    .accessibilityLabel("Close conversation")
+                    .keyboardShortcut("w", modifiers: .command)
                 }
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
-                if isDemo {
-                    HStack {
-                        Label("Read-only local demo", systemImage: "lock.shield")
-                            .font(.caption.weight(.medium))
-                        Spacer()
-                        Text("No worker connection")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(Color(uiColor: .secondarySystemBackground))
-                } else if showsTerminal {
+                if showsTerminal {
                     MobileTerminalKeyBar(controller: controller)
                 }
             }
@@ -140,7 +104,6 @@ struct TerminalScreen: View {
     private var sessionContent: some View {
         if isDemo {
             DemoChatConversationView()
-                .padding(.top, hidesEmbeddedDemoNavigation ? 40 : 0)
         } else {
             switch chatController.phase {
             case .preparing:
@@ -228,10 +191,6 @@ struct TerminalScreen: View {
         .padding()
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
         .padding()
-    }
-
-    private var hidesEmbeddedDemoNavigation: Bool {
-        isDemo && onClose != nil
     }
 
     private var recoveryPresentation: (message: String, canReconnect: Bool)? {

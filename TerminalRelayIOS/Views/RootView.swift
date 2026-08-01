@@ -37,7 +37,6 @@ struct RootView: View {
     @State private var workerPendingDeletion: WorkerProfile?
     @State private var workerSearchText = ""
     @State private var splitColumnVisibility = NavigationSplitViewVisibility.all
-    @State private var projectNavigationID = UUID()
 
     private var filteredWorkerProfiles: [WorkerProfile] {
         model.profiles.filter {
@@ -73,20 +72,13 @@ struct RootView: View {
             }
         }
         .safeAreaInset(edge: .top, spacing: 0) {
-            VStack(spacing: 0) {
-                if model.isDemoMode {
-                    DemoModeBanner {
-                        exitDemo()
-                    }
-                }
-                if model.terminalRoute == nil,
-                   let warning = workerUpdateWarning {
-                    WorkerUpdateWarningBanner(
-                        workerName: warning.profile.displayName,
-                        message: warning.message
-                    ) {
-                        model.dismissUpdateWarning(for: warning.profile.id)
-                    }
+            if model.terminalRoute == nil,
+               let warning = workerUpdateWarning {
+                WorkerUpdateWarningBanner(
+                    workerName: warning.profile.displayName,
+                    message: warning.message
+                ) {
+                    model.dismissUpdateWarning(for: warning.profile.id)
                 }
             }
         }
@@ -120,8 +112,7 @@ struct RootView: View {
                 TerminalScreen(
                     profile: profile,
                     route: route,
-                    isDemo: model.isDemoMode,
-                    onExitDemo: exitDemo
+                    isDemo: model.isDemoMode
                 )
             }
         }
@@ -199,11 +190,9 @@ struct RootView: View {
             NavigationStack {
                 ProjectListView(
                     model: model,
-                    onAddWorker: { showsPairingScanner = true },
-                    onExploreDemo: enterDemo
+                    onAddWorker: { showsPairingScanner = true }
                 )
             }
-            .id(projectNavigationID)
             .tabItem {
                 Label("Projects", systemImage: "folder")
             }
@@ -227,7 +216,6 @@ struct RootView: View {
                     model: model,
                     selectedProject: $selectedProject,
                     onAddWorker: { showsPairingScanner = true },
-                    onExploreDemo: enterDemo,
                     onShowWorkers: showWorkers
                 )
             case .workers:
@@ -247,7 +235,6 @@ struct RootView: View {
                 profile: profile,
                 route: route,
                 isDemo: model.isDemoMode,
-                onExitDemo: exitDemo,
                 onClose: closeEmbeddedTerminal
             )
             .id(route.id)
@@ -326,8 +313,6 @@ struct RootView: View {
                             showsProjectsAfterSave: true
                         )
                     }
-
-                    Button("Explore Demo", action: enterDemo)
                 }
             } else {
                 Group {
@@ -492,25 +477,6 @@ struct RootView: View {
         reconcileWorkerSelection()
     }
 
-    private func enterDemo() {
-        model.enterDemo()
-        selectedTab = .projects
-        selectedProject = ProjectSelection(
-            workerID: DemoWorkspace.worker.id,
-            repositoryName: DemoWorkspace.projects[0]
-        )
-        if usesSplitWorkspace, let session = DemoWorkspace.sessions.first {
-            model.openTerminal(session)
-        }
-    }
-
-    private func exitDemo() {
-        projectNavigationID = UUID()
-        selectedProject = nil
-        selectedWorkerID = nil
-        selectedTab = .projects
-        model.exitDemo()
-    }
 }
 
 enum AdaptiveSelectionPolicy {

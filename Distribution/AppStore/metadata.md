@@ -59,8 +59,8 @@ private workers or Tailscale network. The private review pairing code is:
 1. Launch Terminal Relay on iPhone or iPad.
 2. On the Projects screen, choose **Scan Mac Pairing Code**.
 3. Choose **Paste Pairing Code** and paste the code above.
-4. Open `atlas` and start Codex or Claude. This is the real interactive terminal
-   and SSH/session flow, not the bundled read-only interface preview.
+4. Open `atlas` and start Codex or Claude. This uses the same interactive
+   terminal, SSH/session flow, and interface as every user-owned worker.
 5. Switch between `atlas`, `launchpad`, and `northstar`, reconnect to the active
    terminal, stop it, and open **Workers** to inspect account and resource
    status.
@@ -90,9 +90,9 @@ SSH and Swift Crypto implementation. Do not add
 - Mac marketing site: `Distribution/Screenshots/mac.png`
 - Mac pairing close-up: `Distribution/Screenshots/mac-pairing.png`
 
-All images are direct captures of the native apps running with the Debug-only
-screenshot demo. The fixtures use example worker, repository, session, account,
-SSH-key, and pairing values and never connect to a real worker.
+All images are direct captures of the native apps running with Debug-only
+screenshot fixtures. The fixtures use example worker, repository, session,
+account, SSH-key, and pairing values and never connect to a real worker.
 
 ## Remaining assets and decisions
 

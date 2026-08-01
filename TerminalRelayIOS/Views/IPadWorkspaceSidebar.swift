@@ -20,7 +20,6 @@ struct IPadWorkspaceSidebar: View {
     @ObservedObject var model: WorkerSessionModel
     @Binding var selectedProject: ProjectSelection?
     let onAddWorker: () -> Void
-    let onExploreDemo: () -> Void
     let onShowWorkers: () -> Void
 
     @State private var searchText = ""
@@ -98,12 +97,6 @@ struct IPadWorkspaceSidebar: View {
                     Button(action: onAddWorker) {
                         Label("Scan Mac Pairing Code", systemImage: "qrcode.viewfinder")
                     }
-
-                    Button(action: onExploreDemo) {
-                        Label("Explore Demo", systemImage: "play.circle")
-                    }
-                } footer: {
-                    Text("The demo is local, uses example data, and never contacts a worker.")
                 }
             } else if projects.isEmpty {
                 if !model.projectLoadingIDs.isEmpty {
@@ -345,25 +338,5 @@ struct IPadWorkspaceSidebar: View {
             current: selectedProject,
             available: projects.map(\.selection)
         )
-    }
-}
-
-struct DemoModeBanner: View {
-    let onExit: () -> Void
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Label("Demo workspace · Local example data", systemImage: "play.circle.fill")
-                .font(.subheadline.weight(.medium))
-
-            Spacer()
-
-            Button("Exit Demo", action: onExit)
-                .font(.subheadline.weight(.semibold))
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 9)
-        .foregroundStyle(.white)
-        .background(Color.indigo)
     }
 }
