@@ -792,25 +792,33 @@ private struct ChatMessageView: View {
     let onOpenExternal: (URL) -> Void
     let onOpenRepository: (ChatRepositoryLink) -> Void
 
+    @State private var didCopy = false
+
     var body: some View {
         HStack(alignment: .top) {
             if message.role == .user {
                 Spacer(minLength: 44)
             }
 
-            VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 10) {
-                ForEach(message.contents) { content in
-                    contentView(content)
+            VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 7) {
+                VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 10) {
+                    ForEach(message.contents) { content in
+                        contentView(content)
+                    }
+                    if message.isStreaming {
+                        StreamingIndicator()
+                    }
                 }
-                if message.isStreaming {
-                    StreamingIndicator()
+                .padding(message.role == .user ? 12 : 0)
+                .background {
+                    if message.role == .user {
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .fill(Color.secondary.opacity(0.12))
+                    }
                 }
-            }
-            .padding(message.role == .user ? 12 : 0)
-            .background {
-                if message.role == .user {
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .fill(Color.secondary.opacity(0.12))
+
+                if !message.isStreaming, !message.text.isEmpty {
+                    messageFooter
                 }
             }
             .frame(maxWidth: message.role == .user ? 640 : .infinity, alignment: message.role == .user ? .trailing : .leading)
@@ -823,6 +831,32 @@ private struct ChatMessageView: View {
         .accessibilityLabel(message.role == .user ? "You" : "Assistant")
     }
 
+    private var messageFooter: some View {
+        HStack(spacing: 9) {
+            Button {
+                ChatClipboard.copy(message.text)
+                didCopy = true
+                Task {
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    didCopy = false
+                }
+            } label: {
+                Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
+            }
+            .buttonStyle(.plain)
+            .chatMinimumInteractionTarget(includesWidth: true)
+            .accessibilityLabel(didCopy ? "Message copied" : "Copy message")
+
+            if let date = ChatTimestamp.date(milliseconds: message.occurredAt) {
+                Text(date.formatted(date: .omitted, time: .shortened))
+                    .accessibilityLabel(date.formatted(date: .complete, time: .shortened))
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, message.role == .user ? 4 : 0)
+    }
+
     @ViewBuilder
     private func contentView(_ content: MessageContent) -> some View {
         switch content.kind {
@@ -831,7 +865,8 @@ private struct ChatMessageView: View {
                 id: content.id,
                 code: content.text,
                 language: content.language,
-                isStreaming: !content.isComplete
+                isStreaming: !content.isComplete,
+                showsCopyButton: false
             )
         case .imagePlaceholder:
             Label(content.text, systemImage: "photo")
@@ -856,6 +891,13 @@ private struct ChatMessageView: View {
     }
 }
 
+enum ChatTimestamp {
+    static func date(milliseconds: Int64?) -> Date? {
+        guard let milliseconds, milliseconds >= 0 else { return nil }
+        return Date(timeIntervalSince1970: TimeInterval(milliseconds) / 1_000)
+    }
+}
+
 private struct StreamingIndicator: View {
     var body: some View {
         HStack(spacing: 6) {
@@ -875,18 +917,38 @@ private struct ReasoningCard: View {
 
     var isExpanded: Bool { store.expandedItemIDs.contains(reasoning.id) }
 
+    private var displayText: String? {
+        reasoning.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? nil
+            : reasoning.text
+    }
+
+    @ViewBuilder
     var body: some View {
-        DisclosureCard(
-            title: reasoning.isStreaming ? "Thinking…" : "Reasoning summary",
-            symbol: "brain.head.profile",
-            statusColor: reasoning.isStreaming ? .blue : .secondary,
-            isExpanded: isExpanded,
-            toggle: { store.toggleExpanded(itemID: reasoning.id) }
-        ) {
-            Text(reasoning.text)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .textSelection(.enabled)
+        if let displayText {
+            DisclosureCard(
+                title: reasoning.isStreaming ? "Thinking…" : "Reasoning summary",
+                symbol: "brain.head.profile",
+                statusColor: reasoning.isStreaming ? .blue : .secondary,
+                isExpanded: isExpanded,
+                toggle: { store.toggleExpanded(itemID: reasoning.id) }
+            ) {
+                Text(displayText)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+        } else if reasoning.isStreaming {
+            HStack(spacing: 7) {
+                Image(systemName: "brain.head.profile")
+                    .foregroundStyle(.blue)
+                    .font(.caption)
+                    .frame(width: 16)
+                Text("Thinking…")
+                    .font(.subheadline)
+            }
+            .padding(.vertical, ChatInteractionTargetLayout.compactControlVerticalPadding)
+            .accessibilityElement(children: .combine)
         }
     }
 }

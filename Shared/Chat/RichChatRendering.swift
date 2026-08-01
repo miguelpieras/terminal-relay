@@ -429,7 +429,8 @@ struct TerminalRelayMarkdownCodeBlockStyle: MarkdownCodeBlockStyle {
             id: "markdown-code:\(configuration.code.hashValue)",
             code: configuration.code,
             language: configuration.language,
-            isStreaming: isStreaming
+            isStreaming: isStreaming,
+            showsCopyButton: false
         )
     }
 }
@@ -602,14 +603,9 @@ struct CodeBlockView: View {
     let code: String
     let language: String?
     let isStreaming: Bool
+    var showsCopyButton = true
 
-    @State private var isExpanded = false
     @State private var didCopy = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    private var presentation: CodeBlockPresentation {
-        CodeBlockPresentation(code: code, isExpanded: isExpanded)
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -618,35 +614,22 @@ struct CodeBlockView: View {
                     .font(.caption.monospaced().weight(.medium))
                     .foregroundStyle(.secondary)
                 Spacer()
-                if presentation.needsExpansion {
-                    Button(isExpanded ? "Collapse" : "Show all") {
-                        if reduceMotion {
-                            isExpanded.toggle()
-                        } else {
-                            withAnimation(.easeInOut(duration: 0.16)) {
-                                isExpanded.toggle()
-                            }
+                if showsCopyButton {
+                    Button {
+                        ChatClipboard.copy(code)
+                        didCopy = true
+                        Task {
+                            try? await Task.sleep(nanoseconds: 1_500_000_000)
+                            didCopy = false
                         }
+                    } label: {
+                        Label(didCopy ? "Copied" : "Copy", systemImage: didCopy ? "checkmark" : "doc.on.doc")
                     }
                     .buttonStyle(.plain)
                     .font(.caption.weight(.medium))
                     .chatMinimumInteractionTarget(includesWidth: true)
-                    .accessibilityLabel(isExpanded ? "Collapse code block" : "Expand code block")
+                    .accessibilityLabel(didCopy ? "Code copied" : "Copy code")
                 }
-                Button {
-                    ChatClipboard.copy(code)
-                    didCopy = true
-                    Task {
-                        try? await Task.sleep(nanoseconds: 1_500_000_000)
-                        didCopy = false
-                    }
-                } label: {
-                    Label(didCopy ? "Copied" : "Copy", systemImage: didCopy ? "checkmark" : "doc.on.doc")
-                }
-                .buttonStyle(.plain)
-                .font(.caption.weight(.medium))
-                .chatMinimumInteractionTarget(includesWidth: true)
-                .accessibilityLabel(didCopy ? "Code copied" : "Copy code")
             }
             .padding(.horizontal, 12)
             .padding(.vertical, ChatInteractionTargetLayout.codeHeaderVerticalPadding)
@@ -655,7 +638,7 @@ struct CodeBlockView: View {
 
             ScrollView(.horizontal) {
                 HighlightedCodeText(
-                    code: presentation.displayedCode,
+                    code: code,
                     language: language,
                     usesHighlighting: !isStreaming
                 )
@@ -666,14 +649,6 @@ struct CodeBlockView: View {
                 .padding(12)
             }
             .scrollIndicators(.visible)
-
-            if presentation.wasTruncated {
-                Text("Showing a shortened preview. Copy still includes the complete block.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 9)
-            }
         }
         .background(Color.secondary.opacity(0.065))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -682,28 +657,6 @@ struct CodeBlockView: View {
                 .strokeBorder(Color.secondary.opacity(0.16))
         }
         .accessibilityElement(children: .contain)
-    }
-}
-
-struct CodeBlockPresentation: Equatable {
-    static let collapsedCharacterLimit = 16_384
-    static let collapsedLineLimit = 24
-
-    let code: String
-    let isExpanded: Bool
-
-    var needsExpansion: Bool {
-        code.count > Self.collapsedCharacterLimit
-            || code.split(separator: "\n", omittingEmptySubsequences: false).count > Self.collapsedLineLimit
-    }
-
-    var wasTruncated: Bool { needsExpansion && !isExpanded }
-
-    var displayedCode: String {
-        guard wasTruncated else { return code }
-        let lines = code.split(separator: "\n", omittingEmptySubsequences: false)
-        let lineLimited = lines.prefix(Self.collapsedLineLimit).joined(separator: "\n")
-        return String(lineLimited.prefix(Self.collapsedCharacterLimit)) + "\n…"
     }
 }
 

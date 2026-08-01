@@ -378,22 +378,14 @@ final class RichChatRenderingTests: XCTestCase {
         )
     }
 
-    func testCodeBlockPresentationExpandsLongContentWithoutChangingCopiedSource() {
-        let short = CodeBlockPresentation(code: "let answer = 42", isExpanded: false)
-        XCTAssertFalse(short.needsExpansion)
-        XCTAssertEqual(short.displayedCode, short.code)
+    func testMessageTimestampUsesUnixMilliseconds() throws {
+        XCTAssertNil(ChatTimestamp.date(milliseconds: nil))
+        XCTAssertNil(ChatTimestamp.date(milliseconds: -1))
 
-        let longCode = (1...30).map { "line \($0)" }.joined(separator: "\n")
-        let collapsed = CodeBlockPresentation(code: longCode, isExpanded: false)
-        XCTAssertTrue(collapsed.needsExpansion)
-        XCTAssertTrue(collapsed.wasTruncated)
-        XCTAssertTrue(collapsed.displayedCode.hasSuffix("\n…"))
-        XCTAssertLessThan(collapsed.displayedCode.count, longCode.count)
-
-        let expanded = CodeBlockPresentation(code: longCode, isExpanded: true)
-        XCTAssertFalse(expanded.wasTruncated)
-        XCTAssertEqual(expanded.displayedCode, longCode)
-        XCTAssertEqual(expanded.code, collapsed.code)
+        let date = try XCTUnwrap(
+            ChatTimestamp.date(milliseconds: 1_800_000_000_250)
+        )
+        XCTAssertEqual(date.timeIntervalSince1970, 1_800_000_000.25, accuracy: 0.001)
     }
 
     @MainActor
