@@ -169,6 +169,21 @@ targets:
         TEST_HOST: $(BUILT_PRODUCTS_DIR)/Terminal Relay.app/Terminal Relay
         BUNDLE_LOADER: $(TEST_HOST)
 
+  TerminalRelayIOSUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: TerminalRelayIOSUITests
+    dependencies:
+      - target: TerminalRelayIOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.mpieras.TerminalRelayIOSUITests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: 5.0
+        DEVELOPMENT_TEAM: 6EBZ756H9Q
+        TEST_TARGET_NAME: TerminalRelayIOS
+
 schemes:
   TerminalRelay:
     build:
@@ -184,6 +199,8 @@ schemes:
       targets:
         TerminalRelayIOS: all
         TerminalRelayIOSTests: [test]
+        TerminalRelayIOSUITests: [test]
     test:
       targets:
         - TerminalRelayIOSTests
+        - TerminalRelayIOSUITests

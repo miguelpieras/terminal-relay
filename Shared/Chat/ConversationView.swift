@@ -98,6 +98,7 @@ struct ConversationView: View {
     @State private var viewportPolicy = ConversationViewportPolicy()
     @State private var isAtBottom = true
     @State private var pendingFollowScroll: Task<Void, Never>?
+    @State private var eagerTranscriptTailStartID: String?
 
     init(
         coordinator: ConversationCoordinator,
@@ -177,10 +178,12 @@ struct ConversationView: View {
                         ForEach(olderTranscriptItems) { item in
                             timelineView(for: item)
                                 .id(item.id)
+                                .accessibilityIdentifier("conversation.item.\(item.id)")
                         }
 
-                        // Keep changing rich content and the bottom marker in
-                        // one stable subtree while older history remains lazy.
+                        // Keep the eager-tail boundary stable across appends,
+                        // and compact it only while following the latest item.
+                        // This prevents visible rows moving between stacks.
                         transcriptTail
                     }
                     .frame(maxWidth: 760, alignment: .leading)
@@ -189,8 +192,13 @@ struct ConversationView: View {
                     .padding(.bottom, 16)
                     .frame(maxWidth: .infinity)
                 }
+                .conversationScrollActivity { isActive in
+                    handleScrollActivity(isActive)
+                }
                 .conversationDefaultScrollAnchor()
                 .coordinateSpace(name: "conversation-scroll")
+                .accessibilityIdentifier("conversation.transcript")
+                .accessibilityValue(isAtBottom ? "latest" : "history")
                 .onPreferenceChange(ConversationBottomPreferenceKey.self) { bottomY in
                     guard viewportPolicy.acceptsBottomMeasurements else { return }
                     let atBottom = bottomY <= geometry.size.height + 2
@@ -223,6 +231,10 @@ struct ConversationView: View {
                             pendingFollowScroll?.cancel()
                             pendingFollowScroll = nil
                             viewportPolicy.jumpToLatest()
+                            compactEagerTranscriptTailIfNeeded(
+                                proxy,
+                                force: true
+                            )
                             store.jumpToLatest()
                             scrollToBottom(proxy)
                         } label: {
@@ -241,6 +253,7 @@ struct ConversationView: View {
                                 .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .accessibilityIdentifier("conversation.jump-to-latest")
                         .padding(ChatInteractionTargetLayout.jumpButtonOuterPadding)
                         .accessibilityLabel(
                             store.unreadCount > 0
@@ -255,9 +268,6 @@ struct ConversationView: View {
                     reduceMotion ? nil : .easeInOut(duration: 0.16),
                     value: store.isNearBottom
                 )
-                .conversationScrollActivity { isActive in
-                    handleScrollActivity(isActive)
-                }
                 .onDisappear {
                     pendingFollowScroll?.cancel()
                     pendingFollowScroll = nil
@@ -392,14 +402,37 @@ struct ConversationView: View {
         #endif
     }
 
-    private var olderTranscriptItems: ArraySlice<ConversationItem> {
-        store.state.items.dropLast(
-            min(store.state.items.count, Self.eagerTranscriptTailLimit)
+    private var eagerTranscriptTailStartIndex: Int {
+        let items = store.state.items
+        if let eagerTranscriptTailStartID,
+           let stableIndex = items.firstIndex(where: {
+               $0.id == eagerTranscriptTailStartID
+           }) {
+            return stableIndex
+        }
+        return max(
+            items.endIndex - Self.eagerTranscriptTailLimit,
+            items.startIndex
         )
     }
 
+    private var olderTranscriptItems: ArraySlice<ConversationItem> {
+        store.state.items[..<eagerTranscriptTailStartIndex]
+    }
+
     private var recentTranscriptItems: ArraySlice<ConversationItem> {
-        store.state.items.suffix(Self.eagerTranscriptTailLimit)
+        let items = store.state.items
+        return items[eagerTranscriptTailStartIndex..<items.endIndex]
+    }
+
+    private var preferredEagerTranscriptTailStartID: String? {
+        let items = store.state.items
+        guard !items.isEmpty else { return nil }
+        let startIndex = max(
+            items.endIndex - Self.eagerTranscriptTailLimit,
+            items.startIndex
+        )
+        return items[startIndex].id
     }
 
     private var transcriptTail: some View {
@@ -407,6 +440,7 @@ struct ConversationView: View {
             ForEach(recentTranscriptItems) { item in
                 timelineView(for: item)
                     .id(item.id)
+                    .accessibilityIdentifier("conversation.item.\(item.id)")
             }
 
             ForEach(store.state.approvals) { approval in
@@ -496,11 +530,12 @@ struct ConversationView: View {
         _ update: ConversationViewportUpdateToken,
         proxy: ScrollViewProxy
     ) {
+        stabilizeEagerTranscriptTail()
         switch viewportPolicy.actionForContentUpdate(
             hasContent: update.hasContent
         ) {
         case .preserve:
-            break
+            compactEagerTranscriptTailIfNeeded(proxy)
         case .anchorInitialLatest:
             Task { @MainActor in
                 // Wait for the transcript tail to install the bottom anchor,
@@ -514,6 +549,42 @@ struct ConversationView: View {
                 isAtBottom = true
                 store.setNearBottom(true)
             }
+        }
+    }
+
+    private func stabilizeEagerTranscriptTail() {
+        let items = store.state.items
+        guard !items.isEmpty else {
+            eagerTranscriptTailStartID = nil
+            return
+        }
+        if let eagerTranscriptTailStartID,
+           items.contains(where: { $0.id == eagerTranscriptTailStartID }) {
+            return
+        }
+        eagerTranscriptTailStartID = preferredEagerTranscriptTailStartID
+    }
+
+    private func compactEagerTranscriptTailIfNeeded(
+        _ proxy: ScrollViewProxy,
+        force: Bool = false
+    ) {
+        let compactedStartID = preferredEagerTranscriptTailStartID
+        guard compactedStartID != eagerTranscriptTailStartID else { return }
+        if force {
+            eagerTranscriptTailStartID = compactedStartID
+            return
+        }
+        guard isAtBottom,
+              viewportPolicy.shouldFollowLatestLayout,
+              recentTranscriptItems.count > Self.eagerTranscriptTailLimit * 2 else {
+            return
+        }
+        eagerTranscriptTailStartID = compactedStartID
+        Task { @MainActor in
+            await Task.yield()
+            guard viewportPolicy.shouldFollowLatestLayout else { return }
+            pinToBottom(proxy)
         }
     }
 
@@ -564,10 +635,26 @@ private extension View {
         }
     }
 
+    @ViewBuilder
     func conversationScrollActivity(
         _ onChange: @escaping (Bool) -> Void
     ) -> some View {
-        background(ConversationScrollActivityObserver(onChange: onChange))
+        if #available(iOS 18.0, macOS 15.0, *) {
+            onScrollPhaseChange { _, phase in
+                switch phase {
+                case .tracking, .interacting, .decelerating:
+                    onChange(true)
+                case .idle:
+                    onChange(false)
+                case .animating:
+                    break
+                @unknown default:
+                    break
+                }
+            }
+        } else {
+            background(ConversationScrollActivityObserver(onChange: onChange))
+        }
     }
 }
 

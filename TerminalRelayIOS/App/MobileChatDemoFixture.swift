@@ -1,6 +1,22 @@
 import Foundation
 
 enum MobileChatDemoFixture {
+    struct Instance {
+        let coordinator: ConversationCoordinator
+        fileprivate let scrollUITestTransport: ChatFixtureTransport?
+
+        var supportsScrollUITestUpdate: Bool {
+            scrollUITestTransport != nil
+        }
+
+        func appendScrollUITestUpdate() async {
+            guard let scrollUITestTransport else { return }
+            for event in MobileChatDemoFixture.scrollUITestLateEvents {
+                await scrollUITestTransport.yield(.envelope(event))
+            }
+        }
+    }
+
     static let identity = ChatConversationIdentity(
         relayID: "00000000-0000-4000-8000-000000009001",
         provider: .codex,
@@ -9,11 +25,34 @@ enum MobileChatDemoFixture {
 
     @MainActor
     static func makeCoordinator() -> ConversationCoordinator {
+        makeInstance().coordinator
+    }
+
+    @MainActor
+    static func makeInstance() -> Instance {
+        if ScreenshotDemoMode.runsScrollUITest {
+            let transport = ChatFixtureTransport(
+                initialEvents: scrollUITestInitialEvents
+            )
+            let coordinator = ConversationCoordinator(
+                transport: transport,
+                identity: identity,
+                retryPolicy: .immediate
+            )
+            return Instance(
+                coordinator: coordinator,
+                scrollUITestTransport: transport
+            )
+        }
+
         let transport = ChatFixtureTransport(initialEvents: events)
-        return ConversationCoordinator(
-            transport: transport,
-            identity: identity,
-            retryPolicy: .immediate
+        return Instance(
+            coordinator: ConversationCoordinator(
+                transport: transport,
+                identity: identity,
+                retryPolicy: .immediate
+            ),
+            scrollUITestTransport: nil
         )
     }
 
@@ -175,6 +214,96 @@ enum MobileChatDemoFixture {
                 turnID: turnID
             ),
         ]
+    }
+
+    private static var scrollUITestInitialEvents: [ChatEnvelope] {
+        let generation = "00000000-0000-4000-8000-000000009103"
+        let turnID = "00000000-0000-4000-8000-000000009104"
+        var restoredItems = (1...100).map { row -> ConversationItem in
+            let firstLine = (row - 1) * 5 + 1
+            return .message(
+                ChatMessage(
+                    id: String(format: "scroll-row-%03d", row),
+                    turnID: turnID,
+                    role: .assistant,
+                    text: numberedStreamingLines(firstLine...(firstLine + 4)),
+                    isStreaming: false
+                )
+            )
+        }
+        restoredItems.append(
+            .tool(
+                ToolActivity(
+                    id: "scroll-test-tail",
+                    turnID: turnID,
+                    kind: .shell,
+                    title: "End of restored conversation",
+                    status: .completed,
+                    input: nil,
+                    output: "The initial viewport reached the newest restored item.",
+                    errorMessage: nil,
+                    durationMilliseconds: 1,
+                    exitCode: 0,
+                    occurredAt: 1_800_000_102_000,
+                    isTruncated: false,
+                    originalByteCount: nil
+                )
+            )
+        )
+        let snapshot = ConversationSnapshot(
+            snapshotGeneration: generation,
+            baseSequence: 1,
+            items: restoredItems,
+            connectionState: .streaming,
+            turnState: .completed,
+            activeTurnID: nil,
+            capabilities: ChatCapabilities(features: ["streaming"])
+        )
+
+        return [
+            envelope(
+                type: "conversation.snapshot",
+                sequence: 1,
+                generation: generation,
+                turnID: turnID,
+                payload: (try? JSONValue.encoded(snapshot)) ?? .object([:])
+            ),
+        ]
+    }
+
+    private static var scrollUITestLateEvents: [ChatEnvelope] {
+        let generation = "00000000-0000-4000-8000-000000009103"
+        let turnID = "00000000-0000-4000-8000-000000009104"
+        return [
+            envelope(
+                type: "message.completed",
+                sequence: 2,
+                generation: generation,
+                turnID: turnID,
+                itemID: "scroll-row-100",
+                payload: .object([
+                    "role": .string("assistant"),
+                    "text": .string(numberedStreamingLines(496...600)),
+                ])
+            ),
+            envelope(
+                type: "uiTest.lateUpdate",
+                sequence: 3,
+                generation: generation,
+                turnID: turnID,
+                itemID: "scroll-test-late-update",
+                payload: .object([
+                    "title": .string("Late update arrived"),
+                    "summary": .string("Manual scrolling must remain in control."),
+                ])
+            ),
+        ]
+    }
+
+    private static func numberedStreamingLines(
+        _ range: ClosedRange<Int>
+    ) -> String {
+        range.map { "\($0). streaming" }.joined(separator: "\n")
     }
 
     private static func envelope(

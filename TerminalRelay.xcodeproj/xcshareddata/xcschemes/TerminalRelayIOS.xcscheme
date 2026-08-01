@@ -35,6 +35,20 @@
                ReferencedContainer = "container:TerminalRelay.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
+         <BuildActionEntry
+            buildForTesting = "YES"
+            buildForRunning = "NO"
+            buildForProfiling = "NO"
+            buildForArchiving = "NO"
+            buildForAnalyzing = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "51637FAFE82329B971CD16B8"
+               BuildableName = "TerminalRelayIOSUITests.xctest"
+               BlueprintName = "TerminalRelayIOSUITests"
+               ReferencedContainer = "container:TerminalRelay.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
       </BuildActionEntries>
    </BuildAction>
    <TestAction
@@ -61,6 +75,17 @@
                BlueprintIdentifier = "851AE0990D7B20ED5CB82BBA"
                BuildableName = "TerminalRelayIOSTests.xctest"
                BlueprintName = "TerminalRelayIOSTests"
+               ReferencedContainer = "container:TerminalRelay.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "51637FAFE82329B971CD16B8"
+               BuildableName = "TerminalRelayIOSUITests.xctest"
+               BlueprintName = "TerminalRelayIOSUITests"
                ReferencedContainer = "container:TerminalRelay.xcodeproj">
             </BuildableReference>
          </TestableReference>

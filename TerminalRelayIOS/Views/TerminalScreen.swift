@@ -268,16 +268,35 @@ struct TerminalScreen: View {
 }
 
 private struct DemoChatConversationView: View {
-    @State private var coordinator: ConversationCoordinator
+    @State private var fixture: MobileChatDemoFixture.Instance
 
     init() {
-        _coordinator = State(
-            initialValue: MobileChatDemoFixture.makeCoordinator()
+        _fixture = State(
+            initialValue: MobileChatDemoFixture.makeInstance()
         )
     }
 
     var body: some View {
-        ConversationView(coordinator: coordinator, isReadOnly: true)
+        ConversationView(
+            coordinator: fixture.coordinator,
+            isReadOnly: true
+        )
+        .overlay(alignment: .topTrailing) {
+            if fixture.supportsScrollUITestUpdate {
+                Button {
+                    Task {
+                        await fixture.appendScrollUITestUpdate()
+                    }
+                } label: {
+                    Color.clear
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Append scroll test update")
+                .accessibilityIdentifier("conversation.test.append")
+            }
+        }
     }
 }
 

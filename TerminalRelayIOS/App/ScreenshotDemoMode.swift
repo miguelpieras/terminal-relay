@@ -3,10 +3,19 @@ import Foundation
 enum ScreenshotDemoMode {
     static let launchArgument = "--terminal-relay-screenshot-demo"
     static let terminalLaunchArgument = "--terminal-relay-screenshot-demo-terminal"
+    static let scrollUITestLaunchArgument = "--terminal-relay-ui-test-scroll"
+
+    static var runsScrollUITest: Bool {
+#if DEBUG
+        ProcessInfo.processInfo.arguments.contains(scrollUITestLaunchArgument)
+#else
+        false
+#endif
+    }
 
     static var isEnabled: Bool {
 #if DEBUG
-        ProcessInfo.processInfo.arguments.contains(launchArgument)
+        ProcessInfo.processInfo.arguments.contains(launchArgument) || runsScrollUITest
 #else
         false
 #endif
@@ -14,7 +23,7 @@ enum ScreenshotDemoMode {
 
     static var opensTerminal: Bool {
 #if DEBUG
-        ProcessInfo.processInfo.arguments.contains(terminalLaunchArgument)
+        ProcessInfo.processInfo.arguments.contains(terminalLaunchArgument) || runsScrollUITest
 #else
         false
 #endif
