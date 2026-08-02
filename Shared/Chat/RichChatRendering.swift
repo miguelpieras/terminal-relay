@@ -492,94 +492,154 @@ private struct TerminalRelayMarkdownTable: View {
     }
 }
 
+/// Reference-stable bridge from value-driven transcript rows to the store and
+/// coordinator. Injected through the environment so row view values stay
+/// closure-free and cheap to diff; identity is stable for the life of a
+/// ConversationView, so it never invalidates rows on its own.
+@MainActor
+final class ChatRowActions {
+    private weak var store: ConversationStore?
+    private weak var coordinator: ConversationCoordinator?
+
+    nonisolated init() {}
+
+    init(store: ConversationStore, coordinator: ConversationCoordinator) {
+        self.store = store
+        self.coordinator = coordinator
+    }
+
+    func toggleExpanded(itemID: String) {
+        store?.toggleExpanded(itemID: itemID)
+    }
+
+    func markCopied(itemID: String?) {
+        store?.markCopied(itemID: itemID)
+    }
+
+    func openRepository(_ link: ChatRepositoryLink) {
+        guard let coordinator else { return }
+        Task {
+            await coordinator.previewFile(link)
+        }
+    }
+}
+
+extension ChatRowActions: Equatable {
+    nonisolated static func == (lhs: ChatRowActions, rhs: ChatRowActions) -> Bool {
+        lhs === rhs
+    }
+}
+
+private struct ChatRowActionsKey: EnvironmentKey {
+    static let defaultValue = ChatRowActions()
+}
+
+extension EnvironmentValues {
+    var chatRowActions: ChatRowActions {
+        get { self[ChatRowActionsKey.self] }
+        set { self[ChatRowActionsKey.self] = newValue }
+    }
+}
+
 struct RichMarkdownView: View {
     let text: String
     let isStreaming: Bool
-    let onOpenExternal: (URL) -> Void
-    let onOpenRepository: (ChatRepositoryLink) -> Void
+
+    @Environment(\.openURL) private var openURL
+    @Environment(\.chatRowActions) private var actions
 
     @State private var source = StreamingMarkdownSource()
     @State private var didFinishStreaming = false
 
-    init(
-        text: String,
-        isStreaming: Bool,
-        onOpenExternal: @escaping (URL) -> Void,
-        onOpenRepository: @escaping (ChatRepositoryLink) -> Void
-    ) {
-        self.text = text
-        self.isStreaming = isStreaming
-        self.onOpenExternal = onOpenExternal
-        self.onOpenRepository = onOpenRepository
+    var body: some View {
+        let onOpenExternal: (URL) -> Void = { openURL($0) }
+        let onOpenRepository: (ChatRepositoryLink) -> Void = { actions.openRepository($0) }
+
+        markdownContent
+            .markdownCodeBlockStyle(TerminalRelayMarkdownCodeBlockStyle(isStreaming: isStreaming))
+            .markdownTableStyle(TerminalRelayMarkdownTableStyle())
+            .markdownBaseURL(URL(string: "\(ChatURLPolicy.repositoryScheme):///")!)
+            .markdownElementRenderer(
+                .image(TerminalRelayImageRenderer(onOpenExternal: onOpenExternal), urlScheme: "http")
+            )
+            .markdownElementRenderer(
+                .image(TerminalRelayImageRenderer(onOpenExternal: onOpenExternal), urlScheme: "https")
+            )
+            .markdownElementRenderer(
+                .image(TerminalRelayImageRenderer(onOpenExternal: onOpenExternal), urlScheme: ChatURLPolicy.repositoryScheme)
+            )
+            .markdownElementRenderer(
+                .link(
+                    TerminalRelayLinkRenderer(
+                        onOpenExternal: onOpenExternal,
+                        onOpenRepository: onOpenRepository
+                    ),
+                    urlScheme: "http"
+                )
+            )
+            .markdownElementRenderer(
+                .link(
+                    TerminalRelayLinkRenderer(
+                        onOpenExternal: onOpenExternal,
+                        onOpenRepository: onOpenRepository
+                    ),
+                    urlScheme: "https"
+                )
+            )
+            .markdownElementRenderer(
+                .link(
+                    TerminalRelayLinkRenderer(
+                        onOpenExternal: onOpenExternal,
+                        onOpenRepository: onOpenRepository
+                    ),
+                    urlScheme: ChatURLPolicy.repositoryScheme
+                )
+            )
+            .environment(
+                \.openURL,
+                OpenURLAction { url in
+                    switch ChatURLPolicy.classify(url) {
+                    case .external(let externalURL):
+                        onOpenExternal(externalURL)
+                    case .repository(let link):
+                        onOpenRepository(link)
+                    case .blocked:
+                        break
+                    }
+                    return .handled
+                }
+            )
+            .textSelection(.enabled)
     }
 
-    var body: some View {
-        StreamingMarkdownReader(source) { parseResult in
-            MarkdownView(parseResult)
-        }
-        .markdownStreamingRenderThrottle(.milliseconds(33))
-        .markdownCodeBlockStyle(TerminalRelayMarkdownCodeBlockStyle(isStreaming: isStreaming))
-        .markdownTableStyle(TerminalRelayMarkdownTableStyle())
-        .markdownBaseURL(URL(string: "\(ChatURLPolicy.repositoryScheme):///")!)
-        .markdownElementRenderer(
-            .image(TerminalRelayImageRenderer(onOpenExternal: onOpenExternal), urlScheme: "http")
-        )
-        .markdownElementRenderer(
-            .image(TerminalRelayImageRenderer(onOpenExternal: onOpenExternal), urlScheme: "https")
-        )
-        .markdownElementRenderer(
-            .image(TerminalRelayImageRenderer(onOpenExternal: onOpenExternal), urlScheme: ChatURLPolicy.repositoryScheme)
-        )
-        .markdownElementRenderer(
-            .link(
-                TerminalRelayLinkRenderer(
-                    onOpenExternal: onOpenExternal,
-                    onOpenRepository: onOpenRepository
-                ),
-                urlScheme: "http"
-            )
-        )
-        .markdownElementRenderer(
-            .link(
-                TerminalRelayLinkRenderer(
-                    onOpenExternal: onOpenExternal,
-                    onOpenRepository: onOpenRepository
-                ),
-                urlScheme: "https"
-            )
-        )
-        .markdownElementRenderer(
-            .link(
-                TerminalRelayLinkRenderer(
-                    onOpenExternal: onOpenExternal,
-                    onOpenRepository: onOpenRepository
-                ),
-                urlScheme: ChatURLPolicy.repositoryScheme
-            )
-        )
-        .environment(
-            \.openURL,
-            OpenURLAction { url in
-                switch ChatURLPolicy.classify(url) {
-                case .external(let externalURL):
-                    onOpenExternal(externalURL)
-                case .repository(let link):
-                    onOpenRepository(link)
-                case .blocked:
-                    break
-                }
-                return .handled
+    /// Completed rows whose sanitized source is already cached parse
+    /// synchronously on their first body pass, so they lay out at final height
+    /// on the first frame. Everything else streams through the incremental
+    /// reader and enters the cache on completion.
+    @ViewBuilder
+    private var markdownContent: some View {
+        if !isStreaming,
+           let sanitized = SanitizedMarkdownCache.shared.lookup(raw: text) {
+            MarkdownReader(sanitized) { parseResult in
+                MarkdownView(parseResult)
             }
-        )
-        .textSelection(.enabled)
-        .task(id: MarkdownRenderInput(text: text, isStreaming: isStreaming)) {
-            await synchronizeSource()
+        } else {
+            StreamingMarkdownReader(source) { parseResult in
+                MarkdownView(parseResult)
+            }
+            .markdownStreamingRenderThrottle(.milliseconds(33))
+            .task(id: MarkdownRenderInput(text: text, isStreaming: isStreaming)) {
+                await synchronizeSource()
+            }
         }
     }
 
     private func synchronizeSource() async {
         let result = await MarkdownSafety.sanitizedSourceOffMain(text)
         guard !Task.isCancelled else { return }
+        if !isStreaming {
+            SanitizedMarkdownCache.shared.insert(raw: text, sanitized: result.source)
+        }
         if didFinishStreaming {
             source = StreamingMarkdownSource(result.source)
             didFinishStreaming = false
@@ -675,32 +735,36 @@ private struct HighlightedCodeText: View {
     let code: String
     let language: String?
     let usesHighlighting: Bool
-    @State private var tokens: [ChatCodeToken]?
+    @State private var highlighted: AttributedString?
 
     var body: some View {
         Group {
-            if let tokens {
-                highlightedText(tokens)
+            if let highlighted {
+                Text(highlighted)
             } else {
                 Text(verbatim: code)
             }
         }
         .task(id: HighlightConfiguration(code: code, language: language, enabled: usesHighlighting)) {
-            tokens = nil
+            highlighted = nil
             guard usesHighlighting else { return }
             let result = await ChatSyntaxHighlighter.tokensOffMain(
                 for: code,
                 language: language
             )
             guard !Task.isCancelled else { return }
-            tokens = result.tokens
+            highlighted = Self.attributedText(result.tokens)
         }
     }
 
-    private func highlightedText(_ tokens: [ChatCodeToken]) -> SwiftUI.Text {
-        tokens.reduce(SwiftUI.Text("")) { partial, token in
-            partial + SwiftUI.Text(verbatim: token.text).foregroundColor(token.kind.color)
+    private static func attributedText(_ tokens: [ChatCodeToken]) -> AttributedString {
+        var output = AttributedString()
+        for token in tokens {
+            var piece = AttributedString(token.text)
+            piece.foregroundColor = token.kind.color
+            output += piece
         }
+        return output
     }
 
     private struct HighlightConfiguration: Hashable {

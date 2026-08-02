@@ -1,8 +1,52 @@
+import Combine
 import XCTest
 @testable import TerminalRelay
 
 @MainActor
 final class ConversationStoreTests: XCTestCase {
+    func testNoOpEnvelopesDoNotPublishButRealChangesDo() throws {
+        let store = ConversationStore()
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.completed",
+                sequence: 1,
+                itemID: "message-1",
+                turnID: "turn-1",
+                payload: .object([
+                    "role": .string("assistant"),
+                    "text": .string("Hello"),
+                ])
+            )
+        )
+
+        var publishCount = 0
+        let subscription = store.objectWillChange.sink { publishCount += 1 }
+        defer { subscription.cancel() }
+
+        try store.apply(
+            ChatTestFixtures.event("session.heartbeat", sequence: 0)
+        )
+        XCTAssertEqual(
+            publishCount,
+            0,
+            "A heartbeat that changes nothing must not invalidate the transcript."
+        )
+
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.completed",
+                sequence: 2,
+                itemID: "message-2",
+                turnID: "turn-1",
+                payload: .object([
+                    "role": .string("assistant"),
+                    "text": .string("A real update"),
+                ])
+            )
+        )
+        XCTAssertEqual(publishCount, 1)
+    }
+
     func testSequenceZeroHelloUpdatesCapabilitiesWithoutAdvancingReplayCursor() throws {
         let store = ConversationStore()
         let capabilities = ChatCapabilities(

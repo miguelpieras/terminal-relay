@@ -12,88 +12,148 @@ final class RichChatRenderingTests: XCTestCase {
         XCTAssertEqual(ChatInteractionTargetLayout.attachmentChipVerticalPadding, 6)
     }
 
-    func testViewportPolicyAnchorsInitialSnapshotOnceAndPreservesReadingPosition() {
-        var policy = ConversationViewportPolicy()
-        XCTAssertFalse(policy.acceptsBottomMeasurements)
-        XCTAssertEqual(
-            policy.actionForContentUpdate(
-                hasContent: false
-            ),
-            .preserve
-        )
-        XCTAssertEqual(
-            policy.actionForContentUpdate(
-                hasContent: true
-            ),
-            .anchorInitialLatest
-        )
-        XCTAssertTrue(policy.acceptsBottomMeasurements)
-        XCTAssertTrue(
-            policy.shouldCorrectBottomOffset(isAtBottom: false),
-            "Late rich-content layout must keep correcting the initial anchor."
-        )
-        XCTAssertEqual(
-            policy.actionForContentUpdate(
-                hasContent: true
-            ),
-            .preserve,
-            "Replay updates must wait for the pending initial anchor."
-        )
+    func testScrollControllerAnchorsUntilGeometryConfirmsBottomThenFollows() {
+        var controller = ConversationScrollController()
+        XCTAssertTrue(controller.isAnchoring)
+        XCTAssertEqual(controller.accessibilityValue, "latest")
 
-        policy.completeInitialAnchor()
-        XCTAssertTrue(policy.acceptsBottomMeasurements)
-        XCTAssertTrue(policy.shouldFollowLatestLayout)
         XCTAssertEqual(
-            policy.actionForContentUpdate(
-                hasContent: true
-            ),
-            .preserve,
-            "Laid-out bottom changes, rather than token sequences, drive follow mode."
+            controller.geometryChanged(distanceFromBottom: 400),
+            .instant,
+            "Anchoring must keep correcting while layout settles off-bottom."
+        )
+        XCTAssertEqual(
+            controller.geometryChanged(distanceFromBottom: 120),
+            .instant,
+            "Corrections are level-triggered: every off-bottom geometry event corrects again."
+        )
+        XCTAssertNil(controller.geometryChanged(distanceFromBottom: 0))
+        XCTAssertFalse(controller.isAnchoring)
+        XCTAssertEqual(controller.state, .following)
+
+        XCTAssertNil(
+            controller.geometryChanged(distanceFromBottom: 2),
+            "No scroll writes while measurably at the bottom, so the system anchor stays engaged."
+        )
+        XCTAssertEqual(
+            controller.geometryChanged(distanceFromBottom: 40),
+            .instant,
+            "Follow mode corrects drift while pinned."
         )
     }
 
-    func testViewportPolicyGivesManualScrollingOwnershipUntilBottomIsReached() {
-        var policy = ConversationViewportPolicy()
-        XCTAssertEqual(
-            policy.actionForContentUpdate(hasContent: true),
-            .anchorInitialLatest
+    func testScrollControllerGivesUsersTheViewportAndNeverStealsItBack() {
+        var controller = ConversationScrollController()
+        _ = controller.geometryChanged(distanceFromBottom: 0)
+        XCTAssertEqual(controller.state, .following)
+
+        controller.userScrollBegan()
+        XCTAssertEqual(controller.state, .browsing)
+        XCTAssertEqual(controller.accessibilityValue, "history")
+
+        XCTAssertNil(
+            controller.geometryChanged(distanceFromBottom: 900),
+            "Browsing must emit nothing for any geometry input."
         )
+        XCTAssertNil(controller.geometryChanged(distanceFromBottom: 0))
 
-        policy.beginUserInteraction()
-        XCTAssertTrue(policy.isUserInteracting)
-        XCTAssertFalse(policy.followsLatest)
-        XCTAssertFalse(policy.shouldFollowLatestLayout)
+        XCTAssertNil(
+            controller.userScrollEnded(distanceFromBottom: 500),
+            "Releasing far from the bottom keeps the user in control."
+        )
+        XCTAssertEqual(controller.state, .browsing)
 
-        policy.endUserInteraction(isAtBottom: false)
-        XCTAssertFalse(policy.isUserInteracting)
-        XCTAssertFalse(policy.shouldFollowLatestLayout)
+        XCTAssertEqual(
+            controller.userScrollEnded(distanceFromBottom: 30),
+            .animatedSettle,
+            "Releasing just short of the bottom settles once, with animation."
+        )
+        XCTAssertEqual(controller.state, .animating)
 
-        policy.jumpToLatest()
-        XCTAssertTrue(policy.shouldFollowLatestLayout)
+        XCTAssertNil(controller.animationEnded(distanceFromBottom: 0))
+        XCTAssertEqual(controller.state, .following)
 
-        policy.beginUserInteraction()
-        policy.endUserInteraction(isAtBottom: true)
-        XCTAssertTrue(policy.shouldFollowLatestLayout)
+        controller.userScrollBegan()
+        XCTAssertNil(
+            controller.userScrollEnded(distanceFromBottom: 4),
+            "Releasing at the bottom re-engages following without a scroll write."
+        )
+        XCTAssertEqual(controller.state, .following)
     }
 
-    func testViewportPolicyCorrectsLayoutUntilTheBottomIsReached() {
-        var policy = ConversationViewportPolicy()
-        XCTAssertEqual(
-            policy.actionForContentUpdate(hasContent: true),
-            .anchorInitialLatest
+    func testScrollControllerJumpSuppressesCorrectionsUntilTheAnimationEnds() {
+        var controller = ConversationScrollController()
+        _ = controller.geometryChanged(distanceFromBottom: 0)
+        controller.userScrollBegan()
+        _ = controller.userScrollEnded(distanceFromBottom: 700)
+
+        XCTAssertEqual(controller.jumpRequested(), .animatedJump)
+        XCTAssertEqual(controller.state, .animating)
+        XCTAssertEqual(controller.accessibilityValue, "latest")
+
+        XCTAssertNil(
+            controller.geometryChanged(distanceFromBottom: 320),
+            "Mid-animation geometry must not stomp the eased scroll."
         )
-        XCTAssertTrue(policy.shouldCorrectBottomOffset(isAtBottom: false))
-        policy.completeInitialAnchor()
 
-        XCTAssertTrue(policy.shouldCorrectBottomOffset(isAtBottom: false))
-        XCTAssertFalse(policy.shouldCorrectBottomOffset(isAtBottom: true))
+        XCTAssertEqual(
+            controller.animationEnded(distanceFromBottom: 24),
+            .instant,
+            "A short landing gets exactly one instant correction."
+        )
+        XCTAssertEqual(controller.state, .following)
 
-        policy.beginUserInteraction()
-        policy.endUserInteraction(isAtBottom: false)
-        XCTAssertFalse(policy.shouldCorrectBottomOffset(isAtBottom: false))
+        _ = controller.jumpRequested()
+        controller.userScrollBegan()
+        XCTAssertEqual(
+            controller.state,
+            .browsing,
+            "A user gesture cancels an in-flight jump immediately."
+        )
+    }
 
-        policy.jumpToLatest()
-        XCTAssertTrue(policy.shouldCorrectBottomOffset(isAtBottom: false))
+    func testScrollControllerSelfHealsWhenAnimationPhasesNeverReport() {
+        var controller = ConversationScrollController()
+        _ = controller.geometryChanged(distanceFromBottom: 0)
+        controller.userScrollBegan()
+        _ = controller.userScrollEnded(distanceFromBottom: 30)
+        XCTAssertEqual(controller.state, .animating)
+
+        XCTAssertNil(controller.geometryChanged(distanceFromBottom: 12))
+        XCTAssertNil(
+            controller.geometryChanged(distanceFromBottom: 3),
+            "Reaching the bottom completes the animation state without a phase callback."
+        )
+        XCTAssertEqual(controller.state, .following)
+    }
+
+    func testScrollControllerReanchorsWhenContentLoadsUnlessUserIsBrowsing() {
+        var controller = ConversationScrollController()
+        _ = controller.geometryChanged(distanceFromBottom: 0)
+        XCTAssertEqual(controller.state, .following)
+
+        XCTAssertEqual(
+            controller.contentLoaded(),
+            .instant,
+            "Fresh content gets one deterministic backstop pin."
+        )
+        XCTAssertTrue(controller.isAnchoring)
+
+        controller.userScrollBegan()
+        XCTAssertNil(
+            controller.contentLoaded(),
+            "Content arriving mid-gesture must not re-anchor."
+        )
+        XCTAssertEqual(controller.state, .browsing)
+
+        _ = controller.userScrollEnded(distanceFromBottom: 0)
+        _ = controller.contentLoaded()
+        controller.completeAnchor()
+        XCTAssertEqual(
+            controller.state,
+            .following,
+            "The anchoring failsafe always lands in following."
+        )
     }
 
     func testComposerReturnPolicyKeepsPlainReturnAsNewlineAndCommandReturnAsSend() {

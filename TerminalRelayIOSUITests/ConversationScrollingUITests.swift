@@ -72,8 +72,11 @@ final class ConversationScrollingUITests: XCTestCase {
 
         appendUpdate.tap()
 
+        // The transcript is lazy, so content below the viewport is not
+        // materialized into the accessibility tree. The update's arrival is
+        // observed through the unread affordance on the jump control instead.
         XCTAssertTrue(
-            lateUpdate.waitForExistence(timeout: 5),
+            waitUntilLabelContains("new message", on: jumpToLatest, timeout: 5),
             "The appended conversation update did not arrive."
         )
         XCTAssertFalse(
@@ -144,6 +147,18 @@ final class ConversationScrollingUITests: XCTestCase {
         return !frame.isEmpty
             && frame.minY >= containerFrame.minY
             && frame.maxY <= containerFrame.maxY
+    }
+
+    private func waitUntilLabelContains(
+        _ fragment: String,
+        on element: XCUIElement,
+        timeout: TimeInterval = 3
+    ) -> Bool {
+        let expectation = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label CONTAINS %@", fragment),
+            object: element
+        )
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
     }
 
     private func waitUntilValue(

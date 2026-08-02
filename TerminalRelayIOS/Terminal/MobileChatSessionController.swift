@@ -43,8 +43,15 @@ final class MobileChatSessionController: ObservableObject {
     private let route: TerminalRoute
     private let dependencies: MobileChatSessionDependencies
     private let launchArguments: [String]
+    private let capabilityCacheKey: String?
     private var preparationTask: Task<Void, Never>?
     private var operationID = UUID()
+
+    /// Confirmed native-chat availability per worker and agent kind, so
+    /// reopening a conversation skips one full SSH round trip. Only positive
+    /// results are cached, and only briefly, so worker updates are noticed.
+    private static var confirmedCapabilities: [String: Date] = [:]
+    private static let capabilityCacheLifetime: TimeInterval = 10 * 60
 
     init(
         profile: WorkerProfile,
@@ -56,18 +63,21 @@ final class MobileChatSessionController: ObservableObject {
         self.repositoryName = route.repositoryName
         self.dependencies = .live(profile: profile, identityStore: identityStore)
         self.launchArguments = AgentLaunchDefaults.standard.chatArguments(for: route.kind)
+        self.capabilityCacheKey = "\(profile.id)|\(route.kind.rawValue)"
     }
 
     init(
         route: TerminalRoute,
         launchArguments: [String] = [],
-        dependencies: MobileChatSessionDependencies
+        dependencies: MobileChatSessionDependencies,
+        capabilityCacheKey: String? = nil
     ) {
         self.route = route
         self.kind = route.kind
         self.repositoryName = route.repositoryName
         self.dependencies = dependencies
         self.launchArguments = launchArguments
+        self.capabilityCacheKey = capabilityCacheKey
     }
 
     func start() {
@@ -133,19 +143,24 @@ final class MobileChatSessionController: ObservableObject {
         }
 
         do {
-            let capabilityCommand = try WorkerRemoteCommand.chatCapabilities(
-                kind: kind,
-                repositoryName: repositoryName
-            )
-            let capabilityData = try await dependencies.execute(capabilityCommand)
-            guard self.operationID == operationID, !Task.isCancelled else { return }
-            let capability = try WorkerChatProtocol.parseCapabilities(
-                capabilityData,
-                expectedKind: kind
-            )
-            guard capability.isAvailable else {
-                phase = .failed(unavailableNativeChatMessage)
-                return
+            if !hasFreshConfirmedCapability {
+                let capabilityCommand = try WorkerRemoteCommand.chatCapabilities(
+                    kind: kind,
+                    repositoryName: repositoryName
+                )
+                let capabilityData = try await dependencies.execute(capabilityCommand)
+                guard self.operationID == operationID, !Task.isCancelled else { return }
+                let capability = try WorkerChatProtocol.parseCapabilities(
+                    capabilityData,
+                    expectedKind: kind
+                )
+                guard capability.isAvailable else {
+                    phase = .failed(unavailableNativeChatMessage)
+                    return
+                }
+                if let capabilityCacheKey {
+                    Self.confirmedCapabilities[capabilityCacheKey] = Date()
+                }
             }
 
             let identity: ChatConversationIdentity
@@ -203,6 +218,18 @@ final class MobileChatSessionController: ObservableObject {
                 "Could not prepare native chat. Check the worker connection and try again."
             )
         }
+    }
+
+    private var hasFreshConfirmedCapability: Bool {
+        guard let capabilityCacheKey,
+              let confirmedAt = Self.confirmedCapabilities[capabilityCacheKey] else {
+            return false
+        }
+        guard Date().timeIntervalSince(confirmedAt) < Self.capabilityCacheLifetime else {
+            Self.confirmedCapabilities.removeValue(forKey: capabilityCacheKey)
+            return false
+        }
+        return true
     }
 
     private var unavailableNativeChatMessage: String {

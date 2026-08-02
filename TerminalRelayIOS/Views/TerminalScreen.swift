@@ -110,7 +110,10 @@ struct TerminalScreen: View {
                 preparationView
             case .chat:
                 if let coordinator = chatController.coordinator {
-                    ConversationView(coordinator: coordinator)
+                    ConversationView(
+                        coordinator: coordinator,
+                        startsCoordinator: false
+                    )
                 } else {
                     preparationView
                 }

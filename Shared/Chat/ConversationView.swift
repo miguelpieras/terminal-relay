@@ -7,92 +7,35 @@ import AppKit
 import UIKit
 #endif
 
-enum ConversationViewportAction: Equatable {
-    case preserve
-    case anchorInitialLatest
+private struct ConversationScrollGeometrySample: Equatable {
+    var offsetY: CGFloat
+    var contentHeight: CGFloat
+    var distanceFromBottom: CGFloat
+
+    static let zero = ConversationScrollGeometrySample(
+        offsetY: 0,
+        contentHeight: 0,
+        distanceFromBottom: 0
+    )
 }
 
-struct ConversationViewportPolicy: Equatable {
-    private enum Phase: Equatable {
-        case awaitingContent
-        case initialAnchorPending
-        case positioned
-    }
-
-    private var phase: Phase = .awaitingContent
-    private(set) var isUserInteracting = false
-    private(set) var followsLatest = true
-
-    var acceptsBottomMeasurements: Bool {
-        phase != .awaitingContent
-    }
-
-    var shouldFollowLatestLayout: Bool {
-        phase != .awaitingContent && followsLatest && !isUserInteracting
-    }
-
-    var isInitialAnchorPending: Bool {
-        phase == .initialAnchorPending
-    }
-
-    mutating func actionForContentUpdate(
-        hasContent: Bool
-    ) -> ConversationViewportAction {
-        if phase == .awaitingContent, hasContent {
-            phase = .initialAnchorPending
-            return .anchorInitialLatest
-        }
-        return .preserve
-    }
-
-    mutating func completeInitialAnchor() {
-        guard phase == .initialAnchorPending else { return }
-        phase = .positioned
-        followsLatest = true
-    }
-
-    mutating func beginUserInteraction() {
-        guard phase != .awaitingContent else { return }
-        phase = .positioned
-        isUserInteracting = true
-        followsLatest = false
-    }
-
-    mutating func endUserInteraction(isAtBottom: Bool) {
-        isUserInteracting = false
-        if isAtBottom {
-            followsLatest = true
-        }
-    }
-
-    mutating func jumpToLatest() {
-        isUserInteracting = false
-        followsLatest = true
-    }
-
-    func shouldCorrectBottomOffset(isAtBottom: Bool) -> Bool {
-        !isAtBottom && shouldFollowLatestLayout
-    }
+/// One-shot compensation for a history-page prepend: restores the reading
+/// position once the taller content commits. Cancelled by any user gesture
+/// and expired after a few geometry events if the growth never lands.
+private struct HistoryPrependAdjustment {
+    let offsetY: CGFloat
+    let contentHeight: CGFloat
+    var remainingGeometryEvents: Int
 }
 
-private struct ConversationViewportUpdateToken: Equatable {
-    let lastItemID: String?
-    let pendingApprovalCount: Int
-    let pendingQuestionCount: Int
-
-    var hasContent: Bool {
-        lastItemID != nil || pendingApprovalCount > 0 || pendingQuestionCount > 0
-    }
-}
-
-private struct ConversationScrollMetrics: Equatable {
-    let isAtBottom: Bool
-    let isNearBottom: Bool
+/// Per-frame scroll bookkeeping that must never invalidate the view body.
+@MainActor
+private final class ConversationScrollScratch {
+    var lastSample = ConversationScrollGeometrySample.zero
+    var historyPrepend: HistoryPrependAdjustment?
 }
 
 struct ConversationView: View {
-    private static let eagerTranscriptTailLimit = 50
-
     @ObservedObject private var store: ConversationStore
 
     let coordinator: ConversationCoordinator
@@ -105,11 +48,10 @@ struct ConversationView: View {
     #if os(iOS)
     @State private var escapeRouter = ComposerEscapeRouter()
     #endif
-    @State private var viewportPolicy = ConversationViewportPolicy()
-    @State private var isAtBottom = true
-    @State private var pendingFollowScroll: Task<Void, Never>?
-    @State private var initialAnchorTask: Task<Void, Never>?
-    @State private var eagerTranscriptTailStartID: String?
+    @State private var scrollController = ConversationScrollController()
+    @State private var scrollPosition = ScrollPosition()
+    @State private var scratch = ConversationScrollScratch()
+    @State private var rowActions: ChatRowActions
 
     init(
         coordinator: ConversationCoordinator,
@@ -122,6 +64,12 @@ struct ConversationView: View {
         self.isReadOnly = isReadOnly
         self.showsComposer = showsComposer
         self.startsCoordinator = startsCoordinator
+        _rowActions = State(
+            wrappedValue: ChatRowActions(
+                store: coordinator.store,
+                coordinator: coordinator
+            )
+        )
     }
 
     var body: some View {
@@ -182,124 +130,257 @@ struct ConversationView: View {
     }
 
     private var transcript: some View {
-        GeometryReader { geometry in
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 14) {
-                        historyControl
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 14) {
+                historyControl
 
-                        ForEach(olderTranscriptItems) { item in
-                            timelineView(for: item)
-                                .id(item.id)
-                                .accessibilityIdentifier("conversation.item.\(item.id)")
-                        }
+                ForEach(store.state.items) { item in
+                    timelineView(for: item)
+                        .id(item.id)
+                        .accessibilityIdentifier("conversation.item.\(item.id)")
+                }
 
-                        // Keep the eager-tail boundary stable across appends,
-                        // and compact it only while following the latest item.
-                        // This prevents visible rows moving between stacks.
-                        transcriptTail
-                            .id("chat-bottom")
-                    }
-                    .frame(maxWidth: 760, alignment: .leading)
-                    .padding(.horizontal, horizontalTranscriptPadding)
-                    .padding(.top, 22)
-                    .padding(.bottom, 16)
-                    .frame(maxWidth: .infinity)
-                }
-                .conversationScrollActivity { isActive, metrics in
-                    if let metrics {
-                        applyScrollMetrics(metrics, proxy: proxy)
-                    }
-                    handleScrollActivity(isActive)
-                }
-                .conversationScrollGeometry { metrics in
-                    applyScrollMetrics(metrics, proxy: proxy)
-                }
-                .conversationDefaultScrollAnchor()
-                .coordinateSpace(name: "conversation-scroll")
-                .accessibilityIdentifier("conversation.transcript")
-                .accessibilityValue(isAtBottom ? "latest" : "history")
-                .onPreferenceChange(ConversationBottomPreferenceKey.self) { bottomY in
-                    if #available(iOS 18.0, macOS 15.0, *) { return }
-                    guard viewportPolicy.acceptsBottomMeasurements else { return }
-                    let atBottom = bottomY <= geometry.size.height + 2
-                    let nearBottom = bottomY <= geometry.size.height + 180
-                    applyBottomPosition(
-                        isAtBottom: atBottom,
-                        isNearBottom: nearBottom,
-                        proxy: proxy
+                ForEach(store.state.approvals) { approval in
+                    ApprovalCard(
+                        approval: approval,
+                        store: store,
+                        coordinator: coordinator,
+                        isReadOnly: isReadOnly
                     )
+                    .id("approval:\(approval.id)")
                 }
-                .onChange(of: viewportUpdateSignal, initial: true) { _, update in
-                    handleViewportUpdate(update, proxy: proxy)
+
+                ForEach(store.state.questions) { question in
+                    QuestionCard(
+                        question: question,
+                        store: store,
+                        coordinator: coordinator,
+                        isReadOnly: isReadOnly
+                    )
+                    .id("question:\(question.id)")
                 }
-                .onChange(of: store.state.items.first?.id) { oldValue, newValue in
-                    guard let oldValue,
-                          let newValue,
-                          oldValue != newValue,
-                          !store.isNearBottom else {
-                        return
-                    }
-                    proxy.scrollTo(oldValue, anchor: .top)
-                }
-                .overlay(alignment: .bottomTrailing) {
-                    if !store.isNearBottom {
-                        Button {
-                            pendingFollowScroll?.cancel()
-                            pendingFollowScroll = nil
-                            viewportPolicy.jumpToLatest()
-                            compactEagerTranscriptTailIfNeeded(
-                                proxy,
-                                force: true
-                            )
-                            store.jumpToLatest()
-                            scrollToBottom(proxy)
-                        } label: {
-                            Image(systemName: "arrow.down")
-                                .font(.caption.weight(.semibold))
-                                .frame(width: 28, height: 28)
-                                .background(.regularMaterial, in: Circle())
-                                .overlay {
-                                    Circle()
-                                        .strokeBorder(Color.secondary.opacity(0.16))
-                                }
-                                .frame(
-                                    width: ChatInteractionTargetLayout.jumpButtonDimension,
-                                    height: ChatInteractionTargetLayout.jumpButtonDimension
-                                )
-                                .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityIdentifier("conversation.jump-to-latest")
-                        .padding(ChatInteractionTargetLayout.jumpButtonOuterPadding)
-                        .accessibilityLabel(
-                            store.unreadCount > 0
-                                ? "\(store.unreadCount) new messages. Jump to latest"
-                                : "Jump to latest"
-                        )
-                        .accessibilityHint("Moves to the newest conversation update.")
-                        .transition(.scale.combined(with: .opacity))
-                    }
-                }
-                .animation(
-                    reduceMotion ? nil : .easeInOut(duration: 0.16),
-                    value: store.isNearBottom
+            }
+            .frame(maxWidth: 760, alignment: .leading)
+            .padding(.horizontal, horizontalTranscriptPadding)
+            .padding(.top, 22)
+            .padding(.bottom, 16)
+            .frame(maxWidth: .infinity)
+            #if os(macOS)
+            .background(
+                ConversationWheelScrollObserver(
+                    onBegan: { handleUserScrollBegan() },
+                    onEnded: { handleWheelScrollEnded() }
                 )
-                .onDisappear {
-                    initialAnchorTask?.cancel()
-                    initialAnchorTask = nil
-                    pendingFollowScroll?.cancel()
-                    pendingFollowScroll = nil
+            )
+            #endif
+        }
+        .scrollPosition($scrollPosition)
+        .defaultScrollAnchor(.bottom)
+        .defaultScrollAnchor(.top, for: .alignment)
+        .onScrollGeometryChange(for: ConversationScrollGeometrySample.self) { geometry in
+            ConversationScrollGeometrySample(
+                offsetY: geometry.contentOffset.y,
+                contentHeight: geometry.contentSize.height,
+                distanceFromBottom: geometry.contentSize.height
+                    - geometry.visibleRect.maxY
+            )
+        } action: { _, sample in
+            handleGeometryChange(sample)
+        }
+        .onScrollPhaseChange { oldPhase, newPhase, context in
+            handleScrollPhaseChange(from: oldPhase, to: newPhase, context: context)
+        }
+        #if os(iOS)
+        .scrollDismissesKeyboard(.interactively)
+        #endif
+        .accessibilityIdentifier("conversation.transcript")
+        .accessibilityValue(scrollController.accessibilityValue)
+        .environment(\.chatRowActions, rowActions)
+        .opacity(isAnchoringContent ? 0 : 1)
+        .task(id: isAnchoringContent) {
+            // Failsafe: never leave the transcript hidden if geometry never
+            // confirms the bottom while anchoring.
+            guard isAnchoringContent else { return }
+            try? await Task.sleep(for: .milliseconds(600))
+            guard !Task.isCancelled else { return }
+            scrollController.completeAnchor()
+        }
+        .onChange(of: store.state.items.isEmpty) { wasEmpty, isEmpty in
+            if wasEmpty, !isEmpty {
+                execute(scrollController.contentLoaded())
+            }
+        }
+        .onChange(of: store.state.items.first?.id) { oldValue, newValue in
+            armHistoryPrependAdjustment(oldFirstID: oldValue, newFirstID: newValue)
+        }
+        .overlay(alignment: .bottomTrailing) {
+            jumpToLatestOverlay
+        }
+        .overlay {
+            if isConversationEmpty {
+                emptyConversation
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color.chatCanvas)
+                    .allowsHitTesting(false)
+            }
+        }
+    }
+
+    private var jumpToLatestOverlay: some View {
+        ZStack(alignment: .bottomTrailing) {
+            if !store.isNearBottom {
+                Button {
+                    store.jumpToLatest()
+                    execute(scrollController.jumpRequested())
+                } label: {
+                    Image(systemName: "arrow.down")
+                        .font(.caption.weight(.semibold))
+                        .frame(width: 28, height: 28)
+                        .background(.regularMaterial, in: Circle())
+                        .overlay {
+                            Circle()
+                                .strokeBorder(Color.secondary.opacity(0.16))
+                        }
+                        .frame(
+                            width: ChatInteractionTargetLayout.jumpButtonDimension,
+                            height: ChatInteractionTargetLayout.jumpButtonDimension
+                        )
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("conversation.jump-to-latest")
+                .padding(ChatInteractionTargetLayout.jumpButtonOuterPadding)
+                .accessibilityLabel(
+                    store.unreadCount > 0
+                        ? "\(store.unreadCount) new messages. Jump to latest"
+                        : "Jump to latest"
+                )
+                .accessibilityHint("Moves to the newest conversation update.")
+                .transition(.scale.combined(with: .opacity))
+            }
+        }
+        .animation(
+            reduceMotion ? nil : .easeInOut(duration: 0.16),
+            value: store.isNearBottom
+        )
+    }
+
+    private var isAnchoringContent: Bool {
+        scrollController.isAnchoring && !store.state.items.isEmpty
+    }
+
+    // MARK: Scroll handling
+
+    private func handleGeometryChange(_ sample: ConversationScrollGeometrySample) {
+        scratch.lastSample = sample
+        consumeHistoryPrependAdjustment(with: sample)
+        let nearBottom = sample.distanceFromBottom <= 180
+        if store.isNearBottom != nearBottom {
+            store.setNearBottom(nearBottom)
+        }
+        execute(
+            scrollController.geometryChanged(
+                distanceFromBottom: sample.distanceFromBottom
+            )
+        )
+    }
+
+    private func handleScrollPhaseChange(
+        from oldPhase: ScrollPhase,
+        to newPhase: ScrollPhase,
+        context: ScrollPhaseChangeContext
+    ) {
+        let distance = context.geometry.contentSize.height
+            - context.geometry.visibleRect.maxY
+        switch newPhase {
+        case .tracking, .interacting, .decelerating:
+            handleUserScrollBegan()
+        case .idle:
+            if oldPhase == .animating {
+                execute(scrollController.animationEnded(distanceFromBottom: distance))
+            } else {
+                execute(scrollController.userScrollEnded(distanceFromBottom: distance))
+            }
+        case .animating:
+            break
+        @unknown default:
+            break
+        }
+    }
+
+    private func handleUserScrollBegan() {
+        scratch.historyPrepend = nil
+        scrollController.userScrollBegan()
+    }
+
+    private func handleWheelScrollEnded() {
+        execute(
+            scrollController.userScrollEnded(
+                distanceFromBottom: scratch.lastSample.distanceFromBottom
+            )
+        )
+    }
+
+    private func execute(_ command: ConversationPinCommand?) {
+        guard let command else { return }
+        switch command {
+        case .instant:
+            pinToBottomInstantly()
+        case .animatedSettle, .animatedJump:
+            if reduceMotion {
+                pinToBottomInstantly()
+            } else {
+                withAnimation(.easeOut(duration: 0.18)) {
+                    scrollPosition.scrollTo(edge: .bottom)
                 }
             }
-            .overlay {
-                if isConversationEmpty || isPositioningRestoredConversation {
-                    emptyConversation
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .background(Color.chatCanvas)
-                        .allowsHitTesting(false)
-                }
+        }
+    }
+
+    private func pinToBottomInstantly() {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            scrollPosition.scrollTo(edge: .bottom)
+        }
+    }
+
+    private func armHistoryPrependAdjustment(
+        oldFirstID: String?,
+        newFirstID: String?
+    ) {
+        guard let oldFirstID,
+              let newFirstID,
+              oldFirstID != newFirstID,
+              scrollController.state == .browsing,
+              store.state.items.contains(where: { $0.id == oldFirstID }) else {
+            scratch.historyPrepend = nil
+            return
+        }
+        scratch.historyPrepend = HistoryPrependAdjustment(
+            offsetY: scratch.lastSample.offsetY,
+            contentHeight: scratch.lastSample.contentHeight,
+            remainingGeometryEvents: 4
+        )
+    }
+
+    private func consumeHistoryPrependAdjustment(
+        with sample: ConversationScrollGeometrySample
+    ) {
+        guard var adjustment = scratch.historyPrepend else { return }
+        let delta = sample.contentHeight - adjustment.contentHeight
+        if delta > 0.5 {
+            scratch.historyPrepend = nil
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                scrollPosition.scrollTo(y: adjustment.offsetY + delta)
             }
+        } else {
+            adjustment.remainingGeometryEvents -= 1
+            scratch.historyPrepend = adjustment.remainingGeometryEvents > 0
+                ? adjustment
+                : nil
         }
     }
 
@@ -337,31 +418,36 @@ struct ConversationView: View {
     private func timelineView(for item: ConversationItem) -> some View {
         switch item {
         case .message(let message):
-            ChatMessageView(
-                message: message,
-                onOpenExternal: { openURL($0) },
-                onOpenRepository: { link in
-                    Task {
-                        await coordinator.previewFile(link)
-                    }
-                }
-            )
+            ChatMessageView(message: message)
         case .reasoning(let reasoning):
-            ReasoningCard(reasoning: reasoning, store: store)
+            ReasoningCard(
+                reasoning: reasoning,
+                isExpanded: store.expandedItemIDs.contains(reasoning.id)
+            )
         case .tool(let tool):
-            ToolActivityCard(tool: tool, store: store)
+            ToolActivityCard(
+                tool: tool,
+                isExpanded: store.expandedItemIDs.contains(tool.id),
+                copiedItemID: store.copiedItemID
+            )
         case .diff(let diff):
-            DiffCard(diff: diff, store: store)
+            DiffCard(
+                diff: diff,
+                isExpanded: store.expandedItemIDs.contains(diff.id)
+            )
         case .plan(let plan):
             PlanCard(plan: plan)
         case .generic(let generic):
-            GenericActivityCard(item: generic, store: store)
+            GenericActivityCard(
+                item: generic,
+                isExpanded: store.expandedItemIDs.contains(generic.id)
+            )
         }
     }
 
     private var emptyConversation: some View {
         VStack(spacing: 8) {
-            if isAwaitingInitialSnapshot || isPositioningRestoredConversation {
+            if isAwaitingInitialSnapshot {
                 ProgressView()
                     .controlSize(.small)
                 Text(
@@ -398,11 +484,6 @@ struct ConversationView: View {
         default:
             return true
         }
-    }
-
-    private var isPositioningRestoredConversation: Bool {
-        viewportPolicy.isInitialAnchorPending
-            && store.state.items.count > Self.eagerTranscriptTailLimit
     }
 
     @ViewBuilder
@@ -457,88 +538,6 @@ struct ConversationView: View {
         #endif
     }
 
-    private var eagerTranscriptTailStartIndex: Int {
-        let items = store.state.items
-        if let eagerTranscriptTailStartID,
-           let stableIndex = items.firstIndex(where: {
-               $0.id == eagerTranscriptTailStartID
-           }) {
-            return stableIndex
-        }
-        return max(
-            items.endIndex - Self.eagerTranscriptTailLimit,
-            items.startIndex
-        )
-    }
-
-    private var olderTranscriptItems: ArraySlice<ConversationItem> {
-        store.state.items[..<eagerTranscriptTailStartIndex]
-    }
-
-    private var recentTranscriptItems: ArraySlice<ConversationItem> {
-        let items = store.state.items
-        return items[eagerTranscriptTailStartIndex..<items.endIndex]
-    }
-
-    private var preferredEagerTranscriptTailStartID: String? {
-        let items = store.state.items
-        guard !items.isEmpty else { return nil }
-        let startIndex = max(
-            items.endIndex - Self.eagerTranscriptTailLimit,
-            items.startIndex
-        )
-        return items[startIndex].id
-    }
-
-    private var transcriptTail: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            ForEach(recentTranscriptItems) { item in
-                timelineView(for: item)
-                    .id(item.id)
-                    .accessibilityIdentifier("conversation.item.\(item.id)")
-            }
-
-            ForEach(store.state.approvals) { approval in
-                ApprovalCard(
-                    approval: approval,
-                    store: store,
-                    coordinator: coordinator,
-                    isReadOnly: isReadOnly
-                )
-                .id("approval:\(approval.id)")
-            }
-
-            ForEach(store.state.questions) { question in
-                QuestionCard(
-                    question: question,
-                    store: store,
-                    coordinator: coordinator,
-                    isReadOnly: isReadOnly
-                )
-                .id("question:\(question.id)")
-            }
-
-            Color.clear
-                .frame(height: 1)
-                .background {
-                    GeometryReader { proxy in
-                        Color.clear.preference(
-                            key: ConversationBottomPreferenceKey.self,
-                            value: proxy.frame(in: .named("conversation-scroll")).maxY
-                        )
-                    }
-                }
-        }
-    }
-
-    private var viewportUpdateSignal: ConversationViewportUpdateToken {
-        ConversationViewportUpdateToken(
-            lastItemID: store.state.items.last?.id,
-            pendingApprovalCount: store.state.approvals.count,
-            pendingQuestionCount: store.state.questions.count
-        )
-    }
-
     private var compactNoticeContent: (message: String, canRetry: Bool)? {
         if let message = store.state.lastErrorMessage {
             let canRetry = store.state.connectionState == .failed
@@ -560,236 +559,20 @@ struct ConversationView: View {
         }
     }
 
-    private func scrollToBottom(_ proxy: ScrollViewProxy) {
-        if reduceMotion || store.state.turnState.isActive {
-            pinToBottom(proxy)
-        } else {
-            withAnimation(.easeOut(duration: 0.18)) {
-                pinToBottom(proxy)
-            }
-        }
-    }
-
-    private func pinToBottom(_ proxy: ScrollViewProxy) {
-        proxy.scrollTo("chat-bottom", anchor: .bottom)
-    }
-
-    private func handleViewportUpdate(
-        _ update: ConversationViewportUpdateToken,
-        proxy: ScrollViewProxy
-    ) {
-        stabilizeEagerTranscriptTail()
-        switch viewportPolicy.actionForContentUpdate(
-            hasContent: update.hasContent
-        ) {
-        case .preserve:
-            compactEagerTranscriptTailIfNeeded(proxy)
-        case .anchorInitialLatest:
-            initialAnchorTask?.cancel()
-            initialAnchorTask = Task { @MainActor in
-                await Task.yield()
-                if #available(iOS 18.0, macOS 15.0, *) {
-                    // Lazy rich rows can reveal their final height over several
-                    // layouts. Keep requesting the stable eager-tail target until
-                    // measured scroll geometry confirms the real bottom.
-                    while !Task.isCancelled,
-                          viewportPolicy.isInitialAnchorPending,
-                          viewportPolicy.shouldFollowLatestLayout {
-                        var transaction = Transaction()
-                        transaction.disablesAnimations = true
-                        withTransaction(transaction) {
-                            pinToBottom(proxy)
-                        }
-                        try? await Task.sleep(for: .milliseconds(16))
-                    }
-                } else if !Task.isCancelled,
-                          viewportPolicy.shouldFollowLatestLayout {
-                    pinToBottom(proxy)
-                    await Task.yield()
-                    pinToBottom(proxy)
-                    viewportPolicy.completeInitialAnchor()
-                }
-                initialAnchorTask = nil
-            }
-        }
-    }
-
-    private func stabilizeEagerTranscriptTail() {
-        let items = store.state.items
-        guard !items.isEmpty else {
-            eagerTranscriptTailStartID = nil
-            return
-        }
-        if let eagerTranscriptTailStartID,
-           items.contains(where: { $0.id == eagerTranscriptTailStartID }) {
-            return
-        }
-        eagerTranscriptTailStartID = preferredEagerTranscriptTailStartID
-    }
-
-    private func compactEagerTranscriptTailIfNeeded(
-        _ proxy: ScrollViewProxy,
-        force: Bool = false
-    ) {
-        let compactedStartID = preferredEagerTranscriptTailStartID
-        guard compactedStartID != eagerTranscriptTailStartID else { return }
-        if force {
-            eagerTranscriptTailStartID = compactedStartID
-            return
-        }
-        guard isAtBottom,
-              viewportPolicy.shouldFollowLatestLayout,
-              recentTranscriptItems.count > Self.eagerTranscriptTailLimit * 2 else {
-            return
-        }
-        eagerTranscriptTailStartID = compactedStartID
-        Task { @MainActor in
-            await Task.yield()
-            guard viewportPolicy.shouldFollowLatestLayout else { return }
-            pinToBottom(proxy)
-        }
-    }
-
-    private func handleScrollActivity(_ isActive: Bool) {
-        if isActive {
-            pendingFollowScroll?.cancel()
-            pendingFollowScroll = nil
-            viewportPolicy.beginUserInteraction()
-        } else {
-            viewportPolicy.endUserInteraction(isAtBottom: isAtBottom)
-        }
-    }
-
-    private func applyScrollMetrics(
-        _ metrics: ConversationScrollMetrics,
-        proxy: ScrollViewProxy
-    ) {
-        guard viewportPolicy.acceptsBottomMeasurements else { return }
-        applyBottomPosition(
-            isAtBottom: metrics.isAtBottom,
-            isNearBottom: metrics.isNearBottom,
-            proxy: proxy
-        )
-    }
-
-    private func applyBottomPosition(
-        isAtBottom atBottom: Bool,
-        isNearBottom nearBottom: Bool,
-        proxy: ScrollViewProxy
-    ) {
-        if isAtBottom != atBottom {
-            isAtBottom = atBottom
-        }
-        if store.isNearBottom != nearBottom {
-            store.setNearBottom(nearBottom)
-        }
-        if atBottom {
-            viewportPolicy.completeInitialAnchor()
-        }
-        if !viewportPolicy.isInitialAnchorPending,
-           viewportPolicy.shouldCorrectBottomOffset(isAtBottom: atBottom) {
-            scheduleFollowScroll(proxy)
-        }
-    }
-
-    private func scheduleFollowScroll(_ proxy: ScrollViewProxy) {
-        guard pendingFollowScroll == nil else { return }
-        pendingFollowScroll = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(16))
-            guard !Task.isCancelled, viewportPolicy.shouldFollowLatestLayout else {
-                pendingFollowScroll = nil
-                return
-            }
-            // Clear first so the preference update caused by this correction
-            // can enqueue the next frame if rich content is still settling.
-            pendingFollowScroll = nil
-            var transaction = Transaction()
-            transaction.disablesAnimations = true
-            withTransaction(transaction) {
-                pinToBottom(proxy)
-            }
-        }
-    }
-}
-
-private struct ConversationBottomPreferenceKey: PreferenceKey {
-    static var defaultValue: CGFloat = .greatestFiniteMagnitude
-
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
-    }
-}
-
-private extension View {
-    @ViewBuilder
-    func conversationDefaultScrollAnchor() -> some View {
-        if #available(iOS 18.0, macOS 15.0, *) {
-            defaultScrollAnchor(.bottom)
-                .defaultScrollAnchor(.top, for: .alignment)
-        } else {
-            self
-        }
-    }
-
-    @ViewBuilder
-    func conversationScrollActivity(
-        _ onChange: @escaping (Bool, ConversationScrollMetrics?) -> Void
-    ) -> some View {
-        if #available(iOS 18.0, macOS 15.0, *) {
-            onScrollPhaseChange { _, phase, context in
-                let metrics = ConversationScrollMetrics(
-                    isAtBottom: context.geometry.contentSize.height
-                        - context.geometry.visibleRect.maxY <= 2,
-                    isNearBottom: context.geometry.contentSize.height
-                        - context.geometry.visibleRect.maxY <= 180
-                )
-                switch phase {
-                case .tracking, .interacting, .decelerating:
-                    onChange(true, metrics)
-                case .idle:
-                    onChange(false, metrics)
-                case .animating:
-                    break
-                @unknown default:
-                    break
-                }
-            }
-        } else {
-            background(
-                ConversationScrollActivityObserver { isActive in
-                    onChange(isActive, nil)
-                }
-            )
-        }
-    }
-
-    @ViewBuilder
-    func conversationScrollGeometry(
-        _ onChange: @escaping (ConversationScrollMetrics) -> Void
-    ) -> some View {
-        if #available(iOS 18.0, macOS 15.0, *) {
-            onScrollGeometryChange(for: ConversationScrollMetrics.self) { geometry in
-                let distanceFromBottom = geometry.contentSize.height
-                    - geometry.visibleRect.maxY
-                return ConversationScrollMetrics(
-                    isAtBottom: distanceFromBottom <= 2,
-                    isNearBottom: distanceFromBottom <= 180
-                )
-            } action: { _, metrics in
-                onChange(metrics)
-            }
-        } else {
-            self
-        }
-    }
 }
 
 #if os(macOS)
-private struct ConversationScrollActivityObserver: NSViewRepresentable {
-    let onChange: (Bool) -> Void
+/// Detects user wheel/trackpad scrolling from AppKit events. SwiftUI's
+/// onScrollPhaseChange is not guaranteed to report phases for discrete
+/// mouse-wheel input on macOS, and a wheel scroll that goes unnoticed would
+/// let follow mode drag the user straight back to the bottom. Idempotent
+/// alongside the phase callback.
+private struct ConversationWheelScrollObserver: NSViewRepresentable {
+    let onBegan: () -> Void
+    let onEnded: () -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onChange: onChange)
+        Coordinator(onBegan: onBegan, onEnded: onEnded)
     }
 
     func makeNSView(context: Context) -> LocatorView {
@@ -799,7 +582,8 @@ private struct ConversationScrollActivityObserver: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: LocatorView, context: Context) {
-        context.coordinator.onChange = onChange
+        context.coordinator.onBegan = onBegan
+        context.coordinator.onEnded = onEnded
         context.coordinator.attach(from: nsView)
     }
 
@@ -825,14 +609,16 @@ private struct ConversationScrollActivityObserver: NSViewRepresentable {
 
     @MainActor
     final class Coordinator {
-        var onChange: (Bool) -> Void
+        var onBegan: () -> Void
+        var onEnded: () -> Void
         private weak var scrollView: NSScrollView?
         private var eventMonitor: Any?
         private var endTask: Task<Void, Never>?
         private var isActive = false
 
-        init(onChange: @escaping (Bool) -> Void) {
-            self.onChange = onChange
+        init(onBegan: @escaping () -> Void, onEnded: @escaping () -> Void) {
+            self.onBegan = onBegan
+            self.onEnded = onEnded
         }
 
         func attach(from view: NSView) {
@@ -871,144 +657,21 @@ private struct ConversationScrollActivityObserver: NSViewRepresentable {
             }
             eventMonitor = nil
             scrollView = nil
-            setActive(false)
+            isActive = false
         }
 
         private func recordActivity() {
-            setActive(true)
+            if !isActive {
+                isActive = true
+                onBegan()
+            }
             endTask?.cancel()
             endTask = Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .milliseconds(150))
-                guard !Task.isCancelled else { return }
-                self?.setActive(false)
+                guard !Task.isCancelled, let self else { return }
+                isActive = false
+                onEnded()
             }
-        }
-
-        private func setActive(_ value: Bool) {
-            guard value != isActive else { return }
-            isActive = value
-            onChange(value)
-        }
-    }
-}
-#elseif os(iOS)
-private struct ConversationScrollActivityObserver: UIViewRepresentable {
-    let onChange: (Bool) -> Void
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(onChange: onChange)
-    }
-
-    func makeUIView(context: Context) -> LocatorView {
-        let view = LocatorView()
-        view.coordinator = context.coordinator
-        return view
-    }
-
-    func updateUIView(_ uiView: LocatorView, context: Context) {
-        context.coordinator.onChange = onChange
-        context.coordinator.attach(from: uiView)
-    }
-
-    static func dismantleUIView(_ uiView: LocatorView, coordinator: Coordinator) {
-        coordinator.detach()
-    }
-
-    final class LocatorView: UIView {
-        weak var coordinator: Coordinator?
-
-        override func didMoveToWindow() {
-            super.didMoveToWindow()
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                coordinator?.attach(from: self)
-            }
-        }
-
-        override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
-            false
-        }
-    }
-
-    @MainActor
-    final class Coordinator: NSObject {
-        var onChange: (Bool) -> Void
-        private weak var scrollView: UIScrollView?
-        private var endTask: Task<Void, Never>?
-        private var isActive = false
-
-        init(onChange: @escaping (Bool) -> Void) {
-            self.onChange = onChange
-        }
-
-        func attach(from view: UIView) {
-            guard scrollView == nil else { return }
-            var ancestor = view.superview
-            while let current = ancestor {
-                if let scrollView = current as? UIScrollView {
-                    attach(to: scrollView)
-                    return
-                }
-                ancestor = current.superview
-            }
-        }
-
-        private func attach(to scrollView: UIScrollView) {
-            self.scrollView = scrollView
-            scrollView.panGestureRecognizer.addTarget(
-                self,
-                action: #selector(handlePan(_:))
-            )
-        }
-
-        func detach() {
-            endTask?.cancel()
-            endTask = nil
-            scrollView?.panGestureRecognizer.removeTarget(
-                self,
-                action: #selector(handlePan(_:))
-            )
-            scrollView = nil
-            setActive(false)
-        }
-
-        @objc
-        private func handlePan(_ recognizer: UIPanGestureRecognizer) {
-            switch recognizer.state {
-            case .began, .changed:
-                endTask?.cancel()
-                endTask = nil
-                setActive(true)
-            case .ended:
-                waitForScrollingToEnd()
-            case .cancelled, .failed:
-                setActive(false)
-            case .possible:
-                break
-            @unknown default:
-                setActive(false)
-            }
-        }
-
-        private func waitForScrollingToEnd() {
-            endTask?.cancel()
-            endTask = Task { @MainActor [weak self] in
-                guard let self else { return }
-                try? await Task.sleep(for: .milliseconds(16))
-                guard !Task.isCancelled else { return }
-                while let scrollView,
-                      scrollView.isDragging || scrollView.isDecelerating {
-                    try? await Task.sleep(for: .milliseconds(16))
-                    guard !Task.isCancelled else { return }
-                }
-                setActive(false)
-            }
-        }
-
-        private func setActive(_ value: Bool) {
-            guard value != isActive else { return }
-            isActive = value
-            onChange(value)
         }
     }
 }
@@ -1016,8 +679,6 @@ private struct ConversationScrollActivityObserver: UIViewRepresentable {
 
 private struct ChatMessageView: View {
     let message: ChatMessage
-    let onOpenExternal: (URL) -> Void
-    let onOpenRepository: (ChatRepositoryLink) -> Void
 
     @State private var didCopy = false
 
@@ -1110,9 +771,7 @@ private struct ChatMessageView: View {
         default:
             RichMarkdownView(
                 text: content.text,
-                isStreaming: !content.isComplete,
-                onOpenExternal: onOpenExternal,
-                onOpenRepository: onOpenRepository
+                isStreaming: !content.isComplete
             )
         }
     }
@@ -1140,9 +799,9 @@ private struct StreamingIndicator: View {
 
 private struct ReasoningCard: View {
     let reasoning: ChatReasoning
-    @ObservedObject var store: ConversationStore
+    let isExpanded: Bool
 
-    var isExpanded: Bool { store.expandedItemIDs.contains(reasoning.id) }
+    @Environment(\.chatRowActions) private var actions
 
     private var displayText: String? {
         reasoning.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -1158,7 +817,7 @@ private struct ReasoningCard: View {
                 symbol: "brain.head.profile",
                 statusColor: reasoning.isStreaming ? .blue : .secondary,
                 isExpanded: isExpanded,
-                toggle: { store.toggleExpanded(itemID: reasoning.id) }
+                toggle: { actions.toggleExpanded(itemID: reasoning.id) }
             ) {
                 Text(displayText)
                     .font(.callout)
@@ -1182,11 +841,10 @@ private struct ReasoningCard: View {
 
 private struct ToolActivityCard: View {
     let tool: ToolActivity
-    @ObservedObject var store: ConversationStore
+    let isExpanded: Bool
+    let copiedItemID: String?
 
-    private var isExpanded: Bool {
-        store.expandedItemIDs.contains(tool.id)
-    }
+    @Environment(\.chatRowActions) private var actions
 
     var body: some View {
         DisclosureCard(
@@ -1195,14 +853,24 @@ private struct ToolActivityCard: View {
             symbol: toolSymbol,
             statusColor: statusColor,
             isExpanded: isExpanded,
-            toggle: { store.toggleExpanded(itemID: tool.id) }
+            toggle: { actions.toggleExpanded(itemID: tool.id) }
         ) {
             VStack(alignment: .leading, spacing: 10) {
                 if let input = tool.input, !input.isEmpty {
-                    ToolSection(title: "Input", content: input, itemID: "\(tool.id):input", store: store)
+                    ToolSection(
+                        title: "Input",
+                        content: input,
+                        itemID: "\(tool.id):input",
+                        copiedItemID: copiedItemID
+                    )
                 }
                 if let output = tool.output, !output.isEmpty {
-                    ToolSection(title: "Output", content: output, itemID: "\(tool.id):output", store: store)
+                    ToolSection(
+                        title: "Output",
+                        content: output,
+                        itemID: "\(tool.id):output",
+                        copiedItemID: copiedItemID
+                    )
                 }
                 if let error = tool.errorMessage, !error.isEmpty {
                     Label(error, systemImage: "exclamationmark.triangle.fill")
@@ -1258,7 +926,11 @@ private struct ToolSection: View {
     let title: String
     let content: String
     let itemID: String
-    @ObservedObject var store: ConversationStore
+    let copiedItemID: String?
+
+    @Environment(\.chatRowActions) private var actions
+
+    private var isCopied: Bool { copiedItemID == itemID }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -1269,14 +941,14 @@ private struct ToolSection: View {
                 Spacer()
                 Button {
                     ChatClipboard.copy(content)
-                    store.markCopied(itemID: itemID)
+                    actions.markCopied(itemID: itemID)
                 } label: {
-                    Label(store.copiedItemID == itemID ? "Copied" : "Copy", systemImage: store.copiedItemID == itemID ? "checkmark" : "doc.on.doc")
+                    Label(isCopied ? "Copied" : "Copy", systemImage: isCopied ? "checkmark" : "doc.on.doc")
                 }
                 .buttonStyle(.plain)
                 .font(.caption)
                 .chatMinimumInteractionTarget(includesWidth: true)
-                .accessibilityLabel(store.copiedItemID == itemID ? "\(title) copied" : "Copy \(title.lowercased())")
+                .accessibilityLabel(isCopied ? "\(title) copied" : "Copy \(title.lowercased())")
             }
             CodeBlockView(
                 id: itemID,
@@ -1290,11 +962,9 @@ private struct ToolSection: View {
 
 private struct DiffCard: View {
     let diff: ChatDiff
-    @ObservedObject var store: ConversationStore
+    let isExpanded: Bool
 
-    private var isExpanded: Bool {
-        store.expandedItemIDs.contains(diff.id)
-    }
+    @Environment(\.chatRowActions) private var actions
 
     var body: some View {
         DisclosureCard(
@@ -1303,7 +973,7 @@ private struct DiffCard: View {
             symbol: "doc.badge.gearshape",
             statusColor: .blue,
             isExpanded: isExpanded,
-            toggle: { store.toggleExpanded(itemID: diff.id) }
+            toggle: { actions.toggleExpanded(itemID: diff.id) }
         ) {
             DiffTextView(diff: diff.unifiedDiff)
         }
@@ -1311,19 +981,49 @@ private struct DiffCard: View {
 }
 
 private struct DiffTextView: View {
-    let diff: String
+    private struct Line: Identifiable {
+        enum Kind {
+            case addition
+            case removal
+            case context
+        }
+
+        let id: Int
+        let text: String
+        let kind: Kind
+    }
+
+    private let lines: [Line]
+
+    init(diff: String) {
+        lines = diff
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .enumerated()
+            .map { index, substring in
+                let text = String(substring)
+                let kind: Line.Kind
+                if text.hasPrefix("+"), !text.hasPrefix("+++") {
+                    kind = .addition
+                } else if text.hasPrefix("-"), !text.hasPrefix("---") {
+                    kind = .removal
+                } else {
+                    kind = .context
+                }
+                return Line(id: index, text: text, kind: kind)
+            }
+    }
 
     var body: some View {
         ScrollView(.horizontal) {
             VStack(alignment: .leading, spacing: 0) {
-                ForEach(Array(diff.split(separator: "\n", omittingEmptySubsequences: false).enumerated()), id: \.offset) { _, line in
-                    Text(verbatim: String(line))
+                ForEach(lines) { line in
+                    Text(verbatim: line.text)
                         .font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(lineColor(String(line)))
+                        .foregroundStyle(lineColor(line.kind))
                         .padding(.horizontal, 8)
                         .padding(.vertical, 1)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(lineBackground(String(line)))
+                        .background(lineBackground(line.kind))
                 }
             }
             .fixedSize(horizontal: true, vertical: false)
@@ -1333,16 +1033,20 @@ private struct DiffTextView: View {
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
-    private func lineColor(_ line: String) -> Color {
-        if line.hasPrefix("+"), !line.hasPrefix("+++") { return .green }
-        if line.hasPrefix("-"), !line.hasPrefix("---") { return .red }
-        return .primary
+    private func lineColor(_ kind: Line.Kind) -> Color {
+        switch kind {
+        case .addition: .green
+        case .removal: .red
+        case .context: .primary
+        }
     }
 
-    private func lineBackground(_ line: String) -> Color {
-        if line.hasPrefix("+"), !line.hasPrefix("+++") { return .green.opacity(0.1) }
-        if line.hasPrefix("-"), !line.hasPrefix("---") { return .red.opacity(0.1) }
-        return .clear
+    private func lineBackground(_ kind: Line.Kind) -> Color {
+        switch kind {
+        case .addition: .green.opacity(0.1)
+        case .removal: .red.opacity(0.1)
+        case .context: .clear
+        }
     }
 }
 
@@ -1371,9 +1075,9 @@ private struct PlanCard: View {
 
 private struct GenericActivityCard: View {
     let item: ChatGenericItem
-    @ObservedObject var store: ConversationStore
+    let isExpanded: Bool
 
-    private var isExpanded: Bool { store.expandedItemIDs.contains(item.id) }
+    @Environment(\.chatRowActions) private var actions
 
     var body: some View {
         DisclosureCard(
@@ -1382,7 +1086,7 @@ private struct GenericActivityCard: View {
             symbol: "square.stack.3d.up",
             statusColor: .secondary,
             isExpanded: isExpanded,
-            toggle: { store.toggleExpanded(itemID: item.id) }
+            toggle: { actions.toggleExpanded(itemID: item.id) }
         ) {
             if let detail = item.detail {
                 Text(detail)

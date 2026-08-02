@@ -342,7 +342,7 @@ struct ConversationReducer {
             }
         }
 
-        if let index = state.items.firstIndex(where: { $0.id == itemID }),
+        if let index = state.items.lastIndex(where: { $0.id == itemID }),
            case .message(var message) = state.items[index] {
             message.turnID = envelope.turnID ?? message.turnID
             message.occurredAt = envelope.occurredAt ?? message.occurredAt
@@ -395,7 +395,7 @@ struct ConversationReducer {
             throw ConversationReducerError.invalidEvent(envelope.type)
         }
         let text = envelope.payload["text"]?.stringValue ?? ""
-        if let index = state.items.firstIndex(where: { $0.id == itemID }),
+        if let index = state.items.lastIndex(where: { $0.id == itemID }),
            case .reasoning(var reasoning) = state.items[index] {
             if kind == .reasoningCompleted {
                 if !text.isEmpty { reasoning.text = text }
@@ -448,7 +448,7 @@ struct ConversationReducer {
             ?? envelope.payload["name"]?.stringValue
             ?? "Agent activity"
 
-        if let index = state.items.firstIndex(where: { $0.id == itemID }),
+        if let index = state.items.lastIndex(where: { $0.id == itemID }),
            case .tool(var tool) = state.items[index] {
             tool.title = title
             tool.status = status
@@ -804,7 +804,7 @@ struct ConversationReducer {
     }
 
     private func replaceOrAppend(_ item: ConversationItem, in state: inout ConversationState) {
-        if let index = state.items.firstIndex(where: { $0.id == item.id }) {
+        if let index = state.items.lastIndex(where: { $0.id == item.id }) {
             state.items[index] = item
         } else {
             state.items.append(item)
@@ -1219,6 +1219,7 @@ final class ConversationStore: ObservableObject {
     private func publishImmediately() {
         streamingPublishTask?.cancel()
         streamingPublishTask = nil
+        guard workingState != state else { return }
         state = workingState
     }
 }

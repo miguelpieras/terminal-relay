@@ -488,6 +488,7 @@ final class ConversationCoordinator {
 
     private func apply(_ envelope: ChatEnvelope) async -> Bool {
         do {
+            await warmMarkdownCacheIfNeeded(for: envelope)
             try store.apply(envelope)
             if envelope.type == ChatEventKind.conversationSnapshot.rawValue {
                 reconcileSnapshotTransients()
@@ -549,6 +550,30 @@ final class ConversationCoordinator {
             store.setConnectionState(.failed, message: sanitizedMessage(for: error))
             shouldStayConnected = false
             return true
+        }
+    }
+
+    /// Sanitizes the markdown of a restored conversation's most recent items
+    /// before they publish, so their rows can parse synchronously and land at
+    /// their final height on the first layout frame. Older history keeps
+    /// warming in the background for stable scroll-up.
+    private func warmMarkdownCacheIfNeeded(for envelope: ChatEnvelope) async {
+        guard envelope.type == ChatEventKind.conversationSnapshot.rawValue,
+              let snapshot = try? envelope.decodePayload(ConversationSnapshot.self),
+              !snapshot.items.isEmpty else {
+            return
+        }
+        let texts = SanitizedMarkdownCache.warmableTexts(items: snapshot.items)
+        let recent = Array(texts.suffix(50))
+        await SanitizedMarkdownCache.shared.warm(texts: recent)
+        let older = texts.dropLast(50)
+        if !older.isEmpty {
+            Task(priority: .utility) { @MainActor in
+                await SanitizedMarkdownCache.shared.warm(
+                    texts: Array(older),
+                    budget: .seconds(30)
+                )
+            }
         }
     }
 
