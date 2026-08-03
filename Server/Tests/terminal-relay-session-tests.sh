@@ -341,12 +341,22 @@ case "$signal_name" in
     *) exit 64 ;;
 esac
 
-started="$(LC_ALL=C /bin/ps -o lstart= -p "$pid" 2>/dev/null)" || exit 75
-started="${started#"${started%%[![:space:]]*}"}"
-[[ -n "$started" ]] || exit 75
-started="${started// /_}"
-started="${started//$'\t'/_}"
-[[ "ps_$started" == "$expected_start" ]] || exit 75
+if [[ -r "/proc/$pid/stat" ]]; then
+    IFS= read -r stat_line < "/proc/$pid/stat" || exit 75
+    stat_fields="${stat_line##*) }"
+    [[ "$stat_fields" != "$stat_line" ]] || exit 75
+    read -r -a stat_parts <<< "$stat_fields"
+    [[ ${#stat_parts[@]} -ge 20 && "${stat_parts[19]}" =~ ^[0-9]+$ ]] || exit 75
+    actual_start="proc_${stat_parts[19]}"
+else
+    started="$(LC_ALL=C /bin/ps -o lstart= -p "$pid" 2>/dev/null)" || exit 75
+    started="${started#"${started%%[![:space:]]*}"}"
+    [[ -n "$started" ]] || exit 75
+    started="${started// /_}"
+    started="${started//$'\t'/_}"
+    actual_start="ps_$started"
+fi
+[[ "$actual_start" == "$expected_start" ]] || exit 75
 command="$(/bin/ps -o command= -p "$pid" 2>/dev/null)" || exit 75
 [[ "$command" == *"$TERMINAL_RELAY_TEST_SIGNAL_TARGET_PATH"* ]] || exit 75
 printf 'signal|pid=%s|name=%s\n' "$pid" "$signal_name" \
