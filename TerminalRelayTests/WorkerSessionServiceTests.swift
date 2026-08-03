@@ -500,6 +500,66 @@ final class WorkerSessionServiceTests: XCTestCase {
         XCTAssertEqual(service.error(for: worker.id), "The worker could not start this agent.")
     }
 
+    func testFreshThreadCatalogSkipsRedundantWorkerRoundTrips() async {
+        let worker = makeWorker()
+        let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let recorder = WorkerSessionCommandRecorder(
+            results: [
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data("\(WorkerSessionProtocol.marker)\n".utf8),
+                    standardError: Data()
+                ),
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data("\(WorkerUpdateStatusProtocol.marker)\n".utf8),
+                    standardError: Data()
+                ),
+                threadResult(
+                    """
+                    {"threads":[{"provider":"codex","threadID":"\(threadID)","title":"Cached","updatedAt":10,"archived":false,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":null}
+                    """
+                ),
+                threadResult(
+                    """
+                    {"threads":[],"nextCursor":null}
+                    """
+                ),
+            ]
+        )
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+
+        _ = await service.refresh(worker: worker)
+        let first = await service.loadThreads(
+            repositoryName: "terminal-relay",
+            archived: false,
+            on: worker,
+            skipIfFresh: true
+        )
+        let commandCountAfterFirst = recorder.configurations.count
+
+        let second = await service.loadThreads(
+            repositoryName: "terminal-relay",
+            archived: false,
+            on: worker,
+            skipIfFresh: true
+        )
+
+        XCTAssertEqual(first?.threads.map(\.threadID), [threadID])
+        XCTAssertEqual(
+            second,
+            first,
+            "A fresh catalog must be served from memory."
+        )
+        XCTAssertEqual(
+            recorder.configurations.count,
+            commandCountAfterFirst,
+            "A fresh catalog must not trigger another worker round trip."
+        )
+    }
+
     func testThreadCatalogPaginatesDeduplicatesMergesLiveStateAndKeepsLastGoodValue() async {
         let worker = makeWorker()
         let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"

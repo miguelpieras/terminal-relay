@@ -35,7 +35,7 @@ enum WorkerThreadActivityState: String, Codable, Equatable {
     case unknown
 }
 
-struct WorkerThreadSnapshot: Equatable, Identifiable {
+struct WorkerThreadSnapshot: Codable, Equatable, Identifiable {
     let kind: AgentKind
     let repositoryName: String
     let threadID: String
@@ -80,7 +80,7 @@ struct WorkerThreadSnapshot: Equatable, Identifiable {
     }
 }
 
-struct WorkerThreadResponse: Equatable {
+struct WorkerThreadResponse: Codable, Equatable {
     let threads: [WorkerThreadSnapshot]
     let nextCursor: String?
 
@@ -131,7 +131,7 @@ struct WorkerThreadResponse: Equatable {
     }
 }
 
-struct WorkerThreadCatalogKey: Hashable {
+struct WorkerThreadCatalogKey: Codable, Hashable {
     let workerID: UUID
     let repositoryName: String
     let archived: Bool

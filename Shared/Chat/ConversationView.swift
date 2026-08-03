@@ -7,32 +7,25 @@ import AppKit
 import UIKit
 #endif
 
+/// Coarse scroll geometry: only boundary crossings and content-height motion
+/// change this value, so the scroll-geometry action never runs on plain
+/// scrolled frames. That keeps user scrolling free of SwiftUI graph work.
 private struct ConversationScrollGeometrySample: Equatable {
-    var offsetY: CGFloat
-    var contentHeight: CGFloat
-    var distanceFromBottom: CGFloat
+    var isAtBottom: Bool
+    var isNearBottom: Bool
+    var contentHeightBucket: Int
 
-    static let zero = ConversationScrollGeometrySample(
-        offsetY: 0,
-        contentHeight: 0,
-        distanceFromBottom: 0
+    static let initial = ConversationScrollGeometrySample(
+        isAtBottom: true,
+        isNearBottom: true,
+        contentHeightBucket: 0
     )
 }
 
-/// One-shot compensation for a history-page prepend: restores the reading
-/// position once the taller content commits. Cancelled by any user gesture
-/// and expired after a few geometry events if the growth never lands.
-private struct HistoryPrependAdjustment {
-    let offsetY: CGFloat
-    let contentHeight: CGFloat
-    var remainingGeometryEvents: Int
-}
-
-/// Per-frame scroll bookkeeping that must never invalidate the view body.
+/// Scroll bookkeeping that must never invalidate the view body.
 @MainActor
 private final class ConversationScrollScratch {
-    var lastSample = ConversationScrollGeometrySample.zero
-    var historyPrepend: HistoryPrependAdjustment?
+    var lastSample = ConversationScrollGeometrySample.initial
 }
 
 struct ConversationView: View {
@@ -48,9 +41,6 @@ struct ConversationView: View {
     #if os(iOS)
     @State private var escapeRouter = ComposerEscapeRouter()
     #endif
-    @State private var scrollController = ConversationScrollController()
-    @State private var scrollPosition = ScrollPosition()
-    @State private var scratch = ConversationScrollScratch()
     @State private var rowActions: ChatRowActions
 
     init(
@@ -130,7 +120,17 @@ struct ConversationView: View {
     }
 
     private var transcript: some View {
-        ScrollView {
+        ConversationTranscriptScroller(
+            isConversationEmpty: store.state.items.isEmpty,
+            firstItemID: store.state.items.first?.id,
+            isNearBottom: store.isNearBottom,
+            unreadCount: store.unreadCount,
+            itemExists: { id in
+                store.state.items.contains(where: { $0.id == id })
+            },
+            onNearBottomChange: { store.setNearBottom($0) },
+            onJump: { store.jumpToLatest() }
+        ) {
             LazyVStack(alignment: .leading, spacing: 14) {
                 historyControl
 
@@ -160,62 +160,14 @@ struct ConversationView: View {
                     .id("question:\(question.id)")
                 }
             }
+            .scrollTargetLayout()
             .frame(maxWidth: 760, alignment: .leading)
             .padding(.horizontal, horizontalTranscriptPadding)
             .padding(.top, 22)
             .padding(.bottom, 16)
             .frame(maxWidth: .infinity)
-            #if os(macOS)
-            .background(
-                ConversationWheelScrollObserver(
-                    onBegan: { handleUserScrollBegan() },
-                    onEnded: { handleWheelScrollEnded() }
-                )
-            )
-            #endif
         }
-        .scrollPosition($scrollPosition)
-        .defaultScrollAnchor(.bottom)
-        .defaultScrollAnchor(.top, for: .alignment)
-        .onScrollGeometryChange(for: ConversationScrollGeometrySample.self) { geometry in
-            ConversationScrollGeometrySample(
-                offsetY: geometry.contentOffset.y,
-                contentHeight: geometry.contentSize.height,
-                distanceFromBottom: geometry.contentSize.height
-                    - geometry.visibleRect.maxY
-            )
-        } action: { _, sample in
-            handleGeometryChange(sample)
-        }
-        .onScrollPhaseChange { oldPhase, newPhase, context in
-            handleScrollPhaseChange(from: oldPhase, to: newPhase, context: context)
-        }
-        #if os(iOS)
-        .scrollDismissesKeyboard(.interactively)
-        #endif
-        .accessibilityIdentifier("conversation.transcript")
-        .accessibilityValue(scrollController.accessibilityValue)
         .environment(\.chatRowActions, rowActions)
-        .opacity(isAnchoringContent ? 0 : 1)
-        .task(id: isAnchoringContent) {
-            // Failsafe: never leave the transcript hidden if geometry never
-            // confirms the bottom while anchoring.
-            guard isAnchoringContent else { return }
-            try? await Task.sleep(for: .milliseconds(600))
-            guard !Task.isCancelled else { return }
-            scrollController.completeAnchor()
-        }
-        .onChange(of: store.state.items.isEmpty) { wasEmpty, isEmpty in
-            if wasEmpty, !isEmpty {
-                execute(scrollController.contentLoaded())
-            }
-        }
-        .onChange(of: store.state.items.first?.id) { oldValue, newValue in
-            armHistoryPrependAdjustment(oldFirstID: oldValue, newFirstID: newValue)
-        }
-        .overlay(alignment: .bottomTrailing) {
-            jumpToLatestOverlay
-        }
         .overlay {
             if isConversationEmpty {
                 emptyConversation
@@ -223,164 +175,6 @@ struct ConversationView: View {
                     .background(Color.chatCanvas)
                     .allowsHitTesting(false)
             }
-        }
-    }
-
-    private var jumpToLatestOverlay: some View {
-        ZStack(alignment: .bottomTrailing) {
-            if !store.isNearBottom {
-                Button {
-                    store.jumpToLatest()
-                    execute(scrollController.jumpRequested())
-                } label: {
-                    Image(systemName: "arrow.down")
-                        .font(.caption.weight(.semibold))
-                        .frame(width: 28, height: 28)
-                        .background(.regularMaterial, in: Circle())
-                        .overlay {
-                            Circle()
-                                .strokeBorder(Color.secondary.opacity(0.16))
-                        }
-                        .frame(
-                            width: ChatInteractionTargetLayout.jumpButtonDimension,
-                            height: ChatInteractionTargetLayout.jumpButtonDimension
-                        )
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("conversation.jump-to-latest")
-                .padding(ChatInteractionTargetLayout.jumpButtonOuterPadding)
-                .accessibilityLabel(
-                    store.unreadCount > 0
-                        ? "\(store.unreadCount) new messages. Jump to latest"
-                        : "Jump to latest"
-                )
-                .accessibilityHint("Moves to the newest conversation update.")
-                .transition(.scale.combined(with: .opacity))
-            }
-        }
-        .animation(
-            reduceMotion ? nil : .easeInOut(duration: 0.16),
-            value: store.isNearBottom
-        )
-    }
-
-    private var isAnchoringContent: Bool {
-        scrollController.isAnchoring && !store.state.items.isEmpty
-    }
-
-    // MARK: Scroll handling
-
-    private func handleGeometryChange(_ sample: ConversationScrollGeometrySample) {
-        scratch.lastSample = sample
-        consumeHistoryPrependAdjustment(with: sample)
-        let nearBottom = sample.distanceFromBottom <= 180
-        if store.isNearBottom != nearBottom {
-            store.setNearBottom(nearBottom)
-        }
-        execute(
-            scrollController.geometryChanged(
-                distanceFromBottom: sample.distanceFromBottom
-            )
-        )
-    }
-
-    private func handleScrollPhaseChange(
-        from oldPhase: ScrollPhase,
-        to newPhase: ScrollPhase,
-        context: ScrollPhaseChangeContext
-    ) {
-        let distance = context.geometry.contentSize.height
-            - context.geometry.visibleRect.maxY
-        switch newPhase {
-        case .tracking, .interacting, .decelerating:
-            handleUserScrollBegan()
-        case .idle:
-            if oldPhase == .animating {
-                execute(scrollController.animationEnded(distanceFromBottom: distance))
-            } else {
-                execute(scrollController.userScrollEnded(distanceFromBottom: distance))
-            }
-        case .animating:
-            break
-        @unknown default:
-            break
-        }
-    }
-
-    private func handleUserScrollBegan() {
-        scratch.historyPrepend = nil
-        scrollController.userScrollBegan()
-    }
-
-    private func handleWheelScrollEnded() {
-        execute(
-            scrollController.userScrollEnded(
-                distanceFromBottom: scratch.lastSample.distanceFromBottom
-            )
-        )
-    }
-
-    private func execute(_ command: ConversationPinCommand?) {
-        guard let command else { return }
-        switch command {
-        case .instant:
-            pinToBottomInstantly()
-        case .animatedSettle, .animatedJump:
-            if reduceMotion {
-                pinToBottomInstantly()
-            } else {
-                withAnimation(.easeOut(duration: 0.18)) {
-                    scrollPosition.scrollTo(edge: .bottom)
-                }
-            }
-        }
-    }
-
-    private func pinToBottomInstantly() {
-        var transaction = Transaction()
-        transaction.disablesAnimations = true
-        withTransaction(transaction) {
-            scrollPosition.scrollTo(edge: .bottom)
-        }
-    }
-
-    private func armHistoryPrependAdjustment(
-        oldFirstID: String?,
-        newFirstID: String?
-    ) {
-        guard let oldFirstID,
-              let newFirstID,
-              oldFirstID != newFirstID,
-              scrollController.state == .browsing,
-              store.state.items.contains(where: { $0.id == oldFirstID }) else {
-            scratch.historyPrepend = nil
-            return
-        }
-        scratch.historyPrepend = HistoryPrependAdjustment(
-            offsetY: scratch.lastSample.offsetY,
-            contentHeight: scratch.lastSample.contentHeight,
-            remainingGeometryEvents: 4
-        )
-    }
-
-    private func consumeHistoryPrependAdjustment(
-        with sample: ConversationScrollGeometrySample
-    ) {
-        guard var adjustment = scratch.historyPrepend else { return }
-        let delta = sample.contentHeight - adjustment.contentHeight
-        if delta > 0.5 {
-            scratch.historyPrepend = nil
-            var transaction = Transaction()
-            transaction.disablesAnimations = true
-            withTransaction(transaction) {
-                scrollPosition.scrollTo(y: adjustment.offsetY + delta)
-            }
-        } else {
-            adjustment.remainingGeometryEvents -= 1
-            scratch.historyPrepend = adjustment.remainingGeometryEvents > 0
-                ? adjustment
-                : nil
         }
     }
 
@@ -559,6 +353,251 @@ struct ConversationView: View {
         }
     }
 
+}
+
+/// Owns every piece of scroll-tracking state for the transcript, isolated in
+/// its own view so scroll-driven invalidations (the ScrollPosition binding
+/// updates on every user scroll) re-evaluate only this thin container. The
+/// transcript content is passed in as a stored value, so its rows and their
+/// environment are untouched by scroll frames.
+private struct ConversationTranscriptScroller<Content: View>: View {
+    let isConversationEmpty: Bool
+    let firstItemID: String?
+    let isNearBottom: Bool
+    let unreadCount: Int
+    let itemExists: (String) -> Bool
+    let onNearBottomChange: (Bool) -> Void
+    let onJump: () -> Void
+    let content: Content
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var scrollController: ConversationScrollController
+    @State private var scrollPosition = ScrollPosition()
+    @State private var scratch = ConversationScrollScratch()
+
+    init(
+        isConversationEmpty: Bool,
+        firstItemID: String?,
+        isNearBottom: Bool,
+        unreadCount: Int,
+        itemExists: @escaping (String) -> Bool,
+        onNearBottomChange: @escaping (Bool) -> Void,
+        onJump: @escaping () -> Void,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.isConversationEmpty = isConversationEmpty
+        self.firstItemID = firstItemID
+        self.isNearBottom = isNearBottom
+        self.unreadCount = unreadCount
+        self.itemExists = itemExists
+        self.onNearBottomChange = onNearBottomChange
+        self.onJump = onJump
+        self.content = content()
+        _scrollController = State(
+            wrappedValue: ConversationScrollController(
+                startsAnchored: isConversationEmpty
+            )
+        )
+    }
+
+    var body: some View {
+        ScrollView {
+            content
+                #if os(macOS)
+                .background(
+                    ConversationWheelScrollObserver(
+                        onBegan: { handleUserScrollBegan() },
+                        onEnded: { handleWheelScrollEnded() }
+                    )
+                )
+                #endif
+        }
+        .scrollPosition($scrollPosition)
+        .defaultScrollAnchor(.bottom)
+        .defaultScrollAnchor(.top, for: .alignment)
+        .onScrollGeometryChange(for: ConversationScrollGeometrySample.self) { geometry in
+            let distanceFromBottom = geometry.contentSize.height
+                - geometry.visibleRect.maxY
+            return ConversationScrollGeometrySample(
+                isAtBottom: distanceFromBottom
+                    <= ConversationScrollController.atBottomTolerance,
+                isNearBottom: distanceFromBottom <= 180,
+                contentHeightBucket: Int((geometry.contentSize.height / 8).rounded())
+            )
+        } action: { _, sample in
+            handleGeometryChange(sample)
+        }
+        .onScrollPhaseChange { oldPhase, newPhase, context in
+            handleScrollPhaseChange(from: oldPhase, to: newPhase, context: context)
+        }
+        #if os(iOS)
+        .scrollDismissesKeyboard(.interactively)
+        #endif
+        .accessibilityIdentifier("conversation.transcript")
+        .accessibilityValue(scrollController.accessibilityValue)
+        .task(id: isAnchoringContent) {
+            // Failsafe: never leave the transcript hidden if geometry never
+            // confirms the bottom while anchoring.
+            guard isAnchoringContent else { return }
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled else { return }
+            scrollController.completeAnchor()
+        }
+        .onChange(of: isConversationEmpty) { wasEmpty, isEmpty in
+            if wasEmpty, !isEmpty {
+                execute(scrollController.contentLoaded())
+            }
+        }
+        .onChange(of: firstItemID) { oldValue, newValue in
+            preserveReadingPositionAfterPrepend(
+                oldFirstID: oldValue,
+                newFirstID: newValue
+            )
+        }
+        .overlay(alignment: .bottomTrailing) {
+            jumpToLatestOverlay
+        }
+        .overlay {
+            if isAnchoringContent {
+                // Curtain while freshly loaded content anchors at the latest
+                // item. Conditional so the settled transcript carries no
+                // extra hit-testing or compositing layer.
+                Color.chatCanvas
+                    .allowsHitTesting(false)
+            }
+        }
+    }
+
+    private var jumpToLatestOverlay: some View {
+        ZStack(alignment: .bottomTrailing) {
+            if !isNearBottom {
+                Button {
+                    onJump()
+                    execute(scrollController.jumpRequested())
+                } label: {
+                    Image(systemName: "arrow.down")
+                        .font(.caption.weight(.semibold))
+                        .frame(width: 28, height: 28)
+                        .background(.regularMaterial, in: Circle())
+                        .overlay {
+                            Circle()
+                                .strokeBorder(Color.secondary.opacity(0.16))
+                        }
+                        .frame(
+                            width: ChatInteractionTargetLayout.jumpButtonDimension,
+                            height: ChatInteractionTargetLayout.jumpButtonDimension
+                        )
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("conversation.jump-to-latest")
+                .padding(ChatInteractionTargetLayout.jumpButtonOuterPadding)
+                .accessibilityLabel(
+                    unreadCount > 0
+                        ? "\(unreadCount) new messages. Jump to latest"
+                        : "Jump to latest"
+                )
+                .accessibilityHint("Moves to the newest conversation update.")
+                .transition(.scale.combined(with: .opacity))
+            }
+        }
+        .animation(
+            reduceMotion ? nil : .easeInOut(duration: 0.16),
+            value: isNearBottom
+        )
+    }
+
+    private var isAnchoringContent: Bool {
+        scrollController.isAnchoring && !isConversationEmpty
+    }
+
+    private func handleGeometryChange(_ sample: ConversationScrollGeometrySample) {
+        scratch.lastSample = sample
+        if isNearBottom != sample.isNearBottom {
+            onNearBottomChange(sample.isNearBottom)
+        }
+        execute(scrollController.geometryChanged(isAtBottom: sample.isAtBottom))
+    }
+
+    private func handleScrollPhaseChange(
+        from oldPhase: ScrollPhase,
+        to newPhase: ScrollPhase,
+        context: ScrollPhaseChangeContext
+    ) {
+        let distance = context.geometry.contentSize.height
+            - context.geometry.visibleRect.maxY
+        switch newPhase {
+        case .tracking, .interacting, .decelerating:
+            handleUserScrollBegan()
+        case .idle:
+            if oldPhase == .animating {
+                execute(scrollController.animationEnded(distanceFromBottom: distance))
+            } else {
+                execute(scrollController.userScrollEnded(distanceFromBottom: distance))
+            }
+        case .animating:
+            break
+        @unknown default:
+            break
+        }
+    }
+
+    private func handleUserScrollBegan() {
+        scrollController.userScrollBegan()
+    }
+
+    private func handleWheelScrollEnded() {
+        scrollController.wheelScrollEnded(
+            isAtBottom: scratch.lastSample.isAtBottom
+        )
+    }
+
+    private func execute(_ command: ConversationPinCommand?) {
+        guard let command else { return }
+        switch command {
+        case .instant:
+            pinToBottomInstantly()
+        case .animatedSettle, .animatedJump:
+            if reduceMotion {
+                pinToBottomInstantly()
+            } else {
+                withAnimation(.easeOut(duration: 0.18)) {
+                    scrollPosition.scrollTo(edge: .bottom)
+                }
+            }
+        }
+    }
+
+    private func pinToBottomInstantly() {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            scrollPosition.scrollTo(edge: .bottom)
+        }
+    }
+
+    /// After a history page prepends above the viewport, keep the row the
+    /// user was reading in place by re-anchoring the previous first item to
+    /// the top. Only applies to real prepends while the user owns the
+    /// viewport; a memory trim changes the first ID without keeping the old
+    /// one, and stays untouched.
+    private func preserveReadingPositionAfterPrepend(
+        oldFirstID: String?,
+        newFirstID: String?
+    ) {
+        guard let oldFirstID,
+              let newFirstID,
+              oldFirstID != newFirstID,
+              scrollController.state == .browsing,
+              itemExists(oldFirstID) else {
+            return
+        }
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            scrollPosition.scrollTo(id: oldFirstID, anchor: .top)
+        }
+    }
 }
 
 #if os(macOS)

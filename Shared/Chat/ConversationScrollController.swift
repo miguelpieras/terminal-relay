@@ -16,11 +16,12 @@ enum ConversationPinCommand: Equatable {
 /// Single owner of the transcript's scroll intent.
 ///
 /// The system's `defaultScrollAnchor(.bottom)` is the first-line pinning
-/// mechanism; this controller is only the backstop. Its core invariant: it
-/// never emits a command while the viewport is measurably at the bottom, so
-/// the system anchor stays engaged, and it never emits a command while the
-/// user owns the viewport (`.browsing`) or while a programmatic animation is
-/// in flight (`.animating`).
+/// mechanism; this controller is only the backstop. Its core invariants: it
+/// never emits a command while the viewport is measurably at the bottom (so
+/// the system anchor stays engaged), never while the user owns the viewport
+/// (`.browsing`), and never while a programmatic animation is in flight
+/// (`.animating`). State writes are guarded so scroll-frequency inputs cannot
+/// invalidate the view when nothing changed.
 struct ConversationScrollController: Equatable {
     enum State: Equatable {
         /// Positioning freshly loaded content at the latest item.
@@ -36,7 +37,15 @@ struct ConversationScrollController: Equatable {
     static let atBottomTolerance: CGFloat = 8
     static let settleBand: CGFloat = 60
 
-    private(set) var state: State = .anchoring
+    private(set) var state: State
+
+    /// A transcript whose store already holds items positions correctly on
+    /// its first layout (rows parse synchronously and the system anchor
+    /// starts at the bottom), so it follows immediately with no anchoring
+    /// phase. Anchoring is only for content that loads in while visible.
+    init(startsAnchored: Bool = true) {
+        state = startsAnchored ? .anchoring : .following
+    }
 
     var isAnchoring: Bool { state == .anchoring }
 
@@ -44,17 +53,20 @@ struct ConversationScrollController: Equatable {
         state == .browsing ? "history" : "latest"
     }
 
-    /// Layout geometry changed (scrolling, content growth, resize).
-    mutating func geometryChanged(distanceFromBottom: CGFloat) -> ConversationPinCommand? {
+    /// Coarse layout change: the at-bottom flag crossed a boundary or the
+    /// content height moved. Never fires per scrolled frame.
+    mutating func geometryChanged(isAtBottom: Bool) -> ConversationPinCommand? {
         switch state {
         case .anchoring, .following:
-            if distanceFromBottom <= Self.atBottomTolerance {
-                state = .following
+            if isAtBottom {
+                if state != .following {
+                    state = .following
+                }
                 return nil
             }
             return .instant
         case .animating:
-            if distanceFromBottom <= Self.atBottomTolerance {
+            if isAtBottom {
                 state = .following
             }
             return nil
@@ -65,10 +77,12 @@ struct ConversationScrollController: Equatable {
 
     /// A user scroll gesture began; the user takes the viewport from any state.
     mutating func userScrollBegan() {
-        state = .browsing
+        if state != .browsing {
+            state = .browsing
+        }
     }
 
-    /// A user scroll gesture (including deceleration) came to rest.
+    /// A touch or trackpad gesture (including deceleration) came to rest.
     mutating func userScrollEnded(distanceFromBottom: CGFloat) -> ConversationPinCommand? {
         guard state == .browsing else { return nil }
         if distanceFromBottom <= Self.atBottomTolerance {
@@ -82,6 +96,14 @@ struct ConversationScrollController: Equatable {
         return nil
     }
 
+    /// A discrete-wheel scrolling burst went quiet. Wheel scrolling pauses
+    /// constantly mid-read, so this never emits a pull; it only re-engages
+    /// following when the wheel came to rest exactly at the bottom.
+    mutating func wheelScrollEnded(isAtBottom: Bool) {
+        guard state == .browsing, isAtBottom else { return }
+        state = .following
+    }
+
     /// The jump-to-latest control was activated.
     mutating func jumpRequested() -> ConversationPinCommand {
         state = .animating
@@ -91,7 +113,9 @@ struct ConversationScrollController: Equatable {
     /// A programmatic scroll animation finished.
     mutating func animationEnded(distanceFromBottom: CGFloat) -> ConversationPinCommand? {
         guard state == .animating else {
-            return geometryChanged(distanceFromBottom: distanceFromBottom)
+            return geometryChanged(
+                isAtBottom: distanceFromBottom <= Self.atBottomTolerance
+            )
         }
         state = .following
         if distanceFromBottom <= Self.atBottomTolerance {

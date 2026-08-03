@@ -1056,17 +1056,22 @@ struct ContentView: View {
             },
             onRefreshThreads: {
                 guard !ScreenshotDemoMode.isEnabled, let worker else { return }
-                async let active: WorkerThreadResponse? = workerSessionService.loadThreads(
+                // Cached rows are already visible; refresh the active catalog
+                // first and let the archived one follow without blocking.
+                await workerSessionService.loadThreads(
                     repositoryName: project.displayName,
                     archived: false,
-                    on: worker
+                    on: worker,
+                    skipIfFresh: true
                 )
-                async let archived: WorkerThreadResponse? = workerSessionService.loadThreads(
-                    repositoryName: project.displayName,
-                    archived: true,
-                    on: worker
-                )
-                _ = await (active, archived)
+                Task {
+                    await workerSessionService.loadThreads(
+                        repositoryName: project.displayName,
+                        archived: true,
+                        on: worker,
+                        skipIfFresh: true
+                    )
+                }
             },
             onCreateThread: {
                 guard let worker else { return }

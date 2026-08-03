@@ -62,9 +62,14 @@ final class WorkerSessionService: ObservableObject {
 
     private let runCommand: CommandRunner
     private let inspectsRuntimeOnRefresh: Bool
+    private let persistsThreadCatalogs: Bool
     private var refreshTasks: [UUID: Task<WorkerSessionResponse?, Never>] = [:]
     private var dismissedUpdateTimestamps: [UUID: Int] = [:]
     private var runtimeUpdateTasks: [UUID: Task<Void, Never>] = [:]
+    private var threadCatalogFetchTimes: [WorkerThreadCatalogKey: Date] = [:]
+
+    private static let threadCatalogStorageKey = "workerThreadCatalogs.v1"
+    private static let threadCatalogFreshness: TimeInterval = 30
 
     convenience init() {
         self.init(
@@ -79,21 +84,60 @@ final class WorkerSessionService: ObservableObject {
                     standardError: result.standardError
                 )
             },
-            inspectsRuntimeOnRefresh: true
+            inspectsRuntimeOnRefresh: true,
+            persistsThreadCatalogs: true
         )
     }
 
     init(runCommand: @escaping CommandRunner) {
         self.runCommand = runCommand
         inspectsRuntimeOnRefresh = false
+        persistsThreadCatalogs = false
     }
 
     init(
         runCommand: @escaping CommandRunner,
-        inspectsRuntimeOnRefresh: Bool
+        inspectsRuntimeOnRefresh: Bool,
+        persistsThreadCatalogs: Bool = false
     ) {
         self.runCommand = runCommand
         self.inspectsRuntimeOnRefresh = inspectsRuntimeOnRefresh
+        self.persistsThreadCatalogs = persistsThreadCatalogs
+        if persistsThreadCatalogs {
+            loadPersistedThreadCatalogs()
+        }
+    }
+
+    /// Cached catalog entries let the sidebar render a project's
+    /// conversations instantly on expansion; the SSH refresh then updates
+    /// them in the background.
+    private struct PersistedThreadCatalog: Codable {
+        let key: WorkerThreadCatalogKey
+        let response: WorkerThreadResponse
+    }
+
+    private func loadPersistedThreadCatalogs() {
+        guard let data = UserDefaults.standard.data(
+            forKey: Self.threadCatalogStorageKey
+        ),
+        let entries = try? JSONDecoder().decode(
+            [PersistedThreadCatalog].self,
+            from: data
+        ) else {
+            return
+        }
+        for entry in entries {
+            threadCatalogs[entry.key] = entry.response
+        }
+    }
+
+    private func persistThreadCatalogs() {
+        guard persistsThreadCatalogs else { return }
+        let entries = threadCatalogs.map {
+            PersistedThreadCatalog(key: $0.key, response: $0.value)
+        }
+        guard let data = try? JSONEncoder().encode(entries) else { return }
+        UserDefaults.standard.set(data, forKey: Self.threadCatalogStorageKey)
     }
 
     func response(for workerID: UUID) -> WorkerSessionResponse? {
@@ -533,8 +577,20 @@ final class WorkerSessionService: ObservableObject {
     func loadThreads(
         repositoryName: String,
         archived: Bool,
-        on worker: ServerProfile
+        on worker: ServerProfile,
+        skipIfFresh: Bool = false
     ) async -> WorkerThreadResponse? {
+        let catalogKey = WorkerThreadCatalogKey(
+            workerID: worker.id,
+            repositoryName: repositoryName,
+            archived: archived
+        )
+        if skipIfFresh,
+           let fetchedAt = threadCatalogFetchTimes[catalogKey],
+           Date().timeIntervalSince(fetchedAt) < Self.threadCatalogFreshness,
+           let cached = threadCatalogs[catalogKey] {
+            return cached
+        }
         guard requireCapability("threads-v2", worker: worker) else { return nil }
         guard WorkerSessionProtocol.isValidRepositoryName(repositoryName) else {
             errors[worker.id] = WorkerSessionServiceError.threadFailed.localizedDescription
@@ -593,13 +649,9 @@ final class WorkerSessionService: ObservableObject {
                     } ?? []
                 )
             }
-            threadCatalogs[
-                WorkerThreadCatalogKey(
-                    workerID: worker.id,
-                    repositoryName: repositoryName,
-                    archived: archived
-                )
-            ] = response
+            threadCatalogs[catalogKey] = response
+            threadCatalogFetchTimes[catalogKey] = Date()
+            persistThreadCatalogs()
             errors[worker.id] = nil
             return response
         } catch {

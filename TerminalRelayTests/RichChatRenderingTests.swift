@@ -18,33 +18,44 @@ final class RichChatRenderingTests: XCTestCase {
         XCTAssertEqual(controller.accessibilityValue, "latest")
 
         XCTAssertEqual(
-            controller.geometryChanged(distanceFromBottom: 400),
+            controller.geometryChanged(isAtBottom: false),
             .instant,
             "Anchoring must keep correcting while layout settles off-bottom."
         )
         XCTAssertEqual(
-            controller.geometryChanged(distanceFromBottom: 120),
+            controller.geometryChanged(isAtBottom: false),
             .instant,
-            "Corrections are level-triggered: every off-bottom geometry event corrects again."
+            "Corrections repeat for every off-bottom geometry change."
         )
-        XCTAssertNil(controller.geometryChanged(distanceFromBottom: 0))
+        XCTAssertNil(controller.geometryChanged(isAtBottom: true))
         XCTAssertFalse(controller.isAnchoring)
         XCTAssertEqual(controller.state, .following)
 
         XCTAssertNil(
-            controller.geometryChanged(distanceFromBottom: 2),
+            controller.geometryChanged(isAtBottom: true),
             "No scroll writes while measurably at the bottom, so the system anchor stays engaged."
         )
         XCTAssertEqual(
-            controller.geometryChanged(distanceFromBottom: 40),
+            controller.geometryChanged(isAtBottom: false),
             .instant,
             "Follow mode corrects drift while pinned."
         )
     }
 
+    func testScrollControllerStartsFollowingWhenContentAlreadyLoaded() {
+        var controller = ConversationScrollController(startsAnchored: false)
+        XCTAssertFalse(controller.isAnchoring)
+        XCTAssertEqual(
+            controller.state,
+            .following,
+            "A transcript restored with items positions on its first layout and must never hide behind an anchoring curtain."
+        )
+        XCTAssertNil(controller.geometryChanged(isAtBottom: true))
+    }
+
     func testScrollControllerGivesUsersTheViewportAndNeverStealsItBack() {
         var controller = ConversationScrollController()
-        _ = controller.geometryChanged(distanceFromBottom: 0)
+        _ = controller.geometryChanged(isAtBottom: true)
         XCTAssertEqual(controller.state, .following)
 
         controller.userScrollBegan()
@@ -52,10 +63,10 @@ final class RichChatRenderingTests: XCTestCase {
         XCTAssertEqual(controller.accessibilityValue, "history")
 
         XCTAssertNil(
-            controller.geometryChanged(distanceFromBottom: 900),
+            controller.geometryChanged(isAtBottom: false),
             "Browsing must emit nothing for any geometry input."
         )
-        XCTAssertNil(controller.geometryChanged(distanceFromBottom: 0))
+        XCTAssertNil(controller.geometryChanged(isAtBottom: true))
 
         XCTAssertNil(
             controller.userScrollEnded(distanceFromBottom: 500),
@@ -81,9 +92,29 @@ final class RichChatRenderingTests: XCTestCase {
         XCTAssertEqual(controller.state, .following)
     }
 
+    func testScrollControllerWheelPausesNeverPullTheViewport() {
+        var controller = ConversationScrollController()
+        _ = controller.geometryChanged(isAtBottom: true)
+
+        controller.userScrollBegan()
+        controller.wheelScrollEnded(isAtBottom: false)
+        XCTAssertEqual(
+            controller.state,
+            .browsing,
+            "A wheel pause near the bottom must not drag the user back down."
+        )
+
+        controller.wheelScrollEnded(isAtBottom: true)
+        XCTAssertEqual(
+            controller.state,
+            .following,
+            "Resting exactly at the bottom re-engages following silently."
+        )
+    }
+
     func testScrollControllerJumpSuppressesCorrectionsUntilTheAnimationEnds() {
         var controller = ConversationScrollController()
-        _ = controller.geometryChanged(distanceFromBottom: 0)
+        _ = controller.geometryChanged(isAtBottom: true)
         controller.userScrollBegan()
         _ = controller.userScrollEnded(distanceFromBottom: 700)
 
@@ -92,7 +123,7 @@ final class RichChatRenderingTests: XCTestCase {
         XCTAssertEqual(controller.accessibilityValue, "latest")
 
         XCTAssertNil(
-            controller.geometryChanged(distanceFromBottom: 320),
+            controller.geometryChanged(isAtBottom: false),
             "Mid-animation geometry must not stomp the eased scroll."
         )
 
@@ -114,14 +145,14 @@ final class RichChatRenderingTests: XCTestCase {
 
     func testScrollControllerSelfHealsWhenAnimationPhasesNeverReport() {
         var controller = ConversationScrollController()
-        _ = controller.geometryChanged(distanceFromBottom: 0)
+        _ = controller.geometryChanged(isAtBottom: true)
         controller.userScrollBegan()
         _ = controller.userScrollEnded(distanceFromBottom: 30)
         XCTAssertEqual(controller.state, .animating)
 
-        XCTAssertNil(controller.geometryChanged(distanceFromBottom: 12))
+        XCTAssertNil(controller.geometryChanged(isAtBottom: false))
         XCTAssertNil(
-            controller.geometryChanged(distanceFromBottom: 3),
+            controller.geometryChanged(isAtBottom: true),
             "Reaching the bottom completes the animation state without a phase callback."
         )
         XCTAssertEqual(controller.state, .following)
@@ -129,7 +160,7 @@ final class RichChatRenderingTests: XCTestCase {
 
     func testScrollControllerReanchorsWhenContentLoadsUnlessUserIsBrowsing() {
         var controller = ConversationScrollController()
-        _ = controller.geometryChanged(distanceFromBottom: 0)
+        _ = controller.geometryChanged(isAtBottom: true)
         XCTAssertEqual(controller.state, .following)
 
         XCTAssertEqual(
