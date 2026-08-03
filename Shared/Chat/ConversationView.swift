@@ -47,6 +47,8 @@ struct ConversationView: View {
 
     @Environment(\.openURL) private var openURL
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     #if os(iOS)
     @State private var escapeRouter = ComposerEscapeRouter()
     #endif
@@ -150,11 +152,35 @@ struct ConversationView: View {
         visibleItems.first?.id != store.state.items.first?.id
     }
 
+    /// Everything the hosted transcript content can visually depend on.
+    /// Publishes that leave this unchanged (near-bottom flips, unread
+    /// counters) never reach the hosted tree. Every store-state mutation is
+    /// covered: sequenced envelopes bump lastAppliedSequence, and the
+    /// unsequenced mutations (optimistic messages, trims, snapshot swaps)
+    /// all move the item count or boundary IDs.
+    private var transcriptContentRevision: Int {
+        var hasher = Hasher()
+        hasher.combine(store.lastAppliedSequence)
+        hasher.combine(store.state.items.count)
+        hasher.combine(store.state.items.first?.id)
+        hasher.combine(store.state.items.last?.id)
+        hasher.combine(firstVisibleItemID)
+        hasher.combine(store.expandedItemIDs)
+        hasher.combine(store.copiedItemID)
+        hasher.combine(store.isLoadingOlderHistory)
+        hasher.combine(store.state.hasOlderHistory)
+        hasher.combine(store.state.didTruncateHistory)
+        hasher.combine(colorScheme)
+        hasher.combine(dynamicTypeSize)
+        return hasher.finalize()
+    }
+
     private var transcript: some View {
         let visibleItems = self.visibleItems
         return ConversationTranscriptScroller(
             isConversationEmpty: store.state.items.isEmpty,
             firstItemID: visibleItems.first?.id,
+            contentRevision: transcriptContentRevision,
             isNearBottom: store.isNearBottom,
             unreadCount: store.unreadCount,
             itemExists: { id in
@@ -445,6 +471,7 @@ struct ConversationView: View {
 private struct ConversationTranscriptScroller<Content: View>: View {
     let isConversationEmpty: Bool
     let firstItemID: String?
+    let contentRevision: Int
     let isNearBottom: Bool
     let unreadCount: Int
     let itemExists: (String) -> Bool
@@ -462,6 +489,7 @@ private struct ConversationTranscriptScroller<Content: View>: View {
     init(
         isConversationEmpty: Bool,
         firstItemID: String?,
+        contentRevision: Int,
         isNearBottom: Bool,
         unreadCount: Int,
         itemExists: @escaping (String) -> Bool,
@@ -471,6 +499,7 @@ private struct ConversationTranscriptScroller<Content: View>: View {
     ) {
         self.isConversationEmpty = isConversationEmpty
         self.firstItemID = firstItemID
+        self.contentRevision = contentRevision
         self.isNearBottom = isNearBottom
         self.unreadCount = unreadCount
         self.itemExists = itemExists
@@ -510,6 +539,7 @@ private struct ConversationTranscriptScroller<Content: View>: View {
             content: content,
             isConversationEmpty: isConversationEmpty,
             firstItemID: firstItemID,
+            contentRevision: contentRevision,
             reduceMotion: reduceMotion,
             handle: macHandle,
             onNearBottomChange: onNearBottomChange
@@ -738,6 +768,19 @@ private final class ConversationDocumentView: NSView {
     override var isFlipped: Bool { true }
 }
 
+/// Reports SwiftUI content-size invalidations so the coordinator can resize
+/// the document by frame. The scroll subtree carries no Auto Layout
+/// constraints at all: constraints anchored to a clip view are dirtied by
+/// every scrolled frame and drag the whole window through layout passes.
+private final class TranscriptHostingView: NSHostingView<AnyView> {
+    var onContentSizeInvalidated: (() -> Void)?
+
+    override func invalidateIntrinsicContentSize() {
+        super.invalidateIntrinsicContentSize()
+        onContentSizeInvalidated?()
+    }
+}
+
 @MainActor
 private final class MacScrollCommandHandle {
     var performJump: (() -> Void)?
@@ -757,6 +800,7 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
     let content: Content
     let isConversationEmpty: Bool
     let firstItemID: String?
+    let contentRevision: Int
     let reduceMotion: Bool
     let handle: MacScrollCommandHandle
     let onNearBottomChange: (Bool) -> Void
@@ -771,26 +815,16 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
+        // The transcript reads anchored, not springy: no rubber-band bounce
+        // at the content edges.
+        scrollView.verticalScrollElasticity = .none
 
-        let hosting = NSHostingView(rootView: AnyView(EmptyView()))
-        hosting.translatesAutoresizingMaskIntoConstraints = false
+        let hosting = TranscriptHostingView(rootView: AnyView(EmptyView()))
         hosting.sizingOptions = .intrinsicContentSize
 
         let document = ConversationDocumentView()
-        document.translatesAutoresizingMaskIntoConstraints = false
         document.addSubview(hosting)
         scrollView.documentView = document
-
-        let clipView = scrollView.contentView
-        NSLayoutConstraint.activate([
-            hosting.leadingAnchor.constraint(equalTo: document.leadingAnchor),
-            hosting.topAnchor.constraint(equalTo: document.topAnchor),
-            hosting.bottomAnchor.constraint(equalTo: document.bottomAnchor),
-            document.leadingAnchor.constraint(equalTo: clipView.leadingAnchor),
-            document.trailingAnchor.constraint(equalTo: clipView.trailingAnchor),
-            document.topAnchor.constraint(equalTo: clipView.topAnchor),
-            document.widthAnchor.constraint(equalTo: clipView.widthAnchor),
-        ])
 
         context.coordinator.attach(
             scrollView: scrollView,
@@ -809,7 +843,8 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
             onNearBottomChange: onNearBottomChange
         )
         context.coordinator.applyContent(
-            AnyView(content.environment(\.self, context.environment))
+            AnyView(content.environment(\.self, context.environment)),
+            revision: contentRevision
         )
     }
 
@@ -821,7 +856,7 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
     final class Coordinator {
         private weak var scrollView: NSScrollView?
         private weak var document: ConversationDocumentView?
-        private weak var hosting: NSHostingView<AnyView>?
+        private weak var hosting: TranscriptHostingView?
         private var observers: [NSObjectProtocol] = []
 
         private var reduceMotion = false
@@ -839,11 +874,14 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
         func attach(
             scrollView: NSScrollView,
             document: ConversationDocumentView,
-            hosting: NSHostingView<AnyView>
+            hosting: TranscriptHostingView
         ) {
             self.scrollView = scrollView
             self.document = document
             self.hosting = hosting
+            hosting.onContentSizeInvalidated = { [weak self] in
+                self?.scheduleDocumentResize()
+            }
 
             let clipView = scrollView.contentView
             clipView.postsBoundsChangedNotifications = true
@@ -915,8 +953,15 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
 
         private var pendingContent: AnyView?
         private var lastLayoutWidth: CGFloat = 0
+        private var lastContentRevision: Int?
 
-        func applyContent(_ content: AnyView) {
+        /// Reassigning the hosted root view forces SwiftUI to diff the whole
+        /// transcript — a visible hitch mid-scroll. Publishes that cannot
+        /// have changed the content (near-bottom flips, unread counters)
+        /// keep the same revision and never touch the hosted tree.
+        func applyContent(_ content: AnyView, revision: Int) {
+            guard revision != lastContentRevision else { return }
+            lastContentRevision = revision
             pendingContent = content
             applyRootView()
         }
@@ -933,14 +978,55 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
             hosting.rootView = AnyView(
                 pendingContent.frame(width: width, alignment: .topLeading)
             )
+            debouncedResizeTask?.cancel()
+            resizeDocumentToFitContent()
             if hasContent, !didInitialAnchor {
                 // Open anchor: one deterministic scroll to the latest item,
                 // before this pass draws.
-                scrollView.layoutSubtreeIfNeeded()
                 pinToBottom()
                 wasAtBottom = true
                 didInitialAnchor = true
                 conversationScrollLogger.debug("Anchored at latest")
+            }
+        }
+
+        // MARK: Manual document sizing (no Auto Layout in the scroll subtree)
+
+        private var debouncedResizeTask: Task<Void, Never>?
+
+        /// Intrinsic-size invalidations also fire during scroll-driven
+        /// hosting re-renders, and honoring each one with a fittingSize pass
+        /// would put a full SwiftUI layout evaluation on every scrolled
+        /// frame. Content updates and width changes resize immediately; the
+        /// invalidation hook only arms a debounced safety net for content
+        /// that settles late (async images, tables).
+        func scheduleDocumentResize() {
+            debouncedResizeTask?.cancel()
+            debouncedResizeTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(200))
+                guard !Task.isCancelled else { return }
+                self?.resizeDocumentToFitContent()
+            }
+        }
+
+        private func resizeDocumentToFitContent() {
+            guard let hosting, let document, let scrollView else { return }
+            let width = scrollView.contentView.bounds.width
+            guard width > 0 else { return }
+            let height = hosting.fittingSize.height
+            let size = NSSize(width: width, height: max(height, 0))
+            guard hosting.frame.size != size || document.frame.size != size else {
+                return
+            }
+            conversationScrollLogger.debug(
+                "Document resized to height \(Int(size.height), privacy: .public)"
+            )
+            if hosting.frame.size != size {
+                hosting.frame = NSRect(origin: .zero, size: size)
+            }
+            if document.frame.size != size {
+                // Posts frameDidChange, which drives follow/prepend one-shots.
+                document.setFrameSize(size)
             }
         }
 
@@ -1413,23 +1499,35 @@ private struct DiffTextView: View {
     }
 
     var body: some View {
+        // On macOS diff lines wrap rather than nesting a live NSScrollView
+        // per diff card inside the transcript.
+        #if os(macOS)
+        diffLines
+            .background(Color.secondary.opacity(0.05))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        #else
         ScrollView(.horizontal) {
-            VStack(alignment: .leading, spacing: 0) {
-                ForEach(lines) { line in
-                    Text(verbatim: line.text)
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(lineColor(line.kind))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 1)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(lineBackground(line.kind))
-                }
-            }
-            .fixedSize(horizontal: true, vertical: false)
-            .textSelection(.enabled)
+            diffLines
+                .fixedSize(horizontal: true, vertical: false)
         }
         .background(Color.secondary.opacity(0.05))
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        #endif
+    }
+
+    private var diffLines: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(lines) { line in
+                Text(verbatim: line.text)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(lineColor(line.kind))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 1)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(lineBackground(line.kind))
+            }
+        }
+        .textSelection(.enabled)
     }
 
     private func lineColor(_ kind: Line.Kind) -> Color {

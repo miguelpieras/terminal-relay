@@ -849,6 +849,21 @@ struct CodeBlockView: View {
 
             Divider()
 
+            // On macOS long lines wrap: a scroll view per code block means a
+            // live NSScrollView per block, each maintaining tracking areas on
+            // every scrolled frame and competing for wheel events.
+            #if os(macOS)
+            HighlightedCodeText(
+                code: code,
+                language: language,
+                usesHighlighting: !isStreaming
+            )
+            .font(.system(.callout, design: .monospaced))
+            .lineSpacing(3)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+            #else
             ScrollView(.horizontal) {
                 HighlightedCodeText(
                     code: code,
@@ -862,6 +877,7 @@ struct CodeBlockView: View {
                 .padding(12)
             }
             .scrollIndicators(.visible)
+            #endif
         }
         .background(Color.secondary.opacity(0.065))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
