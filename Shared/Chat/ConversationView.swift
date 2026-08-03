@@ -1,5 +1,14 @@
 import Foundation
+import OSLog
 import SwiftUI
+
+/// Sanitized scroll diagnostics: state names and pin commands only, logged on
+/// transitions rather than per frame. `log stream --predicate 'subsystem ==
+/// "com.mpieras.TerminalRelay"'` shows them under `conversation-scroll`.
+let conversationScrollLogger = Logger(
+    subsystem: "com.mpieras.TerminalRelay",
+    category: "conversation-scroll"
+)
 
 #if os(macOS)
 import AppKit
@@ -119,22 +128,45 @@ struct ConversationView: View {
         }
     }
 
+    /// The transcript renders eagerly (no lazy estimation) so every row has
+    /// its exact height from the first frame: the scrollbar is stable and
+    /// scrolling never stutters on row materialization. The window bounds the
+    /// eager cost for very long histories; revealing more keeps rows in the
+    /// same container so their identity and state are preserved.
+    private static let transcriptWindowStep = 150
+
+    @State private var firstVisibleItemID: String?
+
+    private var visibleItems: ArraySlice<ConversationItem> {
+        let items = store.state.items
+        if let firstVisibleItemID,
+           let index = items.firstIndex(where: { $0.id == firstVisibleItemID }) {
+            return items[index...]
+        }
+        return items.suffix(Self.transcriptWindowStep)
+    }
+
+    private var hasHiddenLocalItems: Bool {
+        visibleItems.first?.id != store.state.items.first?.id
+    }
+
     private var transcript: some View {
-        ConversationTranscriptScroller(
+        let visibleItems = self.visibleItems
+        return ConversationTranscriptScroller(
             isConversationEmpty: store.state.items.isEmpty,
-            firstItemID: store.state.items.first?.id,
+            firstItemID: visibleItems.first?.id,
             isNearBottom: store.isNearBottom,
             unreadCount: store.unreadCount,
             itemExists: { id in
-                store.state.items.contains(where: { $0.id == id })
+                visibleItems.contains(where: { $0.id == id })
             },
             onNearBottomChange: { store.setNearBottom($0) },
             onJump: { store.jumpToLatest() }
         ) {
-            LazyVStack(alignment: .leading, spacing: 14) {
-                historyControl
+            VStack(alignment: .leading, spacing: 14) {
+                earlierContent
 
-                ForEach(store.state.items) { item in
+                ForEach(visibleItems) { item in
                     timelineView(for: item)
                         .id(item.id)
                         .accessibilityIdentifier("conversation.item.\(item.id)")
@@ -168,6 +200,18 @@ struct ConversationView: View {
             .frame(maxWidth: .infinity)
         }
         .environment(\.chatRowActions, rowActions)
+        .onChange(of: store.state.items.first?.id) { oldValue, newValue in
+            let items = store.state.items
+            if let oldValue, items.contains(where: { $0.id == oldValue }) {
+                // A history page prepended: reveal it. Prepends only happen
+                // when the user asked for earlier content.
+                firstVisibleItemID = newValue
+            } else if let firstVisibleItemID,
+                      !items.contains(where: { $0.id == firstVisibleItemID }) {
+                // The window anchor was trimmed away; fall back to the tail.
+                self.firstVisibleItemID = nil
+            }
+        }
         .overlay {
             if isConversationEmpty {
                 emptyConversation
@@ -176,6 +220,44 @@ struct ConversationView: View {
                     .allowsHitTesting(false)
             }
         }
+    }
+
+    /// One control at the top of the transcript: reveal older already-loaded
+    /// rows first, and only once everything local is visible offer the
+    /// worker-side "Load earlier" page.
+    @ViewBuilder
+    private var earlierContent: some View {
+        if hasHiddenLocalItems {
+            HStack {
+                Spacer()
+                Button("Show earlier messages") {
+                    revealEarlierItems()
+                }
+                .buttonStyle(.plain)
+                .chatMinimumInteractionTarget()
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .controlSize(.small)
+                .accessibilityHint("Shows earlier loaded messages without moving your reading position.")
+                Spacer()
+            }
+            .id("history:\(visibleItems.first?.id ?? "window")")
+        } else {
+            historyControl
+        }
+    }
+
+    private func revealEarlierItems() {
+        let items = store.state.items
+        guard let currentFirstID = visibleItems.first?.id,
+              let currentIndex = items.firstIndex(where: { $0.id == currentFirstID }) else {
+            return
+        }
+        let newIndex = max(
+            items.startIndex,
+            currentIndex - Self.transcriptWindowStep
+        )
+        firstVisibleItemID = items[newIndex].id
     }
 
     @ViewBuilder
@@ -371,9 +453,11 @@ private struct ConversationTranscriptScroller<Content: View>: View {
     let content: Content
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    #if os(iOS)
     @State private var scrollController: ConversationScrollController
     @State private var scrollPosition = ScrollPosition()
     @State private var scratch = ConversationScrollScratch()
+    #endif
 
     init(
         isConversationEmpty: Bool,
@@ -393,24 +477,68 @@ private struct ConversationTranscriptScroller<Content: View>: View {
         self.onNearBottomChange = onNearBottomChange
         self.onJump = onJump
         self.content = content()
+        #if os(iOS)
         _scrollController = State(
             wrappedValue: ConversationScrollController(
                 startsAnchored: isConversationEmpty
             )
         )
+        #endif
     }
 
+    #if os(macOS)
+    @State private var macScrollState: ConversationScrollController.State = .following
+    @State private var macHandle = MacScrollCommandHandle()
+    #endif
+
     var body: some View {
+        #if os(macOS)
+        macBody
+        #else
+        iosBody
+        #endif
+    }
+
+    #if os(macOS)
+    /// On macOS the transcript scrolls inside an AppKit NSScrollView hosting
+    /// the SwiftUI content as its document. A user scroll is then a plain
+    /// clip-view bounds change: no SwiftUI graph transactions, no root
+    /// layout passes, no dropped frames. Profiling showed the SwiftUI
+    /// ScrollView path re-entered app-level layout on every scrolled frame.
+    private var macBody: some View {
+        MacConversationScrollView(
+            content: content,
+            isConversationEmpty: isConversationEmpty,
+            firstItemID: firstItemID,
+            reduceMotion: reduceMotion,
+            handle: macHandle,
+            onNearBottomChange: onNearBottomChange
+        )
+        .accessibilityIdentifier("conversation.transcript")
+        .accessibilityValue(isNearBottom ? "latest" : "history")
+        .overlay(alignment: .bottomTrailing) {
+            macJumpToLatestOverlay
+        }
+    }
+
+    private var macJumpToLatestOverlay: some View {
+        ZStack(alignment: .bottomTrailing) {
+            if !isNearBottom {
+                jumpButton {
+                    onJump()
+                    macHandle.performJump?()
+                }
+            }
+        }
+        .animation(
+            reduceMotion ? nil : .easeInOut(duration: 0.16),
+            value: isNearBottom
+        )
+    }
+    #else
+    private var iosBody: some View {
         ScrollView {
             content
-                #if os(macOS)
-                .background(
-                    ConversationWheelScrollObserver(
-                        onBegan: { handleUserScrollBegan() },
-                        onEnded: { handleWheelScrollEnded() }
-                    )
-                )
-                #endif
         }
         .scrollPosition($scrollPosition)
         .defaultScrollAnchor(.bottom)
@@ -430,9 +558,7 @@ private struct ConversationTranscriptScroller<Content: View>: View {
         .onScrollPhaseChange { oldPhase, newPhase, context in
             handleScrollPhaseChange(from: oldPhase, to: newPhase, context: context)
         }
-        #if os(iOS)
         .scrollDismissesKeyboard(.interactively)
-        #endif
         .accessibilityIdentifier("conversation.transcript")
         .accessibilityValue(scrollController.accessibilityValue)
         .task(id: isAnchoringContent) {
@@ -467,38 +593,45 @@ private struct ConversationTranscriptScroller<Content: View>: View {
             }
         }
     }
+    #endif
 
+    @ViewBuilder
+    private func jumpButton(action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: "arrow.down")
+                .font(.caption.weight(.semibold))
+                .frame(width: 28, height: 28)
+                .background(.regularMaterial, in: Circle())
+                .overlay {
+                    Circle()
+                        .strokeBorder(Color.secondary.opacity(0.16))
+                }
+                .frame(
+                    width: ChatInteractionTargetLayout.jumpButtonDimension,
+                    height: ChatInteractionTargetLayout.jumpButtonDimension
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("conversation.jump-to-latest")
+        .padding(ChatInteractionTargetLayout.jumpButtonOuterPadding)
+        .accessibilityLabel(
+            unreadCount > 0
+                ? "\(unreadCount) new messages. Jump to latest"
+                : "Jump to latest"
+        )
+        .accessibilityHint("Moves to the newest conversation update.")
+        .transition(.scale.combined(with: .opacity))
+    }
+
+    #if os(iOS)
     private var jumpToLatestOverlay: some View {
         ZStack(alignment: .bottomTrailing) {
             if !isNearBottom {
-                Button {
+                jumpButton {
                     onJump()
                     execute(scrollController.jumpRequested())
-                } label: {
-                    Image(systemName: "arrow.down")
-                        .font(.caption.weight(.semibold))
-                        .frame(width: 28, height: 28)
-                        .background(.regularMaterial, in: Circle())
-                        .overlay {
-                            Circle()
-                                .strokeBorder(Color.secondary.opacity(0.16))
-                        }
-                        .frame(
-                            width: ChatInteractionTargetLayout.jumpButtonDimension,
-                            height: ChatInteractionTargetLayout.jumpButtonDimension
-                        )
-                        .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("conversation.jump-to-latest")
-                .padding(ChatInteractionTargetLayout.jumpButtonOuterPadding)
-                .accessibilityLabel(
-                    unreadCount > 0
-                        ? "\(unreadCount) new messages. Jump to latest"
-                        : "Jump to latest"
-                )
-                .accessibilityHint("Moves to the newest conversation update.")
-                .transition(.scale.combined(with: .opacity))
             }
         }
         .animation(
@@ -528,7 +661,7 @@ private struct ConversationTranscriptScroller<Content: View>: View {
             - context.geometry.visibleRect.maxY
         switch newPhase {
         case .tracking, .interacting, .decelerating:
-            handleUserScrollBegan()
+            scrollController.userScrollBegan()
         case .idle:
             if oldPhase == .animating {
                 execute(scrollController.animationEnded(distanceFromBottom: distance))
@@ -542,18 +675,11 @@ private struct ConversationTranscriptScroller<Content: View>: View {
         }
     }
 
-    private func handleUserScrollBegan() {
-        scrollController.userScrollBegan()
-    }
-
-    private func handleWheelScrollEnded() {
-        scrollController.wheelScrollEnded(
-            isAtBottom: scratch.lastSample.isAtBottom
-        )
-    }
-
     private func execute(_ command: ConversationPinCommand?) {
         guard let command else { return }
+        conversationScrollLogger.debug(
+            "Pin \(String(describing: command), privacy: .public) in state \(String(describing: scrollController.state), privacy: .public)"
+        )
         switch command {
         case .instant:
             pinToBottomInstantly()
@@ -592,125 +718,359 @@ private struct ConversationTranscriptScroller<Content: View>: View {
               itemExists(oldFirstID) else {
             return
         }
+        conversationScrollLogger.debug("Prepend position preserved")
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
             scrollPosition.scrollTo(id: oldFirstID, anchor: .top)
         }
     }
+    #endif
 }
 
 #if os(macOS)
-/// Detects user wheel/trackpad scrolling from AppKit events. SwiftUI's
-/// onScrollPhaseChange is not guaranteed to report phases for discrete
-/// mouse-wheel input on macOS, and a wheel scroll that goes unnoticed would
-/// let follow mode drag the user straight back to the bottom. Idempotent
-/// alongside the phase callback.
-private struct ConversationWheelScrollObserver: NSViewRepresentable {
-    let onBegan: () -> Void
-    let onEnded: () -> Void
+/// Bridges jump-to-latest and the anchoring failsafe from SwiftUI overlays
+/// into the AppKit scroll coordinator. Reference-stable; never invalidates.
+/// NSScrollView documents lay out top-down; NSHostingView cannot be flipped
+/// directly, so a flipped plain container holds it and keeps document math in
+/// top-left coordinates.
+private final class ConversationDocumentView: NSView {
+    override var isFlipped: Bool { true }
+}
+
+@MainActor
+private final class MacScrollCommandHandle {
+    var performJump: (() -> Void)?
+}
+
+/// AppKit-backed transcript scroller. The SwiftUI content is the document of
+/// a plain NSScrollView, so user scrolling is a clip-view bounds change that
+/// never enters the SwiftUI graph.
+///
+/// VIEWPORT SOVEREIGNTY, BY CONSTRUCTION: no observer of clip-view bounds may
+/// ever scroll. The app moves the viewport at exactly four one-shot sites —
+/// the open anchor, the jump button, a follow pin when content grows while
+/// the viewport was already at the bottom, and pixel-exact prepend
+/// compensation. There is no state machine, no wheel monitor, no timer, and
+/// no level-triggered correction: nothing exists that can fight the user.
+private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
+    let content: Content
+    let isConversationEmpty: Bool
+    let firstItemID: String?
+    let reduceMotion: Bool
+    let handle: MacScrollCommandHandle
+    let onNearBottomChange: (Bool) -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onBegan: onBegan, onEnded: onEnded)
+        Coordinator()
     }
 
-    func makeNSView(context: Context) -> LocatorView {
-        let view = LocatorView()
-        view.coordinator = context.coordinator
-        return view
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = false
+
+        let hosting = NSHostingView(rootView: AnyView(EmptyView()))
+        hosting.translatesAutoresizingMaskIntoConstraints = false
+        hosting.sizingOptions = .intrinsicContentSize
+
+        let document = ConversationDocumentView()
+        document.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(hosting)
+        scrollView.documentView = document
+
+        let clipView = scrollView.contentView
+        NSLayoutConstraint.activate([
+            hosting.leadingAnchor.constraint(equalTo: document.leadingAnchor),
+            hosting.topAnchor.constraint(equalTo: document.topAnchor),
+            hosting.bottomAnchor.constraint(equalTo: document.bottomAnchor),
+            document.leadingAnchor.constraint(equalTo: clipView.leadingAnchor),
+            document.trailingAnchor.constraint(equalTo: clipView.trailingAnchor),
+            document.topAnchor.constraint(equalTo: clipView.topAnchor),
+            document.widthAnchor.constraint(equalTo: clipView.widthAnchor),
+        ])
+
+        context.coordinator.attach(
+            scrollView: scrollView,
+            document: document,
+            hosting: hosting
+        )
+        return scrollView
     }
 
-    func updateNSView(_ nsView: LocatorView, context: Context) {
-        context.coordinator.onBegan = onBegan
-        context.coordinator.onEnded = onEnded
-        context.coordinator.attach(from: nsView)
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        context.coordinator.configure(
+            isConversationEmpty: isConversationEmpty,
+            firstItemID: firstItemID,
+            reduceMotion: reduceMotion,
+            handle: handle,
+            onNearBottomChange: onNearBottomChange
+        )
+        context.coordinator.applyContent(
+            AnyView(content.environment(\.self, context.environment))
+        )
     }
 
-    static func dismantleNSView(_ nsView: LocatorView, coordinator: Coordinator) {
+    static func dismantleNSView(_ nsView: NSScrollView, coordinator: Coordinator) {
         coordinator.detach()
-    }
-
-    final class LocatorView: NSView {
-        weak var coordinator: Coordinator?
-
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                coordinator?.attach(from: self)
-            }
-        }
-
-        override func hitTest(_ point: NSPoint) -> NSView? {
-            nil
-        }
     }
 
     @MainActor
     final class Coordinator {
-        var onBegan: () -> Void
-        var onEnded: () -> Void
         private weak var scrollView: NSScrollView?
-        private var eventMonitor: Any?
-        private var endTask: Task<Void, Never>?
-        private var isActive = false
+        private weak var document: ConversationDocumentView?
+        private weak var hosting: NSHostingView<AnyView>?
+        private var observers: [NSObjectProtocol] = []
 
-        init(onBegan: @escaping () -> Void, onEnded: @escaping () -> Void) {
-            self.onBegan = onBegan
-            self.onEnded = onEnded
-        }
+        private var reduceMotion = false
+        private var onNearBottomChange: (Bool) -> Void = { _ in }
 
-        func attach(from view: NSView) {
-            guard scrollView == nil else { return }
-            var ancestor = view.superview
-            while let current = ancestor {
-                if let scrollView = current as? NSScrollView {
-                    attach(to: scrollView)
-                    return
-                }
-                ancestor = current.superview
-            }
-        }
+        private var lastNearBottom = true
+        private var lastDocumentHeight: CGFloat = 0
+        private var lastFirstItemID: String?
+        private var pendingPrependBaseHeight: CGFloat?
+        private var wasAtBottom = true
+        private var didInitialAnchor = false
+        private var hasContent = false
+        private var isAnimatingJump = false
 
-        private func attach(to scrollView: NSScrollView) {
+        func attach(
+            scrollView: NSScrollView,
+            document: ConversationDocumentView,
+            hosting: NSHostingView<AnyView>
+        ) {
             self.scrollView = scrollView
-            eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) {
-                [weak self, weak scrollView] event in
-                guard let self,
-                      let scrollView,
-                      event.window === scrollView.window else {
-                    return event
-                }
-                let location = scrollView.convert(event.locationInWindow, from: nil)
-                guard scrollView.bounds.contains(location) else { return event }
-                recordActivity()
-                return event
-            }
+            self.document = document
+            self.hosting = hosting
+
+            let clipView = scrollView.contentView
+            clipView.postsBoundsChangedNotifications = true
+            document.postsFrameChangedNotifications = true
+
+            let center = NotificationCenter.default
+            observers = [
+                center.addObserver(
+                    forName: NSView.boundsDidChangeNotification,
+                    object: clipView,
+                    queue: .main
+                ) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        self?.handleScrolled()
+                    }
+                },
+                center.addObserver(
+                    forName: NSView.frameDidChangeNotification,
+                    object: document,
+                    queue: .main
+                ) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        self?.handleContentSizeChanged()
+                    }
+                },
+            ]
         }
 
         func detach() {
-            endTask?.cancel()
-            endTask = nil
-            if let eventMonitor {
-                NSEvent.removeMonitor(eventMonitor)
+            for observer in observers {
+                NotificationCenter.default.removeObserver(observer)
             }
-            eventMonitor = nil
+            observers = []
             scrollView = nil
-            isActive = false
+            document = nil
+            hosting = nil
         }
 
-        private func recordActivity() {
-            if !isActive {
-                isActive = true
-                onBegan()
+        func configure(
+            isConversationEmpty: Bool,
+            firstItemID: String?,
+            reduceMotion: Bool,
+            handle: MacScrollCommandHandle,
+            onNearBottomChange: @escaping (Bool) -> Void
+        ) {
+            self.reduceMotion = reduceMotion
+            self.onNearBottomChange = onNearBottomChange
+            handle.performJump = { [weak self] in
+                self?.jumpToLatest()
             }
-            endTask?.cancel()
-            endTask = Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .milliseconds(150))
-                guard !Task.isCancelled, let self else { return }
-                isActive = false
-                onEnded()
+
+            hasContent = !isConversationEmpty
+            if isConversationEmpty {
+                // Conversation swapped or reset: the next content anchors anew.
+                didInitialAnchor = false
             }
+
+            if firstItemID != lastFirstItemID {
+                if lastFirstItemID != nil, firstItemID != nil, !wasAtBottom {
+                    // A history page is about to prepend above the viewport;
+                    // compensate when its height lands.
+                    pendingPrependBaseHeight = lastDocumentHeight
+                }
+                lastFirstItemID = firstItemID
+            }
+        }
+
+        // MARK: Content
+
+        private var pendingContent: AnyView?
+        private var lastLayoutWidth: CGFloat = 0
+
+        func applyContent(_ content: AnyView) {
+            pendingContent = content
+            applyRootView()
+        }
+
+        /// NSHostingView's intrinsic size is SwiftUI's ideal size, which for
+        /// a text transcript is wide and short. The content therefore
+        /// carries an explicit width matching the viewport, so the intrinsic
+        /// height the document is sized with is the real height-for-width.
+        private func applyRootView() {
+            guard let hosting, let scrollView, let pendingContent else { return }
+            let width = scrollView.contentView.bounds.width
+            guard width > 0 else { return }
+            lastLayoutWidth = width
+            hosting.rootView = AnyView(
+                pendingContent.frame(width: width, alignment: .topLeading)
+            )
+            if hasContent, !didInitialAnchor {
+                // Open anchor: one deterministic scroll to the latest item,
+                // before this pass draws.
+                scrollView.layoutSubtreeIfNeeded()
+                pinToBottom()
+                wasAtBottom = true
+                didInitialAnchor = true
+                conversationScrollLogger.debug("Anchored at latest")
+            }
+        }
+
+        // MARK: Geometry
+
+        /// The scroll view is the authority on how far down the user can
+        /// actually scroll: content insets (full-size content windows place
+        /// the toolbar over the scroll view) make raw height-minus-viewport
+        /// arithmetic land short of the enforced bottom. One authority
+        /// serves the pin target, the at-bottom sample, and the
+        /// near-bottom threshold.
+        private var maximumScrollOriginY: CGFloat {
+            guard let scrollView, let document else { return 0 }
+            let clipView = scrollView.contentView
+            let proposed = NSRect(
+                origin: NSPoint(
+                    x: clipView.bounds.origin.x,
+                    y: document.frame.height
+                ),
+                size: clipView.bounds.size
+            )
+            return clipView.constrainBoundsRect(proposed).origin.y
+        }
+
+        private var distanceFromBottom: CGFloat {
+            guard let scrollView else { return 0 }
+            return maximumScrollOriginY - scrollView.contentView.bounds.origin.y
+        }
+
+        /// Pure sampling; may never scroll. Safe under synchronous re-entry
+        /// from a pin.
+        private func resample() {
+            let distance = distanceFromBottom
+            wasAtBottom = distance <= ConversationScrollController.atBottomTolerance
+            let nearBottom = distance <= 180
+            if nearBottom != lastNearBottom {
+                lastNearBottom = nearBottom
+                onNearBottomChange(nearBottom)
+            }
+        }
+
+        // MARK: Observers (scroll-free by construction)
+
+        private func handleScrolled() {
+            if let scrollView,
+               abs(scrollView.contentView.bounds.width - lastLayoutWidth) > 0.5 {
+                applyRootView()
+            }
+            resample()
+        }
+
+        private func handleContentSizeChanged() {
+            guard let document else { return }
+            let height = document.frame.height
+            guard height != lastDocumentHeight else { return }
+            lastDocumentHeight = height
+
+            if let baseHeight = pendingPrependBaseHeight {
+                pendingPrependBaseHeight = nil
+                let delta = height - baseHeight
+                if delta > 0 {
+                    conversationScrollLogger.debug("Prepend position preserved")
+                    scrollBy(delta)
+                }
+                resample()
+                return
+            }
+
+            // Follow streaming: decided once per content event from the
+            // geometry sampled BEFORE this height change. If the user has
+            // scrolled up even one wheel notch, that notch already flipped
+            // wasAtBottom false and nothing here moves.
+            if wasAtBottom, didInitialAnchor, !isAnimatingJump {
+                conversationScrollLogger.debug("Follow pin after content growth")
+                pinToBottom()
+            }
+            resample()
+        }
+
+        // MARK: Jump
+
+        private func jumpToLatest() {
+            conversationScrollLogger.debug("Jump to latest")
+            if reduceMotion {
+                pinToBottom()
+                resample()
+                return
+            }
+            guard let scrollView else { return }
+            isAnimatingJump = true
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.18
+                context.allowsImplicitAnimation = true
+                scrollView.contentView.animator().setBoundsOrigin(bottomOrigin())
+                scrollView.reflectScrolledClipView(scrollView.contentView)
+            } completionHandler: {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    // One snap absorbs any mid-flight growth; nothing re-arms
+                    // afterward. A wheel interrupt leaves the user in charge.
+                    isAnimatingJump = false
+                    pinToBottom()
+                    resample()
+                }
+            }
+        }
+
+        // MARK: Pinning
+
+        private func bottomOrigin() -> NSPoint {
+            guard let scrollView else { return .zero }
+            return NSPoint(
+                x: scrollView.contentView.bounds.origin.x,
+                y: maximumScrollOriginY
+            )
+        }
+
+        private func pinToBottom() {
+            guard let scrollView else { return }
+            scrollView.contentView.setBoundsOrigin(bottomOrigin())
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
+
+        private func scrollBy(_ deltaY: CGFloat) {
+            guard let scrollView else { return }
+            let clipView = scrollView.contentView
+            var proposed = clipView.bounds
+            proposed.origin.y += deltaY
+            clipView.setBoundsOrigin(clipView.constrainBoundsRect(proposed).origin)
+            scrollView.reflectScrolledClipView(clipView)
         }
     }
 }

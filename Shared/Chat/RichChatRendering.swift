@@ -541,6 +541,107 @@ extension EnvironmentValues {
     }
 }
 
+/// Splits sanitized markdown into bounded segments so no single rendered
+/// stack ever holds hundreds of children. A 1000-line agent output rendered
+/// as one markdown view is a 1000-child layout stack whose sizing dominates
+/// every scroll-time layout pass; bounded segments keep each pass cheap.
+enum MarkdownSegmentation {
+    static let segmentLineLimit = 60
+    static let clampThresholdLines = 160
+    static let clampedTailLines = 120
+
+    /// Lines where a new segment may begin: blank lines, top-level list
+    /// items (tight lists have no blank lines at all), and headings.
+    /// Never splits inside a code fence.
+    static func segments(
+        of text: String,
+        maximumLines: Int = segmentLineLimit
+    ) -> [String] {
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        guard lines.count > maximumLines else { return [text] }
+
+        var result: [String] = []
+        var current: [Substring] = []
+        var insideFence = false
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
+                insideFence.toggle()
+            }
+            if !insideFence,
+               current.count >= maximumLines,
+               isSegmentBoundary(trimmed) {
+                result.append(current.joined(separator: "\n"))
+                current = []
+            }
+            current.append(line)
+        }
+        if !current.isEmpty {
+            result.append(current.joined(separator: "\n"))
+        }
+        return result
+    }
+
+    /// The tail of an over-long text at a safe boundary, or nil when the
+    /// text is short enough to show in full.
+    static func clampedTail(
+        of text: String,
+        thresholdLines: Int = clampThresholdLines,
+        tailLines: Int = clampedTailLines
+    ) -> (tail: String, hiddenLineCount: Int)? {
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        guard lines.count > thresholdLines else { return nil }
+
+        var start = lines.count - tailLines
+        var insideFence = false
+        for line in lines.prefix(start) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
+                insideFence.toggle()
+            }
+        }
+        // Move the cut forward to the next safe boundary; if the cut landed
+        // inside a fence, skip to just past its closing line.
+        while start < lines.count {
+            let trimmed = lines[start].trimmingCharacters(in: .whitespaces)
+            if insideFence {
+                if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
+                    insideFence = false
+                }
+                start += 1
+                continue
+            }
+            if isSegmentBoundary(trimmed) {
+                break
+            }
+            start += 1
+        }
+        guard start > 0, start < lines.count else { return nil }
+        return (
+            tail: lines[start...].joined(separator: "\n"),
+            hiddenLineCount: start
+        )
+    }
+
+    private static func isSegmentBoundary(_ trimmedLine: String) -> Bool {
+        if trimmedLine.isEmpty { return true }
+        if trimmedLine.hasPrefix("#") { return true }
+        if trimmedLine.hasPrefix("- ") || trimmedLine.hasPrefix("* ") || trimmedLine.hasPrefix("+ ") {
+            return true
+        }
+        var digits = 0
+        for character in trimmedLine {
+            if character.isNumber {
+                digits += 1
+                if digits > 9 { return false }
+                continue
+            }
+            return (character == "." || character == ")") && digits > 0
+        }
+        return false
+    }
+}
+
 struct RichMarkdownView: View {
     let text: String
     let isStreaming: Bool
@@ -614,15 +715,15 @@ struct RichMarkdownView: View {
 
     /// Completed rows whose sanitized source is already cached parse
     /// synchronously on their first body pass, so they lay out at final height
-    /// on the first frame. Everything else streams through the incremental
-    /// reader and enters the cache on completion.
+    /// on the first frame — split into bounded segments, and clamped to a
+    /// tail with a reveal control when very long. Everything else streams
+    /// through the incremental reader (tail-clamped while live) and enters
+    /// the cache on completion.
     @ViewBuilder
     private var markdownContent: some View {
         if !isStreaming,
            let sanitized = SanitizedMarkdownCache.shared.lookup(raw: text) {
-            MarkdownReader(sanitized) { parseResult in
-                MarkdownView(parseResult)
-            }
+            SegmentedMarkdownContent(sanitized: sanitized)
         } else {
             StreamingMarkdownReader(source) { parseResult in
                 MarkdownView(parseResult)
@@ -640,15 +741,67 @@ struct RichMarkdownView: View {
         if !isStreaming {
             SanitizedMarkdownCache.shared.insert(raw: text, sanitized: result.source)
         }
-        if didFinishStreaming {
-            source = StreamingMarkdownSource(result.source)
+        // While live, only the tail re-renders: a 1000-line output must not
+        // become a 1000-child layout stack mid-stream.
+        let displayed: String
+        if isStreaming,
+           let clamped = MarkdownSegmentation.clampedTail(of: result.source) {
+            displayed = clamped.tail
+        } else {
+            displayed = result.source
+        }
+        if didFinishStreaming || (isStreaming && source.text.count > displayed.count) {
+            source = StreamingMarkdownSource(displayed)
             didFinishStreaming = false
         } else {
-            source.text = result.source
+            source.text = displayed
         }
         if !isStreaming {
             source.finishStreaming()
             didFinishStreaming = true
+        }
+    }
+}
+
+/// Completed markdown, rendered as bounded segments with an optional
+/// show-everything control for very long outputs. Numbering survives the
+/// splits because ordered-list segments start at their own first number.
+private struct SegmentedMarkdownContent: View {
+    let sanitized: String
+
+    @State private var showsFullMessage = false
+
+    var body: some View {
+        let clamp = showsFullMessage
+            ? nil
+            : MarkdownSegmentation.clampedTail(of: sanitized)
+        VStack(alignment: .leading, spacing: 8) {
+            if let clamp {
+                Button {
+                    showsFullMessage = true
+                } label: {
+                    Label(
+                        "Show \(clamp.hiddenLineCount) earlier lines",
+                        systemImage: "ellipsis.rectangle"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .chatMinimumInteractionTarget()
+                .accessibilityHint("Shows the whole message.")
+            }
+            ForEach(
+                Array(
+                    MarkdownSegmentation.segments(of: clamp?.tail ?? sanitized)
+                        .enumerated()
+                ),
+                id: \.offset
+            ) { _, segment in
+                MarkdownReader(segment) { parseResult in
+                    MarkdownView(parseResult)
+                }
+            }
         }
     }
 }

@@ -13,7 +13,9 @@ enum ConversationPinCommand: Equatable {
     case animatedJump
 }
 
-/// Single owner of the transcript's scroll intent.
+/// Single owner of the iOS transcript's scroll intent. (The macOS transcript
+/// scrolls through an AppKit coordinator with a one-shot-only policy and does
+/// not use this type.)
 ///
 /// The system's `defaultScrollAnchor(.bottom)` is the first-line pinning
 /// mechanism; this controller is only the backstop. Its core invariants: it
@@ -35,16 +37,23 @@ struct ConversationScrollController: Equatable {
     }
 
     static let atBottomTolerance: CGFloat = 8
-    static let settleBand: CGFloat = 60
 
+    /// Releasing a touch gesture just short of the bottom eases back down.
+    static let defaultSettleBand: CGFloat = 60
+
+    let settleBand: CGFloat
     private(set) var state: State
 
     /// A transcript whose store already holds items positions correctly on
     /// its first layout (rows parse synchronously and the system anchor
     /// starts at the bottom), so it follows immediately with no anchoring
     /// phase. Anchoring is only for content that loads in while visible.
-    init(startsAnchored: Bool = true) {
+    init(
+        startsAnchored: Bool = true,
+        settleBand: CGFloat = ConversationScrollController.defaultSettleBand
+    ) {
         state = startsAnchored ? .anchoring : .following
+        self.settleBand = settleBand
     }
 
     var isAnchoring: Bool { state == .anchoring }
@@ -89,19 +98,11 @@ struct ConversationScrollController: Equatable {
             state = .following
             return nil
         }
-        if distanceFromBottom <= Self.settleBand {
+        if distanceFromBottom <= settleBand {
             state = .animating
             return .animatedSettle
         }
         return nil
-    }
-
-    /// A discrete-wheel scrolling burst went quiet. Wheel scrolling pauses
-    /// constantly mid-read, so this never emits a pull; it only re-engages
-    /// following when the wheel came to rest exactly at the bottom.
-    mutating func wheelScrollEnded(isAtBottom: Bool) {
-        guard state == .browsing, isAtBottom else { return }
-        state = .following
     }
 
     /// The jump-to-latest control was activated.

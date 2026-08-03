@@ -54,7 +54,7 @@ final class RichChatRenderingTests: XCTestCase {
     }
 
     func testScrollControllerGivesUsersTheViewportAndNeverStealsItBack() {
-        var controller = ConversationScrollController()
+        var controller = ConversationScrollController(settleBand: 60)
         _ = controller.geometryChanged(isAtBottom: true)
         XCTAssertEqual(controller.state, .following)
 
@@ -92,26 +92,6 @@ final class RichChatRenderingTests: XCTestCase {
         XCTAssertEqual(controller.state, .following)
     }
 
-    func testScrollControllerWheelPausesNeverPullTheViewport() {
-        var controller = ConversationScrollController()
-        _ = controller.geometryChanged(isAtBottom: true)
-
-        controller.userScrollBegan()
-        controller.wheelScrollEnded(isAtBottom: false)
-        XCTAssertEqual(
-            controller.state,
-            .browsing,
-            "A wheel pause near the bottom must not drag the user back down."
-        )
-
-        controller.wheelScrollEnded(isAtBottom: true)
-        XCTAssertEqual(
-            controller.state,
-            .following,
-            "Resting exactly at the bottom re-engages following silently."
-        )
-    }
-
     func testScrollControllerJumpSuppressesCorrectionsUntilTheAnimationEnds() {
         var controller = ConversationScrollController()
         _ = controller.geometryChanged(isAtBottom: true)
@@ -144,7 +124,7 @@ final class RichChatRenderingTests: XCTestCase {
     }
 
     func testScrollControllerSelfHealsWhenAnimationPhasesNeverReport() {
-        var controller = ConversationScrollController()
+        var controller = ConversationScrollController(settleBand: 60)
         _ = controller.geometryChanged(isAtBottom: true)
         controller.userScrollBegan()
         _ = controller.userScrollEnded(distanceFromBottom: 30)
@@ -184,6 +164,58 @@ final class RichChatRenderingTests: XCTestCase {
             controller.state,
             .following,
             "The anchoring failsafe always lands in following."
+        )
+    }
+
+    func testMarkdownSegmentationBoundsSegmentSizeAndSplitsTightLists() {
+        let tightList = (1...300).map { "\($0). streaming" }.joined(separator: "\n")
+        let segments = MarkdownSegmentation.segments(of: tightList, maximumLines: 60)
+
+        XCTAssertGreaterThan(segments.count, 1)
+        for segment in segments {
+            XCTAssertLessThanOrEqual(
+                segment.split(separator: "\n", omittingEmptySubsequences: false).count,
+                61,
+                "No rendered stack may hold hundreds of children."
+            )
+        }
+        XCTAssertEqual(
+            segments.joined(separator: "\n"),
+            tightList,
+            "Splitting must not lose or reorder content."
+        )
+        XCTAssertTrue(
+            segments[1].hasPrefix("61. ") || segments[1].first?.isNumber == true,
+            "Ordered-list segments start on an item so numbering is preserved."
+        )
+    }
+
+    func testMarkdownSegmentationNeverSplitsInsideCodeFences() {
+        let fenced = "intro\n```\n" + (1...100).map { "line \($0)" }.joined(separator: "\n") + "\n```\nafter"
+        let segments = MarkdownSegmentation.segments(of: fenced, maximumLines: 20)
+
+        let fencedSegment = segments.first { $0.contains("line 1\n") }
+        XCTAssertNotNil(fencedSegment)
+        XCTAssertTrue(
+            fencedSegment?.contains("line 100") ?? false,
+            "A code fence must stay whole within one segment."
+        )
+    }
+
+    func testMarkdownClampedTailHidesEarlierLinesAndKeepsShortTextWhole() {
+        let long = (1...1000).map { "\($0). interruption-smoke" }.joined(separator: "\n")
+        let clamp = MarkdownSegmentation.clampedTail(of: long)
+
+        XCTAssertNotNil(clamp)
+        XCTAssertGreaterThan(clamp?.hiddenLineCount ?? 0, 800)
+        XCTAssertTrue(
+            clamp?.tail.hasSuffix("1000. interruption-smoke") ?? false,
+            "The newest output must stay visible."
+        )
+
+        XCTAssertNil(
+            MarkdownSegmentation.clampedTail(of: "short\nmessage"),
+            "Short messages render in full."
         )
     }
 
