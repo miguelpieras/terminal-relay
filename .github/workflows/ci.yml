@@ -10,6 +10,17 @@ on:
       - ".private/**"
       - "dev-tasklists/**"
       - ".github/workflows/server-ci.yml"
+      - ".github/workflows/publish-worker-runtime.yml"
+      - "Scripts/bootstrap-worker.sh"
+      - "Scripts/build-worker-runtime.sh"
+      - "Scripts/check-public-repo.sh"
+      - "Scripts/install-worker-session-helper.sh"
+      - "Scripts/manage-review-worker.sh"
+      - "Scripts/manage-worker.sh"
+      - "Scripts/sync-worker-guidance.sh"
+      - "Scripts/verify-published-worker-runtime.sh"
+      - "Scripts/worker-runtime-version.sh"
+      - "Scripts/write-installed-runtime-manifest.sh"
   pull_request:
     paths-ignore:
       - "Server/**"
@@ -18,6 +29,17 @@ on:
       - ".private/**"
       - "dev-tasklists/**"
       - ".github/workflows/server-ci.yml"
+      - ".github/workflows/publish-worker-runtime.yml"
+      - "Scripts/bootstrap-worker.sh"
+      - "Scripts/build-worker-runtime.sh"
+      - "Scripts/check-public-repo.sh"
+      - "Scripts/install-worker-session-helper.sh"
+      - "Scripts/manage-review-worker.sh"
+      - "Scripts/manage-worker.sh"
+      - "Scripts/sync-worker-guidance.sh"
+      - "Scripts/verify-published-worker-runtime.sh"
+      - "Scripts/worker-runtime-version.sh"
+      - "Scripts/write-installed-runtime-manifest.sh"
 
 permissions:
   contents: read
