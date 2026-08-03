@@ -16,6 +16,7 @@ remote_lock_path="/run/lock/terminal-relay-session-helper.lock"
 
 # Load only the installer's command-rendering helpers; do not run its SSH path.
 temporary_helpers="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/terminal-relay-renderers.XXXXXX")"
+temporary_unit_directory=""
 cleanup() {
     cleanup_status=$?
     trap - EXIT
@@ -23,6 +24,12 @@ cleanup() {
         "${TMPDIR:-/tmp}"/terminal-relay-renderers.*) /bin/rm -f -- "$temporary_helpers" ;;
         *) echo "Refusing to remove unexpected renderer file: $temporary_helpers" >&2; cleanup_status=1 ;;
     esac
+    if [[ -n "$temporary_unit_directory" ]]; then
+        case "$temporary_unit_directory" in
+            "${TMPDIR:-/tmp}"/terminal-relay-units.*) /bin/rm -rf -- "$temporary_unit_directory" ;;
+            *) echo "Refusing to remove unexpected unit directory: $temporary_unit_directory" >&2; cleanup_status=1 ;;
+        esac
+    fi
     exit "$cleanup_status"
 }
 trap cleanup EXIT
@@ -77,7 +84,13 @@ runtime_control_script="$(render_runtime_control_script)"
     || { echo "Restore unit is missing its managed restore lifecycle." >&2; exit 1; }
 
 if command -v systemd-analyze >/dev/null 2>&1; then
-    systemd-analyze verify "$restore_unit"
+    temporary_unit_directory="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/terminal-relay-units.XXXXXX")"
+    /usr/bin/sed \
+        's|^ExecStart=/usr/local/bin/terminal-relay-session restore$|ExecStart=/bin/true|' \
+        "$restore_unit" \
+        > "$temporary_unit_directory/terminal-relay-session-restore@.service"
+    systemd-analyze verify \
+        "$temporary_unit_directory/terminal-relay-session-restore@.service"
 fi
 
 machine_id=00000000000000000000000000000000
