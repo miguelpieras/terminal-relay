@@ -7,8 +7,6 @@ admin="$repository_root/Server/terminal-relay-review-admin"
 enroll="$repository_root/Server/terminal-relay-review-enroll"
 gateway="$repository_root/Server/terminal-relay-review-gateway"
 lifecycle="$repository_root/Scripts/manage-review-worker.sh"
-generator="$repository_root/Scripts/generate-review-pairing.swift"
-payload_model="$repository_root/TerminalRelay/Models/MobilePairingPayload.swift"
 temporary_root="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
 temporary_directory="$(mktemp -d "$temporary_root/terminal-relay-review-tests.XXXXXX")"
 
@@ -32,7 +30,7 @@ fail() {
     exit 1
 }
 
-for file in "$admin" "$enroll" "$gateway" "$lifecycle" "$generator" "$payload_model"; do
+for file in "$admin" "$enroll" "$gateway" "$lifecycle"; do
     [[ -f "$file" && ! -L "$file" ]] || fail "missing review-worker file"
 done
 
@@ -75,7 +73,7 @@ grep -Fq "terminal-relay-review-invitation:$invitation_id" \
 
 device_key_one="$(python3 -c 'import base64; print(base64.b64encode(b"a" * 40).decode())')"
 device_line_one="ssh-ed25519 $device_key_one terminal-relay-ios"
-encoded_device_one="$(printf '%s' "$device_line_one" | base64)"
+encoded_device_one="$(printf '%s' "$device_line_one" | base64 | /usr/bin/tr -d '\n')"
 SSH_ORIGINAL_COMMAND="terminal-relay-enroll-device $encoded_device_one" \
     HOME="$runtime_home" \
     "$enroll" "$invitation_id" "$expires_at" 2 >/dev/null
@@ -91,14 +89,14 @@ grep -Fq "terminal-relay-review-invitation:$invitation_id" \
 
 device_key_two="$(python3 -c 'import base64; print(base64.b64encode(b"b" * 40).decode())')"
 device_line_two="ssh-ed25519 $device_key_two terminal-relay-ios"
-encoded_device_two="$(printf '%s' "$device_line_two" | base64)"
+encoded_device_two="$(printf '%s' "$device_line_two" | base64 | /usr/bin/tr -d '\n')"
 SSH_ORIGINAL_COMMAND="terminal-relay-enroll-device $encoded_device_two" \
     HOME="$runtime_home" \
     "$enroll" "$invitation_id" "$expires_at" 2 >/dev/null
 
 device_key_three="$(python3 -c 'import base64; print(base64.b64encode(b"c" * 40).decode())')"
 device_line_three="ssh-ed25519 $device_key_three terminal-relay-ios"
-encoded_device_three="$(printf '%s' "$device_line_three" | base64)"
+encoded_device_three="$(printf '%s' "$device_line_three" | base64 | /usr/bin/tr -d '\n')"
 if SSH_ORIGINAL_COMMAND="terminal-relay-enroll-device $encoded_device_three" \
     HOME="$runtime_home" \
     "$enroll" "$invitation_id" "$expires_at" 2 >/dev/null 2>&1; then
@@ -163,22 +161,5 @@ if grep -Eq 'terminal-relay-review-(invitation|device):' \
     "$runtime_home/.ssh/authorized_keys"; then
     fail "review invitation revocation left review keys behind"
 fi
-
-xcrun swiftc "$payload_model" "$generator" \
-    -o "$temporary_directory/generate-review-pairing"
-"$temporary_directory/generate-review-pairing" \
-    "App Review Worker" \
-    "worker.example.com" \
-    22 \
-    terminal-relay \
-    "SHA256:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE" \
-    "$expires_at" \
-    8 \
-    "$temporary_directory/generated-entry" \
-    "$temporary_directory/generated-code"
-grep -Fq 'terminal-relay-review-invitation:' "$temporary_directory/generated-entry" \
-    || fail "review pairing generator omitted the restricted invitation"
-grep -Fq 'terminal-relay://pair-device?' "$temporary_directory/generated-code" \
-    || fail "review pairing generator did not create an app pairing code"
 
 printf 'review worker tests passed\n'

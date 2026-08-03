@@ -39,6 +39,9 @@ jobs:
       - name: Check public repository
         run: ./Scripts/check-public-repo.sh
 
+      - name: Test review pairing generator
+        run: /bin/bash ./Scripts/test-review-pairing-generator.sh
+
       - name: Generate Xcode project
         run: xcodegen generate
 
