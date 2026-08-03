@@ -53,8 +53,15 @@ done
 for manifest in \
     TerminalRelay/PrivacyInfo.xcprivacy \
     TerminalRelayIOS/PrivacyInfo.xcprivacy; do
-    /usr/bin/plutil -lint "$repository_root/$manifest" >/dev/null \
-        || fail "invalid privacy manifest: $manifest"
+    if [[ -x /usr/bin/plutil ]]; then
+        /usr/bin/plutil -lint "$repository_root/$manifest" >/dev/null \
+            || fail "invalid privacy manifest: $manifest"
+    else
+        python3 -c \
+            'import plistlib, sys; plistlib.load(open(sys.argv[1], "rb"))' \
+            "$repository_root/$manifest" \
+            || fail "invalid privacy manifest: $manifest"
+    fi
 done
 
 echo "Public repository checks passed."

@@ -1,0 +1,50 @@
+name: Server CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Server/**"
+      - "docs/**"
+      - "*.md"
+      - "**/*.md"
+      - ".private/**"
+      - "dev-tasklists/**"
+      - "Scripts/check-public-repo.sh"
+      - ".github/workflows/server-ci.yml"
+  pull_request:
+    paths:
+      - "Server/**"
+      - "docs/**"
+      - "*.md"
+      - "**/*.md"
+      - ".private/**"
+      - "dev-tasklists/**"
+      - "Scripts/check-public-repo.sh"
+      - ".github/workflows/server-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install test tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck tmux
+
+      - name: Check public repository
+        run: ./Scripts/check-public-repo.sh
+
+      - name: Test worker scripts
+        run: |
+          ./Server/Tests/terminal-relay-session-tests.sh
+          ./Server/Tests/terminal-relay-mcp-tests.sh
+          ./Server/Tests/install-worker-session-helper-generation-tests.sh
+          ./Server/Tests/worker-lifecycle-tests.sh
+          ./Server/Tests/worker-runtime-update-tests.sh
+          ./Server/Tests/stable-runtime-preflight-tests.sh

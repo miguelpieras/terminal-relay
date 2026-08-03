@@ -3,7 +3,21 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "Server/**"
+      - "docs/**"
+      - "**/*.md"
+      - ".private/**"
+      - "dev-tasklists/**"
+      - ".github/workflows/server-ci.yml"
   pull_request:
+    paths-ignore:
+      - "Server/**"
+      - "docs/**"
+      - "**/*.md"
+      - ".private/**"
+      - "dev-tasklists/**"
+      - ".github/workflows/server-ci.yml"
 
 permissions:
   contents: read
@@ -17,22 +31,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install build tools
-        run: brew install xcodegen tmux shellcheck
+        run: brew install xcodegen
 
       - name: Install Metal toolchain
         run: xcodebuild -downloadComponent MetalToolchain
 
       - name: Check public repository
         run: ./Scripts/check-public-repo.sh
-
-      - name: Test worker scripts
-        run: |
-          ./Server/Tests/terminal-relay-session-tests.sh
-          ./Server/Tests/terminal-relay-mcp-tests.sh
-          ./Server/Tests/install-worker-session-helper-generation-tests.sh
-          ./Server/Tests/worker-lifecycle-tests.sh
-          ./Server/Tests/worker-runtime-update-tests.sh
-          ./Server/Tests/stable-runtime-preflight-tests.sh
 
       - name: Generate Xcode project
         run: xcodegen generate
