@@ -69,6 +69,47 @@ final class ConversationStoreTests: XCTestCase {
         XCTAssertEqual(store.state.lastAppliedSequence, 0)
     }
 
+    func testControlEventsAdvanceCursorWithoutInvalidatingTranscriptContent() throws {
+        let store = ConversationStore()
+        let initialRevision = store.transcriptContentRevision
+
+        try store.apply(
+            ChatTestFixtures.event("session.heartbeat", sequence: 1)
+        )
+        try store.apply(
+            ChatTestFixtures.event(
+                "ack",
+                sequence: 2,
+                payload: .object(["commandType": .string("session.attach")])
+            )
+        )
+        try store.apply(
+            ChatTestFixtures.event(
+                "session.state",
+                sequence: 3,
+                payload: .object(["connectionState": .string("streaming")])
+            )
+        )
+
+        XCTAssertEqual(store.state.lastAppliedSequence, 3)
+        XCTAssertEqual(store.transcriptContentRevision, initialRevision)
+
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.completed",
+                sequence: 4,
+                itemID: "message-1",
+                turnID: "turn-1",
+                payload: .object([
+                    "role": .string("assistant"),
+                    "text": .string("Visible update"),
+                ])
+            )
+        )
+
+        XCTAssertEqual(store.transcriptContentRevision, initialRevision + 1)
+    }
+
     func testAppliesFlatSnapshotAndUsesBaseSeqCodingKey() throws {
         let flatItems: JSONValue = .array([
             .object([

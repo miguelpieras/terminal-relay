@@ -887,6 +887,12 @@ final class ConversationStore: ObservableObject {
     @Published private(set) var isNearBottom = true
     @Published private(set) var isLoadingOlderHistory = false
 
+    /// Changes only when the hosted transcript's rows can change. Durable
+    /// control traffic still advances `lastAppliedSequence`, but acknowledgements,
+    /// heartbeats, and connection-state records must not make the macOS host
+    /// synchronously remeasure every visible row.
+    private(set) var transcriptContentRevision: UInt64 = 0
+
     private var workingState: ConversationState
     private let reducer: ConversationReducer
     private let streamingPublishNanoseconds: UInt64
@@ -924,6 +930,9 @@ final class ConversationStore: ObservableObject {
             workingState.items[$0].approximateContentByteCount
         } ?? 0
         try reducer.reduce(envelope, into: &workingState)
+        if Self.affectsTranscriptContent(envelope) {
+            transcriptContentRevision &+= 1
+        }
         let requiresFullByteRecount =
             envelope.type == ChatEventKind.conversationSnapshot.rawValue
             || envelope.type == ChatEventKind.historyPage.rawValue
@@ -994,6 +1003,7 @@ final class ConversationStore: ObservableObject {
             retainedContentBytes: &retainedContentBytes
         )
         clearStaleDestructiveApprovalConfirmation()
+        transcriptContentRevision &+= 1
         publishImmediately()
     }
 
@@ -1024,6 +1034,7 @@ final class ConversationStore: ObservableObject {
         )
         resetReconnectTransients()
         clearStaleDestructiveApprovalConfirmation()
+        transcriptContentRevision &+= 1
         publishImmediately()
     }
 
@@ -1042,10 +1053,12 @@ final class ConversationStore: ObservableObject {
             on: &workingState,
             retainedContentBytes: &retainedContentBytes
         )
+        transcriptContentRevision &+= 1
         publishImmediately()
     }
 
     func removeOptimisticUserMessage(requestID: String) {
+        let previousItemCount = workingState.items.count
         retainedContentBytes -= workingState.items.reduce(0) { result, item in
             guard case .message(let message) = item,
                   message.id == "client:\(requestID)" else {
@@ -1058,6 +1071,9 @@ final class ConversationStore: ObservableObject {
             return message.id == "client:\(requestID)"
         }
         retainedContentBytes = max(0, retainedContentBytes)
+        if workingState.items.count != previousItemCount {
+            transcriptContentRevision &+= 1
+        }
         publishImmediately()
     }
 
@@ -1247,6 +1263,30 @@ final class ConversationStore: ObservableObject {
         }
         guard ChatEventKind(rawValue: envelope.type) == nil else { return nil }
         return envelope.eventID ?? envelope.id
+    }
+
+    private static func affectsTranscriptContent(_ envelope: ChatEnvelope) -> Bool {
+        guard let kind = ChatEventKind(rawValue: envelope.type) else {
+            // Forward-compatible provider records render as generic timeline
+            // items unless explicitly declared non-visual by the reducer.
+            return true
+        }
+        switch kind {
+        case .conversationSnapshot, .historyPage,
+             .messageStarted, .messageDelta, .messageCompleted,
+             .reasoningStarted, .reasoningDelta, .reasoningCompleted,
+             .toolStarted, .toolUpdated, .toolCompleted,
+             .fileChangeUpdated, .diffUpdated,
+             .approvalRequested, .approvalResolved, .approvalExpired,
+             .questionRequested, .questionResolved, .questionExpired,
+             .planUpdated, .error,
+             .turnCompleted, .turnFailed, .turnInterrupted:
+            return true
+        case .sessionHello, .sessionState, .sessionHeartbeat,
+             .terminalFallbackRequired, .sessionEnded, .acknowledgement,
+             .filePreview, .usageUpdated, .turnStarted:
+            return false
+        }
     }
 
     private func recountRetainedContentBytes() {

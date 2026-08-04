@@ -168,14 +168,12 @@ struct ConversationView: View {
     }
 
     /// Everything the hosted transcript content can visually depend on.
-    /// Publishes that leave this unchanged (near-bottom flips, unread
-    /// counters) never reach the hosted tree. Every store-state mutation is
-    /// covered: sequenced envelopes bump lastAppliedSequence, and the
-    /// unsequenced mutations (optimistic messages, trims, snapshot swaps)
-    /// all move the item count or boundary IDs.
+    /// Control-only records advance the replay cursor without changing this
+    /// revision, so opening a cached conversation does not synchronously
+    /// remeasure every row for its attach ack, heartbeats, and ready state.
     private var transcriptContentRevision: Int {
         var hasher = Hasher()
-        hasher.combine(store.lastAppliedSequence)
+        hasher.combine(store.transcriptContentRevision)
         hasher.combine(store.state.items.count)
         hasher.combine(store.state.items.first?.id)
         hasher.combine(store.state.items.last?.id)

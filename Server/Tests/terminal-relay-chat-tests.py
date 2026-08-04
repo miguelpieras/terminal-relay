@@ -1091,6 +1091,9 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
     project = root / "claude-project"
     project.mkdir()
     received: asyncio.Queue = asyncio.Queue()
+    event_loop_thread = threading.get_ident()
+    sdk_load_threads: list[int] = []
+    session_info_threads: list[int] = []
 
     class PermissionResultAllow:
         def __init__(self, **kwargs):
@@ -1132,6 +1135,7 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
             await received.put(None)
 
     def get_session_info(session_id, **_kwargs):
+        session_info_threads.append(threading.get_ident())
         return SimpleNamespace(session_id=session_id)
 
     history_messages = [
@@ -1171,6 +1175,10 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
         PermissionResultDeny=PermissionResultDeny,
     )
 
+    def load_sdk():
+        sdk_load_threads.append(threading.get_ident())
+        return sdk
+
     new_adapter = module.ClaudeAdapter(
         str(project),
         THREAD_ID,
@@ -1181,7 +1189,7 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
             "permissionMode": "default",
         },
     )
-    new_adapter._load_sdk = lambda: sdk
+    new_adapter._load_sdk = load_sdk
     new_events: list[dict] = []
 
     async def emit_new(event_type, payload, *, turn_id=None, item_id=None):
@@ -1209,7 +1217,7 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
         THREAD_ID,
         {"effort": "high", "permissionMode": "default"},
     )
-    adapter._load_sdk = lambda: sdk
+    adapter._load_sdk = load_sdk
     events: list[dict] = []
 
     async def emit(event_type, payload, *, turn_id=None, item_id=None):
@@ -1223,6 +1231,12 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
         return event
 
     assert await adapter.start(emit) == THREAD_ID
+    assert sdk_load_threads and all(
+        thread_id != event_loop_thread for thread_id in sdk_load_threads
+    )
+    assert session_info_threads and all(
+        thread_id != event_loop_thread for thread_id in session_info_threads
+    )
     assert adapter.client.options.kwargs["include_partial_messages"] is True
     assert adapter.client.options.kwargs["effort"] == "high"
     assert "replay_user_messages" not in adapter.client.options.kwargs
@@ -1674,8 +1688,22 @@ async def exercise_early_attach(module, root: pathlib.Path) -> None:
         provider,
         {},
     )
+    published_ready = False
+    write_state = broker._write_state
+
+    def verify_attach_surface_before_state(status):
+        nonlocal published_ready
+        if status == "ready":
+            socket_info = os.lstat(broker.socket_path)
+            assert stat.S_ISSOCK(socket_info.st_mode)
+            assert stat.S_IMODE(socket_info.st_mode) == 0o600
+            published_ready = True
+        write_state(status)
+
+    broker._write_state = verify_attach_surface_before_state
     broker_task = asyncio.create_task(broker.run())
     await wait_attach_surface(broker)
+    assert published_ready is True
 
     # The state file reports ready while the provider is still resuming.
     state = json.loads(pathlib.Path(broker.state_path).read_text(encoding="utf-8"))
