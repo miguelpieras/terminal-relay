@@ -768,6 +768,15 @@ private final class ConversationDocumentView: NSView {
     override var isFlipped: Bool { true }
 }
 
+/// Opts out of responsive scrolling: with it on, momentum overshoot is drawn
+/// by the concurrent scrolling thread before the main thread's
+/// elasticity-none setting can clamp it, so fast arrivals at the content
+/// edges still visibly bounce. The transcript's per-frame scroll cost is
+/// near zero, so the concurrent pipeline buys nothing here.
+private final class TranscriptScrollView: NSScrollView {
+    override class var isCompatibleWithResponsiveScrolling: Bool { false }
+}
+
 /// Reports SwiftUI content-size invalidations so the coordinator can resize
 /// the document by frame. The scroll subtree carries no Auto Layout
 /// constraints at all: constraints anchored to a clip view are dirtied by
@@ -810,14 +819,15 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSScrollView()
+        let scrollView = TranscriptScrollView()
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
         // The transcript reads anchored, not springy: no rubber-band bounce
-        // at the content edges.
+        // at the content edges, on either axis.
         scrollView.verticalScrollElasticity = .none
+        scrollView.horizontalScrollElasticity = .none
 
         let hosting = TranscriptHostingView(rootView: AnyView(EmptyView()))
         hosting.sizingOptions = .intrinsicContentSize
@@ -1004,8 +1014,18 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
             debouncedResizeTask?.cancel()
             debouncedResizeTask = Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .milliseconds(200))
-                guard !Task.isCancelled else { return }
-                self?.resizeDocumentToFitContent()
+                guard !Task.isCancelled, let self else { return }
+                // A transient mid-update measurement can report a collapsed
+                // height; resizing an established document to it would slam
+                // the viewport. Content-driven resizes go through
+                // applyRootView and stay fully trusted.
+                if let hosting,
+                   lastDocumentHeight > 500,
+                   hosting.fittingSize.height < lastDocumentHeight * 0.5 {
+                    conversationScrollLogger.debug("Ignored anomalous shrink measurement")
+                    return
+                }
+                resizeDocumentToFitContent()
             }
         }
 
@@ -1056,6 +1076,8 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
             return maximumScrollOriginY - scrollView.contentView.bounds.origin.y
         }
 
+        private var wasOverscrolled = false
+
         /// Pure sampling; may never scroll. Safe under synchronous re-entry
         /// from a pin.
         private func resample() {
@@ -1066,6 +1088,31 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
                 lastNearBottom = nearBottom
                 onNearBottomChange(nearBottom)
             }
+            let overscrolled = distance < -1
+            if overscrolled != wasOverscrolled {
+                wasOverscrolled = overscrolled
+                if overscrolled {
+                    conversationScrollLogger.debug(
+                        "Overscroll past bottom clamped (\(Int(-distance), privacy: .public)pt)"
+                    )
+                }
+            }
+            // AppKit rubber-bands momentum past the edge even with
+            // elasticity disabled. Beyond the legal range is not a position
+            // the user can intend to occupy, so clamping here cannot fight
+            // them; it is what elasticity-none promised.
+            if overscrolled {
+                clampToBottomEdge()
+            }
+        }
+
+        private func clampToBottomEdge() {
+            guard let scrollView else { return }
+            let clipView = scrollView.contentView
+            var origin = clipView.bounds.origin
+            origin.y = maximumScrollOriginY
+            clipView.setBoundsOrigin(origin)
+            scrollView.reflectScrolledClipView(clipView)
         }
 
         // MARK: Observers (scroll-free by construction)
