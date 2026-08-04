@@ -1377,6 +1377,7 @@ private struct ChatMessageView: View {
     let message: ChatMessage
 
     @State private var didCopy = false
+    @State private var isHovering = false
 
     var body: some View {
         HStack(alignment: .top) {
@@ -1411,6 +1412,7 @@ private struct ChatMessageView: View {
                 Spacer(minLength: 0)
             }
         }
+        .onHover { isHovering = $0 }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(message.role == .user ? "You" : "Assistant")
     }
@@ -1432,13 +1434,23 @@ private struct ChatMessageView: View {
             .accessibilityLabel(didCopy ? "Message copied" : "Copy message")
 
             if let date = ChatTimestamp.date(milliseconds: message.occurredAt) {
-                Text(date.formatted(date: .omitted, time: .shortened))
+                Text(ChatTimestamp.label(for: date))
                     .accessibilityLabel(date.formatted(date: .complete, time: .shortened))
             }
         }
         .font(.caption)
         .foregroundStyle(.secondary)
         .padding(.horizontal, message.role == .user ? 4 : 0)
+        .opacity(showsMessageFooter ? 1 : 0)
+        .allowsHitTesting(showsMessageFooter)
+    }
+
+    private var showsMessageFooter: Bool {
+        #if os(macOS)
+        isHovering || didCopy
+        #else
+        true
+        #endif
     }
 
     @ViewBuilder
@@ -1477,6 +1489,35 @@ enum ChatTimestamp {
     static func date(milliseconds: Int64?) -> Date? {
         guard let milliseconds, milliseconds >= 0 else { return nil }
         return Date(timeIntervalSince1970: TimeInterval(milliseconds) / 1_000)
+    }
+
+    static func label(
+        for date: Date,
+        relativeTo now: Date = Date(),
+        calendar: Calendar = .current,
+        locale: Locale = .current
+    ) -> String {
+        let time = date.formatted(
+            Date.FormatStyle(
+                date: .omitted,
+                time: .shortened,
+                locale: locale,
+                calendar: calendar,
+                timeZone: calendar.timeZone
+            )
+        )
+        guard !calendar.isDate(date, inSameDayAs: now) else {
+            return time
+        }
+        let weekday = date.formatted(
+            Date.FormatStyle(
+                locale: locale,
+                calendar: calendar,
+                timeZone: calendar.timeZone
+            )
+                .weekday(.wide)
+        )
+        return "\(weekday) \(time)"
     }
 }
 

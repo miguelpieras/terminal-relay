@@ -557,6 +557,45 @@ final class RichChatRenderingTests: XCTestCase {
         XCTAssertEqual(date.timeIntervalSince1970, 1_800_000_000.25, accuracy: 0.001)
     }
 
+    func testMessageTimestampLabelOmitsTodayAndIncludesOtherWeekdays() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let locale = Locale(identifier: "en_US")
+        let today = try XCTUnwrap(
+            calendar.date(
+                from: DateComponents(year: 2026, month: 8, day: 4, hour: 18, minute: 30)
+            )
+        )
+        let saturday = try XCTUnwrap(
+            calendar.date(
+                from: DateComponents(year: 2026, month: 8, day: 1, hour: 19, minute: 52)
+            )
+        )
+
+        let todayLabel = ChatTimestamp.label(
+            for: today,
+            relativeTo: today,
+            calendar: calendar,
+            locale: locale
+        )
+            .replacingOccurrences(of: "\u{202F}", with: " ")
+        XCTAssertEqual(
+            todayLabel,
+            "6:30 PM"
+        )
+        let saturdayLabel = ChatTimestamp.label(
+            for: saturday,
+            relativeTo: today,
+            calendar: calendar,
+            locale: locale
+        )
+            .replacingOccurrences(of: "\u{202F}", with: " ")
+        XCTAssertEqual(
+            saturdayLabel,
+            "Saturday 7:52 PM"
+        )
+    }
+
     @MainActor
     func testSyntaxHighlightingWorkRunsOffMainAndKeepsPlainFallback() async {
         let highlighted = await ChatSyntaxHighlighter.tokensOffMain(

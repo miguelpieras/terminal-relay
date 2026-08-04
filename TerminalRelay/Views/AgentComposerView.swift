@@ -235,7 +235,7 @@ struct AgentComposerView: View {
                 selectedModelSection = nil
             }
         } label: {
-            ZStack {
+            HStack(spacing: 4) {
                 (
                     Text(modelDisplayName)
                         .foregroundColor(.primary)
@@ -245,15 +245,12 @@ struct AgentComposerView: View {
                 .font(.system(size: 13))
                 .lineLimit(1)
 
-                HStack {
-                    Spacer()
-                    Image(systemName: isShowingModelPanel ? "chevron.up" : "chevron.down")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.trailing, 11)
+                Image(systemName: isShowingModelPanel ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.secondary)
             }
-            .frame(width: 190, height: 30)
+            .padding(.horizontal, 10)
+            .frame(height: 30)
             .background(
                 Color.white.opacity(isShowingModelPanel ? 0.1 : 0),
                 in: Capsule()
