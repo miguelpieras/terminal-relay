@@ -592,14 +592,18 @@ enum MarkdownSegmentation {
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
         guard lines.count > thresholdLines else { return nil }
 
-        var start = lines.count - tailLines
+        let initialStart = lines.count - tailLines
+        var start = initialStart
         var insideFence = false
+        var openFenceLine: Substring?
         for line in lines.prefix(start) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
                 insideFence.toggle()
+                openFenceLine = insideFence ? line : nil
             }
         }
+        let cutInsideFence = insideFence
         // Move the cut forward to the next safe boundary; if the cut landed
         // inside a fence, skip to just past its closing line.
         while start < lines.count {
@@ -616,7 +620,24 @@ enum MarkdownSegmentation {
             }
             start += 1
         }
-        guard start > 0, start < lines.count else { return nil }
+        if start >= lines.count {
+            // No safe boundary before the end: the tail is dominated by one
+            // giant fence or unbroken run. An unclamped render here is a
+            // whole-transcript layout stall, so cut at the raw tail anyway,
+            // re-opening the fence so the tail still renders as code.
+            if cutInsideFence, let openFenceLine {
+                return (
+                    tail: ([openFenceLine] + lines[initialStart...])
+                        .joined(separator: "\n"),
+                    hiddenLineCount: initialStart
+                )
+            }
+            return (
+                tail: lines[initialStart...].joined(separator: "\n"),
+                hiddenLineCount: initialStart
+            )
+        }
+        guard start > 0 else { return nil }
         return (
             tail: lines[start...].joined(separator: "\n"),
             hiddenLineCount: start

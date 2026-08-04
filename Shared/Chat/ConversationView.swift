@@ -139,6 +139,13 @@ struct ConversationView: View {
 
     @State private var firstVisibleItemID: String?
 
+    #if os(macOS)
+    /// False until the AppKit transcript has applied content and completed
+    /// its one-shot open anchor; the loading curtain covers the canvas until
+    /// then so an open never shows a bare black transcript.
+    @State private var isTranscriptAnchored = false
+    #endif
+
     private var visibleItems: ArraySlice<ConversationItem> {
         let items = store.state.items
         if let firstVisibleItemID,
@@ -187,6 +194,11 @@ struct ConversationView: View {
                 visibleItems.contains(where: { $0.id == id })
             },
             onNearBottomChange: { store.setNearBottom($0) },
+            onAnchoredChange: { anchored in
+                #if os(macOS)
+                isTranscriptAnchored = anchored
+                #endif
+            },
             onJump: { store.jumpToLatest() }
         ) {
             VStack(alignment: .leading, spacing: 14) {
@@ -244,9 +256,34 @@ struct ConversationView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(Color.chatCanvas)
                     .allowsHitTesting(false)
+            } else {
+                #if os(macOS)
+                if !isTranscriptAnchored {
+                    anchoringCurtain
+                }
+                #endif
             }
         }
     }
+
+    #if os(macOS)
+    /// Covers the transcript between content arriving and the open anchor
+    /// landing, so a slow first layout reads as loading instead of a bare
+    /// black pane.
+    private var anchoringCurtain: some View {
+        VStack(spacing: 8) {
+            ProgressView()
+                .controlSize(.small)
+            Text("Loading conversation…")
+                .font(.headline)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.chatCanvas)
+        .allowsHitTesting(false)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Loading conversation")
+    }
+    #endif
 
     /// One control at the top of the transcript: reveal older already-loaded
     /// rows first, and only once everything local is visible offer the
@@ -476,6 +513,7 @@ private struct ConversationTranscriptScroller<Content: View>: View {
     let unreadCount: Int
     let itemExists: (String) -> Bool
     let onNearBottomChange: (Bool) -> Void
+    let onAnchoredChange: (Bool) -> Void
     let onJump: () -> Void
     let content: Content
 
@@ -494,6 +532,7 @@ private struct ConversationTranscriptScroller<Content: View>: View {
         unreadCount: Int,
         itemExists: @escaping (String) -> Bool,
         onNearBottomChange: @escaping (Bool) -> Void,
+        onAnchoredChange: @escaping (Bool) -> Void = { _ in },
         onJump: @escaping () -> Void,
         @ViewBuilder content: () -> Content
     ) {
@@ -504,6 +543,7 @@ private struct ConversationTranscriptScroller<Content: View>: View {
         self.unreadCount = unreadCount
         self.itemExists = itemExists
         self.onNearBottomChange = onNearBottomChange
+        self.onAnchoredChange = onAnchoredChange
         self.onJump = onJump
         self.content = content()
         #if os(iOS)
@@ -542,7 +582,8 @@ private struct ConversationTranscriptScroller<Content: View>: View {
             contentRevision: contentRevision,
             reduceMotion: reduceMotion,
             handle: macHandle,
-            onNearBottomChange: onNearBottomChange
+            onNearBottomChange: onNearBottomChange,
+            onAnchoredChange: onAnchoredChange
         )
         .accessibilityIdentifier("conversation.transcript")
         .accessibilityValue(isNearBottom ? "latest" : "history")
@@ -813,6 +854,7 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
     let reduceMotion: Bool
     let handle: MacScrollCommandHandle
     let onNearBottomChange: (Bool) -> Void
+    let onAnchoredChange: (Bool) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -850,7 +892,8 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
             firstItemID: firstItemID,
             reduceMotion: reduceMotion,
             handle: handle,
-            onNearBottomChange: onNearBottomChange
+            onNearBottomChange: onNearBottomChange,
+            onAnchoredChange: onAnchoredChange
         )
         context.coordinator.applyContent(
             AnyView(content.environment(\.self, context.environment)),
@@ -871,6 +914,20 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
 
         private var reduceMotion = false
         private var onNearBottomChange: (Bool) -> Void = { _ in }
+        private var onAnchoredChange: (Bool) -> Void = { _ in }
+        private var notifiedAnchored: Bool?
+
+        /// Reports open-anchor completion to SwiftUI so the loading curtain
+        /// can lift. Deferred one tick: the anchor fires inside updateNSView,
+        /// where state writes are illegal. Never scrolls.
+        private func notifyAnchored(_ anchored: Bool) {
+            guard notifiedAnchored != anchored else { return }
+            notifiedAnchored = anchored
+            let callback = onAnchoredChange
+            DispatchQueue.main.async {
+                callback(anchored)
+            }
+        }
 
         private var lastNearBottom = true
         private var lastDocumentHeight: CGFloat = 0
@@ -935,10 +992,12 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
             firstItemID: String?,
             reduceMotion: Bool,
             handle: MacScrollCommandHandle,
-            onNearBottomChange: @escaping (Bool) -> Void
+            onNearBottomChange: @escaping (Bool) -> Void,
+            onAnchoredChange: @escaping (Bool) -> Void
         ) {
             self.reduceMotion = reduceMotion
             self.onNearBottomChange = onNearBottomChange
+            self.onAnchoredChange = onAnchoredChange
             handle.performJump = { [weak self] in
                 self?.jumpToLatest()
             }
@@ -947,6 +1006,7 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
             if isConversationEmpty {
                 // Conversation swapped or reset: the next content anchors anew.
                 didInitialAnchor = false
+                notifyAnchored(false)
             }
 
             if firstItemID != lastFirstItemID {
@@ -997,6 +1057,7 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
                 wasAtBottom = true
                 didInitialAnchor = true
                 conversationScrollLogger.debug("Anchored at latest")
+                notifyAnchored(true)
             }
         }
 
@@ -1048,6 +1109,12 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
                 // Posts frameDidChange, which drives follow/prepend one-shots.
                 document.setFrameSize(size)
             }
+            // Content can settle to a new height without invalidating
+            // intrinsic size (glyph substitution, late text settles), which
+            // leaves the document short and clips the last rows. Every real
+            // resize therefore re-verifies once after the debounce; a stable
+            // measurement ends the chain at the size guard above.
+            scheduleDocumentResize()
         }
 
         // MARK: Geometry
