@@ -986,6 +986,7 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
 
             let clipView = scrollView.contentView
             clipView.postsBoundsChangedNotifications = true
+            clipView.postsFrameChangedNotifications = true
             document.postsFrameChangedNotifications = true
 
             let center = NotificationCenter.default
@@ -1001,6 +1002,15 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
                 },
                 center.addObserver(
                     forName: NSView.frameDidChangeNotification,
+                    object: clipView,
+                    queue: .main
+                ) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        self?.handleViewportFrameChanged()
+                    }
+                },
+                center.addObserver(
+                    forName: NSView.frameDidChangeNotification,
                     object: document,
                     queue: .main
                 ) { [weak self] _ in
@@ -1012,6 +1022,10 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
         }
 
         func detach() {
+            rootViewRetryTask?.cancel()
+            rootViewRetryTask = nil
+            debouncedResizeTask?.cancel()
+            debouncedResizeTask = nil
             for observer in observers {
                 NotificationCenter.default.removeObserver(observer)
             }
@@ -1056,8 +1070,10 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
         // MARK: Content
 
         private var pendingContent: AnyView?
+        private var pendingContentRevision: Int?
         private var lastLayoutWidth: CGFloat = 0
         private var lastContentRevision: Int?
+        private var rootViewRetryTask: Task<Void, Never>?
 
         /// Reassigning the hosted root view forces SwiftUI to diff the whole
         /// transcript — a visible hitch mid-scroll. Publishes that cannot
@@ -1065,8 +1081,8 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
         /// keep the same revision and never touch the hosted tree.
         func applyContent(_ content: AnyView, revision: Int) {
             guard revision != lastContentRevision else { return }
-            lastContentRevision = revision
             pendingContent = content
+            pendingContentRevision = revision
             applyRootView()
         }
 
@@ -1074,14 +1090,29 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
         /// a text transcript is wide and short. The content therefore
         /// carries an explicit width matching the viewport, so the intrinsic
         /// height the document is sized with is the real height-for-width.
-        private func applyRootView() {
-            guard let hosting, let scrollView, let pendingContent else { return }
+        @discardableResult
+        private func applyRootView(schedulesRetry: Bool = true) -> Bool {
+            guard let hosting, let scrollView, let pendingContent else { return false }
             let width = scrollView.contentView.bounds.width
-            guard width > 0 else { return }
+            guard width > 0 else {
+                if schedulesRetry {
+                    scheduleRootViewRetry()
+                }
+                return false
+            }
+            rootViewRetryTask?.cancel()
+            rootViewRetryTask = nil
             lastLayoutWidth = width
             hosting.rootView = AnyView(
                 pendingContent.frame(width: width, alignment: .topLeading)
             )
+            // A representable can first update before AppKit has laid out its
+            // clip view. Do not consume that revision until the root is truly
+            // installed; the clip-frame observer retries once width exists.
+            if let pendingContentRevision {
+                lastContentRevision = pendingContentRevision
+                self.pendingContentRevision = nil
+            }
             debouncedResizeTask?.cancel()
             resizeDocumentToFitContent()
             if hasContent, !didInitialAnchor {
@@ -1092,6 +1123,24 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
                 didInitialAnchor = true
                 conversationScrollLogger.debug("Anchored at latest")
                 notifyAnchored(true)
+            }
+            return true
+        }
+
+        /// The clip-frame observer is the normal zero-width retry path, but
+        /// AppKit can lay out the viewport before that notification reaches
+        /// us. A bounded delayed retry keeps a first update at width zero from
+        /// stranding the loading curtain forever.
+        private func scheduleRootViewRetry() {
+            guard rootViewRetryTask == nil else { return }
+            rootViewRetryTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                for delay in [16, 50, 100, 250, 500] {
+                    try? await Task.sleep(for: .milliseconds(delay))
+                    guard !Task.isCancelled else { return }
+                    if self.applyRootView(schedulesRetry: false) { return }
+                }
+                self.rootViewRetryTask = nil
             }
         }
 
@@ -1224,6 +1273,20 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
                 applyRootView()
             }
             resample()
+        }
+
+        /// The representable commonly receives its first content update at
+        /// width zero. A clip-frame change is the bounded AppKit lifecycle
+        /// signal that the viewport has become usable; it also covers window
+        /// resizes that do not produce a bounds notification.
+        private func handleViewportFrameChanged() {
+            guard let scrollView else { return }
+            let widthChanged = abs(
+                scrollView.contentView.bounds.width - lastLayoutWidth
+            ) > 0.5
+            if pendingContentRevision != nil || widthChanged {
+                applyRootView()
+            }
         }
 
         private func handleContentSizeChanged() {
