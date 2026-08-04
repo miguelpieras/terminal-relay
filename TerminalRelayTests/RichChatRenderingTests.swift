@@ -550,11 +550,30 @@ final class RichChatRenderingTests: XCTestCase {
     func testMessageTimestampUsesUnixMilliseconds() throws {
         XCTAssertNil(ChatTimestamp.date(milliseconds: nil))
         XCTAssertNil(ChatTimestamp.date(milliseconds: -1))
+        XCTAssertNil(
+            ChatTimestamp.date(
+                milliseconds: nil,
+                fallbackUUIDv7s: [
+                    "00000000-0000-4000-8000-000000000000"
+                ]
+            )
+        )
 
         let date = try XCTUnwrap(
             ChatTimestamp.date(milliseconds: 1_800_000_000_250)
         )
         XCTAssertEqual(date.timeIntervalSince1970, 1_800_000_000.25, accuracy: 0.001)
+
+        let uuidDate = try XCTUnwrap(
+            ChatTimestamp.date(
+                milliseconds: nil,
+                fallbackUUIDv7s: [
+                    "00000000-0000-4000-8000-000000000000",
+                    "01a3185c-50fa-7000-8000-000000000000",
+                ]
+            )
+        )
+        XCTAssertEqual(uuidDate, date)
     }
 
     func testMessageTimestampLabelOmitsTodayAndIncludesOtherWeekdays() throws {

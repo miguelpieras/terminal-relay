@@ -14,6 +14,7 @@ import base64
 import collections
 import contextlib
 import dataclasses
+import datetime
 import fcntl
 import hashlib
 import inspect
@@ -89,6 +90,34 @@ class ChatError(Exception):
 
 def now_ms() -> int:
     return time.time_ns() // 1_000_000
+
+
+def provider_timestamp_ms(value: Any) -> int | None:
+    """Normalize provider history timestamps to Unix milliseconds."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        if value < 0:
+            return None
+        # Provider history APIs use Unix seconds, while live lifecycle fields
+        # use milliseconds. Contemporary millisecond values are 12+ digits.
+        try:
+            return int(value if value >= 100_000_000_000 else value * 1_000)
+        except (OverflowError, ValueError):
+            return None
+    if isinstance(value, str):
+        try:
+            parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        try:
+            timestamp = parsed.timestamp()
+        except (OverflowError, OSError, ValueError):
+            return None
+        return int(timestamp * 1_000) if timestamp >= 0 else None
+    return None
 
 
 def new_uuid() -> str:
@@ -1932,18 +1961,20 @@ class CodexAdapter(ProviderAdapter):
             if not isinstance(turn, dict):
                 continue
             turn_id = turn.get("id")
+            occurred_at = provider_timestamp_ms(turn.get("startedAt"))
             for item in turn.get("items", []):
                 if not isinstance(item, dict):
                     continue
                 normalized = self.map_item(item, completed=True)
-                mapped.append(
-                    {
-                        "type": normalized["eventType"],
-                        "turnId": turn_id,
-                        "itemId": item.get("id") or new_uuid(),
-                        "payload": normalized["payload"],
-                    }
-                )
+                record = {
+                    "type": normalized["eventType"],
+                    "turnId": turn_id,
+                    "itemId": item.get("id") or new_uuid(),
+                    "payload": normalized["payload"],
+                }
+                if occurred_at is not None:
+                    record["occurredAt"] = occurred_at
+                mapped.append(record)
         if before_item_id:
             before_index = next(
                 (
@@ -2694,6 +2725,12 @@ class ClaudeAdapter(ProviderAdapter):
         message_value = value.get("message")
         if not isinstance(message_value, dict):
             message_value = value
+        occurred_at = provider_timestamp_ms(
+            value.get("timestamp")
+            or value.get("createdAt")
+            or message_value.get("timestamp")
+            or message_value.get("createdAt")
+        )
         role = str(
             value.get("type")
             or message_value.get("role")
@@ -2734,6 +2771,8 @@ class ClaudeAdapter(ProviderAdapter):
                         "originalByteCount": original,
                     },
                 }
+                if occurred_at is not None:
+                    record["occurredAt"] = occurred_at
                 records.append(record)
                 result_by_id[item_id] = record
             elif block_type == "tool_use":
@@ -2753,6 +2792,8 @@ class ClaudeAdapter(ProviderAdapter):
                         "status": "completed",
                     },
                 }
+                if occurred_at is not None:
+                    record["occurredAt"] = occurred_at
                 records.append(record)
                 result_by_id[item_id] = record
             elif block_type == "tool_result":
@@ -2773,24 +2814,25 @@ class ClaudeAdapter(ProviderAdapter):
                         "failed" if block.get("is_error") else "completed"
                     )
                 else:
-                    records.append(
-                        {
-                            "type": "tool.completed",
-                            "turnId": None,
-                            "itemId": item_id,
-                            "payload": {
-                                "kind": "generic",
-                                "title": "Tool result",
-                                "output": sanitize_json(block.get("content")),
-                                "toolUseId": tool_use_id,
-                                "status": (
-                                    "failed"
-                                    if block.get("is_error")
-                                    else "completed"
-                                ),
-                            },
-                        }
-                    )
+                    record = {
+                        "type": "tool.completed",
+                        "turnId": None,
+                        "itemId": item_id,
+                        "payload": {
+                            "kind": "generic",
+                            "title": "Tool result",
+                            "output": sanitize_json(block.get("content")),
+                            "toolUseId": tool_use_id,
+                            "status": (
+                                "failed"
+                                if block.get("is_error")
+                                else "completed"
+                            ),
+                        },
+                    }
+                    if occurred_at is not None:
+                        record["occurredAt"] = occurred_at
+                    records.append(record)
         for bounded in (result_by_id, tool_items):
             while len(bounded) > 512:
                 bounded.popitem(last=False)
@@ -3198,6 +3240,7 @@ class ChatBroker:
         item_id = event.get("itemId")
         turn_id = event.get("turnId")
         payload = event.get("payload", {})
+        occurred_at = event.get("occurredAt")
         if event_type in {
             "message.started",
             "reasoning.started",
@@ -3210,6 +3253,7 @@ class ChatBroker:
                 "type": event_type,
                 "itemId": item_id,
                 "turnId": turn_id,
+                "occurredAt": occurred_at,
                 "payload": payload,
             }
         elif event_type in {"message.delta", "reasoning.delta"} and item_id:
@@ -3219,6 +3263,7 @@ class ChatBroker:
                     "type": event_type.replace(".delta", ".started"),
                     "itemId": item_id,
                     "turnId": turn_id,
+                    "occurredAt": occurred_at,
                     "payload": {"text": ""},
                 },
             )
@@ -3231,10 +3276,16 @@ class ChatBroker:
             "reasoning.completed",
             "tool.completed",
         } and item_id:
+            prior_occurred_at = self.items.get(item_id, {}).get("occurredAt")
             self.items[item_id] = {
                 "type": event_type,
                 "itemId": item_id,
                 "turnId": turn_id,
+                "occurredAt": (
+                    prior_occurred_at
+                    if prior_occurred_at is not None
+                    else occurred_at
+                ),
                 "payload": payload,
             }
         elif event_type == "tool.updated" and item_id:
@@ -3244,6 +3295,7 @@ class ChatBroker:
                     "type": "tool.updated",
                     "itemId": item_id,
                     "turnId": turn_id,
+                    "occurredAt": occurred_at,
                     "payload": {},
                 },
             )

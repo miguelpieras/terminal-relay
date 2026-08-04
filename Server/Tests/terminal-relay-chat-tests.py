@@ -217,6 +217,7 @@ async def exercise_protocol(module, root: pathlib.Path) -> None:
     assert event["seq"] == second_attach_ack["seq"] + 1
     assert (await first.read_type("message.delta"))["seq"] == event["seq"]
     assert (await second.read_type("message.delta"))["seq"] == event["seq"]
+    assert broker.snapshot_payload()["items"][-1]["occurredAt"] == event["occurredAt"]
 
     # Every command receives an acknowledgement and turn.start is idempotent.
     ping_id, ping = first.command("ping", {})
@@ -535,6 +536,7 @@ class FakeCodexWebSocket:
                                 "exitCode": 0,
                             },
                         ],
+                        "startedAt": 1_800_000_000.25,
                     }
                 ]
             self.incoming.put(
@@ -646,6 +648,8 @@ async def exercise_codex_adapter(module, root: pathlib.Path) -> None:
         "tool.completed",
     ]
     assert history[0]["payload"]["clientUserMessageId"] == "client-fixture"
+    assert history[0]["occurredAt"] == 1_800_000_000_250
+    assert history[-1]["occurredAt"] == 1_800_000_000_250
     assert history[-1]["payload"]["exitCode"] == 0
     older_page, has_more = await adapter.history(
         "cccccccc-cccc-4ccc-8ccc-cccccccccccc", 100
@@ -1142,6 +1146,7 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
             SimpleNamespace(
                 uuid="13131313-1313-4313-8313-131313131313",
                 type="user",
+                timestamp="2027-01-15T08:00:00.250Z",
                 message={
                     "role": "user",
                     "content": [{"type": "text", "text": "historic question"}],
@@ -1251,6 +1256,7 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
         "13131313-1313-4313-8313-131313131313:0",
         "14141414-1414-4414-8414-141414141414:0",
     ]
+    assert history[0]["occurredAt"] == 1_800_000_000_250
     attachment_path = project / "15151515-1515-4515-8515-151515151516.png"
     attachment_path.write_bytes(b"\x89PNG\r\n\x1a\n")
     command_id = "15151515-1515-4515-8515-151515151515"

@@ -619,6 +619,7 @@ private struct ConversationTranscriptScroller<Content: View>: View {
             onNearBottomChange: onNearBottomChange,
             onAnchoredChange: onAnchoredChange
         )
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .accessibilityIdentifier("conversation.transcript")
         .accessibilityValue(isNearBottom ? "latest" : "history")
         .overlay(alignment: .bottomTrailing) {
@@ -899,6 +900,7 @@ private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
+        scrollView.scrollerInsets = NSEdgeInsets()
         scrollView.drawsBackground = false
         // The transcript reads anchored, not springy: no rubber-band bounce
         // at the content edges, on either axis.
@@ -1428,12 +1430,16 @@ private struct ChatMessageView: View {
                 }
             } label: {
                 Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
+                    .frame(width: 14, height: 14)
             }
             .buttonStyle(.plain)
             .chatMinimumInteractionTarget(includesWidth: true)
             .accessibilityLabel(didCopy ? "Message copied" : "Copy message")
 
-            if let date = ChatTimestamp.date(milliseconds: message.occurredAt) {
+            if let date = ChatTimestamp.date(
+                milliseconds: message.occurredAt,
+                fallbackUUIDv7s: [message.turnID, message.id]
+            ) {
                 Text(ChatTimestamp.label(for: date))
                     .accessibilityLabel(date.formatted(date: .complete, time: .shortened))
             }
@@ -1486,9 +1492,30 @@ private struct ChatMessageView: View {
 }
 
 enum ChatTimestamp {
-    static func date(milliseconds: Int64?) -> Date? {
-        guard let milliseconds, milliseconds >= 0 else { return nil }
-        return Date(timeIntervalSince1970: TimeInterval(milliseconds) / 1_000)
+    static func date(
+        milliseconds: Int64?,
+        fallbackUUIDv7s: [String?] = []
+    ) -> Date? {
+        let resolvedMilliseconds = milliseconds
+            ?? fallbackUUIDv7s.lazy.compactMap(uuidV7Milliseconds).first
+        guard let resolvedMilliseconds, resolvedMilliseconds >= 0 else {
+            return nil
+        }
+        return Date(
+            timeIntervalSince1970: TimeInterval(resolvedMilliseconds) / 1_000
+        )
+    }
+
+    private static func uuidV7Milliseconds(_ value: String?) -> Int64? {
+        guard let value, let uuid = UUID(uuidString: value) else { return nil }
+        let bytes = uuid.uuid
+        guard bytes.6 >> 4 == 7 else { return nil }
+        return Int64(bytes.0) << 40
+            | Int64(bytes.1) << 32
+            | Int64(bytes.2) << 24
+            | Int64(bytes.3) << 16
+            | Int64(bytes.4) << 8
+            | Int64(bytes.5)
     }
 
     static func label(
