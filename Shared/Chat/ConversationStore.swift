@@ -1,7 +1,7 @@
 import Combine
 import Foundation
 
-struct ConversationState: Equatable, Sendable {
+struct ConversationState: Codable, Equatable, Sendable {
     var snapshotGeneration: String?
     var lastAppliedSequence: Int64 = 0
     var items: [ConversationItem] = []
@@ -946,6 +946,38 @@ final class ConversationStore: ObservableObject {
                 unreadCount += workingState.items.count - previousItemCount
             }
         }
+    }
+
+    /// Adopts a cached state as the pre-connection baseline so the transcript
+    /// paints instantly from disk. Only valid before any live envelope has
+    /// applied; the attach cursor then resumes from the cached sequence and
+    /// the worker replays just the delta (or a fresh snapshot when its
+    /// generation changed).
+    func hydrateFromCache(_ cached: ConversationState) {
+        guard workingState.lastAppliedSequence == 0,
+              workingState.items.isEmpty else {
+            return
+        }
+        var state = cached
+        state.connectionState = .connecting
+        state.lastErrorMessage = nil
+        state.filePreview = nil
+        // Interactive prompts and turn activity are only meaningful live: a
+        // cached pending approval would render actionable buttons wired to a
+        // dead worker generation. The attach replay restores any that are
+        // genuinely still pending.
+        state.approvals.removeAll { $0.status == .pending }
+        state.questions.removeAll { $0.status == .pending }
+        state.turnState = .idle
+        state.activeTurnID = nil
+        workingState = state
+        recountRetainedContentBytes()
+        reducer.enforceMemoryBounds(
+            on: &workingState,
+            retainedContentBytes: &retainedContentBytes
+        )
+        clearStaleDestructiveApprovalConfirmation()
+        publishImmediately()
     }
 
     func replaceWithSnapshot(_ snapshot: ConversationSnapshot) {

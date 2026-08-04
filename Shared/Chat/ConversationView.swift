@@ -76,6 +76,14 @@ struct ConversationView: View {
     var body: some View {
         VStack(spacing: 0) {
             transcript
+                .overlay(alignment: .bottom) {
+                    // Floating, so appearing and disappearing never resizes
+                    // the viewport: a layout shift here would break the
+                    // at-bottom follow state during every reconnect.
+                    if !isReadOnly {
+                        syncingNotice
+                    }
+                }
             if !isReadOnly {
                 compactNotice
             }
@@ -422,6 +430,29 @@ struct ConversationView: View {
             return false
         default:
             return true
+        }
+    }
+
+    /// Shown when cached content is on screen but the live attach hasn't
+    /// caught up yet, so instant-from-disk transcripts are honest about
+    /// possibly trailing the worker.
+    @ViewBuilder
+    private var syncingNotice: some View {
+        if !store.state.items.isEmpty,
+           store.state.connectionState == .connecting {
+            HStack(spacing: 5) {
+                ProgressView()
+                    .controlSize(.mini)
+                Text("Syncing latest…")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(.ultraThinMaterial, in: Capsule())
+            .padding(.bottom, 10)
+            .allowsHitTesting(false)
+            .accessibilityElement(children: .combine)
         }
     }
 

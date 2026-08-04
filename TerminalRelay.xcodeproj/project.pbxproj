@@ -28,15 +28,18 @@
 		14ADAB4E0A22C6C72C412851 /* ServerProfileTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB03758D1CB3A90E9F6492F2 /* ServerProfileTests.swift */; };
 		1A6BD750D30624EE0FC8DCFE /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = 65B7619A8203E1867B49A653 /* Sparkle */; };
 		1B69BD10927990904F26E683 /* WorkerRegistrationTokenAuthorizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = D11B01481FFDEF95AD72D764 /* WorkerRegistrationTokenAuthorizer.swift */; };
+		1E2924EA83433AF03C18BB73 /* ConversationStateCacheTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3FBF85EC53F49F0416A1445C /* ConversationStateCacheTests.swift */; };
 		1FA01C33C8C89624D38B7288 /* SessionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4C76B0396E10CAF3945C3EB /* SessionManager.swift */; };
 		23746C4FAC36F4F1120D9CA7 /* THIRD_PARTY_NOTICES.md in Resources */ = {isa = PBXBuildFile; fileRef = 0FF91CF92B1EA335FEE3D31F /* THIRD_PARTY_NOTICES.md */; };
 		260C7E8CD25E00B853E63C60 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 865E323F9872A2B96FD0A247 /* ContentView.swift */; };
 		2653CA2FF73C430E73EB9F6D /* TerminalRepresentable.swift in Sources */ = {isa = PBXBuildFile; fileRef = 64572D7519667D0D25972D57 /* TerminalRepresentable.swift */; };
 		27733C9C544DD8FBBD51A667 /* ConversationScrollController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D888961A23F7C87FF994A40 /* ConversationScrollController.swift */; };
+		288D52C14ABA493B25C43918 /* ConversationStateCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 088E2C13A037231EA0A64848 /* ConversationStateCache.swift */; };
 		2B8315E7553879CE73F320DD /* MobilePairingClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7074B22037B0051B60A49048 /* MobilePairingClient.swift */; };
 		2BF33DB4120A9B8E4639F6A2 /* SessionManagerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C873751F82394CA5B3125CE3 /* SessionManagerTests.swift */; };
 		354AC532DA7ABB9688F98244 /* ServerProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1A2A3C58843B9F9BBDF0B62 /* ServerProfile.swift */; };
 		3950D9E2BBDA9BBE1AAB2A36 /* MobileChatSessionControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2544C792B533E1E0FFA01CF /* MobileChatSessionControllerTests.swift */; };
+		3A247EFD38B0C6CB31A064F9 /* ConversationStateCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 088E2C13A037231EA0A64848 /* ConversationStateCache.swift */; };
 		3B09B478BC43F5E998CFD148 /* WorkerUpdateStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = 42B3415016E40E746420EBA8 /* WorkerUpdateStatus.swift */; };
 		3C4100A6675A5A2B84A51D1B /* MacChatProcessConnection.swift in Sources */ = {isa = PBXBuildFile; fileRef = EA8120F2FF7B13AF8E8904B7 /* MacChatProcessConnection.swift */; };
 		3F0C3E4D664E8C88BC474F21 /* WorkerMetricsService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0678D0C9803DB05DEFD31A0 /* WorkerMetricsService.swift */; };
@@ -190,6 +193,7 @@
 		007CF39E9B15FD15E0929CF5 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		01417C38DCD882AE840B1999 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		01B842C4635C4D69477F1116 /* MobilePairingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobilePairingTests.swift; sourceTree = "<group>"; };
+		088E2C13A037231EA0A64848 /* ConversationStateCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationStateCache.swift; sourceTree = "<group>"; };
 		0A02BB8092DDF8AED8C6F603 /* TerminalRelayApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalRelayApp.swift; sourceTree = "<group>"; };
 		0B377F87C51DCACFC6C89CE6 /* TerminalRelayIOSUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = TerminalRelayIOSUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		0E0A0111A5E62BD133D1B1D8 /* SSHIdentityStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SSHIdentityStore.swift; sourceTree = "<group>"; };
@@ -218,6 +222,7 @@
 		3B7E5B66FDAB3A827D6F0497 /* WorkerSessionService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerSessionService.swift; sourceTree = "<group>"; };
 		3DA2908A23F422E97FE941C8 /* WorkerUpdateStatusTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerUpdateStatusTests.swift; sourceTree = "<group>"; };
 		3E452EE1DE95DB629F3FFB13 /* WorkerMetricsServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerMetricsServiceTests.swift; sourceTree = "<group>"; };
+		3FBF85EC53F49F0416A1445C /* ConversationStateCacheTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationStateCacheTests.swift; sourceTree = "<group>"; };
 		42B3415016E40E746420EBA8 /* WorkerUpdateStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerUpdateStatus.swift; sourceTree = "<group>"; };
 		43340254D8F8DC327980CD05 /* ChatProtocolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatProtocolTests.swift; sourceTree = "<group>"; };
 		4A206B67C5A2B0B64D46F4A2 /* RelayTerminalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayTerminalView.swift; sourceTree = "<group>"; };
@@ -378,6 +383,7 @@
 				43340254D8F8DC327980CD05 /* ChatProtocolTests.swift */,
 				1FFB1080667036ED5786F005 /* ChatTestFixtures.swift */,
 				DEA3677E73D0BC372979F092 /* ConversationCoordinatorTests.swift */,
+				3FBF85EC53F49F0416A1445C /* ConversationStateCacheTests.swift */,
 				DF82A68671ADE4446F83675D /* ConversationStoreTests.swift */,
 				724443C3BB207BBC277FD61F /* GitHubProjectServiceTests.swift */,
 				7AB6ED13164833C92AD88D6C /* MacChatProcessConnectionTests.swift */,
@@ -492,6 +498,7 @@
 				C26519E2609AF2F9446A577D /* ChatTransport.swift */,
 				7C9E558E422E4F57920A3222 /* ConversationCoordinator.swift */,
 				7D888961A23F7C87FF994A40 /* ConversationScrollController.swift */,
+				088E2C13A037231EA0A64848 /* ConversationStateCache.swift */,
 				FAE18EB898CC23A142738160 /* ConversationStore.swift */,
 				15A512615C3725D227119E55 /* ConversationView.swift */,
 				38AEF7811F16D7AF0555A73A /* NDJSONCodec.swift */,
@@ -824,6 +831,7 @@
 				260C7E8CD25E00B853E63C60 /* ContentView.swift in Sources */,
 				AC20E54CD07ED85A7470FCF5 /* ConversationCoordinator.swift in Sources */,
 				27733C9C544DD8FBBD51A667 /* ConversationScrollController.swift in Sources */,
+				3A247EFD38B0C6CB31A064F9 /* ConversationStateCache.swift in Sources */,
 				69C364BECA913903E57257FB /* ConversationStore.swift in Sources */,
 				CE06105C921DACAECCEDB0E0 /* ConversationView.swift in Sources */,
 				A702CB697043025A4D4B62C4 /* GitHubProjectService.swift in Sources */,
@@ -875,6 +883,7 @@
 				E14A3E7829F411E0640DCD6D /* ChatTransport.swift in Sources */,
 				F00CE9761260D4BBD880938B /* ConversationCoordinator.swift in Sources */,
 				ACD4AC52BFE5566466162B7B /* ConversationScrollController.swift in Sources */,
+				288D52C14ABA493B25C43918 /* ConversationStateCache.swift in Sources */,
 				C57F7B76754766D5AB42A196 /* ConversationStore.swift in Sources */,
 				400C3C5C5A174F964F24121E /* ConversationView.swift in Sources */,
 				84381A73C7C0DF41B3E1E115 /* IOSSSHChatTransport.swift in Sources */,
@@ -930,6 +939,7 @@
 				A1C81C16DF973EFE1EB101D8 /* ChatProtocolTests.swift in Sources */,
 				09402BA2B2F73154A2B02AE9 /* ChatTestFixtures.swift in Sources */,
 				C6F09876A9AFC4A337525A62 /* ConversationCoordinatorTests.swift in Sources */,
+				1E2924EA83433AF03C18BB73 /* ConversationStateCacheTests.swift in Sources */,
 				C97DE0F8B389183FB0226396 /* ConversationStoreTests.swift in Sources */,
 				DC092AA9C4E650C702FC9302 /* GitHubProjectServiceTests.swift in Sources */,
 				7AD3D03A4345F531ADC441CC /* MacChatProcessConnectionTests.swift in Sources */,

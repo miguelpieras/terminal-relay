@@ -84,8 +84,12 @@ final class ConversationCoordinator {
     private var launchOptions: ChatLaunchOptions
     private let retryPolicy: ChatRetryPolicy
     private let stopPolicy: ChatStopPolicy
+    private let cache: ConversationStateCache?
+    private var didAttemptHydration = false
+    private var cacheSaveTask: Task<Void, Never>?
     private var lifecycleTask: Task<Void, Never>?
     private var retryTask: Task<Void, Never>?
+    private var retrySleepTask: Task<Void, Never>?
     private var shouldStayConnected = false
     private var isAttached = false
     private var needsFreshSnapshot = false
@@ -104,7 +108,8 @@ final class ConversationCoordinator {
         identity: ChatConversationIdentity,
         launchOptions: ChatLaunchOptions = ChatLaunchOptions(),
         retryPolicy: ChatRetryPolicy = .standard,
-        stopPolicy: ChatStopPolicy = .standard
+        stopPolicy: ChatStopPolicy = .standard,
+        cache: ConversationStateCache? = nil
     ) {
         self.store = store ?? ConversationStore()
         self.transport = transport
@@ -112,15 +117,21 @@ final class ConversationCoordinator {
         self.launchOptions = launchOptions
         self.retryPolicy = retryPolicy
         self.stopPolicy = stopPolicy
+        self.cache = cache
     }
 
     deinit {
         lifecycleTask?.cancel()
         retryTask?.cancel()
+        retrySleepTask?.cancel()
+        cacheSaveTask?.cancel()
     }
 
     func start() {
-        guard lifecycleTask == nil, retryTask == nil else { return }
+        guard lifecycleTask == nil, retryTask == nil else {
+            expediteReconnectIfWaiting()
+            return
+        }
         guard identity.isValid else {
             store.setConnectionState(
                 .failed,
@@ -131,7 +142,53 @@ final class ConversationCoordinator {
         shouldStayConnected = true
         store.setConnectionState(.connecting)
         lifecycleTask = Task { [weak self] in
+            await self?.hydrateFromCacheIfNeeded()
             await self?.runConnectionLoop()
+        }
+    }
+
+    /// Skips the remainder of a reconnect backoff sleep, if one is pending.
+    /// Called when the user opens the conversation: a transcript someone is
+    /// looking at never waits out a multi-second backoff.
+    func expediteReconnectIfWaiting() {
+        retrySleepTask?.cancel()
+    }
+
+    /// Paints cached history without connecting — used by the launch-pending
+    /// pane so a cold worker resume shows the conversation immediately while
+    /// the real session starts. Safe to call at most once; start() skips
+    /// hydration if this already ran.
+    func hydrateForPreview() {
+        Task { [weak self] in
+            await self?.hydrateFromCacheIfNeeded()
+        }
+    }
+
+    /// Paints the transcript from the on-disk cache before the first connect,
+    /// so opening a known thread shows content immediately. The subsequent
+    /// attach resumes from the cached cursor and reconciles with the worker.
+    private func hydrateFromCacheIfNeeded() async {
+        guard !didAttemptHydration else { return }
+        didAttemptHydration = true
+        guard let cache, store.lastAppliedSequence == 0 else { return }
+        if let cached = await cache.load(for: identity) {
+            store.hydrateFromCache(cached)
+        }
+    }
+
+    /// Persists the current state after live updates, debounced so streaming
+    /// deltas coalesce into one write when the stream quiets.
+    private func scheduleCacheSave(immediate: Bool = false) {
+        guard cache != nil else { return }
+        cacheSaveTask?.cancel()
+        cacheSaveTask = Task { [weak self] in
+            if !immediate {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            }
+            guard !Task.isCancelled, let self, let cache = self.cache else {
+                return
+            }
+            await cache.save(self.store.state, for: self.identity)
         }
     }
 
@@ -162,6 +219,10 @@ final class ConversationCoordinator {
         isAttached = false
         await transport.disconnect()
         store.setConnectionState(.offlineAgentRunning)
+        cacheSaveTask?.cancel()
+        if let cache {
+            await cache.save(store.state, for: identity)
+        }
     }
 
     func retry() {
@@ -478,7 +539,12 @@ final class ConversationCoordinator {
                 retryPolicy.maximumDelayNanoseconds
             )
             if delay > 0 {
-                try? await Task.sleep(nanoseconds: delay)
+                // A cancellable child so opening the conversation can cut the
+                // backoff short without tearing down the connection loop.
+                let sleeper = Task { _ = try? await Task.sleep(nanoseconds: delay) }
+                retrySleepTask = sleeper
+                await sleeper.value
+                retrySleepTask = nil
             }
             if shouldStayConnected {
                 store.setConnectionState(.connecting)
@@ -492,8 +558,12 @@ final class ConversationCoordinator {
             try store.apply(envelope)
             if envelope.type == ChatEventKind.conversationSnapshot.rawValue {
                 reconcileSnapshotTransients()
+                scheduleCacheSave(immediate: true)
             } else if envelope.type == ChatEventKind.turnStarted.rawValue {
                 releasePendingTurnLatchPreservingRestoration()
+                scheduleCacheSave()
+            } else if envelope.sequence != nil {
+                scheduleCacheSave()
             }
             if let pendingInterrupt,
                store.state.activeTurnID != pendingInterrupt.turnID {

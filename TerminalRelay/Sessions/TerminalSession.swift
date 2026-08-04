@@ -186,7 +186,8 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         remoteAttachedClientCount: Int? = nil,
         presentation: WorkerSessionPresentation = .terminal,
         launchState: TerminalSessionLaunchState = .ready,
-        launchDefaults: AgentLaunchDefaults = .standard
+        launchDefaults: AgentLaunchDefaults = .standard,
+        initialChatState: ConversationState? = nil
     ) {
         self.id = id
         self.terminalViewIdentity = terminalViewIdentity
@@ -232,14 +233,20 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
                 repositoryName: project.displayName,
                 instanceToken: instanceToken
             )
+            // A carried state (the launch-pending preview's hydrated store)
+            // keeps the transcript painted across the pending→confirmed
+            // session swap instead of flashing back to a loading pane and
+            // re-reading the cache from disk.
             self.chatCoordinator = ConversationCoordinator(
+                store: initialChatState.map { ConversationStore(state: $0) },
                 transport: transport,
                 identity: ChatConversationIdentity(
                     relayID: instanceToken,
                     provider: ChatProvider(rawValue: kind.rawValue),
                     providerThreadID: threadID
                 ),
-                launchOptions: launchDefaults.chatOptions(for: kind)
+                launchOptions: launchDefaults.chatOptions(for: kind),
+                cache: .shared
             )
         }
         self.terminalView = LocalProcessTerminalView(frame: NSRect(x: 0, y: 0, width: 900, height: 600))
@@ -330,6 +337,11 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
     }
 
     func startIfNeeded() {
+        if hasStarted, let chatCoordinator {
+            // Re-opening an already-started conversation: never let a visible
+            // transcript sit out a reconnect backoff sleep.
+            chatCoordinator.expediteReconnectIfWaiting()
+        }
         guard !hasStarted,
               !hasFinished,
               launchState == .ready,

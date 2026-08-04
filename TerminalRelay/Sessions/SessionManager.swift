@@ -544,7 +544,10 @@ final class SessionManager: ObservableObject {
             threadID: snapshot.threadID,
             remoteAttachedClientCount: snapshot.attachedClientCount,
             presentation: snapshot.presentation,
-            launchDefaults: launchDefaults
+            launchDefaults: launchDefaults,
+            initialChatState: pendingSession.chatCoordinator.flatMap {
+                $0.store.state.items.isEmpty ? nil : $0.store.state
+            }
         )
         sessionObservers[pendingSession.id] = nil
         taskCompletionObservers[pendingSession.id] = nil

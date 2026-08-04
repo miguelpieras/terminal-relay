@@ -1376,30 +1376,63 @@ private struct TerminalPane: View {
             }
 
             if session.isLaunchPending {
-                VStack(spacing: 12) {
-                    ProgressView()
-                        .controlSize(.large)
-                    Text(
-                        session.isLoadingExistingConversation
-                            ? "Loading conversation…"
-                            : "Starting \(agentProductName)…"
+                if session.isLoadingExistingConversation,
+                   let coordinator = session.chatCoordinator {
+                    // A resuming thread paints its cached history immediately
+                    // while the worker cold-starts; the pill keeps the wait
+                    // honest. With no cache the view falls back to its own
+                    // "Loading conversation…" empty state.
+                    ConversationView(
+                        coordinator: coordinator,
+                        isReadOnly: true,
+                        showsComposer: false,
+                        startsCoordinator: false
                     )
-                        .font(.headline)
-                    Text(
-                        session.isLoadingExistingConversation
-                            ? "Retrieving the latest history from \(worker.displayName)"
-                            : "Connecting to \(worker.displayName)"
-                    )
-                        .font(.callout)
+                    .onAppear {
+                        coordinator.hydrateForPreview()
+                    }
+                    .overlay(alignment: .bottom) {
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Resuming on \(worker.displayName)…")
+                        }
+                        .font(.caption)
                         .foregroundStyle(.secondary)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 7)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .padding(.bottom, 14)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel("Resuming conversation")
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    VStack(spacing: 12) {
+                        ProgressView()
+                            .controlSize(.large)
+                        Text(
+                            session.isLoadingExistingConversation
+                                ? "Loading conversation…"
+                                : "Starting \(agentProductName)…"
+                        )
+                            .font(.headline)
+                        Text(
+                            session.isLoadingExistingConversation
+                                ? "Retrieving the latest history from \(worker.displayName)"
+                                : "Connecting to \(worker.displayName)"
+                        )
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(
+                        session.isLoadingExistingConversation
+                            ? "Loading conversation"
+                            : "Starting \(agentProductName)"
+                    )
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel(
-                    session.isLoadingExistingConversation
-                        ? "Loading conversation"
-                        : "Starting \(agentProductName)"
-                )
             } else if let failureMessage = session.launchFailureMessage {
                 ContentUnavailableView {
                     Label(
