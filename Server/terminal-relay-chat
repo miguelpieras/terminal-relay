@@ -3303,26 +3303,38 @@ class ChatBroker:
         }
 
     def bounded_snapshot_event(self) -> tuple[dict[str, Any], bytes]:
+        # Leave enough room for the event envelope and future identity
+        # fields while keeping the encoded NDJSON record below 1 MiB.
+        limit = MAX_RECORD_BYTES - 16 * 1024
         while True:
             payload = self.snapshot_payload()
-            # Leave enough room for the event envelope and future identity
-            # fields while keeping the encoded NDJSON record below 1 MiB.
-            payload_size = len(
+            remaining = len(
                 json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode(
                     "utf-8"
                 )
             )
-            if payload_size <= MAX_RECORD_BYTES - 16 * 1024:
+            if remaining <= limit:
                 break
-            if self.items:
-                self.items.popitem(last=False)
-                self.has_older_history = True
-                self.oldest_item_id = next(iter(self.items), None)
-                continue
-            raise ChatError(
-                "snapshotTooLarge",
-                "The provider snapshot exceeded the chat protocol limit.",
-            )
+            if not self.items:
+                raise ChatError(
+                    "snapshotTooLarge",
+                    "The provider snapshot exceeded the chat protocol limit.",
+                )
+            # Shed the oldest items by their own encoded sizes, then loop to
+            # re-verify the exact bound, instead of re-serializing the whole
+            # payload once per dropped item.
+            while self.items and remaining > limit:
+                _, dropped = self.items.popitem(last=False)
+                remaining -= (
+                    len(
+                        json.dumps(
+                            dropped, separators=(",", ":"), ensure_ascii=False
+                        ).encode("utf-8")
+                    )
+                    + 1
+                )
+            self.has_older_history = True
+            self.oldest_item_id = next(iter(self.items), None)
         snapshot = self.event("conversation.snapshot", payload)
         return snapshot, encode_record(snapshot)
 
@@ -3341,6 +3353,13 @@ class ChatBroker:
                 self.items[item_id] = sanitize_json(item)
         self.has_older_history = has_older
         self.oldest_item_id = next(iter(self.items), None)
+        if self.clients:
+            # Clients admitted before the provider resumed are still on the
+            # pre-resume snapshot generation. Hand them the rebuilt transcript
+            # before any newer-generation live record forces a re-attach.
+            snapshot, encoded = self.bounded_snapshot_event()
+            self._remember_event(snapshot, encoded)
+            await self._broadcast_encoded(encoded)
         while self.buffered_provider_events:
             buffered = self.buffered_provider_events
             self.buffered_provider_events = []
@@ -3416,28 +3435,88 @@ class ChatBroker:
         if self.provider_thread_id is not None:
             self._acquire_provider_lock()
         self.rebuilding_snapshot = True
-        self.provider_thread_id = await self.provider.start(self.emit)
-        self.provider_thread_id = canonical_uuid(
-            self.provider_thread_id, "provider thread ID"
-        )
-        if self.provider_lock_descriptor is None:
-            self._acquire_provider_lock()
-        await self.rebuild_snapshot(load_provider_history=load_provider_history)
-        self.connection_state = "streaming"
-        self._write_state("ready")
-        self.server = await asyncio.start_unix_server(
-            self.handle_client,
-            path=self.socket_path,
-            limit=MAX_RECORD_BYTES + 1,
-        )
-        os.chmod(self.socket_path, 0o600)
-        self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        await self.emit(
-            "session.state",
-            {"connectionState": "streaming", "reason": "providerReady"},
-        )
-        async with self.server:
-            await self.stop_event.wait()
+        # With a known provider thread the attach surface opens before the
+        # provider resumes: clients get an immediate "connecting" snapshot and
+        # the transcript streams in once the history ingest completes, so
+        # opening a dormant thread no longer blocks on the resume.
+        early_ready = self.provider_thread_id is not None
+        if early_ready:
+            await self._open_attach_surface()
+        stopped_while_connecting = False
+        try:
+            if early_ready:
+                # A stop command must interrupt a slow resume; otherwise an
+                # acked stop leaves a "ready" broker holding the provider
+                # thread lock until the resume finishes.
+                connect = asyncio.create_task(
+                    self._connect_provider(load_provider_history)
+                )
+                stop_wait = asyncio.create_task(self.stop_event.wait())
+                try:
+                    await asyncio.wait(
+                        {connect, stop_wait},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    stop_wait.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await stop_wait
+                if connect.done():
+                    connect.result()
+                else:
+                    connect.cancel()
+                    with contextlib.suppress(Exception, asyncio.CancelledError):
+                        await connect
+                    stopped_while_connecting = True
+                    self.rebuilding_snapshot = False
+            else:
+                await self._connect_provider(load_provider_history)
+        except Exception as error:
+            if early_ready:
+                reason = (
+                    error.code
+                    if isinstance(error, ChatError)
+                    else "providerUnavailable"
+                )
+                with contextlib.suppress(Exception):
+                    await self._publish(
+                        "session.ended",
+                        {"reason": reason, "connectionState": "stopped"},
+                    )
+                await asyncio.sleep(0)
+                if self.heartbeat_task:
+                    self.heartbeat_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await self.heartbeat_task
+            # Close the provider even on a failed start: a half-connected
+            # Codex websocket otherwise leaves its blocking reader thread
+            # alive and the process never exits, wedging the thread lock.
+            with contextlib.suppress(Exception):
+                await self.provider.close()
+            if early_ready:
+                for client in tuple(self.clients):
+                    await client.close()
+                self.clients.clear()
+                if self.server:
+                    self.server.close()
+                    await self.server.wait_closed()
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(self.socket_path)
+                self._write_state("stopped")
+                # A conversation whose resume failed is not restorable; drop
+                # the restart intent so boot restore stops relaunching it.
+                self._remove_intent_file()
+            raise
+        if not stopped_while_connecting:
+            self.connection_state = "streaming"
+            if not early_ready:
+                await self._open_attach_surface()
+            await self.emit(
+                "session.state",
+                {"connectionState": "streaming", "reason": "providerReady"},
+            )
+            async with self.server:
+                await self.stop_event.wait()
         await self.emit(
             "session.ended",
             {"reason": "stopped", "connectionState": "stopped"},
@@ -3458,27 +3537,52 @@ class ChatBroker:
             os.unlink(self.socket_path)
         self._write_state("stopped")
         if self.explicit_stop:
-            intent_path = os.path.join(
-                self.runtime_directory, f"{self.relay_id}.chat-intent"
-            )
-            if os.path.lexists(intent_path):
-                info = os.lstat(intent_path)
-                if (
-                    stat.S_ISREG(info.st_mode)
-                    and not stat.S_ISLNK(info.st_mode)
-                    and info.st_uid == os.getuid()
-                    and stat.S_IMODE(info.st_mode) == 0o600
-                ):
-                    os.unlink(intent_path)
+            self._remove_intent_file()
         if self.provider_lock_descriptor is not None:
             os.close(self.provider_lock_descriptor)
             self.provider_lock_descriptor = None
+
+    async def _connect_provider(self, load_provider_history: bool) -> None:
+        self.provider_thread_id = await self.provider.start(self.emit)
+        self.provider_thread_id = canonical_uuid(
+            self.provider_thread_id, "provider thread ID"
+        )
+        if self.provider_lock_descriptor is None:
+            self._acquire_provider_lock()
+        await self.rebuild_snapshot(load_provider_history=load_provider_history)
+
+    def _remove_intent_file(self) -> None:
+        intent_path = os.path.join(
+            self.runtime_directory, f"{self.relay_id}.chat-intent"
+        )
+        if os.path.lexists(intent_path):
+            info = os.lstat(intent_path)
+            if (
+                stat.S_ISREG(info.st_mode)
+                and not stat.S_ISLNK(info.st_mode)
+                and info.st_uid == os.getuid()
+                and stat.S_IMODE(info.st_mode) == 0o600
+            ):
+                os.unlink(intent_path)
+
+    async def _open_attach_surface(self) -> None:
+        self._write_state("ready")
+        self.server = await asyncio.start_unix_server(
+            self.handle_client,
+            path=self.socket_path,
+            limit=MAX_RECORD_BYTES + 1,
+        )
+        os.chmod(self.socket_path, 0o600)
+        self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
     async def _heartbeat_loop(self) -> None:
         while not self.stop_event.is_set():
             await asyncio.sleep(1)
             if time.monotonic() - self.last_emit >= HEARTBEAT_SECONDS:
-                await self.emit(
+                # Publish directly: heartbeats must reach early-attached
+                # clients while a snapshot rebuild is buffering provider
+                # events, or a slow resume looks like a dead broker.
+                await self._publish(
                     "session.heartbeat",
                     {"connectionState": self.connection_state},
                 )
@@ -3650,6 +3754,9 @@ class ChatBroker:
         # idempotency record form one serialized operation. Otherwise two
         # attached devices can race the same request ID through the lookup and
         # invoke a provider mutation twice before either result is remembered.
+        # Responses publish directly, never through the emit() rebuild buffer:
+        # acks and errors must reach clients admitted while the provider is
+        # still resuming.
         async with self.command_lock:
             return await self._handle_command_serialized(client, command)
 
@@ -3670,7 +3777,7 @@ class ChatBroker:
                         "The request ID was reused for a different command.",
                         close=True,
                     )
-                await self.emit(
+                await self._publish(
                     prior_type,
                     prior_payload,
                     turn_id=command.get("turnId"),
@@ -3688,7 +3795,7 @@ class ChatBroker:
             closes_attachment = command_type in {"session.detach", "session.stop"}
             if closes_attachment:
                 self.clients.discard(client)
-                event = await self.emit(
+                event = await self._publish(
                     "ack",
                     response_payload,
                     turn_id=command.get("turnId"),
@@ -3696,7 +3803,7 @@ class ChatBroker:
                 )
                 await client.direct_send(event)
             else:
-                event = await self.emit(
+                event = await self._publish(
                     "ack",
                     response_payload,
                     turn_id=command.get("turnId"),
@@ -3719,7 +3826,7 @@ class ChatBroker:
             }
             if error.close:
                 self.clients.discard(client)
-                event = await self.emit(
+                event = await self._publish(
                     "error",
                     payload,
                     turn_id=command.get("turnId"),
@@ -3727,7 +3834,7 @@ class ChatBroker:
                 )
                 await client.direct_send(event)
             else:
-                event = await self.emit(
+                event = await self._publish(
                     "error",
                     payload,
                     turn_id=command.get("turnId"),

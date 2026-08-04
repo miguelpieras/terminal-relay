@@ -1605,21 +1605,34 @@ load_chat_intent() {
     fi
 }
 
+ensure_codex_chat_backend() {
+    local readiness_status=0
+
+    if [[ $test_mode -eq 1 && "${TERMINAL_RELAY_TEST_CHAT_FAKE:-0}" == "1" ]]; then
+        return 0
+    fi
+    lock_codex_app_server || return $?
+    ensure_codex_app_server_locked || {
+        readiness_status=$?
+        unlock_codex_app_server
+        return "$readiness_status"
+    }
+    unlock_codex_app_server
+}
+
+chat_state_is_ready() {
+    printf '%s\n' "$1" \
+        | "$default_python_path" -c \
+            'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("status") == "ready" else 1)'
+}
+
 chat_capability_json() {
     local provider="$1"
     local raw
-    local readiness_status=0
 
     validate_tool "$provider"
-    if [[ "$provider" == "codex" ]] \
-        && ! [[ $test_mode -eq 1 && "${TERMINAL_RELAY_TEST_CHAT_FAKE:-0}" == "1" ]]; then
-        lock_codex_app_server || return $?
-        ensure_codex_app_server_locked || {
-            readiness_status=$?
-            unlock_codex_app_server
-            return "$readiness_status"
-        }
-        unlock_codex_app_server
+    if [[ "$provider" == "codex" ]]; then
+        ensure_codex_chat_backend || return $?
     fi
     local -a ready_arguments=(
         ready
@@ -1704,8 +1717,6 @@ chat_start_v1() {
     local session_name
     local launch_file
     local launch_command
-    local capability_wrapper
-    local capability_json
     local state_json=""
     local attempt
     local status=0
@@ -1740,10 +1751,12 @@ chat_start_v1() {
     if [[ "$provider" == "claude" ]]; then
         prepare_claude_onboarding || return $?
     fi
-    capability_wrapper="$(chat_capability_json "$provider")" || return $?
-    capability_json="$(printf '%s\n' "$capability_wrapper" \
-        | "$default_python_path" -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["capabilities"],separators=(",",":")))')" \
-        || return 70
+    # The broker validates provider readiness itself and reports the static
+    # capabilities in its state file, so the cold-open path no longer pays a
+    # separate capability probe (a full SDK import for Claude).
+    if [[ "$provider" == "codex" ]]; then
+        ensure_codex_chat_backend || return $?
+    fi
     relay_id="${requested_chat_relay_id:-}"
     if [[ -z "$relay_id" ]]; then
         relay_id="$(generate_instance)" || return 70
@@ -1793,7 +1806,13 @@ chat_start_v1() {
         if state_json="$(run_chat_broker "$provider" inspect \
             --runtime-directory "$runtime_directory" \
             --relay-id "$relay_id" 2>/dev/null)"; then
-            break
+            # Only a live "ready" broker satisfies the start: a "stopped"
+            # state here is either stale (a previous run of this relay, not
+            # yet overwritten) or a resume that already failed.
+            if chat_state_is_ready "$state_json"; then
+                break
+            fi
+            state_json=""
         fi
         if ! tmux_command has-session -t "$session_name" 2>/dev/null; then
             break
@@ -1814,6 +1833,20 @@ chat_start_v1() {
         echo "Structured chat returned an invalid provider conversation." >&2
         return 70
     }
+    # On a restore relaunch, a concurrent stop may have withdrawn the restart
+    # intent after restore loaded it; honor the stop instead of resurrecting
+    # the conversation with a fresh intent.
+    if [[ -n "${requested_chat_relay_id:-}" ]] \
+        && [[ ! -e "$(chat_intent_file_for "$relay_id")" ]]; then
+        run_chat_broker "$provider" stop \
+            --runtime-directory "$runtime_directory" \
+            --relay-id "$relay_id" \
+            --provider "$provider" \
+            --repository "$repository" >/dev/null 2>&1 || true
+        tmux_command kill-session -t "$session_name" 2>/dev/null || true
+        echo "The structured chat was stopped while it was being restored." >&2
+        return 75
+    fi
     if ! write_chat_intent \
         "$provider" "$repository" "$relay_id" "$provider_thread_id" "$boot_id" "$@"; then
         run_chat_broker "$provider" stop \
@@ -1824,24 +1857,51 @@ chat_start_v1() {
         echo "Unable to persist the structured chat restart intent." >&2
         return 70
     fi
+    # Re-inspect after persisting the intent: the early-ready broker may have
+    # failed its resume (and removed its own intent) since the poll sampled
+    # "ready". Never report success — or keep an intent — from stale state.
+    if ! state_json="$(run_chat_broker "$provider" inspect \
+        --runtime-directory "$runtime_directory" \
+        --relay-id "$relay_id" 2>/dev/null)" \
+        || ! chat_state_is_ready "$state_json"; then
+        /bin/rm -f -- "$(chat_intent_file_for "$relay_id")"
+        tmux_command kill-session -t "$session_name" 2>/dev/null || true
+        echo "Structured chat did not become ready." >&2
+        return 70
+    fi
     printf '%s\n' "$chat_protocol_marker"
     "$default_python_path" - "$provider" "$relay_id" \
-        "$capability_json" "$state_json" <<'PYTHON_CHAT_START'
+        "$state_json" <<'PYTHON_CHAT_START'
 import json
 import sys
 
-provider, relay_id, capability_text, state_text = sys.argv[1:]
+provider, relay_id, state_text = sys.argv[1:]
 try:
     state = json.loads(state_text)
-    capabilities = json.loads(capability_text)
 except ValueError:
     raise SystemExit(70)
 thread_id = state.get("providerThreadId")
+capabilities = state.get("capabilities")
+required = {
+    "protocolVersion",
+    "features",
+    "supportsHistory",
+    "supportsFilePreview",
+    "supportsApprovals",
+    "supportsQuestions",
+    "supportsAttachments",
+}
 if (
     state.get("status") != "ready"
     or state.get("provider") != provider
     or state.get("relayId") != relay_id
     or not isinstance(thread_id, str)
+    or not isinstance(capabilities, dict)
+    or set(capabilities) != required
+    or capabilities["protocolVersion"] != 1
+    or not isinstance(capabilities["features"], list)
+    or any(not isinstance(value, bool) for key, value in capabilities.items()
+           if key.startswith("supports"))
 ):
     raise SystemExit(70)
 print(json.dumps({
@@ -1884,18 +1944,30 @@ chat_stop_v1() {
     local relay_id="$3"
     local session_name
     local attempt
+    local stop_status
 
     validate_tool "$provider"
     is_valid_repository_name "$repository" \
         || fail_usage "Invalid chat repository: $repository"
     is_valid_instance "$relay_id" || fail_usage "Invalid chat relay identifier."
     project_directory_for "$repository" >/dev/null || return $?
+    session_name="$(chat_session_name_for "$provider" "$relay_id")"
+    stop_status=0
     run_chat_broker "$provider" stop \
         --runtime-directory "$runtime_directory" \
         --relay-id "$relay_id" \
         --provider "$provider" \
-        --repository "$repository" || return $?
-    session_name="$(chat_session_name_for "$provider" "$relay_id")"
+        --repository "$repository" || stop_status=$?
+    if [[ $stop_status -ne 0 ]]; then
+        # A broker that already exited (failed resume, crash) leaves nothing
+        # to stop; still drop the restart intent so boot restore does not
+        # relaunch a dead conversation.
+        if ! tmux_command has-session -t "$session_name" 2>/dev/null; then
+            /bin/rm -f -- "$(chat_intent_file_for "$relay_id")"
+            return 0
+        fi
+        return "$stop_status"
+    fi
     for attempt in $(seq 1 100); do
         if ! tmux_command has-session -t "$session_name" 2>/dev/null; then
             /bin/rm -f -- "$(chat_intent_file_for "$relay_id")"
@@ -4047,6 +4119,14 @@ restore_chat_sessions() {
                 "$chat_intent_provider" \
                 "$chat_intent_repository" \
                 "$chat_intent_thread_id")" || start_status=$?
+        fi
+        if [[ $start_status -ne 0 && ! -e "$intent_path" ]]; then
+            # A concurrent stop withdrew the intent, or the resume failed and
+            # the broker dropped it; either way there is nothing to restore.
+            printf 'Skipped structured chat %s: its restart intent was withdrawn.\n' \
+                "$chat_intent_relay_id"
+            unset requested_chat_relay_id
+            continue
         fi
         if [[ $start_status -ne 0 ]] \
             && tmux_command has-session -t "$session_name" 2>/dev/null \

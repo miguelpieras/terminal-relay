@@ -424,12 +424,17 @@ struct ConversationView: View {
     }
 
     private var isAwaitingInitialSnapshot: Bool {
-        guard store.lastAppliedSequence == 0 else { return false }
         switch store.state.connectionState {
         case .failed, .offlineAgentRunning, .unsupportedWorker, .stopped:
             return false
-        default:
+        case .connecting:
+            // The worker admits attaches while the provider is still
+            // resuming; an empty snapshot in this state is a placeholder
+            // for history that is still streaming in, not an empty
+            // conversation.
             return true
+        default:
+            return store.lastAppliedSequence == 0
         }
     }
 

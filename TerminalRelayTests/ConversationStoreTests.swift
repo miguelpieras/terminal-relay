@@ -125,6 +125,119 @@ final class ConversationStoreTests: XCTestCase {
         XCTAssertEqual(store.state.oldestItemID, "message-1")
     }
 
+    func testConnectingPlaceholderSnapshotKeepsPaintedTranscript() throws {
+        let store = ConversationStore()
+        func snapshotPayload(
+            generation: String,
+            baseSequence: Int64,
+            connectionState: String,
+            items: JSONValue
+        ) throws -> JSONValue {
+            .object([
+                "snapshotGeneration": .string(generation),
+                "baseSeq": .number(Double(baseSequence)),
+                "items": items,
+                "approvals": .array([]),
+                "questions": .array([]),
+                "connectionState": .string(connectionState),
+                "turnState": .string("idle"),
+                "activeTurnId": .null,
+                "capabilities": try JSONValue.encoded(
+                    ChatCapabilities(features: ["streaming"])
+                ),
+                "usage": .null,
+                "hasOlderHistory": .bool(false),
+                "oldestItemId": .null,
+            ])
+        }
+        func messageItems(_ text: String) -> JSONValue {
+            .array([
+                .object([
+                    "type": .string("message.completed"),
+                    "turnId": .string("turn-1"),
+                    "itemId": .string("message-1"),
+                    "occurredAt": .number(10),
+                    "payload": .object([
+                        "role": .string("assistant"),
+                        "text": .string(text),
+                    ]),
+                ])
+            ])
+        }
+
+        // Painted content — stands in for cache hydration or a prior attach.
+        try store.apply(
+            ChatTestFixtures.event(
+                "conversation.snapshot",
+                sequence: 12,
+                payload: try snapshotPayload(
+                    generation: ChatTestFixtures.generation,
+                    baseSequence: 12,
+                    connectionState: "streaming",
+                    items: messageItems("Hello from history")
+                )
+            )
+        )
+
+        // A restarted worker admits the attach before its provider resumes
+        // and answers with an empty pre-resume placeholder on a new
+        // generation: the painted transcript must survive it.
+        let rebuiltGeneration = "00000000-0000-4000-8000-00000000000e"
+        try store.apply(
+            ChatTestFixtures.event(
+                "conversation.snapshot",
+                sequence: 1,
+                payload: try snapshotPayload(
+                    generation: rebuiltGeneration,
+                    baseSequence: 1,
+                    connectionState: "connecting",
+                    items: .array([])
+                ),
+                snapshotGeneration: rebuiltGeneration
+            )
+        )
+        XCTAssertEqual(store.state.messages.map(\.text), ["Hello from history"])
+        XCTAssertEqual(store.state.snapshotGeneration, rebuiltGeneration)
+        XCTAssertEqual(store.state.lastAppliedSequence, 1)
+        XCTAssertEqual(store.state.connectionState, .connecting)
+
+        // The rebuilt snapshot that follows replaces the transcript.
+        try store.apply(
+            ChatTestFixtures.event(
+                "conversation.snapshot",
+                sequence: 2,
+                payload: try snapshotPayload(
+                    generation: rebuiltGeneration,
+                    baseSequence: 2,
+                    connectionState: "connecting",
+                    items: messageItems("Rebuilt from the worker")
+                ),
+                snapshotGeneration: rebuiltGeneration
+            )
+        )
+        XCTAssertEqual(store.state.messages.map(\.text), ["Rebuilt from the worker"])
+        XCTAssertEqual(store.state.lastAppliedSequence, 2)
+
+        // A genuinely empty conversation still applies an empty placeholder.
+        let freshStore = ConversationStore()
+        try freshStore.apply(
+            ChatTestFixtures.event(
+                "conversation.snapshot",
+                sequence: 1,
+                payload: try snapshotPayload(
+                    generation: rebuiltGeneration,
+                    baseSequence: 1,
+                    connectionState: "connecting",
+                    items: .array([])
+                ),
+                snapshotGeneration: rebuiltGeneration
+            )
+        )
+        XCTAssertEqual(freshStore.state.items, [])
+        XCTAssertEqual(freshStore.state.connectionState, .connecting)
+        XCTAssertEqual(freshStore.state.lastAppliedSequence, 1)
+    }
+
     func testIdleResumeSnapshotInfersActiveTurnFromStreamingItemOnly() throws {
         let activeTurnID = "10000000-0000-4000-8000-000000000001"
         let streamingItem = ConversationItem.message(

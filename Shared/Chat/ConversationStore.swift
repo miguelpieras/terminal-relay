@@ -264,6 +264,23 @@ struct ConversationReducer {
         } catch {
             throw ConversationReducerError.invalidEvent(envelope.type)
         }
+        // The worker admits attaches before its provider has resumed and
+        // answers with an empty "connecting" placeholder snapshot. Adopt its
+        // generation and cursor, but keep already-painted (cache-hydrated)
+        // content: the rebuilt snapshot replaces it once history ingest
+        // completes, and blanking here would flash the transcript empty.
+        if snapshot.connectionState == .connecting,
+           snapshot.items.isEmpty,
+           snapshot.approvals.isEmpty,
+           snapshot.questions.isEmpty,
+           !state.items.isEmpty {
+            state.snapshotGeneration = snapshot.snapshotGeneration
+            state.lastAppliedSequence = snapshot.baseSequence
+            state.connectionState = snapshot.connectionState
+            state.capabilities = snapshot.capabilities
+            state.lastErrorMessage = nil
+            return
+        }
         state.snapshotGeneration = snapshot.snapshotGeneration
         state.lastAppliedSequence = snapshot.baseSequence
         state.items = stableDeduplicated(snapshot.items)

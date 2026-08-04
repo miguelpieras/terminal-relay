@@ -283,6 +283,23 @@ except BlockingIOError:
             process.wait(timeout=5)
             assert process.returncode == 0
 
+            # A stop that fails while the broker is still alive must propagate
+            # the failure, not report success and orphan the live session.
+            original_state = state_path.read_text(encoding="utf-8")
+            state_path.write_text(
+                original_state.replace('"status":"ready"', '"status":"stopped"'),
+                encoding="utf-8",
+            )
+            failed_stop = helper(
+                "chat-stop-v1",
+                "codex",
+                "example-repository",
+                relay_id,
+                check=False,
+            )
+            assert failed_stop.returncode == 75, failed_stop.stderr
+            state_path.write_text(original_state, encoding="utf-8")
+
             helper(
                 "chat-stop-v1",
                 "codex",
@@ -296,6 +313,11 @@ except BlockingIOError:
             else:
                 raise AssertionError("stopped chat remained in status")
 
+            # Stopping an already-stopped relay is idempotent and cleans up a
+            # leaked restart intent (e.g. from a broker whose resume failed).
+            leaked_intent = runtime / f"{relay_id}.chat-intent"
+            leaked_intent.write_text("intent\n", encoding="utf-8")
+            leaked_intent.chmod(0o600)
             stale = helper(
                 "chat-stop-v1",
                 "codex",
@@ -303,8 +325,8 @@ except BlockingIOError:
                 relay_id,
                 check=False,
             )
-            assert stale.returncode == 75
-            assert "no longer active" in stale.stderr.lower()
+            assert stale.returncode == 0, stale.stderr
+            assert not leaked_intent.exists()
         finally:
             subprocess.run(
                 [tmux, "-f", "/dev/null", "-L", socket_label, "kill-server"],

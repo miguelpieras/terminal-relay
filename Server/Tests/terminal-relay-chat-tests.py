@@ -107,11 +107,24 @@ async def connect(module, broker, after_seq=0, generation=None) -> ProtocolClien
 
 
 async def wait_ready(broker) -> None:
+    # The attach surface opens before the provider connects; wait for the
+    # provider-ready state so tests observe the fully resumed broker.
+    for _ in range(200):
+        if (
+            pathlib.Path(broker.socket_path).exists()
+            and broker.connection_state == "streaming"
+        ):
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("broker did not become ready")
+
+
+async def wait_attach_surface(broker) -> None:
     for _ in range(200):
         if pathlib.Path(broker.socket_path).exists():
             return
         await asyncio.sleep(0.01)
-    raise AssertionError("broker did not become ready")
+    raise AssertionError("broker did not open its attach surface")
 
 
 async def exercise_protocol(module, root: pathlib.Path) -> None:
@@ -1628,6 +1641,254 @@ def exercise_validation(module) -> None:
         raise AssertionError("accepted oversized JSON")
 
 
+async def exercise_early_attach(module, root: pathlib.Path) -> None:
+    runtime = root / "er"
+    runtime.mkdir(mode=0o700)
+    project = root / "workspace" / "example-repository"
+
+    history = [
+        {
+            "type": "message.completed",
+            "turnId": THREAD_ID,
+            "itemId": "33333333-3333-4333-8333-333333333333",
+            "payload": {"role": "user", "text": "older", "status": "completed"},
+        }
+    ]
+
+    class GatedProvider(module.FakeProvider):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.release = asyncio.Event()
+
+        async def start(self, emit):
+            await self.release.wait()
+            return await super().start(emit)
+
+    provider = GatedProvider(str(project), THREAD_ID, {}, scripted_history=history)
+    broker = module.ChatBroker(
+        "codex",
+        "example-repository",
+        str(project),
+        str(runtime),
+        RELAY_ID,
+        provider,
+        {},
+    )
+    broker_task = asyncio.create_task(broker.run())
+    await wait_attach_surface(broker)
+
+    # The state file reports ready while the provider is still resuming.
+    state = json.loads(pathlib.Path(broker.state_path).read_text(encoding="utf-8"))
+    assert state["status"] == "ready"
+    assert state["providerThreadId"] == THREAD_ID
+
+    reader, writer = await asyncio.open_unix_connection(broker.socket_path)
+    client = ProtocolClient(module, reader, writer, broker.relay_id)
+    hello, _ = await client.attach()
+    assert hello["payload"]["connectionState"] == "connecting"
+    placeholder = next(
+        record
+        for record in client.records
+        if record["type"] == "conversation.snapshot"
+    )
+    assert placeholder["payload"]["items"] == []
+    assert placeholder["payload"]["connectionState"] == "connecting"
+
+    # Commands are answered while the provider is still resuming.
+    ping_id, ping = client.command("ping", {})
+    await client.send(ping)
+    assert (await client.read_type("ack", ping_id))["payload"]["pong"] is True
+
+    provider.release.set()
+    rebuilt = await client.read_type("conversation.snapshot")
+    assert rebuilt["snapshotGeneration"] != placeholder["snapshotGeneration"]
+    assert rebuilt["payload"]["items"][0]["payload"]["text"] == "older"
+    assert rebuilt["payload"]["baseSeq"] == rebuilt["seq"]
+    state_event = await client.read_type("session.state")
+    assert state_event["payload"]["reason"] == "providerReady"
+    assert state_event["payload"]["connectionState"] == "streaming"
+
+    # Live events continue on the rebuilt generation without re-attaching.
+    event = await broker.emit(
+        "message.delta",
+        {"role": "assistant", "text": "stream"},
+        turn_id=THREAD_ID,
+        item_id="44444444-4444-4444-8444-444444444444",
+    )
+    delta = await client.read_type("message.delta")
+    assert delta["seq"] == event["seq"]
+    assert delta["snapshotGeneration"] == rebuilt["snapshotGeneration"]
+    await client.close()
+    broker.stop_event.set()
+    await asyncio.wait_for(broker_task, 5)
+
+    # A provider that fails to resume ends the admitted session cleanly.
+    class FailingProvider(GatedProvider):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.close_calls = 0
+
+        async def start(self, emit):
+            await self.release.wait()
+            raise module.ChatError(
+                "notFound", "The provider session was not found.", exit_code=66
+            )
+
+        async def close(self):
+            self.close_calls += 1
+
+    failing_runtime = root / "ef"
+    failing_runtime.mkdir(mode=0o700)
+    failing_intent = failing_runtime / f"{RELAY_ID}.chat-intent"
+    failing_intent.write_text("intent\n", encoding="utf-8")
+    failing_intent.chmod(0o600)
+    failing_provider = FailingProvider(str(project), THREAD_ID, {})
+    failing_broker = module.ChatBroker(
+        "codex",
+        "example-repository",
+        str(project),
+        str(failing_runtime),
+        RELAY_ID,
+        failing_provider,
+        {},
+    )
+    failing_task = asyncio.create_task(failing_broker.run())
+    await wait_attach_surface(failing_broker)
+    reader, writer = await asyncio.open_unix_connection(failing_broker.socket_path)
+    failing_client = ProtocolClient(module, reader, writer, failing_broker.relay_id)
+    await failing_client.attach()
+    failing_provider.release.set()
+    ended = await failing_client.read_type("session.ended")
+    assert ended["payload"]["reason"] == "notFound"
+    try:
+        await asyncio.wait_for(failing_task, 5)
+    except module.ChatError as error:
+        assert error.code == "notFound"
+    else:
+        raise AssertionError("failed resume must propagate")
+    state = json.loads(
+        pathlib.Path(failing_broker.state_path).read_text(encoding="utf-8")
+    )
+    assert state["status"] == "stopped"
+    assert not pathlib.Path(failing_broker.socket_path).exists()
+    # The restart intent must not survive a failed resume, or boot restore
+    # keeps relaunching a doomed broker.
+    assert not failing_intent.exists()
+    # The provider must be closed on a failed start, or a half-connected
+    # Codex websocket leaves its blocking reader thread alive forever.
+    assert failing_provider.close_calls == 1
+    await failing_client.close()
+
+    # A stop during the resume window interrupts the resume, ends the session
+    # for other clients, releases the provider lock, and drops the intent.
+    stopping_runtime = root / "es"
+    stopping_runtime.mkdir(mode=0o700)
+    stopping_intent = stopping_runtime / f"{RELAY_ID}.chat-intent"
+    stopping_intent.write_text("intent\n", encoding="utf-8")
+    stopping_intent.chmod(0o600)
+    gated = GatedProvider(str(project), THREAD_ID, {}, scripted_history=history)
+    stopping_broker = module.ChatBroker(
+        "codex",
+        "example-repository",
+        str(project),
+        str(stopping_runtime),
+        RELAY_ID,
+        gated,
+        {},
+    )
+    stopping_task = asyncio.create_task(stopping_broker.run())
+    await wait_attach_surface(stopping_broker)
+    reader, writer = await asyncio.open_unix_connection(stopping_broker.socket_path)
+    watcher = ProtocolClient(module, reader, writer, stopping_broker.relay_id)
+    await watcher.attach()
+    reader, writer = await asyncio.open_unix_connection(stopping_broker.socket_path)
+    stopper = ProtocolClient(module, reader, writer, stopping_broker.relay_id)
+    await stopper.attach()
+    stop_id, stop = stopper.command("session.stop", {})
+    await stopper.send(stop)
+    await stopper.read_type("ack", stop_id)
+    ended = await watcher.read_type("session.ended")
+    assert ended["payload"]["reason"] == "stopped"
+    # The provider gate is never released: completion proves the stop
+    # cancelled the in-flight resume rather than waiting it out.
+    await asyncio.wait_for(stopping_task, 5)
+    assert stopping_broker.provider_lock_descriptor is None
+    state = json.loads(
+        pathlib.Path(stopping_broker.state_path).read_text(encoding="utf-8")
+    )
+    assert state["status"] == "stopped"
+    assert not pathlib.Path(stopping_broker.socket_path).exists()
+    assert not stopping_intent.exists()
+    await watcher.close()
+    await stopper.close()
+
+
+def exercise_snapshot_trim(module, root: pathlib.Path) -> None:
+    runtime = root / "tr"
+    runtime.mkdir(mode=0o700)
+    project = root / "workspace" / "example-repository"
+    provider = module.FakeProvider(str(project), THREAD_ID, {})
+    broker = module.ChatBroker(
+        "codex",
+        "example-repository",
+        str(project),
+        str(runtime),
+        RELAY_ID,
+        provider,
+        {},
+    )
+    total = 600
+    for index in range(total):
+        item_id = f"{index:08d}-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        broker.items[item_id] = {
+            "type": "message.completed",
+            "itemId": item_id,
+            "turnId": THREAD_ID,
+            "payload": {"role": "assistant", "text": "x" * 4096, "status": "completed"},
+        }
+    item_size = len(
+        json.dumps(
+            next(iter(broker.items.values())),
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    )
+    snapshot, encoded = broker.bounded_snapshot_event()
+    assert len(encoded) <= module.MAX_RECORD_BYTES
+    limit = module.MAX_RECORD_BYTES - 16 * 1024
+    payload_size = len(
+        json.dumps(
+            snapshot["payload"], separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    )
+    assert payload_size <= limit
+    items = snapshot["payload"]["items"]
+    assert 0 < len(items) < total
+    # The newest suffix survives and the trim does not over-shed: the
+    # retained payload sits within one item of the cap.
+    assert items[-1]["itemId"] == f"{total - 1:08d}-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    assert payload_size > limit - 2 * (item_size + 1)
+    assert snapshot["payload"]["hasOlderHistory"] is True
+    assert snapshot["payload"]["oldestItemId"] == items[0]["itemId"]
+    assert broker.oldest_item_id == items[0]["itemId"]
+
+    # An unshrinkable snapshot still fails closed.
+    broker.items.clear()
+    broker.items["ffffffff-ffff-4fff-8fff-ffffffffffff"] = {
+        "type": "message.completed",
+        "itemId": "ffffffff-ffff-4fff-8fff-ffffffffffff",
+        "turnId": THREAD_ID,
+        "payload": {"role": "assistant", "text": "x" * (2 * module.MAX_RECORD_BYTES)},
+    }
+    broker.approvals["gggg"] = {"title": "y" * (2 * module.MAX_RECORD_BYTES)}
+    try:
+        broker.bounded_snapshot_event()
+    except module.ChatError as error:
+        assert error.code == "snapshotTooLarge"
+    else:
+        raise AssertionError("accepted an unshrinkable snapshot")
+
+
 def run() -> None:
     module = load_broker()
     exercise_validation(module)
@@ -1637,6 +1898,8 @@ def run() -> None:
     ) as root:
         root_path = pathlib.Path(os.path.realpath(root))
         asyncio.run(exercise_protocol(module, root_path))
+        asyncio.run(exercise_early_attach(module, root_path))
+        exercise_snapshot_trim(module, root_path)
         asyncio.run(exercise_codex_adapter(module, root_path))
         asyncio.run(exercise_codex_reconnect(module, root_path))
         asyncio.run(exercise_codex_close_timeout(module, root_path))
