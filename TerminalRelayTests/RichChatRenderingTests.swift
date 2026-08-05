@@ -202,64 +202,6 @@ final class RichChatRenderingTests: XCTestCase {
         )
     }
 
-    func testMarkdownClampedTailHidesEarlierLinesAndKeepsShortTextWhole() {
-        let long = (1...1000).map { "\($0). interruption-smoke" }.joined(separator: "\n")
-        let clamp = MarkdownSegmentation.clampedTail(of: long)
-
-        XCTAssertNotNil(clamp)
-        XCTAssertGreaterThan(clamp?.hiddenLineCount ?? 0, 800)
-        XCTAssertTrue(
-            clamp?.tail.hasSuffix("1000. interruption-smoke") ?? false,
-            "The newest output must stay visible."
-        )
-
-        XCTAssertNil(
-            MarkdownSegmentation.clampedTail(of: "short\nmessage"),
-            "Short messages render in full."
-        )
-    }
-
-    func testMarkdownClampedTailBoundsFenceDominatedTextByReopeningTheFence() {
-        let fenced = "Here you go:\n```text\n"
-            + (1...1000).map { "\($0)" }.joined(separator: "\n")
-            + "\n```"
-        let clamp = MarkdownSegmentation.clampedTail(of: fenced)
-
-        XCTAssertNotNil(
-            clamp,
-            "A giant fenced output must clamp; rendering it whole stalls the transcript."
-        )
-        let tailLines = clamp?.tail.split(
-            separator: "\n",
-            omittingEmptySubsequences: false
-        ) ?? []
-        XCTAssertLessThanOrEqual(tailLines.count, MarkdownSegmentation.clampedTailLines + 1)
-        XCTAssertEqual(
-            tailLines.first.map(String.init),
-            "```text",
-            "The cut fence must re-open so the tail still renders as code."
-        )
-        XCTAssertTrue(
-            clamp?.tail.hasSuffix("1000\n```") ?? false,
-            "The newest output and the closing fence must stay visible."
-        )
-    }
-
-    func testMarkdownClampedTailBoundsBoundaryFreeProse() {
-        let prose = (1...400).map { "word\($0) and some prose" }
-            .joined(separator: "\n")
-        let clamp = MarkdownSegmentation.clampedTail(of: prose)
-
-        XCTAssertNotNil(
-            clamp,
-            "Text with no safe boundary must still clamp at the raw tail."
-        )
-        XCTAssertEqual(
-            clamp?.hiddenLineCount,
-            400 - MarkdownSegmentation.clampedTailLines
-        )
-    }
-
     func testComposerReturnPolicyKeepsPlainReturnAsNewlineAndCommandReturnAsSend() {
         XCTAssertEqual(
             ComposerInputPolicy.returnAction(

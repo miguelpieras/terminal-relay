@@ -178,27 +178,10 @@ struct ConversationView: View {
                 store.dismissFilePreview()
             }
         }
-        #if os(macOS)
-        .sheet(
-            item: Binding(
-                get: { store.fullContentPresentation },
-                set: { value in
-                    if value == nil { store.dismissFullContent() }
-                }
-            )
-        ) { content in
-            TranscriptFullContentSheet(content: content) {
-                store.dismissFullContent()
-            }
-        }
-        #endif
     }
 
-    /// The transcript renders eagerly (no lazy estimation) so every row has
-    /// its exact height from the first frame: the scrollbar is stable and
-    /// scrolling never stutters on row materialization. The window bounds the
-    /// eager cost for very long histories; revealing more keeps rows in the
-    /// same container so their identity and state are preserved.
+    /// iOS keeps an explicit history window around its eager SwiftUI stack.
+    /// macOS uses reusable AppKit rows and does not use this window.
     private static let transcriptWindowStep = 150
 
     @State private var firstVisibleItemID: String?
@@ -273,13 +256,20 @@ struct ConversationView: View {
                 )
             )
         }
-        rows.append(contentsOf: store.state.items.map { item in
-            .item(
-                store.transcriptProjection(for: item),
-                isExpanded: store.expandedItemIDs.contains(item.id),
-                copiedItemID: store.copiedItemID
-            )
-        })
+        for item in store.state.items {
+            let isExpanded = store.expandedItemIDs.contains(item.id)
+            let projections = store.transcriptProjections(for: item)
+            let visibleProjections = projections.first.map { first in
+                first.kind.isDisclosure && !isExpanded ? [first] : projections
+            } ?? []
+            rows.append(contentsOf: visibleProjections.map { projection in
+                .item(
+                    projection,
+                    isExpanded: isExpanded,
+                    copiedItemID: store.copiedItemID
+                )
+            })
+        }
         rows.append(contentsOf: store.state.approvals.map { approval in
             var hasher = Hasher()
             hasher.combine(approval.id)
@@ -310,8 +300,11 @@ struct ConversationView: View {
         var styleHasher = Hasher()
         styleHasher.combine(colorScheme)
         styleHasher.combine(dynamicTypeSize)
+        let rows = macRows
+        let firstRowID = rows.first?.id
+        let lastRowID = rows.last?.id
         return MacConversationTableView(
-            rows: macRows,
+            rows: rows,
             snapshotGeneration: store.state.snapshotGeneration,
             transcriptMutation: store.transcriptMutation,
             dataRevision: transcriptContentRevision,
@@ -320,7 +313,15 @@ struct ConversationView: View {
             commandHandle: macTableCommandHandle,
             onNearBottomChange: { store.setNearBottom($0) },
             onAnchoredChange: { isTranscriptAnchored = $0 },
-            makeRow: { row in AnyView(macRowView(row)) }
+            makeRow: { row in
+                AnyView(
+                    macRowView(
+                        row,
+                        isFirst: row.id == firstRowID,
+                        isLast: row.id == lastRowID
+                    )
+                )
+            }
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .accessibilityIdentifier("conversation.transcript")
@@ -366,19 +367,35 @@ struct ConversationView: View {
     }
 
     @ViewBuilder
-    private func macRowView(_ row: MacTranscriptRow) -> some View {
-        let isFirst = row.id == macFirstRowID
-        let isLast = row.id == macLastRowID
-        VStack(alignment: .leading, spacing: 8) {
+    private func macRowView(
+        _ row: MacTranscriptRow,
+        isFirst: Bool,
+        isLast: Bool
+    ) -> some View {
+        let beginsItem: Bool = {
+            if case .item(let projection, _, _) = row {
+                return projection.isFirstInItem
+            }
+            return true
+        }()
+        let endsItem: Bool = {
+            if case .item(let projection, let isExpanded, _) = row {
+                return projection.isLastInItem
+                    || (projection.kind.isDisclosure && !isExpanded)
+            }
+            return true
+        }()
+        VStack(alignment: .leading, spacing: 0) {
             switch row {
             case .history:
                 historyControl
             case .item(let projection, _, _):
-                timelineView(for: projection.displayItem)
-                    .accessibilityIdentifier("conversation.item.\(projection.sourceItemID)")
-                if projection.isTruncated {
-                    transcriptTruncationControls(projection)
-                }
+                timelineView(for: projection)
+                    .accessibilityIdentifier(
+                        projection.isFirstInItem
+                            ? "conversation.item.\(projection.sourceItemID)"
+                            : "conversation.item.\(projection.sourceItemID).segment.\(projection.id)"
+                    )
             case .approval(let approval, _):
                 ApprovalCard(
                     approval: approval,
@@ -397,52 +414,10 @@ struct ConversationView: View {
         }
         .frame(maxWidth: 760, alignment: .leading)
         .padding(.horizontal, horizontalTranscriptPadding)
-        .padding(.top, isFirst ? 22 : 0)
-        .padding(.bottom, isLast ? 16 : 0)
+        .padding(.top, isFirst ? 22 : (beginsItem ? 7 : 0))
+        .padding(.bottom, isLast ? 16 : (endsItem ? 7 : 0))
         .frame(maxWidth: .infinity)
         .environment(\.chatRowActions, rowActions)
-    }
-
-    private var macFirstRowID: String? {
-        if store.state.hasOlderHistory {
-            return "history:\(store.state.oldestItemID ?? "start")"
-        }
-        if let item = store.state.items.first { return item.id }
-        if let approval = store.state.approvals.first { return "approval:\(approval.id)" }
-        if let question = store.state.questions.first { return "question:\(question.id)" }
-        return nil
-    }
-
-    private var macLastRowID: String? {
-        if let question = store.state.questions.last { return "question:\(question.id)" }
-        if let approval = store.state.approvals.last { return "approval:\(approval.id)" }
-        if let item = store.state.items.last { return item.id }
-        if store.state.hasOlderHistory {
-            return "history:\(store.state.oldestItemID ?? "start")"
-        }
-        return nil
-    }
-
-    private func transcriptTruncationControls(
-        _ projection: TranscriptRowProjection
-    ) -> some View {
-        HStack(spacing: 10) {
-            Text(
-                projection.hiddenLineCount > 0
-                    ? "\(projection.hiddenLineCount) lines hidden"
-                    : "\(ByteCountFormatter.string(fromByteCount: Int64(projection.hiddenByteCount), countStyle: .file)) hidden"
-            )
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            ForEach(projection.sourceHandles) { handle in
-                Button("View full \(handle.contentType.lowercased())") {
-                    store.presentFullContent(handle)
-                }
-                .buttonStyle(.plain)
-                .font(.caption.weight(.medium))
-                .chatMinimumInteractionTarget()
-            }
-        }
     }
     #endif
 
@@ -639,6 +614,43 @@ struct ConversationView: View {
             )
         }
     }
+
+    #if os(macOS)
+    @ViewBuilder
+    private func timelineView(for projection: TranscriptRowProjection) -> some View {
+        switch projection.displayItem {
+        case .message(let message):
+            ChatMessageView(message: message, segment: projection)
+        case .reasoning(let reasoning):
+            ReasoningCard(
+                reasoning: reasoning,
+                isExpanded: store.expandedItemIDs.contains(reasoning.id),
+                segment: projection
+            )
+        case .tool(let tool):
+            ToolActivityCard(
+                tool: tool,
+                isExpanded: store.expandedItemIDs.contains(tool.id),
+                copiedItemID: store.copiedItemID,
+                segment: projection
+            )
+        case .diff(let diff):
+            DiffCard(
+                diff: diff,
+                isExpanded: store.expandedItemIDs.contains(diff.id),
+                segment: projection
+            )
+        case .plan(let plan):
+            PlanCard(plan: plan, segment: projection)
+        case .generic(let generic):
+            GenericActivityCard(
+                item: generic,
+                isExpanded: store.expandedItemIDs.contains(generic.id),
+                segment: projection
+            )
+        }
+    }
+    #endif
 
     private var emptyConversation: some View {
         VStack(spacing: 8) {
@@ -1031,6 +1043,12 @@ private struct ConversationTranscriptScroller<Content: View>: View {
 
 private struct ChatMessageView: View {
     let message: ChatMessage
+    var segment: TranscriptRowProjection?
+
+    init(message: ChatMessage, segment: TranscriptRowProjection? = nil) {
+        self.message = message
+        self.segment = segment
+    }
 
     @Environment(\.chatRowActions) private var actions
     @State private var didCopy = false
@@ -1051,15 +1069,25 @@ private struct ChatMessageView: View {
                         StreamingIndicator()
                     }
                 }
-                .padding(message.role == .user ? 12 : 0)
+                .padding(.horizontal, message.role == .user ? 12 : 0)
+                .padding(.top, messageTopPadding)
+                .padding(.bottom, messageBottomPadding)
                 .background {
                     if message.role == .user {
-                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        UnevenRoundedRectangle(
+                            cornerRadii: RectangleCornerRadii(
+                                topLeading: isFirstSegment ? 16 : 0,
+                                bottomLeading: isLastSegment ? 16 : 0,
+                                bottomTrailing: isLastSegment ? 16 : 0,
+                                topTrailing: isFirstSegment ? 16 : 0
+                            ),
+                            style: .continuous
+                        )
                             .fill(Color.secondary.opacity(0.12))
                     }
                 }
 
-                if !message.isStreaming, !message.text.isEmpty {
+                if isLastSegment, !message.isStreaming, !message.text.isEmpty {
                     messageFooter
                 }
             }
@@ -1072,6 +1100,21 @@ private struct ChatMessageView: View {
         .onHover { isHovering = $0 }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(message.role == .user ? "You" : "Assistant")
+    }
+
+    private var isFirstSegment: Bool { segment?.isFirstInItem ?? true }
+    private var isLastSegment: Bool { segment?.isLastInItem ?? true }
+
+    private var messageTopPadding: CGFloat {
+        guard message.role == .user else {
+            return isFirstSegment ? 0 : 8
+        }
+        return isFirstSegment ? 12 : (segment?.isFirstInSection == true ? 10 : 4)
+    }
+
+    private var messageBottomPadding: CGFloat {
+        guard message.role == .user else { return 0 }
+        return isLastSegment ? 12 : 4
     }
 
     private var messageFooter: some View {
@@ -1219,6 +1262,17 @@ private struct StreamingIndicator: View {
 private struct ReasoningCard: View {
     let reasoning: ChatReasoning
     let isExpanded: Bool
+    var segment: TranscriptRowProjection?
+
+    init(
+        reasoning: ChatReasoning,
+        isExpanded: Bool,
+        segment: TranscriptRowProjection? = nil
+    ) {
+        self.reasoning = reasoning
+        self.isExpanded = isExpanded
+        self.segment = segment
+    }
 
     @Environment(\.chatRowActions) private var actions
 
@@ -1230,7 +1284,13 @@ private struct ReasoningCard: View {
 
     @ViewBuilder
     var body: some View {
-        if let displayText {
+        if segment?.isFirstInItem == false {
+            if isExpanded, let displayText {
+                reasoningText(displayText)
+                    .padding(.leading, 23)
+                    .padding(.bottom, 4)
+            }
+        } else if let displayText {
             DisclosureCard(
                 title: reasoning.isStreaming ? "Thinking…" : "Reasoning summary",
                 symbol: "brain.head.profile",
@@ -1238,10 +1298,7 @@ private struct ReasoningCard: View {
                 isExpanded: isExpanded,
                 toggle: { actions.toggleExpanded(itemID: reasoning.id) }
             ) {
-                Text(displayText)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
+                reasoningText(displayText)
             }
         } else if reasoning.isStreaming {
             HStack(spacing: 7) {
@@ -1256,52 +1313,91 @@ private struct ReasoningCard: View {
             .accessibilityElement(children: .combine)
         }
     }
+
+    private func reasoningText(_ text: String) -> some View {
+        Text(text)
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+    }
 }
 
 private struct ToolActivityCard: View {
     let tool: ToolActivity
     let isExpanded: Bool
     let copiedItemID: String?
+    var segment: TranscriptRowProjection?
+
+    init(
+        tool: ToolActivity,
+        isExpanded: Bool,
+        copiedItemID: String?,
+        segment: TranscriptRowProjection? = nil
+    ) {
+        self.tool = tool
+        self.isExpanded = isExpanded
+        self.copiedItemID = copiedItemID
+        self.segment = segment
+    }
 
     @Environment(\.chatRowActions) private var actions
 
+    @ViewBuilder
     var body: some View {
-        DisclosureCard(
-            title: tool.title,
-            subtitle: subtitle,
-            symbol: toolSymbol,
-            statusColor: statusColor,
-            isExpanded: isExpanded,
-            toggle: { actions.toggleExpanded(itemID: tool.id) }
-        ) {
-            VStack(alignment: .leading, spacing: 10) {
-                if let input = tool.input, !input.isEmpty {
-                    ToolSection(
-                        title: "Input",
-                        content: input,
-                        itemID: "\(tool.id):input",
-                        copiedItemID: copiedItemID
-                    )
-                }
-                if let output = tool.output, !output.isEmpty {
-                    ToolSection(
-                        title: "Output",
-                        content: output,
-                        itemID: "\(tool.id):output",
-                        copiedItemID: copiedItemID
-                    )
-                }
-                if let error = tool.errorMessage, !error.isEmpty {
-                    Label(error, systemImage: "exclamationmark.triangle.fill")
-                        .font(.callout)
-                        .foregroundStyle(.red)
-                        .textSelection(.enabled)
-                }
-                if tool.input == nil, tool.output == nil, tool.errorMessage == nil {
-                    Text(tool.status == .running ? "Waiting for output…" : "No additional output")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+        if segment?.isFirstInItem == false {
+            if isExpanded {
+                toolContent
+                    .padding(.leading, 23)
+                    .padding(.bottom, 4)
+            }
+        } else {
+            DisclosureCard(
+                title: tool.title,
+                subtitle: subtitle,
+                symbol: toolSymbol,
+                statusColor: statusColor,
+                isExpanded: isExpanded,
+                toggle: { actions.toggleExpanded(itemID: tool.id) }
+            ) {
+                toolContent
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var toolContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let input = tool.input, !input.isEmpty {
+                ToolSection(
+                    title: "Input",
+                    content: input,
+                    itemID: "\(tool.id):input",
+                    copiedItemID: copiedItemID,
+                    showsHeader: segment?.isFirstInSection ?? true,
+                    renderID: segment?.id
+                )
+            }
+            if let output = tool.output, !output.isEmpty {
+                ToolSection(
+                    title: "Output",
+                    content: output,
+                    itemID: "\(tool.id):output",
+                    copiedItemID: copiedItemID,
+                    showsHeader: segment?.isFirstInSection ?? true,
+                    renderID: segment?.id
+                )
+            }
+            if let error = tool.errorMessage, !error.isEmpty {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+            }
+            if tool.input == nil, tool.output == nil, tool.errorMessage == nil {
+                Text(tool.status == .running ? "Waiting for output…" : "No additional output")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -1346,6 +1442,8 @@ private struct ToolSection: View {
     let content: String
     let itemID: String
     let copiedItemID: String?
+    var showsHeader = true
+    var renderID: String?
 
     @Environment(\.chatRowActions) private var actions
 
@@ -1353,24 +1451,26 @@ private struct ToolSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text(title)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button {
-                    actions.copyToolSection(identifier: itemID, fallback: content)
-                    actions.markCopied(itemID: itemID)
-                } label: {
-                    Label(isCopied ? "Copied" : "Copy", systemImage: isCopied ? "checkmark" : "doc.on.doc")
+            if showsHeader {
+                HStack {
+                    Text(title)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button {
+                        actions.copyToolSection(identifier: itemID, fallback: content)
+                        actions.markCopied(itemID: itemID)
+                    } label: {
+                        Label(isCopied ? "Copied" : "Copy", systemImage: isCopied ? "checkmark" : "doc.on.doc")
+                    }
+                    .buttonStyle(.plain)
+                    .font(.caption)
+                    .chatMinimumInteractionTarget(includesWidth: true)
+                    .accessibilityLabel(isCopied ? "\(title) copied" : "Copy \(title.lowercased())")
                 }
-                .buttonStyle(.plain)
-                .font(.caption)
-                .chatMinimumInteractionTarget(includesWidth: true)
-                .accessibilityLabel(isCopied ? "\(title) copied" : "Copy \(title.lowercased())")
             }
             CodeBlockView(
-                id: itemID,
+                id: renderID ?? itemID,
                 code: content,
                 language: nil,
                 isStreaming: false,
@@ -1383,19 +1483,39 @@ private struct ToolSection: View {
 private struct DiffCard: View {
     let diff: ChatDiff
     let isExpanded: Bool
+    var segment: TranscriptRowProjection?
+
+    init(
+        diff: ChatDiff,
+        isExpanded: Bool,
+        segment: TranscriptRowProjection? = nil
+    ) {
+        self.diff = diff
+        self.isExpanded = isExpanded
+        self.segment = segment
+    }
 
     @Environment(\.chatRowActions) private var actions
 
+    @ViewBuilder
     var body: some View {
-        DisclosureCard(
-            title: diff.path ?? "File changes",
-            subtitle: diff.isTruncated ? "Preview truncated" : nil,
-            symbol: "doc.badge.gearshape",
-            statusColor: .blue,
-            isExpanded: isExpanded,
-            toggle: { actions.toggleExpanded(itemID: diff.id) }
-        ) {
-            DiffTextView(diff: diff.unifiedDiff)
+        if segment?.isFirstInItem == false {
+            if isExpanded {
+                DiffTextView(diff: diff.unifiedDiff)
+                    .padding(.leading, 23)
+                    .padding(.bottom, 4)
+            }
+        } else {
+            DisclosureCard(
+                title: diff.path ?? "File changes",
+                subtitle: diff.isTruncated ? "Source truncated" : nil,
+                symbol: "doc.badge.gearshape",
+                statusColor: .blue,
+                isExpanded: isExpanded,
+                toggle: { actions.toggleExpanded(itemID: diff.id) }
+            ) {
+                DiffTextView(diff: diff.unifiedDiff)
+            }
         }
     }
 }
@@ -1484,12 +1604,26 @@ private struct DiffTextView: View {
 
 private struct PlanCard: View {
     let plan: ChatPlan
+    var segment: TranscriptRowProjection?
+
+    init(plan: ChatPlan, segment: TranscriptRowProjection? = nil) {
+        self.plan = plan
+        self.segment = segment
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(plan.title ?? "Plan")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+            if segment == nil || segment?.section == .planTitle {
+                Text(plan.title ?? "Plan")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if segment?.isFirstInItem == true {
+                Text("Plan")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
             ForEach(plan.steps) { step in
                 Label(
                     step.title,
@@ -1508,28 +1642,54 @@ private struct PlanCard: View {
 private struct GenericActivityCard: View {
     let item: ChatGenericItem
     let isExpanded: Bool
+    var segment: TranscriptRowProjection?
+
+    init(
+        item: ChatGenericItem,
+        isExpanded: Bool,
+        segment: TranscriptRowProjection? = nil
+    ) {
+        self.item = item
+        self.isExpanded = isExpanded
+        self.segment = segment
+    }
 
     @Environment(\.chatRowActions) private var actions
 
+    @ViewBuilder
     var body: some View {
-        DisclosureCard(
-            title: item.title,
-            subtitle: item.type,
-            symbol: "square.stack.3d.up",
-            statusColor: .secondary,
-            isExpanded: isExpanded,
-            toggle: { actions.toggleExpanded(itemID: item.id) }
-        ) {
+        if segment?.isFirstInItem == false {
+            if isExpanded {
+                detailContent
+                    .padding(.leading, 23)
+                    .padding(.bottom, 4)
+            }
+        } else {
+            DisclosureCard(
+                title: item.title,
+                subtitle: item.type,
+                symbol: "square.stack.3d.up",
+                statusColor: .secondary,
+                isExpanded: isExpanded,
+                toggle: { actions.toggleExpanded(itemID: item.id) }
+            ) {
+                detailContent
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var detailContent: some View {
             if let detail = item.detail {
                 Text(detail)
                     .font(.callout.monospaced())
                     .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
             } else {
                 Text("No additional details")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-        }
     }
 }
 

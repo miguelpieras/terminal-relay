@@ -954,7 +954,6 @@ final class ConversationStore: ObservableObject {
     @Published private(set) var unreadCount = 0
     @Published private(set) var isNearBottom = true
     @Published private(set) var isLoadingOlderHistory = false
-    @Published private(set) var fullContentPresentation: TranscriptFullContent?
     private(set) var transcriptMutation = TranscriptMutation.empty
 
     /// Changes only when the hosted transcript's rows can change. Durable
@@ -971,10 +970,7 @@ final class ConversationStore: ObservableObject {
     private var retainedContentBytes: Int
     private var nextItemContentRevision: UInt64 = 1
     private var itemContentRevisions: [String: UInt64] = [:]
-    private var itemTextMetrics: [
-        String: [TranscriptSourcePart: TranscriptTextMetrics]
-    ] = [:]
-    private var projectionCache: [String: TranscriptRowProjection] = [:]
+    private var projectionCache: [String: [TranscriptRowProjection]] = [:]
     private var hasPendingStatePublication = false
     private var pendingTranscriptReset = false
     private var pendingTranscriptInsertions: [String: Int] = [:]
@@ -1174,7 +1170,6 @@ final class ConversationStore: ObservableObject {
             itemIndex: &workingItemIndexByID
         )
         transcriptContentRevision &+= 1
-        itemTextMetrics[message.id] = Self.textMetrics(for: item)
         markItemContentChanged(message.id)
         pendingTranscriptInsertions[message.id] = max(0, workingState.items.count - 1)
         hasPendingStatePublication = true
@@ -1199,7 +1194,6 @@ final class ConversationStore: ObservableObject {
         if workingState.items.count != previousItemCount {
             transcriptContentRevision &+= 1
             itemContentRevisions.removeValue(forKey: "client:\(requestID)")
-            itemTextMetrics.removeValue(forKey: "client:\(requestID)")
             projectionCache.removeValue(forKey: "client:\(requestID)")
             pendingTranscriptRemovals.insert("client:\(requestID)")
         }
@@ -1234,35 +1228,15 @@ final class ConversationStore: ObservableObject {
         publishImmediately()
     }
 
-    func transcriptProjection(for item: ConversationItem) -> TranscriptRowProjection {
-        let revision = itemContentRevisions[item.id] ?? 0
-        if let cached = projectionCache[item.id], cached.contentRevision == revision {
+    func transcriptProjections(for item: ConversationItem) -> [TranscriptRowProjection] {
+        if let cached = projectionCache[item.id] {
             return cached
         }
-        let projection = TranscriptPerformance.measureProjection {
-            TranscriptRowProjection.make(
-                item: item,
-                contentRevision: revision,
-                metricsBySource: itemTextMetrics[item.id] ?? [:]
-            )
+        let projections = TranscriptPerformance.measureProjection {
+            TranscriptRowProjection.makeRows(item: item)
         }
-        projectionCache[item.id] = projection
-        return projection
-    }
-
-    func presentFullContent(_ handle: TranscriptSourceHandle) {
-        guard let text = retainedText(for: handle) else { return }
-        let metrics = TranscriptTextMetrics(text)
-        fullContentPresentation = TranscriptFullContent(
-            handle: handle,
-            text: text,
-            retainedByteCount: metrics.byteCount,
-            retainedLineCount: metrics.lineCount
-        )
-    }
-
-    func dismissFullContent() {
-        fullContentPresentation = nil
+        projectionCache[item.id] = projections
+        return projections
     }
 
     func copyRetainedMessage(itemID: String, fallback: String) {
@@ -1503,11 +1477,9 @@ final class ConversationStore: ObservableObject {
 
     private func resetItemContentRevisions(for items: [ConversationItem]) {
         itemContentRevisions.removeAll(keepingCapacity: true)
-        itemTextMetrics.removeAll(keepingCapacity: true)
         projectionCache.removeAll(keepingCapacity: true)
         for item in items {
             itemContentRevisions[item.id] = nextItemContentRevision
-            itemTextMetrics[item.id] = Self.textMetrics(for: item)
             nextItemContentRevision &+= 1
         }
     }
@@ -1534,26 +1506,16 @@ final class ConversationStore: ObservableObject {
             itemContentRevisions = itemContentRevisions.filter {
                 retainedIDs.contains($0.key)
             }
-            itemTextMetrics = itemTextMetrics.filter {
-                retainedIDs.contains($0.key)
-            }
             projectionCache = projectionCache.filter {
                 retainedIDs.contains($0.key)
             }
             for item in workingState.items where itemContentRevisions[item.id] == nil {
-                itemTextMetrics[item.id] = Self.textMetrics(for: item)
                 markItemContentChanged(item.id)
             }
         }
 
         if let changedItemID,
-           let index = workingItemIndexByID[changedItemID] {
-            let changedItem = workingState.items[index]
-            updateTextMetrics(
-                for: changedItem,
-                after: envelope,
-                kind: kind
-            )
+           workingItemIndexByID[changedItemID] != nil {
             markItemContentChanged(changedItemID)
         }
 
@@ -1654,98 +1616,6 @@ final class ConversationStore: ObservableObject {
             }
         default:
             break
-        }
-    }
-
-    private func updateTextMetrics(
-        for item: ConversationItem,
-        after envelope: ChatEnvelope,
-        kind: ChatEventKind?
-    ) {
-        guard itemTextMetrics[item.id] != nil else {
-            itemTextMetrics[item.id] = Self.textMetrics(for: item)
-            return
-        }
-        switch (kind, item) {
-        case (.messageDelta, .message(let message)):
-            let contentID = envelope.payload["contentId"]?.stringValue
-                ?? message.contents.last?.id
-                ?? "\(message.id):content:0"
-            let part = TranscriptSourcePart.messageContent(contentID)
-            let delta = envelope.payload["text"]?.stringValue
-                ?? envelope.payload["content"]?.stringValue
-                ?? ""
-            let current = itemTextMetrics[item.id]?[part]
-                ?? TranscriptTextMetrics("")
-            itemTextMetrics[item.id]?[part] = current.appending(delta)
-        case (.reasoningDelta, _):
-            let delta = envelope.payload["text"]?.stringValue ?? ""
-            let current = itemTextMetrics[item.id]?[.reasoning]
-                ?? TranscriptTextMetrics("")
-            itemTextMetrics[item.id]?[.reasoning] = current.appending(delta)
-        case (.toolUpdated, _)
-            where envelope.payload["output"] == nil
-                && envelope.payload["outputDelta"] != nil:
-            let delta = envelope.payload["outputDelta"]?.displayString ?? ""
-            let current = itemTextMetrics[item.id]?[.toolOutput]
-                ?? TranscriptTextMetrics("")
-            itemTextMetrics[item.id]?[.toolOutput] = current.appending(delta)
-        default:
-            itemTextMetrics[item.id] = Self.textMetrics(for: item)
-        }
-    }
-
-    private static func textMetrics(
-        for item: ConversationItem
-    ) -> [TranscriptSourcePart: TranscriptTextMetrics] {
-        switch item {
-        case .message(let message):
-            return Dictionary(uniqueKeysWithValues: message.contents.map {
-                (.messageContent($0.id), TranscriptTextMetrics($0.text))
-            })
-        case .reasoning(let reasoning):
-            return [.reasoning: TranscriptTextMetrics(reasoning.text)]
-        case .tool(let tool):
-            var values: [TranscriptSourcePart: TranscriptTextMetrics] = [:]
-            if let input = tool.input { values[.toolInput] = TranscriptTextMetrics(input) }
-            if let output = tool.output { values[.toolOutput] = TranscriptTextMetrics(output) }
-            if let error = tool.errorMessage { values[.toolError] = TranscriptTextMetrics(error) }
-            return values
-        case .diff(let diff):
-            return [.diff: TranscriptTextMetrics(diff.unifiedDiff)]
-        case .generic(let generic):
-            return generic.detail.map { [.genericDetail: TranscriptTextMetrics($0)] } ?? [:]
-        case .plan:
-            return [:]
-        }
-    }
-
-    private func retainedText(for handle: TranscriptSourceHandle) -> String? {
-        guard let index = workingItemIndexByID[handle.itemID],
-              workingState.items.indices.contains(index) else {
-            return nil
-        }
-        let item = workingState.items[index]
-        switch (item, handle.part) {
-        case (.message(let message), .messageContent(let contentID)):
-            return message.contents.first(where: { $0.id == contentID })?.text
-        case (.reasoning(let reasoning), .reasoning):
-            return reasoning.text
-        case (.tool(let tool), .toolInput):
-            return tool.input
-        case (.tool(let tool), .toolOutput):
-            return tool.output
-        case (.tool(let tool), .toolError):
-            return tool.errorMessage
-        case (.diff(let diff), .diff):
-            return diff.unifiedDiff
-        case (.plan(let plan), .plan):
-            return ([plan.title].compactMap { $0 } + plan.steps.map(\.title))
-                .joined(separator: "\n")
-        case (.generic(let generic), .genericDetail):
-            return generic.detail
-        default:
-            return nil
         }
     }
 

@@ -555,8 +555,6 @@ extension EnvironmentValues {
 /// every scroll-time layout pass; bounded segments keep each pass cheap.
 enum MarkdownSegmentation {
     static let segmentLineLimit = 60
-    static let clampThresholdLines = 160
-    static let clampedTailLines = 120
 
     /// Lines where a new segment may begin: blank lines, top-level list
     /// items (tight lists have no blank lines at all), and headings.
@@ -588,68 +586,6 @@ enum MarkdownSegmentation {
             result.append(current.joined(separator: "\n"))
         }
         return result
-    }
-
-    /// The tail of an over-long text at a safe boundary, or nil when the
-    /// text is short enough to show in full.
-    static func clampedTail(
-        of text: String,
-        thresholdLines: Int = clampThresholdLines,
-        tailLines: Int = clampedTailLines
-    ) -> (tail: String, hiddenLineCount: Int)? {
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
-        guard lines.count > thresholdLines else { return nil }
-
-        let initialStart = lines.count - tailLines
-        var start = initialStart
-        var insideFence = false
-        var openFenceLine: Substring?
-        for line in lines.prefix(start) {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
-                insideFence.toggle()
-                openFenceLine = insideFence ? line : nil
-            }
-        }
-        let cutInsideFence = insideFence
-        // Move the cut forward to the next safe boundary; if the cut landed
-        // inside a fence, skip to just past its closing line.
-        while start < lines.count {
-            let trimmed = lines[start].trimmingCharacters(in: .whitespaces)
-            if insideFence {
-                if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
-                    insideFence = false
-                }
-                start += 1
-                continue
-            }
-            if isSegmentBoundary(trimmed) {
-                break
-            }
-            start += 1
-        }
-        if start >= lines.count {
-            // No safe boundary before the end: the tail is dominated by one
-            // giant fence or unbroken run. An unclamped render here is a
-            // whole-transcript layout stall, so cut at the raw tail anyway,
-            // re-opening the fence so the tail still renders as code.
-            if cutInsideFence, let openFenceLine {
-                return (
-                    tail: ([openFenceLine] + lines[initialStart...])
-                        .joined(separator: "\n"),
-                    hiddenLineCount: initialStart
-                )
-            }
-            return (
-                tail: lines[initialStart...].joined(separator: "\n"),
-                hiddenLineCount: initialStart
-            )
-        }
-        guard start > 0 else { return nil }
-        return (
-            tail: lines[start...].joined(separator: "\n"),
-            hiddenLineCount: start
-        )
     }
 
     private static func isSegmentBoundary(_ trimmedLine: String) -> Bool {
@@ -744,10 +680,8 @@ struct RichMarkdownView: View {
 
     /// Completed rows whose sanitized source is already cached parse
     /// synchronously on their first body pass, so they lay out at final height
-    /// on the first frame — split into bounded segments, and clamped to a
-    /// tail with a reveal control when very long. Everything else streams
-    /// through the incremental reader (tail-clamped while live) and enters
-    /// the cache on completion.
+    /// on the first frame. macOS gives this view one bounded table segment;
+    /// every segment remains inline in the transcript.
     @ViewBuilder
     private var markdownContent: some View {
         if !isStreaming,
@@ -770,15 +704,7 @@ struct RichMarkdownView: View {
         if !isStreaming {
             SanitizedMarkdownCache.shared.insert(raw: text, sanitized: result.source)
         }
-        // While live, only the tail re-renders: a 1000-line output must not
-        // become a 1000-child layout stack mid-stream.
-        let displayed: String
-        if isStreaming,
-           let clamped = MarkdownSegmentation.clampedTail(of: result.source) {
-            displayed = clamped.tail
-        } else {
-            displayed = result.source
-        }
+        let displayed = result.source
         if didFinishStreaming || (isStreaming && source.text.count > displayed.count) {
             source = StreamingMarkdownSource(displayed)
             didFinishStreaming = false
@@ -792,26 +718,17 @@ struct RichMarkdownView: View {
     }
 }
 
-/// Completed markdown, rendered as bounded segments with an optional
-/// show-everything control for very long outputs. Numbering survives the
-/// splits because ordered-list segments start at their own first number.
+/// Completed markdown rendered in bounded parsing units. The transcript row
+/// projection supplies bounded source chunks on macOS, and this second level
+/// keeps an individual chunk's Markdown hierarchy shallow.
 private struct SegmentedMarkdownContent: View {
     let sanitized: String
 
     var body: some View {
-        let clamp = MarkdownSegmentation.clampedTail(of: sanitized)
         VStack(alignment: .leading, spacing: 8) {
-            if let clamp {
-                Label(
-                    "\(clamp.hiddenLineCount) earlier lines available in the full-content viewer",
-                    systemImage: "ellipsis.rectangle"
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            }
             ForEach(
                 Array(
-                    MarkdownSegmentation.segments(of: clamp?.tail ?? sanitized)
+                    MarkdownSegmentation.segments(of: sanitized)
                         .enumerated()
                 ),
                 id: \.offset

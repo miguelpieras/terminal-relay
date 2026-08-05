@@ -95,15 +95,17 @@ final class SanitizedMarkdownCache {
             guard case .message(let message) = item, !message.isStreaming else {
                 return []
             }
-            return message.contents.compactMap { content in
+            return message.contents.flatMap { content -> [String] in
                 switch content.kind {
                 case .code, .imagePlaceholder:
-                    return nil
+                    return []
                 case .plainText, .generic:
-                    return message.role == .user ? nil : content.text
+                    guard message.role != .user else { return [] }
                 case .markdown:
-                    return content.text
+                    break
                 }
+                return TranscriptTextProjection.markdownSegments(of: content.text)
+                    .map(\.renderedText)
             }
         }
     }

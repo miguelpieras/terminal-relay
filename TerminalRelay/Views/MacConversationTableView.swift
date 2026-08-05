@@ -79,7 +79,10 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         table.headerView = nil
         table.backgroundColor = .clear
         table.gridStyleMask = []
-        table.intercellSpacing = NSSize(width: 0, height: 14)
+        // Consecutive transcript segments must meet with no table-owned gap
+        // so one logical message still reads as one message. Group spacing is
+        // applied by ConversationView only at item boundaries.
+        table.intercellSpacing = .zero
         table.selectionHighlightStyle = .none
         table.allowsColumnSelection = false
         table.allowsEmptySelection = true
@@ -618,90 +621,5 @@ private final class MacConversationHostedCell: NSTableCellView {
         representedRowID = nil
         contentRevision = 0
         hosting?.rootView = AnyView(EmptyView())
-    }
-}
-
-struct TranscriptFullContentSheet: View {
-    let content: TranscriptFullContent
-    let dismiss: () -> Void
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack(alignment: .firstTextBaseline) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(content.handle.title)
-                        .font(.headline)
-                    Text(metadata)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button("Copy") {
-                    ChatClipboard.copy(content.text)
-                }
-                Button("Done", action: dismiss)
-                    .keyboardShortcut(.defaultAction)
-            }
-            .padding(14)
-            Divider()
-            TextKitFullContentView(text: content.text)
-        }
-        .frame(minWidth: 680, minHeight: 500)
-        .accessibilityElement(children: .contain)
-    }
-
-    private var metadata: String {
-        var values = [
-            content.handle.contentType,
-            ByteCountFormatter.string(
-                fromByteCount: Int64(content.retainedByteCount),
-                countStyle: .file
-            ),
-            "\(content.retainedLineCount) lines",
-        ]
-        if content.handle.isTruncatedAtSource {
-            if let original = content.handle.originalByteCount {
-                values.append(
-                    "retained from \(ByteCountFormatter.string(fromByteCount: Int64(original), countStyle: .file))"
-                )
-            } else {
-                values.append("source truncated")
-            }
-        }
-        return values.joined(separator: " · ")
-    }
-}
-
-private struct TextKitFullContentView: NSViewRepresentable {
-    let text: String
-
-    func makeNSView(context: Context) -> NSScrollView {
-        let textView = NSTextView(usingTextLayoutManager: true)
-        textView.isEditable = false
-        textView.isSelectable = true
-        textView.isRichText = false
-        textView.drawsBackground = false
-        textView.font = .monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
-        textView.textContainerInset = NSSize(width: 12, height: 12)
-        textView.isHorizontallyResizable = false
-        textView.isVerticallyResizable = true
-        textView.autoresizingMask = [.width]
-        textView.textContainer?.widthTracksTextView = true
-        textView.textContainer?.lineBreakMode = .byCharWrapping
-        textView.string = text
-
-        let scrollView = NSScrollView()
-        scrollView.documentView = textView
-        scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = false
-        scrollView.autohidesScrollers = true
-        scrollView.drawsBackground = false
-        return scrollView
-    }
-
-    func updateNSView(_ scrollView: NSScrollView, context: Context) {
-        guard let textView = scrollView.documentView as? NSTextView,
-              textView.string != text else { return }
-        textView.string = text
     }
 }
