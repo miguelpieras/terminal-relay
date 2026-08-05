@@ -842,21 +842,30 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
             return
         }
 
-        chatIndicatesWorking = state.turnState.isActive
+        let nextWorking = state.turnState.isActive
+        if chatIndicatesWorking != nextWorking {
+            chatIndicatesWorking = nextWorking
+        }
+        let nextStatus: TerminalSessionStatus
         switch state.connectionState {
         case .connecting:
-            status = .connecting
+            nextStatus = .connecting
         case .streaming, .awaitingApproval, .interrupted:
-            status = .running
+            nextStatus = .running
         case .offlineAgentRunning:
-            status = .remoteRunning
+            nextStatus = .remoteRunning
         case .stopped:
-            status = .exited(nil)
-            hasFinished = true
+            nextStatus = .exited(nil)
         case .unsupportedWorker, .failed:
-            status = .disconnected(nil)
+            nextStatus = .disconnected(nil)
         case .unknown:
-            status = .running
+            nextStatus = .running
+        }
+        if status != nextStatus {
+            status = nextStatus
+        }
+        if state.connectionState == .stopped {
+            hasFinished = true
         }
         updateWorkingState()
     }

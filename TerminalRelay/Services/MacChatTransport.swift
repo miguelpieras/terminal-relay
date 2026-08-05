@@ -6,7 +6,7 @@ import Foundation
 /// long enough to classify a transport failure and is never surfaced verbatim.
 actor MacChatTransport: ChatTransport {
     private enum ProcessEvent: Sendable {
-        case standardOutput(Data)
+        case standardOutput(Data, @Sendable () -> Void)
         case standardError(Data)
         case terminated(Int32)
     }
@@ -61,8 +61,10 @@ actor MacChatTransport: ChatTransport {
             try connection.connect(
                 configuration: configuration,
                 callbacks: .init(
-                    receiveStandardOutput: { data in
-                        processEvents.continuation.yield(.standardOutput(data))
+                    receiveStandardOutput: { data, consumed in
+                        processEvents.continuation.yield(
+                            .standardOutput(data, consumed)
+                        )
                     },
                     receiveStandardError: { data in
                         processEvents.continuation.yield(.standardError(data))
@@ -129,7 +131,8 @@ actor MacChatTransport: ChatTransport {
 
     private func receive(_ event: ProcessEvent, runID: UUID) {
         switch event {
-        case .standardOutput(let data):
+        case .standardOutput(let data, let consumed):
+            defer { consumed() }
             receiveStandardOutput(data, runID: runID)
         case .standardError(let data):
             receiveStandardError(data, runID: runID)

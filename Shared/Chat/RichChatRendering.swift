@@ -516,6 +516,14 @@ final class ChatRowActions {
         store?.markCopied(itemID: itemID)
     }
 
+    func copyMessage(itemID: String, fallback: String) {
+        store?.copyRetainedMessage(itemID: itemID, fallback: fallback)
+    }
+
+    func copyToolSection(identifier: String, fallback: String) {
+        store?.copyRetainedToolSection(identifier: identifier, fallback: fallback)
+    }
+
     func openRepository(_ link: ChatRepositoryLink) {
         guard let coordinator else { return }
         Task {
@@ -790,27 +798,16 @@ struct RichMarkdownView: View {
 private struct SegmentedMarkdownContent: View {
     let sanitized: String
 
-    @State private var showsFullMessage = false
-
     var body: some View {
-        let clamp = showsFullMessage
-            ? nil
-            : MarkdownSegmentation.clampedTail(of: sanitized)
+        let clamp = MarkdownSegmentation.clampedTail(of: sanitized)
         VStack(alignment: .leading, spacing: 8) {
             if let clamp {
-                Button {
-                    showsFullMessage = true
-                } label: {
-                    Label(
-                        "Show \(clamp.hiddenLineCount) earlier lines",
-                        systemImage: "ellipsis.rectangle"
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .chatMinimumInteractionTarget()
-                .accessibilityHint("Shows the whole message.")
+                Label(
+                    "\(clamp.hiddenLineCount) earlier lines available in the full-content viewer",
+                    systemImage: "ellipsis.rectangle"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
             ForEach(
                 Array(

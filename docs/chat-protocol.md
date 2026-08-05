@@ -162,7 +162,12 @@ The v1 event set is:
 
 Message and reasoning deltas append only to the identified incomplete item.
 `*.completed` replaces that item with the provider's authoritative final
-content. Tool completion includes bounded final output, status, duration,
+content. A live `tool.updated` may carry optional `payload.outputDelta`; new
+clients append it, while `payload.output` remains an authoritative replacement
+for compatibility with cumulative v1 workers. If both fields are present,
+`output` wins. Snapshots and `tool.completed` always contain the bounded
+authoritative `output`, so old clients attached to a delta-producing worker
+still converge at completion or reconnect. Tool completion includes bounded final output, status, duration,
 exit code or provider error, and file/MCP/dynamic-tool results as applicable.
 Approval and question events carry a stable display ID separately from the
 provider connection generation and provider request ID.

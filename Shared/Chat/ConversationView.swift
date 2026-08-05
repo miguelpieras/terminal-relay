@@ -16,6 +16,48 @@ import AppKit
 import UIKit
 #endif
 
+#if os(macOS)
+private enum MacTranscriptRow: MacConversationTableRow {
+    case history(id: String, revision: UInt64)
+    case item(TranscriptRowProjection, isExpanded: Bool, copiedItemID: String?)
+    case approval(ApprovalRequest, revision: UInt64)
+    case question(QuestionRequest, revision: UInt64)
+
+    var id: String {
+        switch self {
+        case .history(let id, _): id
+        case .item(let projection, _, _): projection.id
+        case .approval(let approval, _): "approval:\(approval.id)"
+        case .question(let question, _): "question:\(question.id)"
+        }
+    }
+
+    var contentRevision: UInt64 {
+        switch self {
+        case .history(_, let revision), .approval(_, let revision), .question(_, let revision):
+            return revision
+        case .item(let projection, let isExpanded, let copiedItemID):
+            var revision = projection.contentRevision &* 1099511628211
+            revision ^= isExpanded ? 1 : 0
+            if copiedItemID == projection.sourceItemID
+                || copiedItemID?.hasPrefix("\(projection.sourceItemID):") == true {
+                revision ^= 2
+            }
+            return revision
+        }
+    }
+
+    var reuseIdentifier: String {
+        switch self {
+        case .history: "transcript.history"
+        case .item(let projection, _, _): "transcript.\(projection.kind.rawValue)"
+        case .approval: "transcript.approval"
+        case .question: "transcript.question"
+        }
+    }
+}
+#endif
+
 /// Coarse scroll geometry: only boundary crossings and content-height motion
 /// change this value, so the scroll-geometry action never runs on plain
 /// scrolled frames. That keeps user scrolling free of SwiftUI graph work.
@@ -136,6 +178,20 @@ struct ConversationView: View {
                 store.dismissFilePreview()
             }
         }
+        #if os(macOS)
+        .sheet(
+            item: Binding(
+                get: { store.fullContentPresentation },
+                set: { value in
+                    if value == nil { store.dismissFullContent() }
+                }
+            )
+        ) { content in
+            TranscriptFullContentSheet(content: content) {
+                store.dismissFullContent()
+            }
+        }
+        #endif
     }
 
     /// The transcript renders eagerly (no lazy estimation) so every row has
@@ -180,6 +236,9 @@ struct ConversationView: View {
         hasher.combine(firstVisibleItemID)
         hasher.combine(store.expandedItemIDs)
         hasher.combine(store.copiedItemID)
+        hasher.combine(store.respondingInteractionIDs)
+        hasher.combine(store.selectedQuestionOptions)
+        hasher.combine(store.questionText)
         hasher.combine(store.isLoadingOlderHistory)
         hasher.combine(store.state.hasOlderHistory)
         hasher.combine(store.state.didTruncateHistory)
@@ -188,7 +247,207 @@ struct ConversationView: View {
         return hasher.finalize()
     }
 
+    @ViewBuilder
     private var transcript: some View {
+        #if os(macOS)
+        macTranscript
+        #else
+        iosTranscript
+        #endif
+    }
+
+    #if os(macOS)
+    @State private var macTableCommandHandle = MacConversationTableCommandHandle()
+
+    private var macRows: [MacTranscriptRow] {
+        var rows: [MacTranscriptRow] = []
+        if store.state.hasOlderHistory {
+            var hasher = Hasher()
+            hasher.combine(store.state.oldestItemID)
+            hasher.combine(store.state.didTruncateHistory)
+            hasher.combine(store.isLoadingOlderHistory)
+            rows.append(
+                .history(
+                    id: "history:\(store.state.oldestItemID ?? "start")",
+                    revision: UInt64(truncatingIfNeeded: hasher.finalize())
+                )
+            )
+        }
+        rows.append(contentsOf: store.state.items.map { item in
+            .item(
+                store.transcriptProjection(for: item),
+                isExpanded: store.expandedItemIDs.contains(item.id),
+                copiedItemID: store.copiedItemID
+            )
+        })
+        rows.append(contentsOf: store.state.approvals.map { approval in
+            var hasher = Hasher()
+            hasher.combine(approval.id)
+            hasher.combine(approval.status.rawValue)
+            hasher.combine(store.respondingInteractionIDs.contains(approval.id))
+            hasher.combine(store.pendingDestructiveApprovalConfirmation?.approvalID == approval.id)
+            return .approval(
+                approval,
+                revision: UInt64(truncatingIfNeeded: hasher.finalize())
+            )
+        })
+        rows.append(contentsOf: store.state.questions.map { question in
+            var hasher = Hasher()
+            hasher.combine(question.id)
+            hasher.combine(question.status.rawValue)
+            hasher.combine(store.respondingInteractionIDs.contains(question.id))
+            hasher.combine(store.selectedQuestionOptions)
+            hasher.combine(store.questionText)
+            return .question(
+                question,
+                revision: UInt64(truncatingIfNeeded: hasher.finalize())
+            )
+        })
+        return rows
+    }
+
+    private var macTranscript: some View {
+        var styleHasher = Hasher()
+        styleHasher.combine(colorScheme)
+        styleHasher.combine(dynamicTypeSize)
+        return MacConversationTableView(
+            rows: macRows,
+            snapshotGeneration: store.state.snapshotGeneration,
+            transcriptMutation: store.transcriptMutation,
+            dataRevision: transcriptContentRevision,
+            styleRevision: styleHasher.finalize(),
+            reduceMotion: reduceMotion,
+            commandHandle: macTableCommandHandle,
+            onNearBottomChange: { store.setNearBottom($0) },
+            onAnchoredChange: { isTranscriptAnchored = $0 },
+            makeRow: { row in AnyView(macRowView(row)) }
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityIdentifier("conversation.transcript")
+        .accessibilityValue(store.isNearBottom ? "latest" : "history")
+        .environment(\.chatRowActions, rowActions)
+        .overlay(alignment: .bottomTrailing) {
+            if !store.isNearBottom {
+                Button {
+                    store.jumpToLatest()
+                    macTableCommandHandle.performJump?()
+                } label: {
+                    Image(systemName: "arrow.down")
+                        .font(.caption.weight(.semibold))
+                        .frame(width: 28, height: 28)
+                        .background(.regularMaterial, in: Circle())
+                        .overlay { Circle().strokeBorder(Color.secondary.opacity(0.16)) }
+                        .frame(
+                            width: ChatInteractionTargetLayout.jumpButtonDimension,
+                            height: ChatInteractionTargetLayout.jumpButtonDimension
+                        )
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("conversation.jump-to-latest")
+                .padding(ChatInteractionTargetLayout.jumpButtonOuterPadding)
+                .accessibilityLabel(
+                    store.unreadCount > 0
+                        ? "\(store.unreadCount) new messages. Jump to latest"
+                        : "Jump to latest"
+                )
+            }
+        }
+        .overlay {
+            if isConversationEmpty {
+                emptyConversation
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color.chatCanvas)
+                    .allowsHitTesting(false)
+            } else if !isTranscriptAnchored {
+                anchoringCurtain
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func macRowView(_ row: MacTranscriptRow) -> some View {
+        let isFirst = row.id == macFirstRowID
+        let isLast = row.id == macLastRowID
+        VStack(alignment: .leading, spacing: 8) {
+            switch row {
+            case .history:
+                historyControl
+            case .item(let projection, _, _):
+                timelineView(for: projection.displayItem)
+                    .accessibilityIdentifier("conversation.item.\(projection.sourceItemID)")
+                if projection.isTruncated {
+                    transcriptTruncationControls(projection)
+                }
+            case .approval(let approval, _):
+                ApprovalCard(
+                    approval: approval,
+                    store: store,
+                    coordinator: coordinator,
+                    isReadOnly: isReadOnly
+                )
+            case .question(let question, _):
+                QuestionCard(
+                    question: question,
+                    store: store,
+                    coordinator: coordinator,
+                    isReadOnly: isReadOnly
+                )
+            }
+        }
+        .frame(maxWidth: 760, alignment: .leading)
+        .padding(.horizontal, horizontalTranscriptPadding)
+        .padding(.top, isFirst ? 22 : 0)
+        .padding(.bottom, isLast ? 16 : 0)
+        .frame(maxWidth: .infinity)
+        .environment(\.chatRowActions, rowActions)
+    }
+
+    private var macFirstRowID: String? {
+        if store.state.hasOlderHistory {
+            return "history:\(store.state.oldestItemID ?? "start")"
+        }
+        if let item = store.state.items.first { return item.id }
+        if let approval = store.state.approvals.first { return "approval:\(approval.id)" }
+        if let question = store.state.questions.first { return "question:\(question.id)" }
+        return nil
+    }
+
+    private var macLastRowID: String? {
+        if let question = store.state.questions.last { return "question:\(question.id)" }
+        if let approval = store.state.approvals.last { return "approval:\(approval.id)" }
+        if let item = store.state.items.last { return item.id }
+        if store.state.hasOlderHistory {
+            return "history:\(store.state.oldestItemID ?? "start")"
+        }
+        return nil
+    }
+
+    private func transcriptTruncationControls(
+        _ projection: TranscriptRowProjection
+    ) -> some View {
+        HStack(spacing: 10) {
+            Text(
+                projection.hiddenLineCount > 0
+                    ? "\(projection.hiddenLineCount) lines hidden"
+                    : "\(ByteCountFormatter.string(fromByteCount: Int64(projection.hiddenByteCount), countStyle: .file)) hidden"
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            ForEach(projection.sourceHandles) { handle in
+                Button("View full \(handle.contentType.lowercased())") {
+                    store.presentFullContent(handle)
+                }
+                .buttonStyle(.plain)
+                .font(.caption.weight(.medium))
+                .chatMinimumInteractionTarget()
+            }
+        }
+    }
+    #endif
+
+    #if os(iOS)
+    private var iosTranscript: some View {
         let visibleItems = self.visibleItems
         return ConversationTranscriptScroller(
             isConversationEmpty: store.state.items.isEmpty,
@@ -200,11 +459,7 @@ struct ConversationView: View {
                 visibleItems.contains(where: { $0.id == id })
             },
             onNearBottomChange: { store.setNearBottom($0) },
-            onAnchoredChange: { anchored in
-                #if os(macOS)
-                isTranscriptAnchored = anchored
-                #endif
-            },
+            onAnchoredChange: { _ in },
             onJump: { store.jumpToLatest() }
         ) {
             VStack(alignment: .leading, spacing: 14) {
@@ -262,15 +517,10 @@ struct ConversationView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(Color.chatCanvas)
                     .allowsHitTesting(false)
-            } else {
-                #if os(macOS)
-                if !isTranscriptAnchored {
-                    anchoringCurtain
-                }
-                #endif
             }
         }
     }
+    #endif
 
     #if os(macOS)
     /// Covers the transcript between content arriving and the open anchor
@@ -539,6 +789,7 @@ struct ConversationView: View {
 /// updates on every user scroll) re-evaluate only this thin container. The
 /// transcript content is passed in as a stored value, so its rows and their
 /// environment are untouched by scroll frames.
+#if os(iOS)
 private struct ConversationTranscriptScroller<Content: View>: View {
     let isConversationEmpty: Bool
     let firstItemID: String?
@@ -552,11 +803,9 @@ private struct ConversationTranscriptScroller<Content: View>: View {
     let content: Content
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    #if os(iOS)
     @State private var scrollController: ConversationScrollController
     @State private var scrollPosition = ScrollPosition()
     @State private var scratch = ConversationScrollScratch()
-    #endif
 
     init(
         isConversationEmpty: Bool,
@@ -580,68 +829,17 @@ private struct ConversationTranscriptScroller<Content: View>: View {
         self.onAnchoredChange = onAnchoredChange
         self.onJump = onJump
         self.content = content()
-        #if os(iOS)
         _scrollController = State(
             wrappedValue: ConversationScrollController(
                 startsAnchored: isConversationEmpty
             )
         )
-        #endif
     }
-
-    #if os(macOS)
-    @State private var macScrollState: ConversationScrollController.State = .following
-    @State private var macHandle = MacScrollCommandHandle()
-    #endif
 
     var body: some View {
-        #if os(macOS)
-        macBody
-        #else
         iosBody
-        #endif
     }
 
-    #if os(macOS)
-    /// On macOS the transcript scrolls inside an AppKit NSScrollView hosting
-    /// the SwiftUI content as its document. A user scroll is then a plain
-    /// clip-view bounds change: no SwiftUI graph transactions, no root
-    /// layout passes, no dropped frames. Profiling showed the SwiftUI
-    /// ScrollView path re-entered app-level layout on every scrolled frame.
-    private var macBody: some View {
-        MacConversationScrollView(
-            content: content,
-            isConversationEmpty: isConversationEmpty,
-            firstItemID: firstItemID,
-            contentRevision: contentRevision,
-            reduceMotion: reduceMotion,
-            handle: macHandle,
-            onNearBottomChange: onNearBottomChange,
-            onAnchoredChange: onAnchoredChange
-        )
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .accessibilityIdentifier("conversation.transcript")
-        .accessibilityValue(isNearBottom ? "latest" : "history")
-        .overlay(alignment: .bottomTrailing) {
-            macJumpToLatestOverlay
-        }
-    }
-
-    private var macJumpToLatestOverlay: some View {
-        ZStack(alignment: .bottomTrailing) {
-            if !isNearBottom {
-                jumpButton {
-                    onJump()
-                    macHandle.performJump?()
-                }
-            }
-        }
-        .animation(
-            reduceMotion ? nil : .easeInOut(duration: 0.16),
-            value: isNearBottom
-        )
-    }
-    #else
     private var iosBody: some View {
         ScrollView {
             content
@@ -699,8 +897,6 @@ private struct ConversationTranscriptScroller<Content: View>: View {
             }
         }
     }
-    #endif
-
     @ViewBuilder
     private func jumpButton(action: @escaping () -> Void) -> some View {
         Button(action: action) {
@@ -730,7 +926,6 @@ private struct ConversationTranscriptScroller<Content: View>: View {
         .transition(.scale.combined(with: .opacity))
     }
 
-    #if os(iOS)
     private var jumpToLatestOverlay: some View {
         ZStack(alignment: .bottomTrailing) {
             if !isNearBottom {
@@ -831,553 +1026,13 @@ private struct ConversationTranscriptScroller<Content: View>: View {
             scrollPosition.scrollTo(id: oldFirstID, anchor: .top)
         }
     }
-    #endif
-}
-
-#if os(macOS)
-/// Bridges jump-to-latest and the anchoring failsafe from SwiftUI overlays
-/// into the AppKit scroll coordinator. Reference-stable; never invalidates.
-/// NSScrollView documents lay out top-down; NSHostingView cannot be flipped
-/// directly, so a flipped plain container holds it and keeps document math in
-/// top-left coordinates.
-private final class ConversationDocumentView: NSView {
-    override var isFlipped: Bool { true }
-}
-
-/// Opts out of responsive scrolling: with it on, momentum overshoot is drawn
-/// by the concurrent scrolling thread before the main thread's
-/// elasticity-none setting can clamp it, so fast arrivals at the content
-/// edges still visibly bounce. The transcript's per-frame scroll cost is
-/// near zero, so the concurrent pipeline buys nothing here.
-private final class TranscriptScrollView: NSScrollView {
-    override class var isCompatibleWithResponsiveScrolling: Bool { false }
-}
-
-/// Reports SwiftUI content-size invalidations so the coordinator can resize
-/// the document by frame. The scroll subtree carries no Auto Layout
-/// constraints at all: constraints anchored to a clip view are dirtied by
-/// every scrolled frame and drag the whole window through layout passes.
-private final class TranscriptHostingView: NSHostingView<AnyView> {
-    var onContentSizeInvalidated: (() -> Void)?
-
-    override func invalidateIntrinsicContentSize() {
-        super.invalidateIntrinsicContentSize()
-        onContentSizeInvalidated?()
-    }
-}
-
-@MainActor
-private final class MacScrollCommandHandle {
-    var performJump: (() -> Void)?
-}
-
-/// AppKit-backed transcript scroller. The SwiftUI content is the document of
-/// a plain NSScrollView, so user scrolling is a clip-view bounds change that
-/// never enters the SwiftUI graph.
-///
-/// VIEWPORT SOVEREIGNTY, BY CONSTRUCTION: no observer of clip-view bounds may
-/// ever scroll. The app moves the viewport at exactly four one-shot sites —
-/// the open anchor, the jump button, a follow pin when content grows while
-/// the viewport was already at the bottom, and pixel-exact prepend
-/// compensation. There is no state machine, no wheel monitor, no timer, and
-/// no level-triggered correction: nothing exists that can fight the user.
-private struct MacConversationScrollView<Content: View>: NSViewRepresentable {
-    let content: Content
-    let isConversationEmpty: Bool
-    let firstItemID: String?
-    let contentRevision: Int
-    let reduceMotion: Bool
-    let handle: MacScrollCommandHandle
-    let onNearBottomChange: (Bool) -> Void
-    let onAnchoredChange: (Bool) -> Void
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator()
-    }
-
-    func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = TranscriptScrollView()
-        scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = false
-        scrollView.autohidesScrollers = true
-        scrollView.scrollerInsets = NSEdgeInsets()
-        scrollView.drawsBackground = false
-        // The transcript reads anchored, not springy: no rubber-band bounce
-        // at the content edges, on either axis.
-        scrollView.verticalScrollElasticity = .none
-        scrollView.horizontalScrollElasticity = .none
-
-        let hosting = TranscriptHostingView(rootView: AnyView(EmptyView()))
-        hosting.sizingOptions = .intrinsicContentSize
-
-        let document = ConversationDocumentView()
-        document.addSubview(hosting)
-        scrollView.documentView = document
-
-        context.coordinator.attach(
-            scrollView: scrollView,
-            document: document,
-            hosting: hosting
-        )
-        return scrollView
-    }
-
-    func updateNSView(_ scrollView: NSScrollView, context: Context) {
-        context.coordinator.configure(
-            isConversationEmpty: isConversationEmpty,
-            firstItemID: firstItemID,
-            reduceMotion: reduceMotion,
-            handle: handle,
-            onNearBottomChange: onNearBottomChange,
-            onAnchoredChange: onAnchoredChange
-        )
-        context.coordinator.applyContent(
-            AnyView(content.environment(\.self, context.environment)),
-            revision: contentRevision
-        )
-    }
-
-    static func dismantleNSView(_ nsView: NSScrollView, coordinator: Coordinator) {
-        coordinator.detach()
-    }
-
-    @MainActor
-    final class Coordinator {
-        private weak var scrollView: NSScrollView?
-        private weak var document: ConversationDocumentView?
-        private weak var hosting: TranscriptHostingView?
-        private var observers: [NSObjectProtocol] = []
-
-        private var reduceMotion = false
-        private var onNearBottomChange: (Bool) -> Void = { _ in }
-        private var onAnchoredChange: (Bool) -> Void = { _ in }
-        private var notifiedAnchored: Bool?
-
-        /// Reports open-anchor completion to SwiftUI so the loading curtain
-        /// can lift. Deferred one tick: the anchor fires inside updateNSView,
-        /// where state writes are illegal. Never scrolls.
-        private func notifyAnchored(_ anchored: Bool) {
-            guard notifiedAnchored != anchored else { return }
-            notifiedAnchored = anchored
-            let callback = onAnchoredChange
-            DispatchQueue.main.async {
-                callback(anchored)
-            }
-        }
-
-        private var lastNearBottom = true
-        private var lastDocumentHeight: CGFloat = 0
-        private var lastFirstItemID: String?
-        private var pendingPrependBaseHeight: CGFloat?
-        private var wasAtBottom = true
-        private var didInitialAnchor = false
-        private var hasContent = false
-        private var isAnimatingJump = false
-
-        func attach(
-            scrollView: NSScrollView,
-            document: ConversationDocumentView,
-            hosting: TranscriptHostingView
-        ) {
-            self.scrollView = scrollView
-            self.document = document
-            self.hosting = hosting
-            hosting.onContentSizeInvalidated = { [weak self] in
-                self?.scheduleDocumentResize()
-            }
-
-            let clipView = scrollView.contentView
-            clipView.postsBoundsChangedNotifications = true
-            clipView.postsFrameChangedNotifications = true
-            document.postsFrameChangedNotifications = true
-
-            let center = NotificationCenter.default
-            observers = [
-                center.addObserver(
-                    forName: NSView.boundsDidChangeNotification,
-                    object: clipView,
-                    queue: .main
-                ) { [weak self] _ in
-                    MainActor.assumeIsolated {
-                        self?.handleScrolled()
-                    }
-                },
-                center.addObserver(
-                    forName: NSView.frameDidChangeNotification,
-                    object: clipView,
-                    queue: .main
-                ) { [weak self] _ in
-                    MainActor.assumeIsolated {
-                        self?.handleViewportFrameChanged()
-                    }
-                },
-                center.addObserver(
-                    forName: NSView.frameDidChangeNotification,
-                    object: document,
-                    queue: .main
-                ) { [weak self] _ in
-                    MainActor.assumeIsolated {
-                        self?.handleContentSizeChanged()
-                    }
-                },
-            ]
-        }
-
-        func detach() {
-            rootViewRetryTask?.cancel()
-            rootViewRetryTask = nil
-            debouncedResizeTask?.cancel()
-            debouncedResizeTask = nil
-            for observer in observers {
-                NotificationCenter.default.removeObserver(observer)
-            }
-            observers = []
-            scrollView = nil
-            document = nil
-            hosting = nil
-        }
-
-        func configure(
-            isConversationEmpty: Bool,
-            firstItemID: String?,
-            reduceMotion: Bool,
-            handle: MacScrollCommandHandle,
-            onNearBottomChange: @escaping (Bool) -> Void,
-            onAnchoredChange: @escaping (Bool) -> Void
-        ) {
-            self.reduceMotion = reduceMotion
-            self.onNearBottomChange = onNearBottomChange
-            self.onAnchoredChange = onAnchoredChange
-            handle.performJump = { [weak self] in
-                self?.jumpToLatest()
-            }
-
-            hasContent = !isConversationEmpty
-            if isConversationEmpty {
-                // Conversation swapped or reset: the next content anchors anew.
-                didInitialAnchor = false
-                notifyAnchored(false)
-            }
-
-            if firstItemID != lastFirstItemID {
-                if lastFirstItemID != nil, firstItemID != nil, !wasAtBottom {
-                    // A history page is about to prepend above the viewport;
-                    // compensate when its height lands.
-                    pendingPrependBaseHeight = lastDocumentHeight
-                }
-                lastFirstItemID = firstItemID
-            }
-        }
-
-        // MARK: Content
-
-        private var pendingContent: AnyView?
-        private var pendingContentRevision: Int?
-        private var lastLayoutWidth: CGFloat = 0
-        private var lastContentRevision: Int?
-        private var rootViewRetryTask: Task<Void, Never>?
-
-        /// Reassigning the hosted root view forces SwiftUI to diff the whole
-        /// transcript — a visible hitch mid-scroll. Publishes that cannot
-        /// have changed the content (near-bottom flips, unread counters)
-        /// keep the same revision and never touch the hosted tree.
-        func applyContent(_ content: AnyView, revision: Int) {
-            guard revision != lastContentRevision else { return }
-            pendingContent = content
-            pendingContentRevision = revision
-            applyRootView()
-        }
-
-        /// NSHostingView's intrinsic size is SwiftUI's ideal size, which for
-        /// a text transcript is wide and short. The content therefore
-        /// carries an explicit width matching the viewport, so the intrinsic
-        /// height the document is sized with is the real height-for-width.
-        @discardableResult
-        private func applyRootView(schedulesRetry: Bool = true) -> Bool {
-            guard let hosting, let scrollView, let pendingContent else { return false }
-            let width = scrollView.contentView.bounds.width
-            guard width > 0 else {
-                if schedulesRetry {
-                    scheduleRootViewRetry()
-                }
-                return false
-            }
-            rootViewRetryTask?.cancel()
-            rootViewRetryTask = nil
-            lastLayoutWidth = width
-            hosting.rootView = AnyView(
-                pendingContent.frame(width: width, alignment: .topLeading)
-            )
-            // A representable can first update before AppKit has laid out its
-            // clip view. Do not consume that revision until the root is truly
-            // installed; the clip-frame observer retries once width exists.
-            if let pendingContentRevision {
-                lastContentRevision = pendingContentRevision
-                self.pendingContentRevision = nil
-            }
-            debouncedResizeTask?.cancel()
-            resizeDocumentToFitContent()
-            if hasContent, !didInitialAnchor {
-                // Open anchor: one deterministic scroll to the latest item,
-                // before this pass draws.
-                pinToBottom()
-                wasAtBottom = true
-                didInitialAnchor = true
-                conversationScrollLogger.debug("Anchored at latest")
-                notifyAnchored(true)
-            }
-            return true
-        }
-
-        /// The clip-frame observer is the normal zero-width retry path, but
-        /// AppKit can lay out the viewport before that notification reaches
-        /// us. A bounded delayed retry keeps a first update at width zero from
-        /// stranding the loading curtain forever.
-        private func scheduleRootViewRetry() {
-            guard rootViewRetryTask == nil else { return }
-            rootViewRetryTask = Task { @MainActor [weak self] in
-                guard let self else { return }
-                for delay in [16, 50, 100, 250, 500] {
-                    try? await Task.sleep(for: .milliseconds(delay))
-                    guard !Task.isCancelled else { return }
-                    if self.applyRootView(schedulesRetry: false) { return }
-                }
-                self.rootViewRetryTask = nil
-            }
-        }
-
-        // MARK: Manual document sizing (no Auto Layout in the scroll subtree)
-
-        private var debouncedResizeTask: Task<Void, Never>?
-
-        /// Intrinsic-size invalidations also fire during scroll-driven
-        /// hosting re-renders, and honoring each one with a fittingSize pass
-        /// would put a full SwiftUI layout evaluation on every scrolled
-        /// frame. Content updates and width changes resize immediately; the
-        /// invalidation hook only arms a debounced safety net for content
-        /// that settles late (async images, tables).
-        func scheduleDocumentResize() {
-            debouncedResizeTask?.cancel()
-            debouncedResizeTask = Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .milliseconds(200))
-                guard !Task.isCancelled, let self else { return }
-                // A transient mid-update measurement can report a collapsed
-                // height; resizing an established document to it would slam
-                // the viewport. Content-driven resizes go through
-                // applyRootView and stay fully trusted.
-                if let hosting,
-                   lastDocumentHeight > 500,
-                   hosting.fittingSize.height < lastDocumentHeight * 0.5 {
-                    conversationScrollLogger.debug("Ignored anomalous shrink measurement")
-                    return
-                }
-                resizeDocumentToFitContent()
-            }
-        }
-
-        private func resizeDocumentToFitContent() {
-            guard let hosting, let document, let scrollView else { return }
-            let width = scrollView.contentView.bounds.width
-            guard width > 0 else { return }
-            let height = hosting.fittingSize.height
-            let size = NSSize(width: width, height: max(height, 0))
-            guard hosting.frame.size != size || document.frame.size != size else {
-                return
-            }
-            conversationScrollLogger.debug(
-                "Document resized to height \(Int(size.height), privacy: .public)"
-            )
-            if hosting.frame.size != size {
-                hosting.frame = NSRect(origin: .zero, size: size)
-            }
-            if document.frame.size != size {
-                // Posts frameDidChange, which drives follow/prepend one-shots.
-                document.setFrameSize(size)
-            }
-            // Content can settle to a new height without invalidating
-            // intrinsic size (glyph substitution, late text settles), which
-            // leaves the document short and clips the last rows. Every real
-            // resize therefore re-verifies once after the debounce; a stable
-            // measurement ends the chain at the size guard above.
-            scheduleDocumentResize()
-        }
-
-        // MARK: Geometry
-
-        /// The scroll view is the authority on how far down the user can
-        /// actually scroll: content insets (full-size content windows place
-        /// the toolbar over the scroll view) make raw height-minus-viewport
-        /// arithmetic land short of the enforced bottom. One authority
-        /// serves the pin target, the at-bottom sample, and the
-        /// near-bottom threshold.
-        private var maximumScrollOriginY: CGFloat {
-            guard let scrollView, let document else { return 0 }
-            let clipView = scrollView.contentView
-            let proposed = NSRect(
-                origin: NSPoint(
-                    x: clipView.bounds.origin.x,
-                    y: document.frame.height
-                ),
-                size: clipView.bounds.size
-            )
-            return clipView.constrainBoundsRect(proposed).origin.y
-        }
-
-        private var distanceFromBottom: CGFloat {
-            guard let scrollView else { return 0 }
-            return maximumScrollOriginY - scrollView.contentView.bounds.origin.y
-        }
-
-        private var wasOverscrolled = false
-
-        /// Pure sampling; may never scroll. Safe under synchronous re-entry
-        /// from a pin.
-        private func resample() {
-            let distance = distanceFromBottom
-            wasAtBottom = distance <= ConversationScrollController.atBottomTolerance
-            let nearBottom = distance <= 180
-            if nearBottom != lastNearBottom {
-                lastNearBottom = nearBottom
-                onNearBottomChange(nearBottom)
-            }
-            let overscrolled = distance < -1
-            if overscrolled != wasOverscrolled {
-                wasOverscrolled = overscrolled
-                if overscrolled {
-                    conversationScrollLogger.debug(
-                        "Overscroll past bottom clamped (\(Int(-distance), privacy: .public)pt)"
-                    )
-                }
-            }
-            // AppKit rubber-bands momentum past the edge even with
-            // elasticity disabled. Beyond the legal range is not a position
-            // the user can intend to occupy, so clamping here cannot fight
-            // them; it is what elasticity-none promised.
-            if overscrolled {
-                clampToBottomEdge()
-            }
-        }
-
-        private func clampToBottomEdge() {
-            guard let scrollView else { return }
-            let clipView = scrollView.contentView
-            var origin = clipView.bounds.origin
-            origin.y = maximumScrollOriginY
-            clipView.setBoundsOrigin(origin)
-            scrollView.reflectScrolledClipView(clipView)
-        }
-
-        // MARK: Observers (scroll-free by construction)
-
-        private func handleScrolled() {
-            if let scrollView,
-               abs(scrollView.contentView.bounds.width - lastLayoutWidth) > 0.5 {
-                applyRootView()
-            }
-            resample()
-        }
-
-        /// The representable commonly receives its first content update at
-        /// width zero. A clip-frame change is the bounded AppKit lifecycle
-        /// signal that the viewport has become usable; it also covers window
-        /// resizes that do not produce a bounds notification.
-        private func handleViewportFrameChanged() {
-            guard let scrollView else { return }
-            let widthChanged = abs(
-                scrollView.contentView.bounds.width - lastLayoutWidth
-            ) > 0.5
-            if pendingContentRevision != nil || widthChanged {
-                applyRootView()
-            }
-        }
-
-        private func handleContentSizeChanged() {
-            guard let document else { return }
-            let height = document.frame.height
-            guard height != lastDocumentHeight else { return }
-            lastDocumentHeight = height
-
-            if let baseHeight = pendingPrependBaseHeight {
-                pendingPrependBaseHeight = nil
-                let delta = height - baseHeight
-                if delta > 0 {
-                    conversationScrollLogger.debug("Prepend position preserved")
-                    scrollBy(delta)
-                }
-                resample()
-                return
-            }
-
-            // Follow streaming: decided once per content event from the
-            // geometry sampled BEFORE this height change. If the user has
-            // scrolled up even one wheel notch, that notch already flipped
-            // wasAtBottom false and nothing here moves.
-            if wasAtBottom, didInitialAnchor, !isAnimatingJump {
-                conversationScrollLogger.debug("Follow pin after content growth")
-                pinToBottom()
-            }
-            resample()
-        }
-
-        // MARK: Jump
-
-        private func jumpToLatest() {
-            conversationScrollLogger.debug("Jump to latest")
-            if reduceMotion {
-                pinToBottom()
-                resample()
-                return
-            }
-            guard let scrollView else { return }
-            isAnimatingJump = true
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.18
-                context.allowsImplicitAnimation = true
-                scrollView.contentView.animator().setBoundsOrigin(bottomOrigin())
-                scrollView.reflectScrolledClipView(scrollView.contentView)
-            } completionHandler: {
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    // One snap absorbs any mid-flight growth; nothing re-arms
-                    // afterward. A wheel interrupt leaves the user in charge.
-                    isAnimatingJump = false
-                    pinToBottom()
-                    resample()
-                }
-            }
-        }
-
-        // MARK: Pinning
-
-        private func bottomOrigin() -> NSPoint {
-            guard let scrollView else { return .zero }
-            return NSPoint(
-                x: scrollView.contentView.bounds.origin.x,
-                y: maximumScrollOriginY
-            )
-        }
-
-        private func pinToBottom() {
-            guard let scrollView else { return }
-            scrollView.contentView.setBoundsOrigin(bottomOrigin())
-            scrollView.reflectScrolledClipView(scrollView.contentView)
-        }
-
-        private func scrollBy(_ deltaY: CGFloat) {
-            guard let scrollView else { return }
-            let clipView = scrollView.contentView
-            var proposed = clipView.bounds
-            proposed.origin.y += deltaY
-            clipView.setBoundsOrigin(clipView.constrainBoundsRect(proposed).origin)
-            scrollView.reflectScrolledClipView(clipView)
-        }
-    }
 }
 #endif
 
 private struct ChatMessageView: View {
     let message: ChatMessage
 
+    @Environment(\.chatRowActions) private var actions
     @State private var didCopy = false
     @State private var isHovering = false
 
@@ -1422,7 +1077,7 @@ private struct ChatMessageView: View {
     private var messageFooter: some View {
         HStack(spacing: 9) {
             Button {
-                ChatClipboard.copy(message.text)
+                actions.copyMessage(itemID: message.id, fallback: message.text)
                 didCopy = true
                 Task {
                     try? await Task.sleep(nanoseconds: 1_500_000_000)
@@ -1704,7 +1359,7 @@ private struct ToolSection: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button {
-                    ChatClipboard.copy(content)
+                    actions.copyToolSection(identifier: itemID, fallback: content)
                     actions.markCopied(itemID: itemID)
                 } label: {
                     Label(isCopied ? "Copied" : "Copy", systemImage: isCopied ? "checkmark" : "doc.on.doc")
@@ -1718,7 +1373,8 @@ private struct ToolSection: View {
                 id: itemID,
                 code: content,
                 language: nil,
-                isStreaming: false
+                isStreaming: false,
+                showsCopyButton: false
             )
         }
     }

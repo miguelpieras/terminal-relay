@@ -72,6 +72,7 @@ final class ConversationStoreTests: XCTestCase {
     func testControlEventsAdvanceCursorWithoutInvalidatingTranscriptContent() throws {
         let store = ConversationStore()
         let initialRevision = store.transcriptContentRevision
+        let initialMutation = store.transcriptMutation
 
         try store.apply(
             ChatTestFixtures.event("session.heartbeat", sequence: 1)
@@ -93,6 +94,7 @@ final class ConversationStoreTests: XCTestCase {
 
         XCTAssertEqual(store.state.lastAppliedSequence, 3)
         XCTAssertEqual(store.transcriptContentRevision, initialRevision)
+        XCTAssertEqual(store.transcriptMutation, initialMutation)
 
         try store.apply(
             ChatTestFixtures.event(
@@ -108,6 +110,119 @@ final class ConversationStoreTests: XCTestCase {
         )
 
         XCTAssertEqual(store.transcriptContentRevision, initialRevision + 1)
+    }
+
+    func testToolOutputDeltaAppendsAndAuthoritativeOutputWins() throws {
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        try store.apply(
+            ChatTestFixtures.event(
+                "tool.started",
+                sequence: 1,
+                itemID: "tool-1",
+                turnID: "turn-1",
+                payload: .object([
+                    "kind": .string("shell"),
+                    "title": .string("Command"),
+                    "status": .string("running"),
+                ])
+            )
+        )
+        try store.apply(
+            ChatTestFixtures.event(
+                "tool.updated",
+                sequence: 2,
+                itemID: "tool-1",
+                turnID: "turn-1",
+                payload: .object(["outputDelta": .string("first ")])
+            )
+        )
+        store.flushStreamingUpdates()
+        try store.apply(
+            ChatTestFixtures.event(
+                "tool.updated",
+                sequence: 3,
+                itemID: "tool-1",
+                turnID: "turn-1",
+                payload: .object(["outputDelta": .string("second")])
+            )
+        )
+        store.flushStreamingUpdates()
+        XCTAssertEqual(store.state.tools.first?.output, "first second")
+
+        try store.apply(
+            ChatTestFixtures.event(
+                "tool.updated",
+                sequence: 4,
+                itemID: "tool-1",
+                turnID: "turn-1",
+                payload: .object([
+                    "output": .string("authoritative"),
+                    "outputDelta": .string("must-not-append"),
+                ])
+            )
+        )
+        store.flushStreamingUpdates()
+        XCTAssertEqual(store.state.tools.first?.output, "authoritative")
+    }
+
+    func testTranscriptMutationReportsOneCoalescedChangedRowAndExactEviction() throws {
+        let store = ConversationStore(
+            reducer: ConversationReducer(
+                maximumRetainedItems: 2,
+                maximumRetainedContentBytes: 1_048_576
+            ),
+            streamingPublishNanoseconds: 1_000_000_000
+        )
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.started",
+                sequence: 1,
+                itemID: "message-1",
+                turnID: "turn",
+                payload: .object(["role": .string("assistant")])
+            )
+        )
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.delta",
+                sequence: 2,
+                itemID: "message-1",
+                turnID: "turn",
+                payload: .object(["text": .string("a")])
+            )
+        )
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.delta",
+                sequence: 3,
+                itemID: "message-1",
+                turnID: "turn",
+                payload: .object(["text": .string("b")])
+            )
+        )
+        store.flushStreamingUpdates()
+        XCTAssertEqual(store.transcriptMutation.changedIDs, ["message-1"])
+        XCTAssertTrue(store.transcriptMutation.insertions.isEmpty)
+        XCTAssertTrue(store.transcriptMutation.removedIDs.isEmpty)
+        XCTAssertEqual(store.state.messages.first?.text, "ab")
+
+        for (sequence, id) in [(4, "message-2"), (5, "message-3")] {
+            try store.apply(
+                ChatTestFixtures.event(
+                    "message.completed",
+                    sequence: Int64(sequence),
+                    itemID: id,
+                    turnID: "turn",
+                    payload: .object([
+                        "role": .string("assistant"),
+                        "text": .string(id),
+                    ])
+                )
+            )
+        }
+        XCTAssertEqual(store.state.items.map(\.id), ["message-2", "message-3"])
+        XCTAssertEqual(store.transcriptMutation.removedIDs, ["message-1"])
+        XCTAssertEqual(store.transcriptMutation.insertions.map(\.id), ["message-3"])
     }
 
     func testAppliesFlatSnapshotAndUsesBaseSeqCodingKey() throws {
@@ -525,8 +640,12 @@ final class ConversationStoreTests: XCTestCase {
             payload: .object(["role": .string("assistant"), "text": .string("One")])
         )
         try store.apply(first)
+        let revisionAfterFirstApply = store.transcriptContentRevision
+        let mutationAfterFirstApply = store.transcriptMutation
         try store.apply(first)
         XCTAssertEqual(store.state.messages.count, 1)
+        XCTAssertEqual(store.transcriptContentRevision, revisionAfterFirstApply)
+        XCTAssertEqual(store.transcriptMutation, mutationAfterFirstApply)
 
         XCTAssertThrowsError(
             try store.apply(

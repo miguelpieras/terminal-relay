@@ -807,7 +807,11 @@ async def exercise_codex_adapter(module, root: pathlib.Path) -> None:
         ):
             break
         await asyncio.sleep(0.01)
-    assert output_events[-1]["payload"]["output"] == "first second"
+    assert [event["payload"]["outputDelta"] for event in output_events] == [
+        "first ",
+        "second",
+    ]
+    assert all("output" not in event["payload"] for event in output_events)
     usage = next(event for event in events if event["type"] == "usage.updated")
     assert usage["payload"] == {
         "inputTokens": 10,
@@ -1871,6 +1875,70 @@ def exercise_snapshot_trim(module, root: pathlib.Path) -> None:
         provider,
         {},
     )
+    tool_id = "abababab-abab-4bab-8bab-abababababab"
+    broker._apply_to_snapshot(
+        {
+            "type": "tool.started",
+            "itemId": tool_id,
+            "turnId": THREAD_ID,
+            "occurredAt": 1,
+            "payload": {"kind": "shell", "title": "Command", "output": ""},
+        }
+    )
+    broker._apply_to_snapshot(
+        {
+            "type": "tool.updated",
+            "itemId": tool_id,
+            "turnId": THREAD_ID,
+            "occurredAt": 2,
+            "payload": {"status": "running", "outputDelta": "first "},
+        }
+    )
+    broker._apply_to_snapshot(
+        {
+            "type": "tool.updated",
+            "itemId": tool_id,
+            "turnId": THREAD_ID,
+            "occurredAt": 3,
+            "payload": {"status": "running", "outputDelta": "second"},
+        }
+    )
+    running_tool = next(
+        item
+        for item in broker.snapshot_payload()["items"]
+        if item["itemId"] == tool_id
+    )
+    assert running_tool["payload"]["output"] == "first second"
+    assert "outputDelta" not in running_tool["payload"]
+    broker._apply_to_snapshot(
+        {
+            "type": "tool.updated",
+            "itemId": tool_id,
+            "turnId": THREAD_ID,
+            "occurredAt": 4,
+            "payload": {
+                "status": "running",
+                "output": "authoritative",
+                "outputDelta": "must-not-append",
+            },
+        }
+    )
+    assert broker.items[tool_id]["payload"]["output"] == "authoritative"
+    broker.items.clear()
+    broker.snapshot_text_chunks.clear()
+
+    chunks = module.BoundedTextChunks()
+    delta = "x" * 1024
+    for _ in range(1024):
+        chunks.append(delta)
+    assert len(chunks.chunks) == 1024
+    assert chunks.original_byte_count == module.MAX_ITEM_BYTES
+    assert chunks.materialize() == delta * 1024
+    chunks.append(delta)
+    assert chunks.truncated
+    assert len(chunks.materialize().encode("utf-8")) <= module.MAX_ITEM_BYTES
+    assert chunks.original_byte_count == module.MAX_ITEM_BYTES + len(delta)
+
     total = 600
     for index in range(total):
         item_id = f"{index:08d}-aaaa-4aaa-8aaa-aaaaaaaaaaaa"

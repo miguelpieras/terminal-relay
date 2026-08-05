@@ -27,7 +27,10 @@ enum MacChatProcessConnectionError: LocalizedError, Equatable {
 /// exact-stop command.
 final class MacChatProcessConnection {
     struct Callbacks {
-        let receiveStandardOutput: (Data) -> Void
+        /// The receiver must invoke `consumed` exactly once after it has
+        /// decoded or discarded the bytes. That acknowledgement is the
+        /// stdout backpressure boundary.
+        let receiveStandardOutput: (Data, @escaping @Sendable () -> Void) -> Void
         let receiveStandardError: (Data) -> Void
         let terminate: (Int32) -> Void
     }
@@ -42,6 +45,8 @@ final class MacChatProcessConnection {
         var standardOutputEnded = false
         var standardErrorEnded = false
         var terminationStatus: Int32?
+        var queuedStandardOutputBytes = 0
+        var standardOutputPaused = false
 
         init(
             id: UUID,
@@ -68,9 +73,15 @@ final class MacChatProcessConnection {
         label: "com.mpieras.TerminalRelay.mac-chat-process-readers"
     )
     private var run: Run?
+    static let standardOutputHighWaterBytes = 4 * 1_048_576
+    static let standardOutputLowWaterBytes = 1 * 1_048_576
 
     var isConnected: Bool {
         lock.whileLocked { run?.process.isRunning == true }
+    }
+
+    var queuedStandardOutputByteCount: Int {
+        lock.whileLocked { run?.queuedStandardOutputBytes ?? 0 }
     }
 
     func connect(
@@ -107,15 +118,7 @@ final class MacChatProcessConnection {
             throw MacChatProcessConnectionError.alreadyConnected
         }
 
-        output.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            self?.readerQueue.async {
-                self?.readAvailable(
-                    from: handle,
-                    standardError: false,
-                    runID: runID
-                )
-            }
-        }
+        installStandardOutputHandler(on: output.fileHandleForReading, runID: runID)
         error.fileHandleForReading.readabilityHandler = { [weak self] handle in
             self?.readerQueue.async {
                 self?.readAvailable(
@@ -166,15 +169,76 @@ final class MacChatProcessConnection {
     }
 
     private func receive(_ data: Data, fromStandardError: Bool, runID: UUID) {
+        if !fromStandardError {
+            receiveStandardOutput(data, runID: runID)
+            return
+        }
         let callback = lock.whileLocked { () -> ((Data) -> Void)? in
             guard let run, run.id == runID else { return nil }
-            return fromStandardError
-                ? run.callbacks.receiveStandardError
-                : run.callbacks.receiveStandardOutput
+            return run.callbacks.receiveStandardError
         }
         if let callback {
             callbackQueue.async {
                 callback(data)
+            }
+        }
+    }
+
+    private func receiveStandardOutput(_ data: Data, runID: UUID) {
+        let callback = lock.whileLocked {
+            () -> ((Data, @escaping @Sendable () -> Void) -> Void)? in
+            guard let run, run.id == runID else { return nil }
+            run.queuedStandardOutputBytes += data.count
+            if run.queuedStandardOutputBytes >= Self.standardOutputHighWaterBytes,
+               !run.standardOutputPaused {
+                run.standardOutputPaused = true
+                run.output.fileHandleForReading.readabilityHandler = nil
+            }
+            TranscriptPerformance.emitCounters(
+                queuedTransportBytes: run.queuedStandardOutputBytes
+            )
+            return run.callbacks.receiveStandardOutput
+        }
+        guard let callback else { return }
+        callbackQueue.async { [weak self] in
+            callback(data) { [weak self] in
+                self?.standardOutputConsumed(data.count, runID: runID)
+            }
+        }
+    }
+
+    private func standardOutputConsumed(_ byteCount: Int, runID: UUID) {
+        let handle = lock.whileLocked { () -> FileHandle? in
+            guard let run, run.id == runID else { return nil }
+            run.queuedStandardOutputBytes = max(
+                0,
+                run.queuedStandardOutputBytes - byteCount
+            )
+            TranscriptPerformance.emitCounters(
+                queuedTransportBytes: run.queuedStandardOutputBytes
+            )
+            guard run.standardOutputPaused,
+                  run.queuedStandardOutputBytes <= Self.standardOutputLowWaterBytes,
+                  !run.standardOutputEnded,
+                  run.process.isRunning else {
+                return nil
+            }
+            run.standardOutputPaused = false
+            return run.output.fileHandleForReading
+        }
+        if let handle {
+            installStandardOutputHandler(on: handle, runID: runID)
+        }
+    }
+
+    private func installStandardOutputHandler(on handle: FileHandle, runID: UUID) {
+        handle.readabilityHandler = { [weak self] handle in
+            self?.readerQueue.async {
+                self?.readAvailable(
+                    from: handle,
+                    standardError: false,
+                    runID: runID
+                )
             }
         }
     }

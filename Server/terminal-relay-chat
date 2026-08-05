@@ -197,6 +197,67 @@ def bounded_text(
     return result, True, original
 
 
+class BoundedTextChunks:
+    """Append bounded UTF-8 chunks without copying prior content per delta."""
+
+    marker = "\n\n… output truncated by Terminal Relay …"
+
+    def __init__(self, value: str = "", maximum: int = MAX_ITEM_BYTES):
+        self.maximum = maximum
+        self.chunks: list[str] = []
+        self.retained_bytes = 0
+        self.original_byte_count = 0
+        self.truncated = False
+        if value:
+            self.append(value)
+
+    def append(self, value: str, original_byte_count: int | None = None) -> None:
+        encoded = value.encode("utf-8", errors="replace")
+        reported = (
+            original_byte_count
+            if isinstance(original_byte_count, int)
+            and original_byte_count >= len(encoded)
+            else len(encoded)
+        )
+        self.original_byte_count += reported
+        if self.truncated:
+            return
+        if self.original_byte_count <= self.maximum:
+            self.chunks.append(value)
+            self.retained_bytes += len(encoded)
+            return
+
+        marker_bytes = len(self.marker.encode("utf-8"))
+        allowance = max(0, self.maximum - marker_bytes)
+        self._trim_to(allowance)
+        if self.retained_bytes < allowance:
+            retained = encoded[: allowance - self.retained_bytes].decode(
+                "utf-8", errors="ignore"
+            )
+            if retained:
+                self.chunks.append(retained)
+                self.retained_bytes += len(retained.encode("utf-8"))
+        self.truncated = True
+
+    def _trim_to(self, maximum: int) -> None:
+        while self.chunks and self.retained_bytes > maximum:
+            chunk = self.chunks.pop()
+            encoded = chunk.encode("utf-8")
+            before_chunk = self.retained_bytes - len(encoded)
+            if before_chunk < maximum:
+                retained = encoded[: maximum - before_chunk].decode(
+                    "utf-8", errors="ignore"
+                )
+                if retained:
+                    self.chunks.append(retained)
+                self.retained_bytes = before_chunk + len(retained.encode("utf-8"))
+                return
+            self.retained_bytes = before_chunk
+
+    def materialize(self) -> str:
+        return "".join(self.chunks) + (self.marker if self.truncated else "")
+
+
 def sanitize_json(value: Any, depth: int = 0) -> Any:
     """Return a bounded JSON-compatible value without arbitrary object reprs."""
     if depth >= 12:
@@ -1034,7 +1095,6 @@ class CodexAdapter(ProviderAdapter):
         self.closing = False
         self.last_reconciled_thread: dict[str, Any] | None = None
         self.interactions: dict[str, dict[str, Any]] = {}
-        self.tool_output_buffers: dict[str, str] = {}
         self.plan_buffers: dict[str, str] = {}
 
     async def start(self, emit: Callable[..., Awaitable[dict[str, Any]]]) -> str:
@@ -1616,7 +1676,6 @@ class CodexAdapter(ProviderAdapter):
                 item_id=item_id,
             )
             if isinstance(item_id, str):
-                self.tool_output_buffers.pop(item_id, None)
                 self.plan_buffers.pop(item_id, None)
             return
         if method in {
@@ -1646,11 +1705,7 @@ class CodexAdapter(ProviderAdapter):
             delta = params.get("delta")
             if not isinstance(delta, str):
                 return
-            accumulated = self.tool_output_buffers.get(item_id, "") + delta
-            accumulated, truncated, original = bounded_text(
-                accumulated, MAX_ITEM_BYTES
-            )
-            self.tool_output_buffers[item_id] = accumulated
+            output_delta, truncated, original = bounded_text(delta)
             await self.emit(
                 "tool.updated",
                 {
@@ -1661,7 +1716,7 @@ class CodexAdapter(ProviderAdapter):
                         else "File change"
                     ),
                     "status": "running",
-                    "output": accumulated,
+                    "outputDelta": output_delta,
                     "truncated": truncated,
                     "originalByteCount": original,
                 },
@@ -3069,6 +3124,7 @@ class ChatBroker:
         self.replay_bytes = 0
         self.clients: set[ClientConnection] = set()
         self.items: collections.OrderedDict[str, dict[str, Any]] = collections.OrderedDict()
+        self.snapshot_text_chunks: dict[tuple[str, str], BoundedTextChunks] = {}
         self.approvals: dict[str, dict[str, Any]] = {}
         self.questions: dict[str, dict[str, Any]] = {}
         self.usage: dict[str, Any] | None = None
@@ -3249,6 +3305,7 @@ class ChatBroker:
             "diff.updated",
             "plan.updated",
         } and item_id:
+            self._discard_snapshot_text(item_id)
             self.items[item_id] = {
                 "type": event_type,
                 "itemId": item_id,
@@ -3256,6 +3313,15 @@ class ChatBroker:
                 "occurredAt": occurred_at,
                 "payload": payload,
             }
+            field = (
+                "text"
+                if event_type in {"message.started", "reasoning.started"}
+                else "output" if event_type == "tool.started" else None
+            )
+            if field and isinstance(payload.get(field), str):
+                self.snapshot_text_chunks[(item_id, field)] = BoundedTextChunks(
+                    payload[field]
+                )
         elif event_type in {"message.delta", "reasoning.delta"} and item_id:
             item = self.items.setdefault(
                 item_id,
@@ -3268,8 +3334,12 @@ class ChatBroker:
                 },
             )
             item_payload = item.setdefault("payload", {})
-            item_payload["text"] = str(item_payload.get("text", "")) + str(
-                payload.get("text", "")
+            accumulator = self._snapshot_text_accumulator(
+                item_id, "text", str(item_payload.get("text", ""))
+            )
+            accumulator.append(
+                str(payload.get("text", "")),
+                payload.get("originalByteCount"),
             )
         elif event_type in {
             "message.completed",
@@ -3277,6 +3347,7 @@ class ChatBroker:
             "tool.completed",
         } and item_id:
             prior_occurred_at = self.items.get(item_id, {}).get("occurredAt")
+            self._discard_snapshot_text(item_id)
             self.items[item_id] = {
                 "type": event_type,
                 "itemId": item_id,
@@ -3302,8 +3373,31 @@ class ChatBroker:
             item["type"] = "tool.updated"
             item["turnId"] = turn_id or item.get("turnId")
             item_payload = item.setdefault("payload", {})
+            output_delta = payload.get("outputDelta")
+            if payload.get("output") is not None:
+                item_payload["output"] = payload["output"]
+                item_payload.pop("truncated", None)
+                item_payload.pop("originalByteCount", None)
+                self.snapshot_text_chunks[(item_id, "output")] = BoundedTextChunks(
+                    str(payload["output"])
+                )
+            elif isinstance(output_delta, str):
+                accumulator = self._snapshot_text_accumulator(
+                    item_id,
+                    "output",
+                    str(item_payload.get("output", "")),
+                )
+                accumulator.append(
+                    output_delta,
+                    payload.get("originalByteCount"),
+                )
             item_payload.update(
-                {key: value for key, value in payload.items() if value is not None}
+                {
+                    key: value
+                    for key, value in payload.items()
+                    if value is not None
+                    and key not in {"output", "outputDelta"}
+                }
             )
         elif event_type == "approval.requested" and item_id:
             self.approvals[item_id] = payload
@@ -3337,6 +3431,36 @@ class ChatBroker:
         if self.items:
             self.oldest_item_id = next(iter(self.items))
 
+    def _snapshot_text_accumulator(
+        self, item_id: str, field: str, initial: str
+    ) -> BoundedTextChunks:
+        key = (item_id, field)
+        accumulator = self.snapshot_text_chunks.get(key)
+        if accumulator is None:
+            accumulator = BoundedTextChunks(initial)
+            self.snapshot_text_chunks[key] = accumulator
+        return accumulator
+
+    def _discard_snapshot_text(self, item_id: str) -> None:
+        for key in [key for key in self.snapshot_text_chunks if key[0] == item_id]:
+            self.snapshot_text_chunks.pop(key, None)
+
+    def _snapshot_item(
+        self, item_id: str, item: dict[str, Any]
+    ) -> dict[str, Any]:
+        materialized = dict(item)
+        payload = dict(item.get("payload", {}))
+        materialized["payload"] = payload
+        for field in ("text", "output"):
+            accumulator = self.snapshot_text_chunks.get((item_id, field))
+            if accumulator is None:
+                continue
+            payload[field] = accumulator.materialize()
+            if accumulator.truncated:
+                payload["truncated"] = True
+                payload["originalByteCount"] = accumulator.original_byte_count
+        return materialized
+
     def snapshot_payload(self) -> dict[str, Any]:
         return {
             "snapshotGeneration": self.snapshot_generation,
@@ -3344,7 +3468,10 @@ class ChatBroker:
             # Clients use baseSeq as their durable cursor before the following
             # live event, so it must equal that record's sequence.
             "baseSeq": self.sequence + 1,
-            "items": list(self.items.values()),
+            "items": [
+                self._snapshot_item(item_id, item)
+                for item_id, item in self.items.items()
+            ],
             "approvals": list(self.approvals.values()),
             "questions": list(self.questions.values()),
             "connectionState": self.connection_state,
@@ -3378,7 +3505,8 @@ class ChatBroker:
             # re-verify the exact bound, instead of re-serializing the whole
             # payload once per dropped item.
             while self.items and remaining > limit:
-                _, dropped = self.items.popitem(last=False)
+                dropped_id, dropped = self.items.popitem(last=False)
+                self._discard_snapshot_text(dropped_id)
                 remaining -= (
                     len(
                         json.dumps(
@@ -3401,6 +3529,7 @@ class ChatBroker:
             history, has_older = [], False
         self.snapshot_generation = new_uuid()
         self.items.clear()
+        self.snapshot_text_chunks.clear()
         for item in history:
             item_id = item.get("itemId")
             if isinstance(item_id, str):

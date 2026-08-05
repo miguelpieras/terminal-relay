@@ -15,7 +15,8 @@ final class MacChatProcessConnectionTests: XCTestCase {
         try connection.connect(
             configuration: SSHLaunchConfiguration(executable: "/bin/cat", arguments: []),
             callbacks: .init(
-                receiveStandardOutput: { data in
+                receiveStandardOutput: { data, consumed in
+                    defer { consumed() }
                     lock.lock()
                     output.append(data)
                     let isComplete = output == payload
@@ -65,7 +66,8 @@ final class MacChatProcessConnectionTests: XCTestCase {
                 arguments: ["-c", "printf diagnostic >&2"]
             ),
             callbacks: .init(
-                receiveStandardOutput: { _ in
+                receiveStandardOutput: { _, consumed in
+                    consumed()
                     XCTFail("process unexpectedly wrote stdout")
                 },
                 receiveStandardError: { data in
@@ -97,7 +99,7 @@ final class MacChatProcessConnectionTests: XCTestCase {
         try connection.connect(
             configuration: SSHLaunchConfiguration(executable: "/bin/cat", arguments: []),
             callbacks: .init(
-                receiveStandardOutput: { _ in },
+                receiveStandardOutput: { _, consumed in consumed() },
                 receiveStandardError: { _ in },
                 terminate: { _ in terminated.fulfill() }
             )
@@ -107,7 +109,7 @@ final class MacChatProcessConnectionTests: XCTestCase {
             try connection.connect(
                 configuration: SSHLaunchConfiguration(executable: "/bin/cat", arguments: []),
                 callbacks: .init(
-                    receiveStandardOutput: { _ in },
+                    receiveStandardOutput: { _, consumed in consumed() },
                     receiveStandardError: { _ in },
                     terminate: { _ in }
                 )
@@ -133,7 +135,7 @@ final class MacChatProcessConnectionTests: XCTestCase {
                     arguments: []
                 ),
                 callbacks: .init(
-                    receiveStandardOutput: { _ in },
+                    receiveStandardOutput: { _, consumed in consumed() },
                     receiveStandardError: { _ in },
                     terminate: { _ in }
                 )
@@ -142,5 +144,67 @@ final class MacChatProcessConnectionTests: XCTestCase {
             XCTAssertEqual(error as? MacChatProcessConnectionError, .launchFailed)
         }
         XCTAssertFalse(connection.isConnected)
+    }
+
+    func testStandardOutputPausesAtByteHighWaterAndResumesAfterConsumption() throws {
+        let connection = MacChatProcessConnection()
+        let reachedHighWater = expectation(description: "reached high water")
+        let terminated = expectation(description: "terminated")
+        let lock = NSLock()
+        var pending: [() -> Void] = []
+        var consumeImmediately = false
+        var didReachHighWater = false
+
+        try connection.connect(
+            configuration: SSHLaunchConfiguration(
+                executable: "/bin/sh",
+                arguments: ["-c", "/usr/bin/head -c 6291456 /dev/zero"]
+            ),
+            callbacks: .init(
+                receiveStandardOutput: { _, consumed in
+                    lock.lock()
+                    if consumeImmediately {
+                        lock.unlock()
+                        consumed()
+                    } else {
+                        pending.append(consumed)
+                        lock.unlock()
+                    }
+                    if !didReachHighWater,
+                       connection.queuedStandardOutputByteCount
+                        >= MacChatProcessConnection.standardOutputHighWaterBytes {
+                        lock.lock()
+                        if !didReachHighWater {
+                            didReachHighWater = true
+                            lock.unlock()
+                            reachedHighWater.fulfill()
+                        } else {
+                            lock.unlock()
+                        }
+                    }
+                },
+                receiveStandardError: { _ in },
+                terminate: { status in
+                    XCTAssertEqual(status, 0)
+                    terminated.fulfill()
+                }
+            )
+        )
+
+        wait(for: [reachedHighWater], timeout: 5)
+        XCTAssertLessThanOrEqual(
+            connection.queuedStandardOutputByteCount,
+            MacChatProcessConnection.standardOutputHighWaterBytes + 1_048_576
+        )
+
+        lock.lock()
+        consumeImmediately = true
+        let acknowledgements = pending
+        pending.removeAll()
+        lock.unlock()
+        acknowledgements.forEach { $0() }
+
+        wait(for: [terminated], timeout: 5)
+        XCTAssertEqual(connection.queuedStandardOutputByteCount, 0)
     }
 }
