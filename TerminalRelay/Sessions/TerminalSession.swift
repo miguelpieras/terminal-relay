@@ -246,7 +246,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
                     providerThreadID: threadID
                 ),
                 launchOptions: launchDefaults.chatOptions(for: kind),
-                cache: .shared
+                cache: ConversationStateCache.shared
             )
         }
         self.terminalView = LocalProcessTerminalView(frame: NSRect(x: 0, y: 0, width: 900, height: 600))

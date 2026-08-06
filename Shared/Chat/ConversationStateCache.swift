@@ -1,12 +1,20 @@
 import Foundation
 
+protocol ConversationStateCaching: Sendable {
+    func load(for identity: ChatConversationIdentity) async -> ConversationState?
+    func save(
+        _ state: ConversationState,
+        for identity: ChatConversationIdentity
+    ) async
+}
+
 /// Persists each conversation's reduced state on disk so reopening a thread
 /// paints the transcript instantly from the cache while the live attach
 /// resumes through the existing afterSeq/snapshotGeneration cursor: the
 /// worker then replays only the delta, or a fresh snapshot when its
 /// generation changed. The cache is a render head start, never an authority —
 /// every hydrated conversation still reconciles against the worker.
-actor ConversationStateCache {
+actor ConversationStateCache: ConversationStateCaching {
     static let shared = ConversationStateCache()
 
     static let schemaVersion = 1
@@ -33,7 +41,7 @@ actor ConversationStateCache {
             )
     }
 
-    func load(for identity: ChatConversationIdentity) -> ConversationState? {
+    func load(for identity: ChatConversationIdentity) async -> ConversationState? {
         guard let url = fileURL(for: identity),
               let data = try? Data(contentsOf: url),
               let entry = try? JSONDecoder().decode(Entry.self, from: data),
@@ -44,7 +52,10 @@ actor ConversationStateCache {
         return entry.state
     }
 
-    func save(_ state: ConversationState, for identity: ChatConversationIdentity) {
+    func save(
+        _ state: ConversationState,
+        for identity: ChatConversationIdentity
+    ) async {
         guard let url = fileURL(for: identity), !state.items.isEmpty else {
             return
         }

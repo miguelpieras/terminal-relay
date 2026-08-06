@@ -89,13 +89,17 @@ final class ConversationCoordinator {
     private var launchOptions: ChatLaunchOptions
     private let retryPolicy: ChatRetryPolicy
     private let stopPolicy: ChatStopPolicy
-    private let cache: ConversationStateCache?
+    private let cache: (any ConversationStateCaching)?
+    private let cachedHydrationWillApply: (@MainActor () async -> Void)?
     private var didAttemptHydration = false
+    private var previewHydrationTask: Task<Void, Never>?
+    private var previewHydrationToken: UInt64 = 0
     private var cacheSaveTask: Task<Void, Never>?
     private var lifecycleTask: Task<Void, Never>?
     private var lifecycleEpoch: UInt64 = 0
     private var lifecycleTransition: LifecycleTransition?
     private var startRequestedAfterDetach = false
+    private var detachRequestedAfterStop = false
     private var retryTask: Task<Void, Never>?
     private var retrySleepTask: Task<Void, Never>?
     private var retrySleepToken: UUID?
@@ -118,7 +122,8 @@ final class ConversationCoordinator {
         launchOptions: ChatLaunchOptions = ChatLaunchOptions(),
         retryPolicy: ChatRetryPolicy = .standard,
         stopPolicy: ChatStopPolicy = .standard,
-        cache: ConversationStateCache? = nil
+        cache: (any ConversationStateCaching)? = nil,
+        cachedHydrationWillApply: (@MainActor () async -> Void)? = nil
     ) {
         self.store = store ?? ConversationStore()
         self.transport = transport
@@ -127,12 +132,14 @@ final class ConversationCoordinator {
         self.retryPolicy = retryPolicy
         self.stopPolicy = stopPolicy
         self.cache = cache
+        self.cachedHydrationWillApply = cachedHydrationWillApply
     }
 
     deinit {
         lifecycleTask?.cancel()
         retryTask?.cancel()
         retrySleepTask?.cancel()
+        previewHydrationTask?.cancel()
         cacheSaveTask?.cancel()
     }
 
@@ -177,9 +184,24 @@ final class ConversationCoordinator {
     /// the real session starts. Safe to call at most once; start() skips
     /// hydration if this already ran.
     func hydrateForPreview() {
-        Task { [weak self] in
+        guard previewHydrationTask == nil else { return }
+        previewHydrationToken &+= 1
+        let token = previewHydrationToken
+        previewHydrationTask = Task { [weak self] in
             await self?.hydrateFromCacheIfNeeded()
+            self?.finishPreviewHydration(token: token)
         }
+    }
+
+    private func finishPreviewHydration(token: UInt64) {
+        guard previewHydrationToken == token else { return }
+        previewHydrationTask = nil
+    }
+
+    private func cancelPreviewHydration() {
+        previewHydrationToken &+= 1
+        previewHydrationTask?.cancel()
+        previewHydrationTask = nil
     }
 
     /// Paints the transcript from the on-disk cache before the first connect,
@@ -191,19 +213,31 @@ final class ConversationCoordinator {
         guard !didAttemptHydration else { return }
         didAttemptHydration = true
         guard let cache, store.lastAppliedSequence == 0 else { return }
-        if let cached = await cache.load(for: identity) {
-            guard canContinueLifecycle(expectedEpoch) else { return }
-            async let preparedProjections = ConversationStore
-                .prepareTranscriptProjections(for: cached.items)
-            await warmRecentMarkdown(for: cached.items)
-            guard canContinueLifecycle(expectedEpoch) else { return }
-            let prepared = await preparedProjections
-            guard canContinueLifecycle(expectedEpoch) else { return }
-            store.hydrateFromCache(
-                cached,
-                preparedProjections: prepared
-            )
+        let cached = await cache.load(for: identity)
+        if cached != nil, let cachedHydrationWillApply {
+            await cachedHydrationWillApply()
         }
+        guard canContinueLifecycle(expectedEpoch) else {
+            didAttemptHydration = false
+            return
+        }
+        guard let cached else { return }
+        async let preparedProjections = ConversationStore
+            .prepareTranscriptProjections(for: cached.items)
+        await warmRecentMarkdown(for: cached.items)
+        guard canContinueLifecycle(expectedEpoch) else {
+            didAttemptHydration = false
+            return
+        }
+        let prepared = await preparedProjections
+        guard canContinueLifecycle(expectedEpoch) else {
+            didAttemptHydration = false
+            return
+        }
+        store.hydrateFromCache(
+            cached,
+            preparedProjections: prepared
+        )
     }
 
     /// Persists the current state after live updates, debounced so streaming
@@ -218,7 +252,8 @@ final class ConversationCoordinator {
             guard !Task.isCancelled, let self, let cache = self.cache else {
                 return
             }
-            await cache.save(self.store.state, for: self.identity)
+            let snapshot = self.store.stateForCachePersistence
+            await cache.save(snapshot, for: self.identity)
         }
     }
 
@@ -237,6 +272,11 @@ final class ConversationCoordinator {
     }
 
     func detach() async {
+        cancelPreviewHydration()
+        if lifecycleTransition == .stopping {
+            detachRequestedAfterStop = true
+            return
+        }
         guard lifecycleTransition == nil else { return }
         lifecycleTransition = .detaching
         defer {
@@ -246,7 +286,6 @@ final class ConversationCoordinator {
                 start()
             }
         }
-
         shouldStayConnected = false
         lifecycleEpoch &+= 1
         let epoch = lifecycleEpoch
@@ -262,31 +301,30 @@ final class ConversationCoordinator {
         let shouldSendDetach = isAttached
         resetReconnectScopedState()
 
-        _ = await previousRetryTask?.value
-        _ = await previousLifecycleTask?.value
-        guard lifecycleEpoch == epoch, lifecycleTransition == .detaching else {
-            return
-        }
-        if shouldSendDetach {
-            try? await sendCommand(.detach)
-        }
+        let detachEnvelope = shouldSendDetach
+            ? try? ChatCommand.detach.envelope(identity: identity)
+            : nil
         guard lifecycleEpoch == epoch, lifecycleTransition == .detaching else {
             return
         }
         isAttached = false
-        await transport.disconnect()
+        await transport.disconnect(sendingBestEffort: detachEnvelope)
+        _ = await previousRetryTask?.value
+        _ = await previousLifecycleTask?.value
         guard lifecycleEpoch == epoch, lifecycleTransition == .detaching else {
             return
         }
         store.setConnectionState(.offlineAgentRunning)
         cacheSaveTask?.cancel()
         if let cache {
-            await cache.save(store.state, for: identity)
+            let snapshot = store.stateForCachePersistence
+            await cache.save(snapshot, for: identity)
         }
     }
 
     func retry() {
         guard retryTask == nil, lifecycleTransition == nil else { return }
+        cancelPreviewHydration()
         shouldStayConnected = false
         lifecycleEpoch &+= 1
         let epoch = lifecycleEpoch
@@ -300,16 +338,8 @@ final class ConversationCoordinator {
         store.setConnectionState(.connecting)
         let task = Task { [weak self] in
             guard let self else { return }
-            _ = await previousLifecycleTask?.value
-            guard !Task.isCancelled,
-                  lifecycleEpoch == epoch,
-                  lifecycleTransition == nil else {
-                if lifecycleEpoch == epoch {
-                    retryTask = nil
-                }
-                return
-            }
             await transport.disconnect()
+            _ = await previousLifecycleTask?.value
             guard !Task.isCancelled,
                   lifecycleEpoch == epoch,
                   lifecycleTransition == nil else {
@@ -334,7 +364,7 @@ final class ConversationCoordinator {
     func send(text: String, attachments: [ChatAttachmentReference] = []) async {
         do {
             try validatePrompt(text, attachments: attachments)
-            guard !store.state.turnState.isActive, pendingTurnByCommand.isEmpty else {
+            guard !store.hasActiveWorkingTurn, pendingTurnByCommand.isEmpty else {
                 throw ConversationCoordinatorError.turnAlreadyActive
             }
             let requestID = UUID().uuidString.lowercased()
@@ -345,10 +375,43 @@ final class ConversationCoordinator {
             ).envelope(identity: identity, requestID: requestID)
 
             store.clearComposer()
-            store.addOptimisticUserMessage(requestID: requestID, text: text)
             pendingTurnByCommand[requestID] = PendingTurn(
                 text: text,
                 attachments: attachments
+            )
+            let optimisticItem = ConversationStore.optimisticUserMessage(
+                requestID: requestID,
+                text: text,
+                occurredAt: Int64(Date().timeIntervalSince1970 * 1_000)
+            )
+            let prepared = await ConversationStore.prepareTranscriptProjections(
+                for: [optimisticItem]
+            )
+            guard pendingTurnByCommand[requestID] != nil,
+                  prepared[optimisticItem.id] != nil else {
+                let abandoned = pendingTurnByCommand.removeValue(forKey: requestID)
+                    ?? unconfirmedTurnByCommand.removeValue(forKey: requestID)
+                if let abandoned {
+                    store.restoreFailedSubmission(
+                        text: abandoned.text,
+                        attachments: abandoned.attachments
+                    )
+                }
+                throw ConversationCoordinatorError.interactionUnavailable
+            }
+            guard !store.hasActiveWorkingTurn else {
+                let rejected = pendingTurnByCommand.removeValue(forKey: requestID)
+                if let rejected {
+                    store.restoreFailedSubmission(
+                        text: rejected.text,
+                        attachments: rejected.attachments
+                    )
+                }
+                throw ConversationCoordinatorError.turnAlreadyActive
+            }
+            store.addOptimisticUserMessage(
+                optimisticItem,
+                preparedTranscriptProjections: prepared
             )
             do {
                 try await transport.send(envelope)
@@ -512,12 +575,22 @@ final class ConversationCoordinator {
         guard !isStopping,
               lifecycleTransition == nil,
               store.state.connectionState != .stopped else { return }
+        cancelPreviewHydration()
         lifecycleTransition = .stopping
         isStopping = true
+        var didCompleteStop = false
         defer {
             isStopping = false
             if lifecycleTransition == .stopping {
                 lifecycleTransition = nil
+            }
+            let shouldReplayDetach = detachRequestedAfterStop
+                && !didCompleteStop
+            detachRequestedAfterStop = false
+            if shouldReplayDetach {
+                Task { [weak self] in
+                    await self?.detach()
+                }
             }
         }
         let requestID = stopEnvelope?.requestID ?? UUID().uuidString.lowercased()
@@ -565,19 +638,16 @@ final class ConversationCoordinator {
         retrySleepTask?.cancel()
         retrySleepTask = nil
         retrySleepToken = nil
+        isAttached = false
+        await transport.disconnect()
         _ = await previousRetryTask?.value
         _ = await previousLifecycleTask?.value
         guard lifecycleEpoch == epoch, lifecycleTransition == .stopping else {
             lifecycleTransition = nil
             return
         }
-        isAttached = false
-        await transport.disconnect()
-        guard lifecycleEpoch == epoch, lifecycleTransition == .stopping else {
-            lifecycleTransition = nil
-            return
-        }
         store.setConnectionState(.stopped)
+        didCompleteStop = true
         stopRequestID = nil
     }
 
@@ -674,16 +744,40 @@ final class ConversationCoordinator {
         guard canContinueLifecycle(epoch) else { return true }
         let kind = ChatEventKind(rawValue: envelope.type)
         let projectionPreparation: Task<PreparedTranscriptProjectionBatch, Never>?
-        if kind == .conversationSnapshot
-            || kind == .historyPage
-            || kind == .messageCompleted
-            || kind == .reasoningCompleted
-            || kind == .toolCompleted {
-            let currentItems = store.itemsForTranscriptProjectionPreparation
+        let requiresProjectionPreparation: Bool
+        switch kind {
+        case .conversationSnapshot, .historyPage,
+             .messageStarted, .messageDelta, .messageCompleted,
+             .reasoningStarted, .reasoningDelta, .reasoningCompleted,
+             .toolStarted, .toolUpdated, .toolCompleted,
+             .fileChangeUpdated, .diffUpdated, .planUpdated,
+             .turnCompleted, .turnFailed, .turnInterrupted:
+            requiresProjectionPreparation = true
+        default:
+            requiresProjectionPreparation = false
+        }
+        if requiresProjectionPreparation {
+            let currentState: ConversationState?
+            switch kind {
+            case .conversationSnapshot, .historyPage,
+                 .turnCompleted, .turnFailed, .turnInterrupted:
+                currentState = store.stateForTranscriptProjectionPreparation
+            default:
+                currentState = nil
+            }
+            let currentItem = store.transcriptProjectionPreparationItem(
+                for: envelope
+            )
+            let stagedProjection = store.stagedTranscriptProjection(
+                for: envelope
+            )
             projectionPreparation = Task {
                 await ConversationStore.prepareTranscriptProjections(
                     for: envelope,
-                    retaining: currentItems
+                    retaining: currentState?.items ?? [],
+                    currentState: currentState,
+                    currentItem: currentItem,
+                    stagedProjection: stagedProjection
                 )
             }
         } else {

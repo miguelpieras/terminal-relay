@@ -1008,6 +1008,137 @@ final class ConversationCoordinatorTests: XCTestCase {
         XCTAssertEqual(stops.first?.requestID, stops.last?.requestID)
     }
 
+    func testDetachDisconnectsBeforeAwaitingASuspendedConnect() async {
+        let transport = LifecycleRegressionTransport(
+            initialEnvelope: nil,
+            suspendsConnectUntilDisconnect: true
+        )
+        let store = ConversationStore()
+        let coordinator = makeCoordinator(store: store, transport: transport)
+        coordinator.start()
+        await waitUntil { await transport.isConnectSuspended(call: 1) }
+
+        let detachTask = Task { @MainActor in
+            await coordinator.detach()
+        }
+        let disconnectedWithoutReleasingConnect = await conditionBecomesTrue {
+            await transport.disconnectCallCount() == 1
+        }
+        if !disconnectedWithoutReleasingConnect {
+            await transport.releasePendingConnectForCleanup()
+        }
+        await detachTask.value
+
+        XCTAssertTrue(
+            disconnectedWithoutReleasingConnect,
+            "Detach must disconnect the transport before awaiting a connect call that only disconnect can resume."
+        )
+        let disconnectCalls = await transport.disconnectCallCount()
+        XCTAssertEqual(disconnectCalls, 1)
+        XCTAssertEqual(store.state.connectionState, .offlineAgentRunning)
+    }
+
+    func testAttachedDetachUsesAtomicBestEffortCloseInsteadOfAwaitingSend() async {
+        let transport = LifecycleRegressionTransport(
+            initialEnvelope: Self.hello(sequence: 1),
+            suspendsConnectUntilDisconnect: false,
+            suspendsDetachSendUntilDisconnect: true
+        )
+        let store = ConversationStore()
+        let coordinator = makeCoordinator(store: store, transport: transport)
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+
+        let detachTask = Task { @MainActor in
+            await coordinator.detach()
+        }
+        let disconnected = await conditionBecomesTrue {
+            await transport.disconnectCallCount() == 1
+        }
+        if !disconnected {
+            await transport.releasePendingDetachSendForCleanup()
+        }
+        await detachTask.value
+
+        XCTAssertTrue(
+            disconnected,
+            "Detach must enqueue its final record and close without awaiting an ordinary transport send."
+        )
+        let ordinaryDetachSends = await transport.ordinaryDetachSendCallCount()
+        let bestEffortDetaches = await transport.bestEffortDetachCallCount()
+        XCTAssertEqual(ordinaryDetachSends, 0)
+        XCTAssertEqual(bestEffortDetaches, 1)
+        XCTAssertEqual(store.state.connectionState, .offlineAgentRunning)
+    }
+
+    func testExplicitRetryDisconnectsBeforeAwaitingASuspendedConnect() async {
+        let transport = LifecycleRegressionTransport(
+            initialEnvelope: nil,
+            suspendsConnectUntilDisconnect: true
+        )
+        let store = ConversationStore()
+        let coordinator = makeCoordinator(store: store, transport: transport)
+        coordinator.start()
+        await waitUntil { await transport.isConnectSuspended(call: 1) }
+
+        coordinator.retry()
+        let disconnectedWithoutReleasingConnect = await conditionBecomesTrue {
+            await transport.disconnectCallCount() == 1
+        }
+        if !disconnectedWithoutReleasingConnect {
+            await transport.releasePendingConnectForCleanup()
+        }
+        let reconnected = await conditionBecomesTrue {
+            await transport.isConnectSuspended(call: 2)
+        }
+
+        XCTAssertTrue(
+            disconnectedWithoutReleasingConnect,
+            "Retry must disconnect the transport before awaiting a connect call that only disconnect can resume."
+        )
+        XCTAssertTrue(reconnected, "Retry must start a fresh connection after the old lifecycle exits.")
+
+        await coordinator.detach()
+        let disconnectCalls = await transport.disconnectCallCount()
+        XCTAssertEqual(disconnectCalls, 2)
+        XCTAssertEqual(store.state.connectionState, .offlineAgentRunning)
+    }
+
+    func testDetachDuringUnconfirmedStopIsReplayedAndDisconnectsExactlyOnce() async {
+        let transport = LifecycleRegressionTransport(
+            initialEnvelope: Self.hello(sequence: 1),
+            suspendsConnectUntilDisconnect: false
+        )
+        let store = ConversationStore()
+        let coordinator = ConversationCoordinator(
+            store: store,
+            transport: transport,
+            identity: ChatTestFixtures.identity,
+            retryPolicy: .immediate,
+            stopPolicy: ChatStopPolicy(
+                confirmationPollCount: 1,
+                pollDelayNanoseconds: 200_000_000
+            )
+        )
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+
+        let stopTask = Task { @MainActor in
+            await coordinator.stop()
+        }
+        await waitUntil { await transport.sentCommandCount(type: "session.stop") == 1 }
+        await coordinator.detach()
+        await stopTask.value
+        await waitUntil { await transport.disconnectCallCount() == 1 }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+
+        let disconnectCalls = await transport.disconnectCallCount()
+        let detachCommands = await transport.sentCommandCount(type: "session.detach")
+        XCTAssertEqual(disconnectCalls, 1)
+        XCTAssertEqual(detachCommands, 1)
+        XCTAssertEqual(store.state.connectionState, .offlineAgentRunning)
+    }
+
     func testDetachDefersAConcurrentStartUntilTheOldTransportIsDisconnected() async {
         let transport = LifecycleGateTransport(
             initialEnvelope: Self.hello(sequence: 1),
@@ -1137,6 +1268,286 @@ final class ConversationCoordinatorTests: XCTestCase {
         await coordinator.detach()
     }
 
+    func testDetachDuringConfirmedStopDoesNotReplayFromFrozenPublishedState() async {
+        let transport = LifecycleGateTransport(
+            initialEnvelope: Self.hello(sequence: 1),
+            heldDisconnectCalls: [1],
+            acknowledgesStop: true
+        )
+        let store = ConversationStore()
+        let coordinator = makeCoordinator(store: store, transport: transport)
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+        store.setTranscriptLiveScrolling(true)
+
+        let stopTask = Task { @MainActor in
+            await coordinator.stop()
+        }
+        await waitUntil { await transport.disconnectCallCount() == 1 }
+        await coordinator.detach()
+        await transport.releaseDisconnect(call: 1)
+        await stopTask.value
+        try? await Task.sleep(nanoseconds: 20_000_000)
+
+        let disconnectCalls = await transport.disconnectCallCount()
+        let detachCommands = await transport.sentCommandCount(type: "session.detach")
+        XCTAssertEqual(
+            disconnectCalls,
+            1,
+            "A confirmed stop is complete even when publication is frozen by live scrolling."
+        )
+        XCTAssertEqual(detachCommands, 0)
+        XCTAssertEqual(
+            store.state.connectionState,
+            .streaming,
+            "The published state remains frozen until the live scroll gesture ends."
+        )
+        store.setTranscriptLiveScrolling(false)
+        XCTAssertEqual(store.state.connectionState, .stopped)
+    }
+
+    func testPreviewHydrationCannotPublishAfterDetachInvalidatesIt() async throws {
+        let cachedStore = ConversationStore()
+        try cachedStore.apply(
+            ChatTestFixtures.event(
+                "message.completed",
+                sequence: 1,
+                itemID: "cached-message",
+                turnID: "turn",
+                payload: .object([
+                    "role": .string("assistant"),
+                    "text": .string(String(repeating: "cached line\n", count: 2_000)),
+                ])
+            )
+        )
+        let cache = ControlledConversationStateCache()
+        let store = ConversationStore()
+        let coordinator = ConversationCoordinator(
+            store: store,
+            transport: ChatFixtureTransport(),
+            identity: ChatTestFixtures.identity,
+            retryPolicy: .immediate,
+            stopPolicy: .immediate,
+            cache: cache
+        )
+
+        coordinator.hydrateForPreview()
+        await cache.waitUntilLoadStarts()
+        await coordinator.detach()
+        await cache.releaseLoad(returning: cachedStore.state)
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertTrue(store.state.items.isEmpty)
+        XCTAssertEqual(store.lastAppliedSequence, 0)
+        XCTAssertEqual(store.state.connectionState, .offlineAgentRunning)
+    }
+
+    func testCacheSaveUsesWorkingStateWhileLiveScrollFreezesPublication() async throws {
+        let cache = ControlledConversationStateCache(
+            loadResult: nil,
+            suspendsLoad: false
+        )
+        let transport = ChatFixtureTransport(initialEvents: [Self.hello(sequence: 1)])
+        let store = ConversationStore()
+        let coordinator = ConversationCoordinator(
+            store: store,
+            transport: transport,
+            identity: ChatTestFixtures.identity,
+            retryPolicy: .immediate,
+            stopPolicy: .immediate,
+            cache: cache
+        )
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+        store.setTranscriptLiveScrolling(true)
+        let text = "latest reduced content"
+        let snapshot = try ChatTestFixtures.snapshotEvent(
+            baseSequence: 2,
+            items: [
+                .message(
+                    ChatMessage(
+                        id: "cached-latest",
+                        turnID: "turn",
+                        role: .assistant,
+                        text: text
+                    )
+                ),
+            ]
+        )
+
+        await transport.yield(.envelope(snapshot))
+        await waitUntil { await cache.savedStates().count == 1 }
+
+        XCTAssertEqual(store.state.lastAppliedSequence, 1)
+        XCTAssertTrue(store.state.items.isEmpty)
+        let savedStates = await cache.savedStates()
+        let saved = try XCTUnwrap(savedStates.last)
+        XCTAssertEqual(saved.lastAppliedSequence, 2)
+        XCTAssertEqual(saved.messages.first?.text, text)
+
+        store.setTranscriptLiveScrolling(false)
+        XCTAssertEqual(store.state.lastAppliedSequence, 2)
+        await coordinator.detach()
+    }
+
+    func testFirstMessageAndReasoningDeltasArePreparedBeforePublication() async throws {
+        try await assertFirstDeltaIsPreparedOffMain(
+            type: "message.delta",
+            itemID: "message-from-delta",
+            payload: .object([
+                "role": .string("assistant"),
+                "text": .string(String(repeating: "delta message line\n", count: 4_000)),
+            ]),
+            expectedTextPrefix: "delta message line"
+        )
+        try await assertFirstDeltaIsPreparedOffMain(
+            type: "reasoning.delta",
+            itemID: "reasoning-from-delta",
+            payload: .object([
+                "text": .string(String(repeating: "delta reasoning line\n", count: 4_000)),
+            ]),
+            expectedTextPrefix: "delta reasoning line"
+        )
+    }
+
+    func testStartedMessageStreamsThroughStagedRowsDuringLiveScroll() async throws {
+        let transport = ChatFixtureTransport(initialEvents: [Self.hello(sequence: 1)])
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        let coordinator = makeCoordinator(store: store, transport: transport)
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+        store.setTranscriptLiveScrolling(true)
+        let prefix = String(repeating: "prepared prefix line\n", count: 4_000)
+        let firstDelta = String(repeating: "first delta line\n", count: 500)
+        let secondDelta = String(repeating: "second delta line\n", count: 500)
+
+        await transport.yield(
+            .envelope(
+                ChatTestFixtures.event(
+                    "message.started",
+                    sequence: 2,
+                    itemID: "live-scroll-stream",
+                    turnID: "turn",
+                    payload: .object([
+                        "role": .string("assistant"),
+                        "text": .string(prefix),
+                    ])
+                )
+            )
+        )
+        await transport.yield(
+            .envelope(
+                ChatTestFixtures.event(
+                    "message.delta",
+                    sequence: 3,
+                    itemID: "live-scroll-stream",
+                    turnID: "turn",
+                    payload: .object(["text": .string(firstDelta)])
+                )
+            )
+        )
+        await transport.yield(
+            .envelope(
+                ChatTestFixtures.event(
+                    "message.delta",
+                    sequence: 4,
+                    itemID: "live-scroll-stream",
+                    turnID: "turn",
+                    payload: .object(["text": .string(secondDelta)])
+                )
+            )
+        )
+        await waitUntil { store.lastAppliedSequence == 4 }
+
+        XCTAssertTrue(store.state.items.isEmpty)
+        store.setTranscriptLiveScrolling(false)
+        let item = try XCTUnwrap(store.state.items.first)
+        let rows = store.transcriptProjections(for: item)
+
+        XCTAssertEqual(
+            rows.map(\.sourceText).joined(),
+            prefix + firstDelta + secondDelta
+        )
+        XCTAssertEqual(
+            store.projectionDiagnostics.fullItemBuilds,
+            0,
+            "Prepared unpublished rows must advance through every streamed tail before catch-up publication."
+        )
+        await coordinator.detach()
+    }
+
+    func testMaximumOptimisticPromptIsProjectedBeforePublication() async throws {
+        let transport = ChatFixtureTransport(initialEvents: [Self.hello(sequence: 1)])
+        let store = ConversationStore()
+        let coordinator = makeCoordinator(store: store, transport: transport)
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+        let text = String(repeating: "x", count: 256 * 1_024)
+
+        await coordinator.send(text: text)
+
+        let item = try XCTUnwrap(
+            store.state.items.first { $0.id.hasPrefix("client:") }
+        )
+        let rows = store.transcriptProjections(for: item)
+        XCTAssertGreaterThan(rows.count, 1)
+        XCTAssertEqual(rows.map(\.sourceText).joined(), text)
+        XCTAssertEqual(store.projectionDiagnostics.fullItemBuilds, 0)
+        let sent = await transport.sentEnvelopes()
+        XCTAssertEqual(sent.filter { $0.type == "turn.start" }.count, 1)
+        await coordinator.detach()
+    }
+
+    private func assertFirstDeltaIsPreparedOffMain(
+        type: String,
+        itemID: String,
+        payload: JSONValue,
+        expectedTextPrefix: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let transport = ChatFixtureTransport(initialEvents: [Self.hello(sequence: 1)])
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        let coordinator = makeCoordinator(store: store, transport: transport)
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+
+        await transport.yield(
+            .envelope(
+                ChatTestFixtures.event(
+                    type,
+                    sequence: 2,
+                    itemID: itemID,
+                    turnID: "turn",
+                    payload: payload
+                )
+            )
+        )
+        await waitUntil {
+            store.flushStreamingUpdates()
+            return store.state.items.contains { $0.id == itemID }
+        }
+        let item = try XCTUnwrap(
+            store.state.items.first { $0.id == itemID },
+            file: file,
+            line: line
+        )
+        let rows = store.transcriptProjections(for: item)
+
+        XCTAssertTrue(
+            rows.map(\.sourceText).joined().hasPrefix(expectedTextPrefix),
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            store.projectionDiagnostics.fullItemBuilds,
+            0,
+            "The coordinator must prepare first-delta projection rebuilds off-main before publishing.",
+            file: file,
+            line: line
+        )
+    }
+
     private func makeConnectedTransport() -> ChatFixtureTransport {
         ChatFixtureTransport(initialEvents: [Self.hello(sequence: 1)])
     }
@@ -1179,6 +1590,206 @@ final class ConversationCoordinatorTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 5_000_000)
         }
     }
+
+    private func conditionBecomesTrue(
+        timeoutNanoseconds: UInt64 = 1_000_000_000,
+        _ condition: @escaping @MainActor () async -> Bool
+    ) async -> Bool {
+        let start = DispatchTime.now().uptimeNanoseconds
+        while !(await condition()) {
+            if DispatchTime.now().uptimeNanoseconds - start > timeoutNanoseconds {
+                return false
+            }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        return true
+    }
+}
+
+private actor ControlledConversationStateCache: ConversationStateCaching {
+    private var loadContinuation:
+        CheckedContinuation<ConversationState?, Never>?
+    private var loadStartedContinuations:
+        [CheckedContinuation<Void, Never>] = []
+    private var didStartLoad = false
+    private var saved: [ConversationState] = []
+    private let loadResult: ConversationState?
+    private let suspendsLoad: Bool
+
+    init(
+        loadResult: ConversationState? = nil,
+        suspendsLoad: Bool = true
+    ) {
+        self.loadResult = loadResult
+        self.suspendsLoad = suspendsLoad
+    }
+
+    func load(
+        for identity: ChatConversationIdentity
+    ) async -> ConversationState? {
+        didStartLoad = true
+        let waiters = loadStartedContinuations
+        loadStartedContinuations.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+        guard suspendsLoad else { return loadResult }
+        return await withCheckedContinuation { continuation in
+            loadContinuation = continuation
+        }
+    }
+
+    func save(
+        _ state: ConversationState,
+        for identity: ChatConversationIdentity
+    ) async {
+        saved.append(state)
+    }
+
+    func waitUntilLoadStarts() async {
+        guard !didStartLoad else { return }
+        await withCheckedContinuation { continuation in
+            loadStartedContinuations.append(continuation)
+        }
+    }
+
+    func releaseLoad(returning state: ConversationState?) {
+        loadContinuation?.resume(returning: state)
+        loadContinuation = nil
+    }
+
+    func savedStates() -> [ConversationState] {
+        saved
+    }
+}
+
+private actor LifecycleRegressionTransport: ChatTransport {
+    private let stream: AsyncStream<ChatTransportEvent>
+    private let continuation: AsyncStream<ChatTransportEvent>.Continuation
+    private let initialEnvelope: ChatEnvelope?
+    private let suspendsConnectUntilDisconnect: Bool
+    private let suspendsDetachSendUntilDisconnect: Bool
+    private var pendingConnect: CheckedContinuation<Void, Error>?
+    private var pendingDetachSend: CheckedContinuation<Void, Never>?
+    private var connectCalls = 0
+    private var disconnectCalls = 0
+    private var sentCommandTypes: [String] = []
+    private var ordinaryDetachSends = 0
+    private var bestEffortDetaches = 0
+    private var isConnected = false
+
+    init(
+        initialEnvelope: ChatEnvelope?,
+        suspendsConnectUntilDisconnect: Bool,
+        suspendsDetachSendUntilDisconnect: Bool = false
+    ) {
+        let pair = AsyncStream.makeStream(of: ChatTransportEvent.self)
+        stream = pair.stream
+        continuation = pair.continuation
+        self.initialEnvelope = initialEnvelope
+        self.suspendsConnectUntilDisconnect = suspendsConnectUntilDisconnect
+        self.suspendsDetachSendUntilDisconnect = suspendsDetachSendUntilDisconnect
+    }
+
+    func connect() async throws {
+        connectCalls += 1
+        if suspendsConnectUntilDisconnect {
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, Error>) in
+                pendingConnect = continuation
+            }
+        } else {
+            isConnected = true
+        }
+    }
+
+    func send(_ envelope: ChatEnvelope) async throws {
+        guard isConnected else {
+            throw ChatTransportFailure(
+                category: "not_connected",
+                message: "The lifecycle regression transport is disconnected.",
+                isRecoverable: true
+            )
+        }
+        sentCommandTypes.append(envelope.type)
+        if envelope.type == "session.detach" {
+            ordinaryDetachSends += 1
+            if suspendsDetachSendUntilDisconnect {
+                await withCheckedContinuation { continuation in
+                    pendingDetachSend = continuation
+                }
+            }
+        }
+        if envelope.type == "session.attach", let initialEnvelope {
+            continuation.yield(.envelope(initialEnvelope))
+        }
+    }
+
+    func disconnect(sendingBestEffort envelope: ChatEnvelope?) async {
+        if let envelope, isConnected {
+            sentCommandTypes.append(envelope.type)
+            if envelope.type == "session.detach" {
+                bestEffortDetaches += 1
+            }
+        }
+        disconnectCalls += 1
+        isConnected = false
+        resumePendingConnect()
+        resumePendingDetachSend()
+    }
+
+    func events() async -> AsyncStream<ChatTransportEvent> {
+        stream
+    }
+
+    func isConnectSuspended(call: Int) -> Bool {
+        connectCalls == call && pendingConnect != nil
+    }
+
+    func connectCallCount() -> Int {
+        connectCalls
+    }
+
+    func disconnectCallCount() -> Int {
+        disconnectCalls
+    }
+
+    func sentCommandCount(type: String) -> Int {
+        sentCommandTypes.count { $0 == type }
+    }
+
+    func ordinaryDetachSendCallCount() -> Int {
+        ordinaryDetachSends
+    }
+
+    func bestEffortDetachCallCount() -> Int {
+        bestEffortDetaches
+    }
+
+    func releasePendingConnectForCleanup() {
+        resumePendingConnect()
+    }
+
+    func releasePendingDetachSendForCleanup() {
+        resumePendingDetachSend()
+    }
+
+    private func resumePendingConnect() {
+        guard let continuation = pendingConnect else { return }
+        pendingConnect = nil
+        continuation.resume(
+            throwing: ChatTransportFailure(
+                category: "cancelled",
+                message: "The lifecycle regression connection was closed.",
+                isRecoverable: true
+            )
+        )
+    }
+
+    private func resumePendingDetachSend() {
+        pendingDetachSend?.resume()
+        pendingDetachSend = nil
+    }
 }
 
 private actor LifecycleGateTransport: ChatTransport {
@@ -1190,6 +1801,7 @@ private actor LifecycleGateTransport: ChatTransport {
     private var heldDisconnectCalls: Set<Int>
     private var disconnectContinuations: [Int: CheckedContinuation<Void, Never>] = [:]
     private var connectCalls = 0
+    private var sentCommandTypes: [String] = []
     private var disconnectCalls = 0
     private var isConnected = false
 
@@ -1228,6 +1840,7 @@ private actor LifecycleGateTransport: ChatTransport {
                 isRecoverable: true
             )
         }
+        sentCommandTypes.append(envelope.type)
         if envelope.type == "session.attach", let initialEnvelope {
             continuation.yield(.envelope(initialEnvelope))
         }
@@ -1246,7 +1859,10 @@ private actor LifecycleGateTransport: ChatTransport {
         }
     }
 
-    func disconnect() async {
+    func disconnect(sendingBestEffort envelope: ChatEnvelope?) async {
+        if let envelope, isConnected {
+            sentCommandTypes.append(envelope.type)
+        }
         disconnectCalls += 1
         let call = disconnectCalls
         if heldDisconnectCalls.contains(call) {
@@ -1276,5 +1892,9 @@ private actor LifecycleGateTransport: ChatTransport {
 
     func disconnectCallCount() -> Int {
         disconnectCalls
+    }
+
+    func sentCommandCount(type: String) -> Int {
+        sentCommandTypes.count { $0 == type }
     }
 }

@@ -41,6 +41,7 @@ struct MacMessageFooter: Equatable {
     let itemID: String
     let turnID: String?
     let occurredAt: Int64?
+    let role: ChatMessageRole
 
     var id: String { "\(itemID):footer" }
 }
@@ -123,9 +124,9 @@ enum MacTranscriptRow: MacConversationTableRow {
         }
     }
 
-    /// Stable text tiles bypass SwiftUI hosting entirely. Interactive rows,
-    /// streaming tails, user bubbles, and disclosure headers stay hosted; a
-    /// completed assistant footer is a separate small hosted row, so even the
+    /// Stable message tiles bypass SwiftUI hosting entirely. Interactive rows,
+    /// streaming tails, code/image content, and disclosure headers stay hosted;
+    /// a completed message footer is a separate small native control row, so the
     /// final large-message text tile can use TextKit.
     @MainActor
     func nativeTextPresentation(
@@ -144,8 +145,7 @@ enum MacTranscriptRow: MacConversationTableRow {
 
         switch projection.displayItem {
         case .message(let message):
-            guard message.role == .assistant,
-                  !message.isStreaming,
+            guard !message.isStreaming,
                   let content = message.contents.first,
                   content.isComplete else {
                 return nil
@@ -155,6 +155,16 @@ enum MacTranscriptRow: MacConversationTableRow {
                 return nil
             case .markdown, .plainText, .generic:
                 break
+            }
+
+            if message.role == .user,
+               content.kind == .plainText || content.kind == .generic {
+                return Self.userNativePresentation(
+                    text: projection.sourceText,
+                    projection: projection,
+                    identifier: identifier,
+                    fontScale: fontScale
+                )
             }
             let source = content.text
             let cached = SanitizedMarkdownCache.shared.lookupPrepared(raw: source)
@@ -184,6 +194,16 @@ enum MacTranscriptRow: MacConversationTableRow {
                 }
             } else {
                 deferred = nil
+            }
+            if message.role == .user {
+                return Self.userNativePresentation(
+                    attributedString: immediate,
+                    fallbackText: projection.sourceText,
+                    projection: projection,
+                    identifier: identifier,
+                    fontScale: fontScale,
+                    deferredAttributedString: deferred
+                )
             }
             return MacConversationNativeTextPresentation(
                 attributedString: immediate,
@@ -245,6 +265,97 @@ enum MacTranscriptRow: MacConversationTableRow {
         case .tool, .diff, .plan:
             return nil
         }
+    }
+
+    @MainActor
+    func nativeFooterPresentation(
+        dynamicTypeSize: DynamicTypeSize,
+        colorScheme: ColorScheme
+    ) -> MacConversationNativeFooterPresentation? {
+        guard case .messageFooter(let footer, _) = self else { return nil }
+        let date = ChatTimestamp.date(
+            milliseconds: footer.occurredAt,
+            fallbackUUIDv7s: [footer.turnID, footer.itemID]
+        )
+        return MacConversationNativeFooterPresentation(
+            itemID: footer.itemID,
+            timestampLabel: date.map { ChatTimestamp.label(for: $0) },
+            timestampAccessibilityLabel: date?.formatted(
+                date: .complete,
+                time: .shortened
+            ),
+            isTrailing: footer.role == .user,
+            fontScale: dynamicTypeSize.macTranscriptFontScale,
+            accessibilityIdentifier: "conversation.item.\(footer.itemID).footer"
+        )
+    }
+
+    @MainActor
+    private static func userNativePresentation(
+        text: String,
+        projection: TranscriptRowProjection,
+        identifier: String,
+        fontScale: CGFloat
+    ) -> MacConversationNativeTextPresentation {
+        return userNativePresentation(
+            attributedString: nil,
+            fallbackText: text,
+            projection: projection,
+            identifier: identifier,
+            fontScale: fontScale
+        )
+    }
+
+    @MainActor
+    private static func userNativePresentation(
+        attributedString: NSAttributedString?,
+        fallbackText: String,
+        projection: TranscriptRowProjection,
+        identifier: String,
+        fontScale: CGFloat,
+        deferredAttributedString:
+            MacConversationNativeTextPresentation.DeferredAttributedString? = nil
+    ) -> MacConversationNativeTextPresentation {
+        var corners: MacConversationNativeTextPresentation.RoundedCorners = []
+        if projection.isFirstInItem {
+            corners.formUnion([.topLeading, .topTrailing])
+        }
+        if projection.isLastInItem {
+            corners.formUnion([.bottomLeading, .bottomTrailing])
+        }
+        return MacConversationNativeTextPresentation(
+            attributedString: attributedString,
+            fallbackString: fallbackText,
+            contentInsets: NSEdgeInsets(
+                top: projection.isFirstInItem ? 7 : 0,
+                left: 28,
+                bottom: 0,
+                right: 28
+            ),
+            firstRowTopInsetAdjustment: 15,
+            lastRowBottomInsetAdjustment: 0,
+            textEdgeInsets: NSEdgeInsets(
+                top: projection.isFirstInItem
+                    ? 12
+                    : (projection.isFirstInSection ? 10 : 0),
+                left: 12,
+                bottom: projection.isLastInItem ? 12 : 0,
+                right: 12
+            ),
+            maximumContentWidth: 760,
+            maximumTextWidth: 640,
+            backgroundColor: NSColor.secondaryLabelColor.withAlphaComponent(0.12),
+            backgroundCornerRadius: 16,
+            roundedCorners: corners,
+            horizontalAlignment: .trailing,
+            fallbackFont: NSFont.systemFont(
+                ofSize: NSFont.systemFontSize * fontScale
+            ),
+            fallbackColor: .labelColor,
+            accessibilityLabel: projection.accessibilitySummary,
+            accessibilityIdentifier: identifier,
+            deferredAttributedString: deferredAttributedString
+        )
     }
 
     @MainActor
@@ -311,7 +422,6 @@ func makeMacTranscriptRows(
         )
     }
     if case .message(let message) = item,
-       message.role == .assistant,
        !message.isStreaming,
        !message.text.isEmpty {
         rows.append(
@@ -319,7 +429,8 @@ func makeMacTranscriptRows(
                 MacMessageFooter(
                     itemID: message.id,
                     turnID: message.turnID,
-                    occurredAt: message.occurredAt
+                    occurredAt: message.occurredAt,
+                    role: message.role
                 ),
                 revision: sectionRevision
             )
@@ -675,6 +786,9 @@ struct ConversationView: View {
                 }
                 return true
             },
+            onNativeCopyMessage: { itemID in
+                rowActions.copyMessage(itemID: itemID, fallback: "")
+            },
             makeRow: { row, isFirst, isLast in
                 AnyView(
                     macRowView(
@@ -743,7 +857,6 @@ struct ConversationView: View {
         let endsItem: Bool = {
             if case .item(let projection, let isExpanded, _) = row {
                 if case .message(let message) = projection.displayItem,
-                   message.role == .assistant,
                    !message.isStreaming,
                    !message.text.isEmpty {
                     // The copy/timestamp footer is its own following row, so
@@ -767,7 +880,7 @@ struct ConversationView: View {
                             : "conversation.item.\(projection.sourceItemID).segment.\(projection.id)"
                     )
             case .messageFooter(let footer, _):
-                MacAssistantMessageFooter(footer: footer)
+                MacMessageFooterView(footer: footer)
                     .accessibilityIdentifier(
                         "conversation.item.\(footer.itemID).footer"
                     )
@@ -998,7 +1111,7 @@ struct ConversationView: View {
             ChatMessageView(
                 message: message,
                 segment: projection,
-                showsFooter: message.role != .assistant
+                showsFooter: false
             )
         case .reasoning(let reasoning):
             ReasoningCard(
@@ -1571,36 +1684,46 @@ private struct ChatMessageView: View {
 }
 
 #if os(macOS)
-private struct MacAssistantMessageFooter: View {
+private struct MacMessageFooterView: View {
     let footer: MacMessageFooter
 
     @Environment(\.chatRowActions) private var actions
     @State private var didCopy = false
 
     var body: some View {
-        HStack(spacing: 9) {
-            Button {
-                actions.copyMessage(itemID: footer.itemID, fallback: "")
-                didCopy = true
-                Task {
-                    try? await Task.sleep(nanoseconds: 1_500_000_000)
-                    didCopy = false
-                }
-            } label: {
-                Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
-                    .frame(width: 14, height: 14)
+        HStack(spacing: 0) {
+            if footer.role == .user {
+                Spacer(minLength: 44)
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel(didCopy ? "Message copied" : "Copy message")
+            HStack(spacing: 9) {
+                Button {
+                    actions.copyMessage(itemID: footer.itemID, fallback: "")
+                    didCopy = true
+                    Task {
+                        try? await Task.sleep(nanoseconds: 1_500_000_000)
+                        didCopy = false
+                    }
+                } label: {
+                    Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
+                        .frame(width: 14, height: 14)
+                }
+                .buttonStyle(.plain)
+                .chatMinimumInteractionTarget(includesWidth: true)
+                .accessibilityLabel(didCopy ? "Message copied" : "Copy message")
 
-            if let date = ChatTimestamp.date(
-                milliseconds: footer.occurredAt,
-                fallbackUUIDv7s: [footer.turnID, footer.itemID]
-            ) {
-                Text(ChatTimestamp.label(for: date))
-                    .accessibilityLabel(
-                        date.formatted(date: .complete, time: .shortened)
-                    )
+                if let date = ChatTimestamp.date(
+                    milliseconds: footer.occurredAt,
+                    fallbackUUIDv7s: [footer.turnID, footer.itemID]
+                ) {
+                    Text(ChatTimestamp.label(for: date))
+                        .accessibilityLabel(
+                            date.formatted(date: .complete, time: .shortened)
+                        )
+                }
+            }
+            .padding(.horizontal, footer.role == .user ? 4 : 0)
+            if footer.role != .user {
+                Spacer(minLength: 0)
             }
         }
         .font(.caption)

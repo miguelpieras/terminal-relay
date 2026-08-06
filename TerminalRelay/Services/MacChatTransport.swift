@@ -110,8 +110,12 @@ actor MacChatTransport: ChatTransport {
         }
     }
 
-    func disconnect() async {
+    func disconnect(sendingBestEffort envelope: ChatEnvelope?) async {
         guard runID != nil else { return }
+        if let envelope,
+           let data = try? ChatNDJSONEncoder.encode(envelope) {
+            try? connection.send(data)
+        }
         requestedDisconnect = true
         await withCheckedContinuation { continuation in
             disconnectContinuations.append(continuation)

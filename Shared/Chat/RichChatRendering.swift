@@ -653,20 +653,32 @@ private extension AttributeDynamicLookup {
 }
 
 private final class PreparedMarkdownNativeTextCache: @unchecked Sendable {
-    @MainActor private var styleKey: Int?
+    private struct StyleKey: Equatable {
+        let fontScale: Int
+        let isDark: Bool
+    }
+
+    @MainActor private var styleKey: StyleKey?
     @MainActor private var value: NSAttributedString?
 
     @MainActor
-    func lookup(fontScale: CGFloat) -> NSAttributedString? {
-        styleKey == Self.key(for: fontScale) ? value : nil
+    func lookup(
+        fontScale: CGFloat,
+        colorScheme: ColorScheme
+    ) -> NSAttributedString? {
+        styleKey == Self.key(for: fontScale, colorScheme: colorScheme) ? value : nil
     }
 
     @MainActor
     func resolve(
         fontScale: CGFloat,
+        colorScheme: ColorScheme,
         _ makeValue: () -> NSAttributedString
     ) -> NSAttributedString {
-        let requestedKey = Self.key(for: fontScale)
+        let requestedKey = Self.key(
+            for: fontScale,
+            colorScheme: colorScheme
+        )
         if styleKey == requestedKey, let value { return value }
         let prepared = makeValue()
         styleKey = requestedKey
@@ -674,8 +686,14 @@ private final class PreparedMarkdownNativeTextCache: @unchecked Sendable {
         return prepared
     }
 
-    private static func key(for fontScale: CGFloat) -> Int {
-        Int((max(0.5, min(fontScale, 4)) * 1_000).rounded())
+    private static func key(
+        for fontScale: CGFloat,
+        colorScheme: ColorScheme
+    ) -> StyleKey {
+        StyleKey(
+            fontScale: Int((max(0.5, min(fontScale, 4)) * 1_000).rounded()),
+            isDark: colorScheme == .dark
+        )
     }
 }
 
@@ -707,14 +725,24 @@ struct PreparedMarkdown: Sendable {
     /// no repeated attributed-string conversion.
     @MainActor
     func cachedAppKitAttributedText(
-        fontScale: CGFloat = 1
+        fontScale: CGFloat = 1,
+        colorScheme: ColorScheme = .light
     ) -> NSAttributedString? {
-        nativeTextCache.lookup(fontScale: fontScale)
+        nativeTextCache.lookup(
+            fontScale: fontScale,
+            colorScheme: colorScheme
+        )
     }
 
     @MainActor
-    func appKitAttributedText(fontScale: CGFloat = 1) -> NSAttributedString {
-        nativeTextCache.resolve(fontScale: fontScale) {
+    func appKitAttributedText(
+        fontScale: CGFloat = 1,
+        colorScheme: ColorScheme = .light
+    ) -> NSAttributedString {
+        nativeTextCache.resolve(
+            fontScale: fontScale,
+            colorScheme: colorScheme
+        ) {
             let result = NSMutableAttributedString()
             for run in attributedText.runs {
                 let text = String(attributedText[run.range].characters)
@@ -736,8 +764,10 @@ struct PreparedMarkdown: Sendable {
                     attributes[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
                 }
                 if style.isCode && style.headingLevel == nil {
-                    attributes[.backgroundColor] = NSColor.secondaryLabelColor
-                        .withAlphaComponent(0.07)
+                    attributes[.backgroundColor] = NSColor(
+                        white: colorScheme == .dark ? 1 : 0,
+                        alpha: 0.07
+                    )
                 }
                 if let link = run.link {
                     attributes[.link] = link

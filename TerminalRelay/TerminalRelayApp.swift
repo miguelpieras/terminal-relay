@@ -161,9 +161,9 @@ struct TerminalRelayApp: App {
     @State private var workerRegistrationAlert: WorkerRegistrationAlert?
 
     init() {
+        let shouldStartUpdater = ApplicationUpdateConfiguration.shouldStartUpdater()
         updaterController = SPUStandardUpdaterController(
-            startingUpdater: ApplicationUpdateConfiguration.shouldStartUpdater()
-                && !ScreenshotDemoMode.isEnabled,
+            startingUpdater: shouldStartUpdater && !ScreenshotDemoMode.isEnabled,
             updaterDelegate: nil,
             userDriverDelegate: nil
         )
@@ -172,10 +172,11 @@ struct TerminalRelayApp: App {
         let projectStore: ProjectStore
         let sessionManager: SessionManager
         let accountUsageService: AccountUsageService
-#if DEBUG
-        if !ApplicationUpdateConfiguration.shouldStartUpdater() {
+        if !shouldStartUpdater {
             let suiteName = "com.mpieras.TerminalRelay.xctest-host"
-            let defaults = UserDefaults(suiteName: suiteName) ?? .standard
+            guard let defaults = UserDefaults(suiteName: suiteName) else {
+                preconditionFailure("Unable to create isolated XCTest defaults")
+            }
             defaults.removePersistentDomain(forName: suiteName)
             serverStore = ServerStore(defaults: defaults)
             projectStore = ProjectStore(
@@ -184,35 +185,38 @@ struct TerminalRelayApp: App {
             )
             sessionManager = SessionManager(defaults: defaults)
             accountUsageService = AccountUsageService()
-        } else if ScreenshotDemoMode.isEnabled {
-            let fixture = ScreenshotDemoMode.fixture()
-            let defaults = ScreenshotDemoMode.isolatedDefaults()
-            serverStore = ServerStore(
-                defaults: defaults,
-                initialServers: [fixture.worker]
-            )
-            projectStore = ProjectStore(
-                defaults: defaults,
-                servers: serverStore.servers,
-                initialProjects: fixture.projects
-            )
-            sessionManager = SessionManager(defaults: defaults)
-            sessionManager.loadScreenshotDemo(fixture.sessions, on: fixture.worker)
-            accountUsageService = AccountUsageService(
-                screenshotDemoWorkerID: fixture.worker.id
-            )
         } else {
+#if DEBUG
+            if ScreenshotDemoMode.isEnabled {
+                let fixture = ScreenshotDemoMode.fixture()
+                let defaults = ScreenshotDemoMode.isolatedDefaults()
+                serverStore = ServerStore(
+                    defaults: defaults,
+                    initialServers: [fixture.worker]
+                )
+                projectStore = ProjectStore(
+                    defaults: defaults,
+                    servers: serverStore.servers,
+                    initialProjects: fixture.projects
+                )
+                sessionManager = SessionManager(defaults: defaults)
+                sessionManager.loadScreenshotDemo(fixture.sessions, on: fixture.worker)
+                accountUsageService = AccountUsageService(
+                    screenshotDemoWorkerID: fixture.worker.id
+                )
+            } else {
+                serverStore = ServerStore()
+                projectStore = ProjectStore(servers: serverStore.servers)
+                sessionManager = SessionManager()
+                accountUsageService = AccountUsageService()
+            }
+#else
             serverStore = ServerStore()
             projectStore = ProjectStore(servers: serverStore.servers)
             sessionManager = SessionManager()
             accountUsageService = AccountUsageService()
-        }
-#else
-        serverStore = ServerStore()
-        projectStore = ProjectStore(servers: serverStore.servers)
-        sessionManager = SessionManager()
-        accountUsageService = AccountUsageService()
 #endif
+        }
 
         _serverStore = StateObject(wrappedValue: serverStore)
         _projectStore = StateObject(wrappedValue: projectStore)

@@ -325,6 +325,49 @@ final class SanitizedMarkdownCacheTests: XCTestCase {
         )
     }
 
+    func testPreparedNativeArtifactCacheTracksColorScheme() async {
+        guard let prepared = await PreparedMarkdownRenderer.prepareOffMain(
+            "Text with `inline code`."
+        ) else {
+            return XCTFail("Expected prepared Markdown")
+        }
+
+        let light = prepared.appKitAttributedText(
+            fontScale: 1,
+            colorScheme: .light
+        )
+        let dark = prepared.appKitAttributedText(
+            fontScale: 1,
+            colorScheme: .dark
+        )
+        let repeatedDark = prepared.appKitAttributedText(
+            fontScale: 1,
+            colorScheme: .dark
+        )
+        let codeRange = (light.string as NSString).range(of: "inline code")
+        let lightBackground = light.attribute(
+            .backgroundColor,
+            at: codeRange.location,
+            effectiveRange: nil
+        ) as? NSColor
+        let darkBackground = dark.attribute(
+            .backgroundColor,
+            at: codeRange.location,
+            effectiveRange: nil
+        ) as? NSColor
+
+        XCTAssertFalse(light === dark)
+        XCTAssertTrue(dark === repeatedDark)
+        XCTAssertNotEqual(lightBackground, darkBackground)
+        XCTAssertNil(
+            prepared.cachedAppKitAttributedText(
+                fontScale: 1,
+                colorScheme: .light
+            ),
+            "A theme change must not reuse a resolved code-background color from the old appearance."
+        )
+    }
+
     func testPreparedMarkdownHandlesLargeBoundedChunkWithoutLosingText() async {
         let lines = (1...80).map { "bounded-line-\($0)" }
         let source = lines.joined(separator: "\n")

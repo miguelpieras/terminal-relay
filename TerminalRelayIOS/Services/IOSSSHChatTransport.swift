@@ -259,10 +259,14 @@ actor IOSSSHChatTransport: ChatTransport {
         }
     }
 
-    func disconnect() async {
+    func disconnect(sendingBestEffort envelope: ChatEnvelope?) async {
         isLocalDisconnect = true
         connectionGeneration = UUID()
         endCallbackPump(cancelTask: true)
+        if let envelope,
+           let data = try? ChatNDJSONEncoder.encode(envelope) {
+            connection?.send(data)
+        }
         connection?.disconnect()
         connection = nil
         resumeConnect(

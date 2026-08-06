@@ -413,6 +413,235 @@ final class ConversationStoreTests: XCTestCase {
         )
     }
 
+    func testLargeStartedAndReplacementEventsPublishPreparedRowsWithoutMainActorBuild() async throws {
+        let source = String(repeating: "prepared-event-line-0123456789\n", count: 4_000)
+        let fixtures: [(ChatEnvelope, String)] = [
+            (
+                ChatTestFixtures.event(
+                    "message.started",
+                    sequence: 1,
+                    itemID: "message",
+                    turnID: "turn",
+                    payload: .object([
+                        "role": .string("assistant"),
+                        "text": .string(source),
+                    ])
+                ),
+                "message"
+            ),
+            (
+                ChatTestFixtures.event(
+                    "tool.started",
+                    sequence: 1,
+                    itemID: "tool",
+                    turnID: "turn",
+                    payload: .object([
+                        "kind": .string("shell"),
+                        "title": .string("Command"),
+                        "status": .string("running"),
+                        "input": .string(source),
+                    ])
+                ),
+                "tool"
+            ),
+            (
+                ChatTestFixtures.event(
+                    "diff.updated",
+                    sequence: 1,
+                    itemID: "diff",
+                    turnID: "turn",
+                    payload: .object([
+                        "path": .string("Example.swift"),
+                        "diff": .string(source),
+                    ])
+                ),
+                "diff"
+            ),
+        ]
+
+        for (envelope, expectedID) in fixtures {
+            let store = ConversationStore(streamingPublishNanoseconds: 0)
+            let prepared = await ConversationStore.prepareTranscriptProjections(
+                for: envelope,
+                retaining: store.itemsForTranscriptProjectionPreparation,
+                currentState: store.stateForTranscriptProjectionPreparation
+            )
+            XCTAssertNotNil(
+                prepared[expectedID],
+                "Every large start/replacement event must be projected off-main."
+            )
+
+            try store.apply(
+                envelope,
+                preparedTranscriptProjections: prepared
+            )
+            let item = try XCTUnwrap(store.state.items.first)
+            let rows = store.transcriptProjections(for: item)
+
+            XCTAssertEqual(item.id, expectedID)
+            XCTAssertGreaterThan(rows.count, 1)
+            XCTAssertEqual(rows.map(\.sourceText).joined(), source)
+            XCTAssertEqual(
+                store.projectionDiagnostics.fullItemBuilds,
+                0,
+                "The first visible request must adopt the detached projection."
+            )
+        }
+    }
+
+    func testAuthoritativeToolReplacementPublishesPreparedRowsWithoutMainActorBuild() async throws {
+        let initial = String(repeating: "initial-output\n", count: 2_000)
+        let replacement = String(repeating: "replacement-output\n", count: 4_000)
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        try store.apply(
+            ChatTestFixtures.event(
+                "tool.started",
+                sequence: 1,
+                itemID: "tool",
+                turnID: "turn",
+                payload: .object([
+                    "kind": .string("shell"),
+                    "title": .string("Command"),
+                    "status": .string("running"),
+                    "output": .string(initial),
+                ])
+            )
+        )
+        _ = store.transcriptProjections(
+            for: try XCTUnwrap(store.state.items.first)
+        )
+        let fullBuilds = store.projectionDiagnostics.fullItemBuilds
+        let update = ChatTestFixtures.event(
+            "tool.updated",
+            sequence: 2,
+            itemID: "tool",
+            turnID: "turn",
+            payload: .object([
+                "kind": .string("shell"),
+                "title": .string("Command"),
+                "status": .string("running"),
+                "output": .string(replacement),
+            ])
+        )
+        let prepared = await ConversationStore.prepareTranscriptProjections(
+            for: update,
+            retaining: store.itemsForTranscriptProjectionPreparation,
+            currentState: store.stateForTranscriptProjectionPreparation
+        )
+
+        try store.apply(update, preparedTranscriptProjections: prepared)
+        store.flushStreamingUpdates()
+        let rows = store.transcriptProjections(
+            for: try XCTUnwrap(store.state.items.first)
+        )
+
+        XCTAssertEqual(rows.map(\.sourceText).joined(), replacement)
+        XCTAssertEqual(store.projectionDiagnostics.fullItemBuilds, fullBuilds)
+    }
+
+    func testPureToolOutputDeltaKeepsIncrementalTailProjectionPath() async throws {
+        let prefix = String(repeating: "sealed-output\n", count: 2_000)
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        try store.apply(
+            ChatTestFixtures.event(
+                "tool.started",
+                sequence: 1,
+                itemID: "tool",
+                turnID: "turn",
+                payload: .object([
+                    "kind": .string("shell"),
+                    "title": .string("Command"),
+                    "status": .string("running"),
+                    "output": .string(prefix),
+                ])
+            )
+        )
+        _ = store.transcriptProjections(
+            for: try XCTUnwrap(store.state.items.first)
+        )
+        let update = ChatTestFixtures.event(
+            "tool.updated",
+            sequence: 2,
+            itemID: "tool",
+            turnID: "turn",
+            payload: .object([
+                "kind": .string("shell"),
+                "title": .string("Command"),
+                "status": .string("running"),
+                "outputDelta": .string("tail"),
+            ])
+        )
+        let prepared = await ConversationStore.prepareTranscriptProjections(
+            for: update,
+            retaining: store.itemsForTranscriptProjectionPreparation,
+            currentState: store.stateForTranscriptProjectionPreparation
+        )
+
+        XCTAssertTrue(
+            prepared.isEmpty,
+            "A compatible append must preserve the bounded mutable-tail path."
+        )
+        try store.apply(update, preparedTranscriptProjections: prepared)
+        store.flushStreamingUpdates()
+        let rows = store.transcriptProjections(
+            for: try XCTUnwrap(store.state.items.first)
+        )
+        XCTAssertEqual(
+            rows.filter { $0.section == .toolOutput }.map(\.sourceText).joined(),
+            prefix + "tail"
+        )
+        XCTAssertEqual(store.projectionDiagnostics.fullItemBuilds, 1)
+        XCTAssertEqual(store.projectionDiagnostics.incrementalTailBuilds, 1)
+    }
+
+    func testTerminalFailurePreparesLargeToolWithoutOutputBeforePublication() async throws {
+        let input = String(repeating: "long-command-argument\n", count: 4_000)
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        try store.apply(
+            ChatTestFixtures.event(
+                "tool.started",
+                sequence: 1,
+                itemID: "tool",
+                turnID: "turn",
+                payload: .object([
+                    "kind": .string("shell"),
+                    "title": .string("Command"),
+                    "status": .string("running"),
+                    "input": .string(input),
+                ])
+            )
+        )
+        _ = store.transcriptProjections(
+            for: try XCTUnwrap(store.state.items.first)
+        )
+        let fullBuilds = store.projectionDiagnostics.fullItemBuilds
+        let terminal = ChatTestFixtures.event(
+            "turn.failed",
+            sequence: 2,
+            turnID: "turn",
+            payload: .object(["message": .string("Failed")])
+        )
+        let prepared = await ConversationStore.prepareTranscriptProjections(
+            for: terminal,
+            retaining: store.itemsForTranscriptProjectionPreparation,
+            currentState: store.stateForTranscriptProjectionPreparation
+        )
+        XCTAssertNotNil(prepared["tool"])
+
+        try store.apply(terminal, preparedTranscriptProjections: prepared)
+        let rows = store.transcriptProjections(
+            for: try XCTUnwrap(store.state.items.first)
+        )
+
+        XCTAssertEqual(store.state.tools.first?.status, .failed)
+        XCTAssertEqual(rows.map(\.sourceText).joined(), input)
+        XCTAssertEqual(
+            store.projectionDiagnostics.fullItemBuilds,
+            fullBuilds,
+            "Terminal metadata must not rebuild a large tool on the main actor."
+        )
+    }
+
     func testSnapshotProjectionIsPreparedBeforePublishedRowsAreRequested() async throws {
         let source = String(repeating: "snapshot-line-0123456789\n", count: 20_000)
         let item = ConversationItem.message(
@@ -679,6 +908,74 @@ final class ConversationStoreTests: XCTestCase {
         XCTAssertEqual(store.transcriptMutation.revision, publishedMutationRevision + 1)
         XCTAssertEqual(store.projectionDiagnostics.incrementalTailBuilds, 1)
         XCTAssertEqual(publishCount, 1)
+    }
+
+    func testPreparedReplacementCannotGetAheadOfPublishedRowsDuringLiveScroll() async throws {
+        let oldSource = String(repeating: "published-before-scroll\n", count: 2_000)
+        let newSource = String(repeating: "prepared-during-scroll\n", count: 3_000)
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.started",
+                sequence: 1,
+                itemID: "message",
+                turnID: "turn",
+                payload: .object([
+                    "role": .string("assistant"),
+                    "text": .string(oldSource),
+                ])
+            )
+        )
+        let oldItem = try XCTUnwrap(store.state.items.first)
+        XCTAssertEqual(
+            store.transcriptProjections(for: oldItem).map(\.sourceText).joined(),
+            oldSource
+        )
+        let fullBuilds = store.projectionDiagnostics.fullItemBuilds
+
+        store.setTranscriptLiveScrolling(true)
+        let completion = ChatTestFixtures.event(
+            "message.completed",
+            sequence: 2,
+            itemID: "message",
+            turnID: "turn",
+            payload: .object([
+                "role": .string("assistant"),
+                "text": .string(newSource),
+            ])
+        )
+        let prepared = await ConversationStore.prepareTranscriptProjections(
+            for: completion,
+            retaining: store.itemsForTranscriptProjectionPreparation,
+            currentState: store.stateForTranscriptProjectionPreparation
+        )
+        try store.apply(
+            completion,
+            preparedTranscriptProjections: prepared
+        )
+
+        XCTAssertEqual(store.state.lastAppliedSequence, 1)
+        XCTAssertEqual(store.state.messages.first?.text, oldSource)
+        XCTAssertEqual(
+            store.transcriptProjections(for: oldItem).map(\.sourceText).joined(),
+            oldSource,
+            "Prepared rows for working state must not replace the frozen published cache."
+        )
+        XCTAssertEqual(store.projectionDiagnostics.fullItemBuilds, fullBuilds)
+
+        store.setTranscriptLiveScrolling(false)
+
+        let newItem = try XCTUnwrap(store.state.items.first)
+        XCTAssertEqual(store.state.lastAppliedSequence, 2)
+        XCTAssertEqual(
+            store.transcriptProjections(for: newItem).map(\.sourceText).joined(),
+            newSource
+        )
+        XCTAssertEqual(
+            store.projectionDiagnostics.fullItemBuilds,
+            fullBuilds,
+            "The catch-up publication must atomically adopt its detached rows."
+        )
     }
 
     func testBrowsingHistoryDefersStreamingPublicationUntilJumpToLatest() throws {
@@ -1277,7 +1574,15 @@ final class ConversationStoreTests: XCTestCase {
                 turnState: .idle
             )
         )
-        store.addOptimisticUserMessage(requestID: requestID, text: "Start another turn")
+        let optimisticItem = ConversationStore.optimisticUserMessage(
+            requestID: requestID,
+            text: "Start another turn",
+            occurredAt: 0
+        )
+        store.addOptimisticUserMessage(
+            optimisticItem,
+            preparedTranscriptProjections: [:]
+        )
 
         try store.apply(
             ChatTestFixtures.event(
@@ -1656,6 +1961,93 @@ final class ConversationStoreTests: XCTestCase {
             DispatchTime.now().uptimeNanoseconds - startedAt
         ) / 1_000_000_000
         XCTAssertLessThan(elapsedSeconds, 2.0)
+    }
+
+    func testNearLimitStreamsAppendChunksWithoutMaterializingAccumulatedText() throws {
+        let chunk = String(repeating: "z", count: 1_024)
+        let deltaCount = 900
+
+        let messageStore = ConversationStore(streamingPublishNanoseconds: 0)
+        messageStore.setTranscriptLiveScrolling(true)
+        try messageStore.apply(
+            ChatTestFixtures.event(
+                "message.started",
+                sequence: 1,
+                itemID: "chunked-message",
+                turnID: "turn",
+                payload: .object([
+                    "role": .string("assistant"),
+                    "text": .string(""),
+                ])
+            )
+        )
+        for sequence in 2...(deltaCount + 1) {
+            try messageStore.apply(
+                ChatTestFixtures.event(
+                    "message.delta",
+                    sequence: Int64(sequence),
+                    itemID: "chunked-message",
+                    turnID: "turn",
+                    payload: .object(["text": .string(chunk)])
+                )
+            )
+        }
+        guard case .message(let message)? = messageStore
+            .stateForTranscriptProjectionPreparation.items.first,
+              let content = message.contents.first else {
+            return XCTFail("Expected the working streaming message")
+        }
+        XCTAssertEqual(content.textUTF8Count, chunk.utf8.count * deltaCount)
+        XCTAssertEqual(content.textStorageChunkCount, deltaCount + 1)
+        XCTAssertFalse(
+            content.isTextStorageMaterialized,
+            "Applying deltas must not rebuild the accumulated String on the main actor."
+        )
+        XCTAssertEqual(content.text, String(repeating: chunk, count: deltaCount))
+
+        let toolStore = ConversationStore(streamingPublishNanoseconds: 0)
+        toolStore.setTranscriptLiveScrolling(true)
+        try toolStore.apply(
+            ChatTestFixtures.event(
+                "tool.started",
+                sequence: 1,
+                itemID: "chunked-tool",
+                turnID: "turn",
+                payload: .object([
+                    "kind": .string("shell"),
+                    "title": .string("Command"),
+                    "status": .string("running"),
+                    "output": .string(""),
+                ])
+            )
+        )
+        for sequence in 2...(deltaCount + 1) {
+            try toolStore.apply(
+                ChatTestFixtures.event(
+                    "tool.updated",
+                    sequence: Int64(sequence),
+                    itemID: "chunked-tool",
+                    turnID: "turn",
+                    payload: .object([
+                        "kind": .string("shell"),
+                        "title": .string("Command"),
+                        "status": .string("running"),
+                        "outputDelta": .string(chunk),
+                    ])
+                )
+            )
+        }
+        guard case .tool(let tool)? = toolStore
+            .stateForTranscriptProjectionPreparation.items.first else {
+            return XCTFail("Expected the working streaming tool")
+        }
+        XCTAssertEqual(tool.outputUTF8Count, chunk.utf8.count * deltaCount)
+        XCTAssertEqual(tool.outputStorageChunkCount, deltaCount + 1)
+        XCTAssertFalse(
+            tool.isOutputStorageMaterialized,
+            "Tool output deltas must remain immutable chunks until exact text is requested."
+        )
+        XCTAssertEqual(tool.output, String(repeating: chunk, count: deltaCount))
     }
 
     func testIncrementalContentAccountingEnforcesByteLimitAfterStreamingGrowth() throws {

@@ -190,6 +190,28 @@ final class MacConversationTableCommandHandle {
 /// Callers retain control of link routing and may provide a deferred artifact;
 /// the table adopts that artifact only after live scrolling has ended.
 struct MacConversationNativeTextPresentation {
+    enum HorizontalAlignment: Equatable {
+        case fill
+        case leading
+        case center
+        case trailing
+    }
+
+    struct RoundedCorners: OptionSet {
+        let rawValue: UInt8
+
+        static let topLeading = Self(rawValue: 1 << 0)
+        static let topTrailing = Self(rawValue: 1 << 1)
+        static let bottomLeading = Self(rawValue: 1 << 2)
+        static let bottomTrailing = Self(rawValue: 1 << 3)
+        static let all: Self = [
+            .topLeading,
+            .topTrailing,
+            .bottomLeading,
+            .bottomTrailing,
+        ]
+    }
+
     struct DeferredArtifact: @unchecked Sendable {
         private let resolver: @MainActor () -> NSAttributedString?
 
@@ -212,8 +234,13 @@ struct MacConversationNativeTextPresentation {
     let firstRowTopInsetAdjustment: CGFloat
     let lastRowBottomInsetAdjustment: CGFloat
     let textContainerInset: NSSize
+    let textEdgeInsets: NSEdgeInsets
     let maximumContentWidth: CGFloat?
+    let maximumTextWidth: CGFloat?
     let backgroundColor: NSColor?
+    let backgroundCornerRadius: CGFloat
+    let roundedCorners: RoundedCorners
+    let horizontalAlignment: HorizontalAlignment
     let fallbackFont: NSFont?
     let fallbackColor: NSColor?
     let accessibilityLabel: String?
@@ -233,8 +260,18 @@ struct MacConversationNativeTextPresentation {
         firstRowTopInsetAdjustment: CGFloat = 0,
         lastRowBottomInsetAdjustment: CGFloat = 0,
         textContainerInset: NSSize = .zero,
+        textEdgeInsets: NSEdgeInsets = NSEdgeInsets(
+            top: 0,
+            left: 0,
+            bottom: 0,
+            right: 0
+        ),
         maximumContentWidth: CGFloat? = nil,
+        maximumTextWidth: CGFloat? = nil,
         backgroundColor: NSColor? = nil,
+        backgroundCornerRadius: CGFloat = 0,
+        roundedCorners: RoundedCorners = [],
+        horizontalAlignment: HorizontalAlignment = .fill,
         fallbackFont: NSFont? = nil,
         fallbackColor: NSColor? = nil,
         accessibilityLabel: String? = nil,
@@ -255,10 +292,19 @@ struct MacConversationNativeTextPresentation {
             ? lastRowBottomInsetAdjustment
             : 0
         self.textContainerInset = textContainerInset
+        self.textEdgeInsets = textEdgeInsets
         self.maximumContentWidth = maximumContentWidth.flatMap {
             $0.isFinite && $0 > 0 ? $0 : nil
         }
+        self.maximumTextWidth = maximumTextWidth.flatMap {
+            $0.isFinite && $0 > 0 ? $0 : nil
+        }
         self.backgroundColor = backgroundColor
+        self.backgroundCornerRadius = backgroundCornerRadius.isFinite
+            ? max(0, backgroundCornerRadius)
+            : 0
+        self.roundedCorners = roundedCorners
+        self.horizontalAlignment = horizontalAlignment
         self.fallbackFont = fallbackFont
         self.fallbackColor = fallbackColor
         self.accessibilityLabel = accessibilityLabel
@@ -266,6 +312,18 @@ struct MacConversationNativeTextPresentation {
         self.linkHandler = linkHandler
         self.deferredAttributedString = deferredAttributedString
     }
+}
+
+/// Lightweight native controls for the action row following a completed
+/// message. Keeping this repeated row out of SwiftUI avoids constructing a
+/// new view graph every time a cold message boundary enters the viewport.
+struct MacConversationNativeFooterPresentation {
+    let itemID: String
+    let timestampLabel: String?
+    let timestampAccessibilityLabel: String?
+    let isTrailing: Bool
+    let fontScale: CGFloat
+    let accessibilityIdentifier: String?
 }
 
 protocol MacConversationTableRow: Equatable, Identifiable where ID == String {
@@ -278,6 +336,13 @@ protocol MacConversationTableRow: Equatable, Identifiable where ID == String {
         dynamicTypeSize: DynamicTypeSize,
         colorScheme: ColorScheme
     ) -> MacConversationNativeTextPresentation?
+    /// Non-nil completed-message footers use one reusable AppKit button/label
+    /// cell instead of paying a SwiftUI hosting transition at every message.
+    @MainActor
+    func nativeFooterPresentation(
+        dynamicTypeSize: DynamicTypeSize,
+        colorScheme: ColorScheme
+    ) -> MacConversationNativeFooterPresentation?
     /// The logical transcript record that owns this rendered row. A single
     /// record can project into many reusable table rows, so mutation IDs from
     /// the store do not necessarily match `id`.
@@ -291,6 +356,14 @@ extension MacConversationTableRow {
         dynamicTypeSize: DynamicTypeSize,
         colorScheme: ColorScheme
     ) -> MacConversationNativeTextPresentation? {
+        nil
+    }
+
+    @MainActor
+    func nativeFooterPresentation(
+        dynamicTypeSize: DynamicTypeSize,
+        colorScheme: ColorScheme
+    ) -> MacConversationNativeFooterPresentation? {
         nil
     }
 }
@@ -449,6 +522,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
     let onAnchoredChange: (Bool) -> Void
     var prefetchRows: ([Row]) async -> Void = { _ in }
     var onNativeLink: @MainActor (URL) -> Bool = { _ in true }
+    var onNativeCopyMessage: @MainActor (String) -> Void = { _ in }
     let makeRow: (Row, Bool, Bool) -> AnyView
 
     func makeCoordinator() -> Coordinator {
@@ -503,6 +577,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             onAnchoredChange: onAnchoredChange,
             prefetchRows: prefetchRows,
             onNativeLink: onNativeLink,
+            onNativeCopyMessage: onNativeCopyMessage,
             makeRow: makeRow
         )
     }
@@ -535,6 +610,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         private var onAnchoredChange: (Bool) -> Void = { _ in }
         private var prefetchRows: ([Row]) async -> Void = { _ in }
         private var onNativeLink: @MainActor (URL) -> Bool = { _ in true }
+        private var onNativeCopyMessage: @MainActor (String) -> Void = { _ in }
         private var viewportPrefetchTask: Task<Void, Never>?
         private let scrollActivity = MacTranscriptScrollActivity()
         private var reduceMotion = false
@@ -665,6 +741,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             onAnchoredChange: @escaping (Bool) -> Void,
             prefetchRows: @escaping ([Row]) async -> Void,
             onNativeLink: @escaping @MainActor (URL) -> Bool,
+            onNativeCopyMessage: @escaping @MainActor (String) -> Void,
             makeRow: @escaping (Row, Bool, Bool) -> AnyView
         ) {
             self.reduceMotion = reduceMotion
@@ -674,6 +751,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             self.onAnchoredChange = onAnchoredChange
             self.prefetchRows = prefetchRows
             self.onNativeLink = onNativeLink
+            self.onNativeCopyMessage = onNativeCopyMessage
             self.makeRow = makeRow
             commandHandle.performJump = { [weak self] in self?.jumpToLatest() }
 
@@ -827,6 +905,8 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                     cell = MacConversationHostedCell()
                 case .native:
                     cell = MacConversationNativeTextCell()
+                case .nativeFooter:
+                    cell = MacConversationNativeFooterCell()
                 }
                 cell.identifier = identifier
             }
@@ -1093,14 +1173,25 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 cell.contentRevision = row.contentRevision
                 cell.isFirst = isFirst
                 cell.isLast = isLast
-                if let presentation = row.nativeTextPresentation(
+                if let presentation = row.nativeFooterPresentation(
+                    dynamicTypeSize: environment.dynamicTypeSize,
+                    colorScheme: environment.colorScheme
+                ) {
+                    cell.setContent(
+                        .nativeFooter(presentation),
+                        scrollActivity: scrollActivity,
+                        nativeLinkHandler: onNativeLink,
+                        nativeCopyMessageHandler: onNativeCopyMessage
+                    )
+                } else if let presentation = row.nativeTextPresentation(
                     dynamicTypeSize: environment.dynamicTypeSize,
                     colorScheme: environment.colorScheme
                 ) {
                     cell.setContent(
                         .native(presentation),
                         scrollActivity: scrollActivity,
-                        nativeLinkHandler: onNativeLink
+                        nativeLinkHandler: onNativeLink,
+                        nativeCopyMessageHandler: onNativeCopyMessage
                     )
                 } else {
                     cell.setContent(
@@ -1114,7 +1205,8 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                                 )
                         )),
                         scrollActivity: scrollActivity,
-                        nativeLinkHandler: onNativeLink
+                        nativeLinkHandler: onNativeLink,
+                        nativeCopyMessageHandler: onNativeCopyMessage
                     )
                 }
             }
@@ -1130,7 +1222,13 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         }
 
         private func cellKind(for row: Row) -> MacConversationReusableCell.Kind {
-            row.nativeTextPresentation(
+            if row.nativeFooterPresentation(
+                dynamicTypeSize: environment.dynamicTypeSize,
+                colorScheme: environment.colorScheme
+            ) != nil {
+                return .nativeFooter
+            }
+            return row.nativeTextPresentation(
                 dynamicTypeSize: environment.dynamicTypeSize,
                 colorScheme: environment.colorScheme
             ) == nil ? .hosted : .native
@@ -1549,11 +1647,13 @@ private class MacConversationReusableCell: NSTableCellView {
     enum Kind: String {
         case hosted
         case native
+        case nativeFooter = "native-footer"
     }
 
     enum Content {
         case hosted(AnyView)
         case native(MacConversationNativeTextPresentation)
+        case nativeFooter(MacConversationNativeFooterPresentation)
     }
 
     let kind: Kind
@@ -1575,7 +1675,8 @@ private class MacConversationReusableCell: NSTableCellView {
     func setContent(
         _ content: Content,
         scrollActivity: MacTranscriptScrollActivity,
-        nativeLinkHandler: @escaping MacConversationNativeTextPresentation.LinkHandler
+        nativeLinkHandler: @escaping MacConversationNativeTextPresentation.LinkHandler,
+        nativeCopyMessageHandler: @escaping @MainActor (String) -> Void
     ) {
         preconditionFailure("Reusable transcript cell must implement content adoption")
     }
@@ -1605,7 +1706,8 @@ private final class MacConversationHostedCell: MacConversationReusableCell {
     override func setContent(
         _ content: Content,
         scrollActivity: MacTranscriptScrollActivity,
-        nativeLinkHandler: @escaping MacConversationNativeTextPresentation.LinkHandler
+        nativeLinkHandler: @escaping MacConversationNativeTextPresentation.LinkHandler,
+        nativeCopyMessageHandler: @escaping @MainActor (String) -> Void
     ) {
         guard case let .hosted(rootView) = content else {
             assertionFailure("Hosted transcript cell received native content")
@@ -1636,10 +1738,174 @@ private final class MacConversationHostedCell: MacConversationReusableCell {
 }
 
 @MainActor
+private final class MacConversationNativeFooterCell: MacConversationReusableCell {
+    private let layoutContainer = NSView(frame: .zero)
+    private let controls = NSStackView(frame: .zero)
+    private let copyButton = NSButton(frame: .zero)
+    private let timestampLabel = NSTextField(labelWithString: "")
+    private var topConstraint: NSLayoutConstraint!
+    private var bottomConstraint: NSLayoutConstraint!
+    private var controlsLeadingConstraint: NSLayoutConstraint!
+    private var controlsTrailingConstraint: NSLayoutConstraint!
+    private var copiedResetTask: Task<Void, Never>?
+    private var copyMessageHandler: (@MainActor (String) -> Void)?
+    private var itemID: String?
+
+    init() {
+        super.init(kind: .nativeFooter)
+
+        layoutContainer.translatesAutoresizingMaskIntoConstraints = false
+        controls.translatesAutoresizingMaskIntoConstraints = false
+        controls.orientation = .horizontal
+        controls.alignment = .centerY
+        controls.spacing = 9
+
+        copyButton.translatesAutoresizingMaskIntoConstraints = false
+        copyButton.title = ""
+        copyButton.isBordered = false
+        copyButton.imagePosition = .imageOnly
+        copyButton.contentTintColor = .secondaryLabelColor
+        copyButton.target = self
+        copyButton.action = #selector(copyMessage)
+
+        timestampLabel.translatesAutoresizingMaskIntoConstraints = false
+        timestampLabel.textColor = .secondaryLabelColor
+        timestampLabel.lineBreakMode = .byClipping
+        timestampLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        addSubview(layoutContainer)
+        layoutContainer.addSubview(controls)
+        controls.addArrangedSubview(copyButton)
+        controls.addArrangedSubview(timestampLabel)
+
+        topConstraint = layoutContainer.topAnchor.constraint(equalTo: topAnchor)
+        bottomConstraint = layoutContainer.bottomAnchor.constraint(equalTo: bottomAnchor)
+        controlsLeadingConstraint = controls.leadingAnchor.constraint(
+            equalTo: layoutContainer.leadingAnchor
+        )
+        controlsTrailingConstraint = controls.trailingAnchor.constraint(
+            equalTo: layoutContainer.trailingAnchor
+        )
+        let preferredWidth = layoutContainer.widthAnchor.constraint(
+            equalToConstant: 760
+        )
+        preferredWidth.priority = .defaultHigh
+        NSLayoutConstraint.activate([
+            layoutContainer.leadingAnchor.constraint(
+                greaterThanOrEqualTo: leadingAnchor,
+                constant: 28
+            ),
+            layoutContainer.trailingAnchor.constraint(
+                lessThanOrEqualTo: trailingAnchor,
+                constant: -28
+            ),
+            layoutContainer.centerXAnchor.constraint(equalTo: centerXAnchor),
+            layoutContainer.widthAnchor.constraint(lessThanOrEqualToConstant: 760),
+            preferredWidth,
+            topConstraint,
+            bottomConstraint,
+            controls.topAnchor.constraint(equalTo: layoutContainer.topAnchor),
+            controls.bottomAnchor.constraint(equalTo: layoutContainer.bottomAnchor),
+            copyButton.widthAnchor.constraint(equalToConstant: 44),
+            copyButton.heightAnchor.constraint(equalToConstant: 44),
+        ])
+        setCopyState(copied: false)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func setContent(
+        _ content: Content,
+        scrollActivity: MacTranscriptScrollActivity,
+        nativeLinkHandler: @escaping MacConversationNativeTextPresentation.LinkHandler,
+        nativeCopyMessageHandler: @escaping @MainActor (String) -> Void
+    ) {
+        guard case let .nativeFooter(presentation) = content else {
+            assertionFailure("Native footer cell received non-footer content")
+            return
+        }
+
+        if itemID != presentation.itemID {
+            copiedResetTask?.cancel()
+            copiedResetTask = nil
+            itemID = presentation.itemID
+            setCopyState(copied: false)
+        }
+        copyMessageHandler = nativeCopyMessageHandler
+
+        topConstraint.constant = isFirst ? 22 : 7
+        bottomConstraint.constant = -(isLast ? 16 : 7)
+        controlsLeadingConstraint.isActive = false
+        controlsTrailingConstraint.isActive = false
+        controlsLeadingConstraint.isActive = !presentation.isTrailing
+        controlsTrailingConstraint.isActive = presentation.isTrailing
+
+        timestampLabel.font = NSFont.systemFont(
+            ofSize: NSFont.smallSystemFontSize * max(0.5, presentation.fontScale)
+        )
+        timestampLabel.stringValue = presentation.timestampLabel ?? ""
+        timestampLabel.isHidden = presentation.timestampLabel == nil
+        timestampLabel.setAccessibilityLabel(
+            presentation.timestampAccessibilityLabel
+        )
+        setAccessibilityIdentifier(presentation.accessibilityIdentifier)
+        copyButton.setAccessibilityIdentifier(
+            presentation.accessibilityIdentifier.map { "\($0).copy" }
+        )
+    }
+
+    override func prepareForReuse() {
+        copiedResetTask?.cancel()
+        copiedResetTask = nil
+        copyMessageHandler = nil
+        itemID = nil
+        timestampLabel.stringValue = ""
+        timestampLabel.setAccessibilityLabel(nil)
+        setAccessibilityIdentifier(nil)
+        copyButton.setAccessibilityIdentifier(nil)
+        setCopyState(copied: false)
+        super.prepareForReuse()
+    }
+
+    @objc
+    private func copyMessage() {
+        guard let itemID, let copyMessageHandler else { return }
+        copyMessageHandler(itemID)
+        setCopyState(copied: true)
+        let representedRowID = representedRowID
+        copiedResetTask?.cancel()
+        copiedResetTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard !Task.isCancelled,
+                  let self,
+                  self.representedRowID == representedRowID else { return }
+            self.setCopyState(copied: false)
+        }
+    }
+
+    private func setCopyState(copied: Bool) {
+        let label = copied ? "Message copied" : "Copy message"
+        let symbol = copied ? "checkmark" : "doc.on.doc"
+        copyButton.image = NSImage(
+            systemSymbolName: symbol,
+            accessibilityDescription: label
+        )?.withSymbolConfiguration(
+            NSImage.SymbolConfiguration(pointSize: 11, weight: .regular)
+        )
+        copyButton.setAccessibilityLabel(label)
+    }
+}
+
+@MainActor
 private final class MacConversationNativeTextCell:
     MacConversationReusableCell,
     NSTextViewDelegate
 {
+    private let layoutContainer = NSView(frame: .zero)
+    private let textContainerView = NSView(frame: .zero)
     private let nativeTextView = MacConversationIntrinsicTextView(frame: .zero)
     private var leadingLimitConstraint: NSLayoutConstraint!
     private var trailingLimitConstraint: NSLayoutConstraint!
@@ -1650,6 +1916,16 @@ private final class MacConversationNativeTextCell:
     private var preferredWidthConstraint: NSLayoutConstraint!
     private var topConstraint: NSLayoutConstraint!
     private var bottomConstraint: NSLayoutConstraint!
+    private var textFillLeadingConstraint: NSLayoutConstraint!
+    private var textFillTrailingConstraint: NSLayoutConstraint!
+    private var textAlignedLeadingConstraint: NSLayoutConstraint!
+    private var textAlignedTrailingConstraint: NSLayoutConstraint!
+    private var textCenterXConstraint: NSLayoutConstraint!
+    private var maximumTextWidthConstraint: NSLayoutConstraint!
+    private var textTopConstraint: NSLayoutConstraint!
+    private var textBottomConstraint: NSLayoutConstraint!
+    private var textContentLeadingConstraint: NSLayoutConstraint!
+    private var textContentTrailingConstraint: NSLayoutConstraint!
     private var linkHandler: MacConversationNativeTextPresentation.LinkHandler?
     private var deferredPreparationTask: Task<Void, Never>?
     private var presentationGeneration: UInt64 = 0
@@ -1657,34 +1933,69 @@ private final class MacConversationNativeTextCell:
     init() {
         super.init(kind: .native)
 
+        layoutContainer.translatesAutoresizingMaskIntoConstraints = false
+        textContainerView.translatesAutoresizingMaskIntoConstraints = false
         nativeTextView.translatesAutoresizingMaskIntoConstraints = false
         nativeTextView.delegate = self
-        addSubview(nativeTextView)
+        addSubview(layoutContainer)
+        layoutContainer.addSubview(textContainerView)
+        textContainerView.addSubview(nativeTextView)
 
-        leadingLimitConstraint = nativeTextView.leadingAnchor.constraint(
+        leadingLimitConstraint = layoutContainer.leadingAnchor.constraint(
             greaterThanOrEqualTo: leadingAnchor
         )
-        trailingLimitConstraint = nativeTextView.trailingAnchor.constraint(
+        trailingLimitConstraint = layoutContainer.trailingAnchor.constraint(
             lessThanOrEqualTo: trailingAnchor
         )
-        fillLeadingConstraint = nativeTextView.leadingAnchor.constraint(
+        fillLeadingConstraint = layoutContainer.leadingAnchor.constraint(
             equalTo: leadingAnchor
         )
-        fillTrailingConstraint = nativeTextView.trailingAnchor.constraint(
+        fillTrailingConstraint = layoutContainer.trailingAnchor.constraint(
             equalTo: trailingAnchor
         )
-        centerXConstraint = nativeTextView.centerXAnchor.constraint(
+        centerXConstraint = layoutContainer.centerXAnchor.constraint(
             equalTo: centerXAnchor
         )
-        maximumWidthConstraint = nativeTextView.widthAnchor.constraint(
+        maximumWidthConstraint = layoutContainer.widthAnchor.constraint(
             lessThanOrEqualToConstant: 1
         )
-        preferredWidthConstraint = nativeTextView.widthAnchor.constraint(
+        preferredWidthConstraint = layoutContainer.widthAnchor.constraint(
             equalToConstant: 1
         )
         preferredWidthConstraint.priority = .defaultHigh
-        topConstraint = nativeTextView.topAnchor.constraint(equalTo: topAnchor)
-        bottomConstraint = nativeTextView.bottomAnchor.constraint(equalTo: bottomAnchor)
+        topConstraint = layoutContainer.topAnchor.constraint(equalTo: topAnchor)
+        bottomConstraint = layoutContainer.bottomAnchor.constraint(equalTo: bottomAnchor)
+
+        textFillLeadingConstraint = textContainerView.leadingAnchor.constraint(
+            equalTo: layoutContainer.leadingAnchor
+        )
+        textFillTrailingConstraint = textContainerView.trailingAnchor.constraint(
+            equalTo: layoutContainer.trailingAnchor
+        )
+        textAlignedLeadingConstraint = textContainerView.leadingAnchor.constraint(
+            equalTo: layoutContainer.leadingAnchor
+        )
+        textAlignedTrailingConstraint = textContainerView.trailingAnchor.constraint(
+            equalTo: layoutContainer.trailingAnchor
+        )
+        textCenterXConstraint = textContainerView.centerXAnchor.constraint(
+            equalTo: layoutContainer.centerXAnchor
+        )
+        maximumTextWidthConstraint = textContainerView.widthAnchor.constraint(
+            lessThanOrEqualToConstant: 1
+        )
+        textTopConstraint = nativeTextView.topAnchor.constraint(
+            equalTo: textContainerView.topAnchor
+        )
+        textBottomConstraint = nativeTextView.bottomAnchor.constraint(
+            equalTo: textContainerView.bottomAnchor
+        )
+        textContentLeadingConstraint = nativeTextView.leadingAnchor.constraint(
+            equalTo: textContainerView.leadingAnchor
+        )
+        textContentTrailingConstraint = nativeTextView.trailingAnchor.constraint(
+            equalTo: textContainerView.trailingAnchor
+        )
         NSLayoutConstraint.activate([
             leadingLimitConstraint,
             trailingLimitConstraint,
@@ -1692,6 +2003,18 @@ private final class MacConversationNativeTextCell:
             fillTrailingConstraint,
             topConstraint,
             bottomConstraint,
+            textFillLeadingConstraint,
+            textFillTrailingConstraint,
+            textContainerView.topAnchor.constraint(
+                equalTo: layoutContainer.topAnchor
+            ),
+            textContainerView.bottomAnchor.constraint(
+                equalTo: layoutContainer.bottomAnchor
+            ),
+            textTopConstraint,
+            textBottomConstraint,
+            textContentLeadingConstraint,
+            textContentTrailingConstraint,
         ])
     }
 
@@ -1703,7 +2026,8 @@ private final class MacConversationNativeTextCell:
     override func setContent(
         _ content: Content,
         scrollActivity: MacTranscriptScrollActivity,
-        nativeLinkHandler: @escaping MacConversationNativeTextPresentation.LinkHandler
+        nativeLinkHandler: @escaping MacConversationNativeTextPresentation.LinkHandler,
+        nativeCopyMessageHandler: @escaping @MainActor (String) -> Void
     ) {
         guard case let .native(presentation) = content else {
             assertionFailure("Native transcript cell received hosted content")
@@ -1741,18 +2065,61 @@ private final class MacConversationNativeTextCell:
             fillLeadingConstraint.isActive = true
             fillTrailingConstraint.isActive = true
         }
+
+        textFillLeadingConstraint.isActive = false
+        textFillTrailingConstraint.isActive = false
+        textAlignedLeadingConstraint.isActive = false
+        textAlignedTrailingConstraint.isActive = false
+        textCenterXConstraint.isActive = false
+        maximumTextWidthConstraint.isActive = false
+        switch presentation.horizontalAlignment {
+        case .fill:
+            textFillLeadingConstraint.isActive = true
+            textFillTrailingConstraint.isActive = true
+        case .leading:
+            textAlignedLeadingConstraint.isActive = true
+        case .center:
+            textCenterXConstraint.isActive = true
+        case .trailing:
+            textAlignedTrailingConstraint.isActive = true
+        }
+        if presentation.horizontalAlignment != .fill {
+            maximumTextWidthConstraint.constant = presentation.maximumTextWidth
+                ?? presentation.maximumContentWidth
+                ?? 760
+            maximumTextWidthConstraint.isActive = true
+        }
+
+        textTopConstraint.constant = presentation.textEdgeInsets.top
+        textBottomConstraint.constant = -presentation.textEdgeInsets.bottom
+        textContentLeadingConstraint.constant = presentation.textEdgeInsets.left
+        textContentTrailingConstraint.constant = -presentation.textEdgeInsets.right
         nativeTextView.textContainerInset = presentation.textContainerInset
+        nativeTextView.maximumIntrinsicWidth = presentation.maximumTextWidth.map {
+            max(
+                1,
+                $0 - presentation.textEdgeInsets.left
+                    - presentation.textEdgeInsets.right
+            )
+        }
         linkHandler = presentation.linkHandler ?? nativeLinkHandler
         nativeTextView.setAccessibilityLabel(presentation.accessibilityLabel)
         nativeTextView.setAccessibilityIdentifier(
             presentation.accessibilityIdentifier
         )
 
-        if let backgroundColor = presentation.backgroundColor {
-            wantsLayer = true
-            layer?.backgroundColor = backgroundColor.cgColor
-        } else {
-            layer?.backgroundColor = NSColor.clear.cgColor
+        let usesDecoratedContainer = presentation.backgroundColor != nil
+            || presentation.backgroundCornerRadius > 0
+        textContainerView.wantsLayer = usesDecoratedContainer
+        if usesDecoratedContainer {
+            textContainerView.layer?.backgroundColor = (
+                presentation.backgroundColor ?? .clear
+            ).cgColor
+            textContainerView.layer?.cornerRadius = presentation.backgroundCornerRadius
+            textContainerView.layer?.maskedCorners = Self.layerCorners(
+                presentation.roundedCorners
+            )
+            textContainerView.layer?.masksToBounds = presentation.backgroundCornerRadius > 0
         }
 
         setAttributedString(
@@ -1808,6 +2175,10 @@ private final class MacConversationNativeTextCell:
         nativeTextView.setAccessibilityLabel(nil)
         nativeTextView.setAccessibilityIdentifier(nil)
         nativeTextView.textStorage?.setAttributedString(NSAttributedString())
+        nativeTextView.maximumIntrinsicWidth = nil
+        textContainerView.layer?.backgroundColor = NSColor.clear.cgColor
+        textContainerView.layer?.cornerRadius = 0
+        textContainerView.layer?.maskedCorners = []
         super.prepareForReuse()
     }
 
@@ -1815,6 +2186,25 @@ private final class MacConversationNativeTextCell:
         nativeTextView.textStorage?.setAttributedString(attributedString)
         nativeTextView.invalidateIntrinsicContentSize()
         invalidateIntrinsicContentSize()
+    }
+
+    private static func layerCorners(
+        _ corners: MacConversationNativeTextPresentation.RoundedCorners
+    ) -> CACornerMask {
+        var result: CACornerMask = []
+        if corners.contains(.topLeading) {
+            result.insert(.layerMinXMaxYCorner)
+        }
+        if corners.contains(.topTrailing) {
+            result.insert(.layerMaxXMaxYCorner)
+        }
+        if corners.contains(.bottomLeading) {
+            result.insert(.layerMinXMinYCorner)
+        }
+        if corners.contains(.bottomTrailing) {
+            result.insert(.layerMaxXMinYCorner)
+        }
+        return result
     }
 
     private static func fallbackAttributedString(
@@ -1838,6 +2228,13 @@ private final class MacConversationIntrinsicTextView: NSTextView {
     private let ownedLayoutManager: NSLayoutManager
     private let ownedTextContainer: NSTextContainer
     private var lastMeasuredWidth: CGFloat = -1
+    var maximumIntrinsicWidth: CGFloat? {
+        didSet {
+            if oldValue != maximumIntrinsicWidth {
+                invalidateIntrinsicContentSize()
+            }
+        }
+    }
 
     override init(frame frameRect: NSRect) {
         let textStorage = NSTextStorage()
@@ -1865,6 +2262,27 @@ private final class MacConversationIntrinsicTextView: NSTextView {
     override var intrinsicContentSize: NSSize {
         guard let textContainer, let layoutManager else {
             return NSSize(width: NSView.noIntrinsicMetric, height: 0)
+        }
+        if let maximumIntrinsicWidth {
+            let layoutWidth = max(
+                1,
+                maximumIntrinsicWidth - (textContainerInset.width * 2)
+            )
+            if abs(textContainer.containerSize.width - layoutWidth) > 0.5 {
+                textContainer.containerSize = NSSize(
+                    width: layoutWidth,
+                    height: CGFloat.greatestFiniteMagnitude
+                )
+            }
+            layoutManager.ensureLayout(for: textContainer)
+            let used = layoutManager.usedRect(for: textContainer)
+            return NSSize(
+                width: min(
+                    maximumIntrinsicWidth,
+                    ceil(used.width + (textContainerInset.width * 2))
+                ),
+                height: ceil(used.height + (textContainerInset.height * 2))
+            )
         }
         // Auto Layout can ask before horizontal constraints have assigned the
         // cell its real viewport/max-content width. Laying TextKit out at the
@@ -1920,6 +2338,8 @@ private final class MacConversationIntrinsicTextView: NSTextView {
         textContainer?.widthTracksTextView = true
         textContainer?.heightTracksTextView = false
         textContainer?.lineFragmentPadding = 0
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         setContentHuggingPriority(.required, for: .vertical)
         setContentCompressionResistancePriority(.required, for: .vertical)
     }

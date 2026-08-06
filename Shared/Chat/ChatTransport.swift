@@ -24,8 +24,17 @@ protocol ChatTransport: AnyObject {
     func send(_ envelope: ChatEnvelope) async throws
     /// Closes only the local attachment. Intentional caller-initiated disconnects
     /// do not emit `.disconnected`; that event is reserved for remote/failure closure.
-    func disconnect() async
+    /// The optional final envelope is enqueued without awaiting transport-level
+    /// write completion, so local teardown cannot deadlock behind a stalled
+    /// best-effort detach write.
+    func disconnect(sendingBestEffort envelope: ChatEnvelope?) async
     func events() async -> AsyncStream<ChatTransportEvent>
+}
+
+extension ChatTransport {
+    func disconnect() async {
+        await disconnect(sendingBestEffort: nil)
+    }
 }
 
 actor ChatFixtureTransport: ChatTransport {
@@ -62,20 +71,13 @@ actor ChatFixtureTransport: ChatTransport {
                 isRecoverable: true
             )
         }
-        sent.append(envelope)
-
-        if envelope.type == "session.attach", !deliveredInitialEvents {
-            deliveredInitialEvents = true
-            for event in initialEvents {
-                continuation.yield(.envelope(event))
-            }
-        }
-        for event in commandHandler(envelope) {
-            continuation.yield(.envelope(event))
-        }
+        recordAndRespond(to: envelope)
     }
 
-    func disconnect() async {
+    func disconnect(sendingBestEffort envelope: ChatEnvelope?) async {
+        if let envelope, isConnected {
+            recordAndRespond(to: envelope)
+        }
         guard isConnected else { return }
         isConnected = false
     }
@@ -90,5 +92,18 @@ actor ChatFixtureTransport: ChatTransport {
 
     func yield(_ event: ChatTransportEvent) {
         continuation.yield(event)
+    }
+
+    private func recordAndRespond(to envelope: ChatEnvelope) {
+        sent.append(envelope)
+        if envelope.type == "session.attach", !deliveredInitialEvents {
+            deliveredInitialEvents = true
+            for event in initialEvents {
+                continuation.yield(.envelope(event))
+            }
+        }
+        for event in commandHandler(envelope) {
+            continuation.yield(.envelope(event))
+        }
     }
 }

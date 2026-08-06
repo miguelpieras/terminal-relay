@@ -164,10 +164,113 @@ enum MessageContentKind: String, Codable, Equatable, Sendable {
     case generic
 }
 
+/// Immutable append-chain storage keeps published transcript snapshots cheap:
+/// a streaming delta adds one small node instead of copying the accumulated
+/// String. Materialization is cached and only needed for wire/cache encoding,
+/// exact copy, or one-time full projection work.
+private struct PersistentChatText: Equatable, Sendable {
+    private final class Node: @unchecked Sendable {
+        let previous: Node?
+        let chunk: String
+        let utf8Count: Int
+        let chunkCount: Int
+
+        private let cacheLock = NSLock()
+        private var cachedText: String?
+
+        init(previous: Node?, chunk: String) {
+            self.previous = previous
+            self.chunk = chunk
+            utf8Count = (previous?.utf8Count ?? 0) + chunk.utf8.count
+            chunkCount = (previous?.chunkCount ?? 0) + 1
+            cachedText = previous == nil ? chunk : nil
+        }
+
+        func materialized() -> String {
+            cacheLock.lock()
+            if let cachedText {
+                cacheLock.unlock()
+                return cachedText
+            }
+            cacheLock.unlock()
+
+            var chunks: [String] = []
+            chunks.reserveCapacity(chunkCount)
+            var node: Node? = self
+            while let current = node {
+                chunks.append(current.chunk)
+                node = current.previous
+            }
+            var result = ""
+            result.reserveCapacity(utf8Count)
+            for chunk in chunks.reversed() {
+                result.append(contentsOf: chunk)
+            }
+
+            cacheLock.lock()
+            if cachedText == nil {
+                cachedText = result
+            }
+            let resolved = cachedText ?? result
+            cacheLock.unlock()
+            return resolved
+        }
+
+        var isMaterialized: Bool {
+            cacheLock.lock()
+            let result = cachedText != nil
+            cacheLock.unlock()
+            return result
+        }
+    }
+
+    private let tail: Node
+
+    init(_ value: String) {
+        tail = Node(previous: nil, chunk: value)
+    }
+
+    var string: String { tail.materialized() }
+    var utf8Count: Int { tail.utf8Count }
+    var chunkCount: Int { tail.chunkCount }
+    var isMaterialized: Bool { tail.isMaterialized }
+
+    func appending(_ value: String) -> PersistentChatText {
+        guard !value.isEmpty else { return self }
+        return PersistentChatText(tail: Node(previous: tail, chunk: value))
+    }
+
+    private init(tail: Node) {
+        self.tail = tail
+    }
+
+    static func == (lhs: PersistentChatText, rhs: PersistentChatText) -> Bool {
+        if lhs.tail === rhs.tail { return true }
+        guard lhs.utf8Count == rhs.utf8Count else { return false }
+
+        var left: Node? = lhs.tail
+        var right: Node? = rhs.tail
+        while let leftNode = left, let rightNode = right {
+            if leftNode === rightNode { return true }
+            guard leftNode.chunk == rightNode.chunk else {
+                return lhs.string == rhs.string
+            }
+            left = leftNode.previous
+            right = rightNode.previous
+        }
+        if left == nil, right == nil { return true }
+        return lhs.string == rhs.string
+    }
+}
+
 struct MessageContent: Codable, Equatable, Identifiable, Sendable {
     let id: String
     var kind: MessageContentKind
-    var text: String
+    private var textStorage: PersistentChatText
+    var text: String {
+        get { textStorage.string }
+        set { textStorage = PersistentChatText(newValue) }
+    }
     var language: String?
     var isComplete: Bool
     var isTruncated: Bool
@@ -184,11 +287,60 @@ struct MessageContent: Codable, Equatable, Identifiable, Sendable {
     ) {
         self.id = id
         self.kind = kind
-        self.text = text
+        textStorage = PersistentChatText(text)
         self.language = language
         self.isComplete = isComplete
         self.isTruncated = isTruncated
         self.originalByteCount = originalByteCount
+    }
+
+    var textUTF8Count: Int { textStorage.utf8Count }
+    var textStorageChunkCount: Int { textStorage.chunkCount }
+    var isTextStorageMaterialized: Bool { textStorage.isMaterialized }
+
+    mutating func appendText(_ delta: String) {
+        textStorage = textStorage.appending(delta)
+    }
+
+    func hasSameText(as other: MessageContent) -> Bool {
+        textStorage == other.textStorage
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case kind
+        case text
+        case language
+        case isComplete
+        case isTruncated
+        case originalByteCount
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        kind = try container.decode(MessageContentKind.self, forKey: .kind)
+        textStorage = PersistentChatText(
+            try container.decode(String.self, forKey: .text)
+        )
+        language = try container.decodeIfPresent(String.self, forKey: .language)
+        isComplete = try container.decode(Bool.self, forKey: .isComplete)
+        isTruncated = try container.decode(Bool.self, forKey: .isTruncated)
+        originalByteCount = try container.decodeIfPresent(
+            Int.self,
+            forKey: .originalByteCount
+        )
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(kind, forKey: .kind)
+        try container.encode(text, forKey: .text)
+        try container.encodeIfPresent(language, forKey: .language)
+        try container.encode(isComplete, forKey: .isComplete)
+        try container.encode(isTruncated, forKey: .isTruncated)
+        try container.encodeIfPresent(originalByteCount, forKey: .originalByteCount)
     }
 }
 
@@ -232,7 +384,7 @@ struct ChatMessage: Codable, Equatable, Identifiable, Sendable {
     mutating func append(_ delta: String, contentID: String? = nil) {
         let resolvedID = contentID ?? contents.last?.id ?? "\(id):content:0"
         if let index = contents.firstIndex(where: { $0.id == resolvedID }) {
-            contents[index].text += delta
+            contents[index].appendText(delta)
             contents[index].isComplete = false
         } else {
             contents.append(
@@ -270,9 +422,67 @@ struct ChatMessage: Codable, Equatable, Identifiable, Sendable {
 struct ChatReasoning: Codable, Equatable, Identifiable, Sendable {
     let id: String
     var turnID: String?
-    var text: String
+    private var textStorage: PersistentChatText
+    var text: String {
+        get { textStorage.string }
+        set { textStorage = PersistentChatText(newValue) }
+    }
     var isStreaming: Bool
     var occurredAt: Int64?
+
+    init(
+        id: String,
+        turnID: String?,
+        text: String,
+        isStreaming: Bool,
+        occurredAt: Int64?
+    ) {
+        self.id = id
+        self.turnID = turnID
+        textStorage = PersistentChatText(text)
+        self.isStreaming = isStreaming
+        self.occurredAt = occurredAt
+    }
+
+    var textUTF8Count: Int { textStorage.utf8Count }
+    var textStorageChunkCount: Int { textStorage.chunkCount }
+    var isTextStorageMaterialized: Bool { textStorage.isMaterialized }
+
+    mutating func appendText(_ delta: String) {
+        textStorage = textStorage.appending(delta)
+    }
+
+    func hasSameText(as other: ChatReasoning) -> Bool {
+        textStorage == other.textStorage
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case turnID
+        case text
+        case isStreaming
+        case occurredAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        turnID = try container.decodeIfPresent(String.self, forKey: .turnID)
+        textStorage = PersistentChatText(
+            try container.decode(String.self, forKey: .text)
+        )
+        isStreaming = try container.decode(Bool.self, forKey: .isStreaming)
+        occurredAt = try container.decodeIfPresent(Int64.self, forKey: .occurredAt)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encodeIfPresent(turnID, forKey: .turnID)
+        try container.encode(text, forKey: .text)
+        try container.encode(isStreaming, forKey: .isStreaming)
+        try container.encodeIfPresent(occurredAt, forKey: .occurredAt)
+    }
 }
 
 enum ToolActivityStatus: String, Codable, Equatable, Sendable {
@@ -301,13 +511,122 @@ struct ToolActivity: Codable, Equatable, Identifiable, Sendable {
     var title: String
     var status: ToolActivityStatus
     var input: String?
-    var output: String?
+    private var outputStorage: PersistentChatText?
+    var output: String? {
+        get { outputStorage?.string }
+        set { outputStorage = newValue.map(PersistentChatText.init) }
+    }
     var errorMessage: String?
     var durationMilliseconds: Int64?
     var exitCode: Int?
     var occurredAt: Int64?
     var isTruncated: Bool
     var originalByteCount: Int?
+
+    init(
+        id: String,
+        turnID: String?,
+        kind: ToolActivityKind,
+        title: String,
+        status: ToolActivityStatus,
+        input: String?,
+        output: String?,
+        errorMessage: String?,
+        durationMilliseconds: Int64?,
+        exitCode: Int?,
+        occurredAt: Int64?,
+        isTruncated: Bool,
+        originalByteCount: Int?
+    ) {
+        self.id = id
+        self.turnID = turnID
+        self.kind = kind
+        self.title = title
+        self.status = status
+        self.input = input
+        outputStorage = output.map(PersistentChatText.init)
+        self.errorMessage = errorMessage
+        self.durationMilliseconds = durationMilliseconds
+        self.exitCode = exitCode
+        self.occurredAt = occurredAt
+        self.isTruncated = isTruncated
+        self.originalByteCount = originalByteCount
+    }
+
+    var outputUTF8Count: Int { outputStorage?.utf8Count ?? 0 }
+    var outputStorageChunkCount: Int { outputStorage?.chunkCount ?? 0 }
+    var isOutputStorageMaterialized: Bool {
+        outputStorage?.isMaterialized ?? true
+    }
+
+    mutating func appendOutput(_ delta: String) {
+        if let outputStorage {
+            self.outputStorage = outputStorage.appending(delta)
+        } else {
+            outputStorage = PersistentChatText(delta)
+        }
+    }
+
+    func hasSameOutput(as other: ToolActivity) -> Bool {
+        outputStorage == other.outputStorage
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case turnID
+        case kind
+        case title
+        case status
+        case input
+        case output
+        case errorMessage
+        case durationMilliseconds
+        case exitCode
+        case occurredAt
+        case isTruncated
+        case originalByteCount
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        turnID = try container.decodeIfPresent(String.self, forKey: .turnID)
+        kind = try container.decode(ToolActivityKind.self, forKey: .kind)
+        title = try container.decode(String.self, forKey: .title)
+        status = try container.decode(ToolActivityStatus.self, forKey: .status)
+        input = try container.decodeIfPresent(String.self, forKey: .input)
+        outputStorage = try container.decodeIfPresent(String.self, forKey: .output)
+            .map(PersistentChatText.init)
+        errorMessage = try container.decodeIfPresent(String.self, forKey: .errorMessage)
+        durationMilliseconds = try container.decodeIfPresent(
+            Int64.self,
+            forKey: .durationMilliseconds
+        )
+        exitCode = try container.decodeIfPresent(Int.self, forKey: .exitCode)
+        occurredAt = try container.decodeIfPresent(Int64.self, forKey: .occurredAt)
+        isTruncated = try container.decode(Bool.self, forKey: .isTruncated)
+        originalByteCount = try container.decodeIfPresent(
+            Int.self,
+            forKey: .originalByteCount
+        )
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encodeIfPresent(turnID, forKey: .turnID)
+        try container.encode(kind, forKey: .kind)
+        try container.encode(title, forKey: .title)
+        try container.encode(status, forKey: .status)
+        try container.encodeIfPresent(input, forKey: .input)
+        try container.encodeIfPresent(output, forKey: .output)
+        try container.encodeIfPresent(errorMessage, forKey: .errorMessage)
+        try container.encodeIfPresent(durationMilliseconds, forKey: .durationMilliseconds)
+        try container.encodeIfPresent(exitCode, forKey: .exitCode)
+        try container.encodeIfPresent(occurredAt, forKey: .occurredAt)
+        try container.encode(isTruncated, forKey: .isTruncated)
+        try container.encodeIfPresent(originalByteCount, forKey: .originalByteCount)
+    }
 }
 
 struct ChatDiff: Codable, Equatable, Identifiable, Sendable {
