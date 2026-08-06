@@ -3,6 +3,7 @@ import Foundation
 
 struct MobileChatSessionDependencies {
     let execute: (String) async throws -> Data
+    let executeWithInput: (String, Data) async throws -> Data
     let makeTransport: (String) -> any ChatTransport
 
     static func live(
@@ -13,6 +14,13 @@ struct MobileChatSessionDependencies {
         return MobileChatSessionDependencies(
             execute: { command in
                 try await workerClient.execute(command, on: profile)
+            },
+            executeWithInput: { command, data in
+                try await workerClient.execute(
+                    command,
+                    on: profile,
+                    standardInput: data
+                )
             },
             makeTransport: { command in
                 IOSSSHChatTransport(
@@ -36,6 +44,7 @@ enum MobileChatSessionPhase: Equatable {
 final class MobileChatSessionController: ObservableObject {
     @Published private(set) var phase: MobileChatSessionPhase = .preparing
     @Published private(set) var coordinator: ConversationCoordinator?
+    @Published private(set) var attachmentActions: ChatAttachmentActions?
 
     let kind: AgentKind
     let repositoryName: String
@@ -207,6 +216,7 @@ final class MobileChatSessionController: ObservableObject {
                 return
             }
             self.coordinator = coordinator
+            self.attachmentActions = makeAttachmentActions(identity: identity)
             phase = .chat
             coordinator.start()
         } catch WorkerChatProtocolError.missingMarker {
@@ -230,6 +240,48 @@ final class MobileChatSessionController: ObservableObject {
             return false
         }
         return true
+    }
+
+    private func makeAttachmentActions(
+        identity: ChatConversationIdentity
+    ) -> ChatAttachmentActions? {
+        guard kind == .codex else { return nil }
+        return ChatAttachmentActions(
+            upload: { [dependencies, kind, repositoryName] attachment, requestID in
+                let command = try WorkerRemoteCommand.uploadChatAttachment(
+                    kind: kind,
+                    repositoryName: repositoryName,
+                    relayID: identity.relayID,
+                    requestID: requestID,
+                    attachmentID: attachment.id,
+                    fileExtension: attachment.fileExtension,
+                    byteCount: attachment.byteCount
+                )
+                let output = try await dependencies.executeWithInput(
+                    command,
+                    attachment.data
+                )
+                let path = String(decoding: output, as: UTF8.self)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard path.hasPrefix("/"),
+                      path.utf8.count <= 4_096,
+                      path.unicodeScalars.allSatisfy({
+                          !CharacterSet.controlCharacters.contains($0)
+                      }) else {
+                    throw WorkerChatProtocolError.invalidResponse
+                }
+                return attachment.reference(path: path)
+            },
+            discard: { [dependencies, kind, repositoryName] requestID in
+                guard let command = try? WorkerRemoteCommand.deleteChatAttachmentUpload(
+                    kind: kind,
+                    repositoryName: repositoryName,
+                    relayID: identity.relayID,
+                    requestID: requestID
+                ) else { return }
+                _ = try? await dependencies.execute(command)
+            }
+        )
     }
 
     private var unavailableNativeChatMessage: String {

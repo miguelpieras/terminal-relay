@@ -143,6 +143,8 @@ usage:
   terminal-relay-session chat-start-v1 <codex|claude> <repository> [provider-thread-id] [agent arguments...]
   terminal-relay-session chat-attach-v1 <codex|claude> <repository> <relay-id>
   terminal-relay-session chat-stop-v1 <codex|claude> <repository> <relay-id>
+  terminal-relay-session chat-attachment-upload-v1 <codex> <repository> <relay-id> <request-id> <attachment-id> <extension> <byte-count>
+  terminal-relay-session chat-attachment-delete-v1 <codex> <repository> <relay-id> <request-id>
   terminal-relay-session restore
   terminal-relay-session threads <repository> <active|archived> [cursor]
   terminal-relay-session threads-v2 <codex|claude> <repository> <open|archived> [cursor]
@@ -1963,6 +1965,9 @@ chat_stop_v1() {
         # to stop; still drop the restart intent so boot restore does not
         # relaunch a dead conversation.
         if ! tmux_command has-session -t "$session_name" 2>/dev/null; then
+            run_chat_broker "$provider" cleanup-uploads \
+                --runtime-directory "$runtime_directory" \
+                --relay-id "$relay_id" || return $?
             /bin/rm -f -- "$(chat_intent_file_for "$relay_id")"
             return 0
         fi
@@ -1977,6 +1982,59 @@ chat_stop_v1() {
     done
     echo "Structured chat did not stop cleanly." >&2
     return 70
+}
+
+chat_attachment_upload_v1() {
+    local provider="$1"
+    local repository="$2"
+    local relay_id="$3"
+    local request_id="$4"
+    local attachment_id="$5"
+    local extension="$6"
+    local byte_count="$7"
+
+    [[ "$provider" == "codex" ]] \
+        || fail_usage "File attachment uploads require Codex."
+    is_valid_repository_name "$repository" \
+        || fail_usage "Invalid chat repository: $repository"
+    is_valid_instance "$relay_id" || fail_usage "Invalid chat relay identifier."
+    is_valid_instance "$request_id" || fail_usage "Invalid attachment request identifier."
+    is_valid_instance "$attachment_id" || fail_usage "Invalid attachment identifier."
+    [[ "$extension" =~ ^[a-z0-9]{0,10}$ ]] \
+        || fail_usage "Invalid attachment extension."
+    [[ "$byte_count" =~ ^(0|[1-9][0-9]*)$ && $byte_count -le 26214400 ]] \
+        || fail_usage "Invalid attachment byte count."
+    project_directory_for "$repository" >/dev/null || return $?
+    run_chat_broker "$provider" upload \
+        --runtime-directory "$runtime_directory" \
+        --relay-id "$relay_id" \
+        --provider "$provider" \
+        --repository "$repository" \
+        --request-id "$request_id" \
+        --attachment-id "$attachment_id" \
+        --extension "$extension" \
+        --byte-count "$byte_count"
+}
+
+chat_attachment_delete_v1() {
+    local provider="$1"
+    local repository="$2"
+    local relay_id="$3"
+    local request_id="$4"
+
+    [[ "$provider" == "codex" ]] \
+        || fail_usage "File attachment cleanup requires Codex."
+    is_valid_repository_name "$repository" \
+        || fail_usage "Invalid chat repository: $repository"
+    is_valid_instance "$relay_id" || fail_usage "Invalid chat relay identifier."
+    is_valid_instance "$request_id" || fail_usage "Invalid attachment request identifier."
+    project_directory_for "$repository" >/dev/null || return $?
+    run_chat_broker "$provider" discard-upload \
+        --runtime-directory "$runtime_directory" \
+        --relay-id "$relay_id" \
+        --provider "$provider" \
+        --repository "$repository" \
+        --request-id "$request_id"
 }
 
 require_flock() {
@@ -5716,6 +5774,16 @@ case "$command_name" in
         [[ $# -eq 3 ]] \
             || fail_usage "chat-stop-v1 requires a provider, repository, and relay id."
         chat_stop_v1 "$1" "$2" "$3"
+        ;;
+    chat-attachment-upload-v1)
+        [[ $# -eq 7 ]] \
+            || fail_usage "chat-attachment-upload-v1 requires provider, repository, relay, request, attachment, extension, and byte count."
+        chat_attachment_upload_v1 "$@"
+        ;;
+    chat-attachment-delete-v1)
+        [[ $# -eq 4 ]] \
+            || fail_usage "chat-attachment-delete-v1 requires provider, repository, relay, and request."
+        chat_attachment_delete_v1 "$@"
         ;;
     restore)
         [[ $# -eq 0 ]] || fail_usage "restore does not accept arguments."

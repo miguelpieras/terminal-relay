@@ -171,6 +171,24 @@ conversation. Already-running legacy terminal sessions remain separate; never
 start a terminal against the same provider thread to bypass a native-chat
 failure or provider lock.
 
+## A Codex attachment fails or remains on the worker
+
+First confirm `chat-capabilities-v1 codex` reports
+`file-attachments-v1`. A worker without that feature accepts only the existing
+PNG-image flow; update its runtime before retrying a regular file. The app
+retains selected bytes in memory after a failed upload, so use the attachment's
+Retry action instead of selecting the file again.
+
+After a turn completes, fails, or is interrupted, the relay's temporary
+attachment tree should contain no directory for that request. The same applies
+after a rejected submission or after closing the broker. If cleanup appears
+stuck, inspect only directory counts, ages, ownership, and modes beneath the
+exact relay runtime directory. Do not print, copy, or attach filenames, paths,
+file contents, raw `turn.start` records, provider context, or provider logs to
+an issue. The broker also removes unclaimed request directories older than ten
+minutes; do not delete the repository or broader runtime directories while
+investigating.
+
 ## Thread catalog or built-in MCP is unavailable
 
 Inspect open and archived metadata for one repository without reading its

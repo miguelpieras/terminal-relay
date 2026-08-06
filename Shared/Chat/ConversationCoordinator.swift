@@ -38,7 +38,9 @@ enum ConversationCoordinatorError: LocalizedError, Equatable {
     case emptyPrompt
     case promptTooLarge
     case tooManyAttachments
+    case attachmentsTooLarge
     case attachmentPathTooLarge
+    case unsupportedAttachments
     case turnAlreadyActive
     case noActiveTurn
     case interactionUnavailable
@@ -53,8 +55,12 @@ enum ConversationCoordinatorError: LocalizedError, Equatable {
             "This message is larger than the 256 KiB chat limit."
         case .tooManyAttachments:
             "A turn can include at most 32 attachments."
+        case .attachmentsTooLarge:
+            "The selected attachments exceed the 100 MiB per-message limit."
         case .attachmentPathTooLarge:
             "An attachment path is too long to send safely."
+        case .unsupportedAttachments:
+            "This worker does not support file attachments for this conversation."
         case .turnAlreadyActive:
             "Wait for the current turn to finish before sending another message."
         case .noActiveTurn:
@@ -361,13 +367,18 @@ final class ConversationCoordinator {
         await send(text: text, attachments: attachments)
     }
 
-    func send(text: String, attachments: [ChatAttachmentReference] = []) async {
+    @discardableResult
+    func send(
+        text: String,
+        attachments: [ChatAttachmentReference] = [],
+        requestID suppliedRequestID: String? = nil
+    ) async -> Bool {
         do {
             try validatePrompt(text, attachments: attachments)
             guard !store.hasActiveWorkingTurn, pendingTurnByCommand.isEmpty else {
                 throw ConversationCoordinatorError.turnAlreadyActive
             }
-            let requestID = UUID().uuidString.lowercased()
+            let requestID = suppliedRequestID ?? UUID().uuidString.lowercased()
             let envelope = try ChatCommand.startTurn(
                 text: text,
                 attachments: attachments,
@@ -427,8 +438,10 @@ final class ConversationCoordinator {
                 }
                 throw error
             }
+            return true
         } catch {
             store.setConnectionState(store.state.connectionState, message: sanitizedMessage(for: error))
+            return false
         }
     }
 
@@ -1028,17 +1041,35 @@ final class ConversationCoordinator {
         _ text: String,
         attachments: [ChatAttachmentReference]
     ) throws {
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !attachments.isEmpty else {
             throw ConversationCoordinatorError.emptyPrompt
         }
         guard text.utf8.count <= 256 * 1_024 else {
             throw ConversationCoordinatorError.promptTooLarge
         }
-        guard attachments.count <= 32 else {
+        guard attachments.count <= ChatAttachmentPolicy.maximumCount else {
             throw ConversationCoordinatorError.tooManyAttachments
+        }
+        var attachmentBytes = 0
+        for attachment in attachments {
+            let byteCount = attachment.byteCount ?? 0
+            guard byteCount >= 0,
+                  byteCount <= ChatAttachmentPolicy.maximumFileBytes,
+                  attachmentBytes <= ChatAttachmentPolicy.maximumTurnBytes - byteCount else {
+                throw ConversationCoordinatorError.attachmentsTooLarge
+            }
+            attachmentBytes += byteCount
         }
         guard attachments.allSatisfy({ $0.path.utf8.count <= 4_096 }) else {
             throw ConversationCoordinatorError.attachmentPathTooLarge
+        }
+        guard attachments.allSatisfy({
+            $0.kind == .image
+                || (identity.provider == .codex
+                    && store.state.capabilities.supportsFileAttachments)
+        }) else {
+            throw ConversationCoordinatorError.unsupportedAttachments
         }
     }
 

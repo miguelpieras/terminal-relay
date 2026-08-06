@@ -256,6 +256,65 @@ enum WorkerRemoteCommand {
         ].map(shellQuote).joined(separator: " ")
     }
 
+    static func uploadChatAttachment(
+        kind: AgentKind,
+        repositoryName: String,
+        relayID: String,
+        requestID: String,
+        attachmentID: String,
+        fileExtension: String,
+        byteCount: Int
+    ) throws -> String {
+        try validateSessionIdentity(
+            repositoryName: repositoryName,
+            instanceToken: relayID
+        )
+        guard kind == .codex,
+              ChatWireValidation.isCanonicalUUID(requestID),
+              ChatWireValidation.isCanonicalUUID(attachmentID),
+              fileExtension.range(
+                  of: #"^[a-z0-9]{0,10}$"#,
+                  options: .regularExpression
+              ) != nil,
+              (0...ChatAttachmentPolicy.maximumFileBytes).contains(byteCount) else {
+            throw WorkerRemoteCommandError.invalidInstanceToken
+        }
+        return [
+            WorkerSessionProtocol.helperPath,
+            "chat-attachment-upload-v1",
+            kind.rawValue,
+            repositoryName,
+            relayID,
+            requestID,
+            attachmentID,
+            fileExtension,
+            String(byteCount),
+        ].map(shellQuote).joined(separator: " ")
+    }
+
+    static func deleteChatAttachmentUpload(
+        kind: AgentKind,
+        repositoryName: String,
+        relayID: String,
+        requestID: String
+    ) throws -> String {
+        try validateSessionIdentity(
+            repositoryName: repositoryName,
+            instanceToken: relayID
+        )
+        guard kind == .codex, ChatWireValidation.isCanonicalUUID(requestID) else {
+            throw WorkerRemoteCommandError.invalidInstanceToken
+        }
+        return [
+            WorkerSessionProtocol.helperPath,
+            "chat-attachment-delete-v1",
+            kind.rawValue,
+            repositoryName,
+            relayID,
+            requestID,
+        ].map(shellQuote).joined(separator: " ")
+    }
+
     static func threads(
         kind: AgentKind,
         repositoryName: String,

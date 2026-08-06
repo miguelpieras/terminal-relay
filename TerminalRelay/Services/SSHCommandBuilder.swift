@@ -278,6 +278,50 @@ enum SSHCommandBuilder {
         return batchConfiguration(for: server, remoteCommand: remoteCommand)
     }
 
+    static func workerChatAttachmentUploadConfiguration(
+        for server: ServerProfile,
+        kind: AgentKind,
+        repositoryName: String,
+        relayID: String,
+        requestID: String,
+        attachmentID: String,
+        fileExtension: String,
+        byteCount: Int
+    ) -> SSHLaunchConfiguration {
+        workerSessionStreamConfiguration(
+            for: server,
+            arguments: [
+                "chat-attachment-upload-v1",
+                kind.rawValue,
+                repositoryName,
+                relayID,
+                requestID,
+                attachmentID,
+                fileExtension,
+                String(byteCount),
+            ]
+        )
+    }
+
+    static func workerChatAttachmentDeleteConfiguration(
+        for server: ServerProfile,
+        kind: AgentKind,
+        repositoryName: String,
+        relayID: String,
+        requestID: String
+    ) -> SSHLaunchConfiguration {
+        workerSessionConfiguration(
+            for: server,
+            arguments: [
+                "chat-attachment-delete-v1",
+                kind.rawValue,
+                repositoryName,
+                relayID,
+                requestID,
+            ]
+        )
+    }
+
     static func shellQuote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
     }

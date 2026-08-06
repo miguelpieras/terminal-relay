@@ -35,6 +35,10 @@ The worker and clients enforce the same limits before allocating or decoding:
 | JSON nesting depth | 32 |
 | Prompt text | 256 KiB UTF-8 |
 | Attachment references per turn | 32 |
+| One attachment | 25 MiB |
+| All attachments in one turn | 100 MiB |
+| Attachment display name | 512 bytes UTF-8 |
+| Attachment media type | 255 bytes UTF-8 |
 | One attachment path | 4 KiB UTF-8 |
 | One content/tool item | 1 MiB UTF-8 |
 | File preview | 256 KiB |
@@ -141,6 +145,48 @@ The broker remembers the bounded set of prior mutation results. Repeating an ID
 returns the prior result and never starts another turn, answers twice, or stops
 a replacement session. Reusing an ID with a different command or payload is a
 protocol error.
+
+## Ephemeral attachments
+
+Codex workers that advertise `file-attachments-v1` accept regular files and
+images. Older workers retain the existing PNG-image behavior; clients do not
+send regular files to them. Claude conversations do not accept regular file
+attachments.
+
+The client generates the `turn.start` request UUID before upload and invokes
+one of two fixed, typed SSH helper operations:
+
+```text
+terminal-relay-session chat-attachment-upload-v1 codex <repository> <relay-id> <request-id> <attachment-id> <extension> <byte-count>
+terminal-relay-session chat-attachment-delete-v1 codex <repository> <relay-id> <request-id>
+```
+
+The upload bytes are carried on SSH standard input. The helper creates
+owner-only directories and writes the file atomically as
+`<runtime>/chat-<relay-id>/attachments/<request-id>/<attachment-id>.<extension>`
+with mode `0600`. The original display name is sanitized metadata and is never
+used as a worker path. Repeating an identical upload is idempotent; reusing an
+attachment identity with different bytes is rejected.
+
+Each `turn.start.payload.attachments` entry contains `id`, `kind`
+(`image` or `file`), `displayName`, `mediaType`, `byteCount`, and the returned
+absolute `path`. The broker requires the path to identify the same relay,
+request, and attachment; rejects links, special files, unsafe permissions,
+unexpected ownership, size mismatches, and paths outside the private upload
+tree; and enforces the limits above before invoking the provider.
+
+Codex images are sent as `localImage` inputs. Regular files are exposed only
+through one untrusted `additionalContext.terminal_relay_attachments` value
+containing bounded JSON metadata and worker-local paths. Terminal Relay does
+not copy attachment bytes into the repository, provider history, replay
+window, or its own transcript storage.
+
+The broker deletes the exact request directory after the associated turn
+completes, fails, or is interrupted. It also deletes uploads when validation or
+provider submission fails, when the client explicitly cancels, and when the
+broker starts or stops. A bounded sweep removes unclaimed request directories
+older than ten minutes. Attachment names, paths, and contents are excluded
+from diagnostics.
 
 ## Server events
 

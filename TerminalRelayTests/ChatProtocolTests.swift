@@ -141,7 +141,14 @@ final class ChatProtocolTests: XCTestCase {
         let turn = try ChatCommand.startTurn(
             text: "Hello",
             attachments: [
-                ChatAttachmentReference(path: "/workspace/example/file.png", displayName: "file.png"),
+                ChatAttachmentReference(
+                    id: "11111111-1111-4111-8111-111111111111",
+                    path: "/worker/private/file.txt",
+                    displayName: "Notes.txt",
+                    mediaType: "text/plain",
+                    kind: .file,
+                    byteCount: 12
+                ),
             ],
             options: ChatLaunchOptions(model: "test-model", reasoningEffort: "high")
         ).envelope(identity: ChatTestFixtures.identity)
@@ -150,10 +157,79 @@ final class ChatProtocolTests: XCTestCase {
         XCTAssertEqual(turn.payload["model"]?.stringValue, "test-model")
         XCTAssertEqual(turn.payload["reasoningEffort"]?.stringValue, "high")
         XCTAssertEqual(turn.payload["attachments"]?.arrayValue?.count, 1)
+        let attachment = try XCTUnwrap(turn.payload["attachments"]?.arrayValue?.first)
+        XCTAssertEqual(attachment["id"]?.stringValue, "11111111-1111-4111-8111-111111111111")
+        XCTAssertEqual(attachment["path"]?.stringValue, "/worker/private/file.txt")
+        XCTAssertEqual(attachment["displayName"]?.stringValue, "Notes.txt")
+        XCTAssertEqual(attachment["mediaType"]?.stringValue, "text/plain")
+        XCTAssertEqual(attachment["kind"]?.stringValue, "file")
+        XCTAssertEqual(attachment["byteCount"]?.int64Value, 12)
 
         let encoded = try ChatNDJSONEncoder.encode(turn)
         XCTAssertEqual(encoded.last, 0x0A)
         XCTAssertFalse(encoded.dropLast().contains(0x0A))
+    }
+
+    func testAttachmentReferenceDecodesLegacyImageShape() throws {
+        let data = Data(
+            #"{"id":"attachment","path":"/worker/private/image.png","displayName":"image.png","mediaType":"image/png"}"#.utf8
+        )
+
+        let attachment = try JSONDecoder.chat.decode(
+            ChatAttachmentReference.self,
+            from: data
+        )
+
+        XCTAssertEqual(attachment.kind, .image)
+        XCTAssertNil(attachment.byteCount)
+        XCTAssertEqual(attachment.displayName, "image.png")
+    }
+
+    func testAttachmentPolicyEnforcesCountAndByteLimitsWithoutOverflow() {
+        XCTAssertTrue(
+            ChatAttachmentPolicy.accepts(
+                byteCount: ChatAttachmentPolicy.maximumFileBytes,
+                existingCount: ChatAttachmentPolicy.maximumCount - 1,
+                existingBytes: ChatAttachmentPolicy.maximumTurnBytes
+                    - ChatAttachmentPolicy.maximumFileBytes
+            )
+        )
+        XCTAssertFalse(
+            ChatAttachmentPolicy.accepts(
+                byteCount: ChatAttachmentPolicy.maximumFileBytes + 1,
+                existingCount: 0,
+                existingBytes: 0
+            )
+        )
+        XCTAssertFalse(
+            ChatAttachmentPolicy.accepts(
+                byteCount: 1,
+                existingCount: ChatAttachmentPolicy.maximumCount,
+                existingBytes: 0
+            )
+        )
+        XCTAssertFalse(
+            ChatAttachmentPolicy.accepts(
+                byteCount: 1,
+                existingCount: 0,
+                existingBytes: Int.max
+            )
+        )
+    }
+
+    func testAttachmentDraftSanitizesTheWorkerExtensionAndRetainsBytes() {
+        let draft = ChatAttachmentDraft(
+            id: "22222222-2222-4222-8222-222222222222",
+            displayName: "Quarterly Notes.PDF",
+            mediaType: "application/pdf",
+            kind: .file,
+            fileExtension: "P.D/F-too-long",
+            data: Data("opaque".utf8)
+        )
+
+        XCTAssertEqual(draft.fileExtension, "pdftoolong")
+        XCTAssertEqual(draft.byteCount, 6)
+        XCTAssertEqual(draft.reference(path: "/private/item.pdf").kind, .file)
     }
 
     func testCommandWriterSerializesConcurrentWrites() async throws {

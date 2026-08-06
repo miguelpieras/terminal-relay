@@ -706,10 +706,7 @@ enum Subprocess {
                 .appendingPathComponent("terminal-relay-output-\(UUID().uuidString)")
             let errorURL = fileManager.temporaryDirectory
                 .appendingPathComponent("terminal-relay-error-\(UUID().uuidString)")
-            let inputURL = standardInput.map { _ in
-                fileManager.temporaryDirectory
-                    .appendingPathComponent("terminal-relay-input-\(UUID().uuidString)")
-            }
+            let inputPipe = standardInput.map { _ in Pipe() }
 
             guard fileManager.createFile(
                 atPath: outputURL.path,
@@ -718,10 +715,6 @@ enum Subprocess {
             ), fileManager.createFile(
                 atPath: errorURL.path,
                 contents: nil,
-                attributes: [.posixPermissions: 0o600]
-            ), inputURL == nil || fileManager.createFile(
-                atPath: inputURL!.path,
-                contents: standardInput,
                 attributes: [.posixPermissions: 0o600]
             ) else {
                 throw GitHubProjectError.commandFailed(
@@ -732,27 +725,37 @@ enum Subprocess {
             defer {
                 try? fileManager.removeItem(at: outputURL)
                 try? fileManager.removeItem(at: errorURL)
-                if let inputURL {
-                    try? fileManager.removeItem(at: inputURL)
-                }
             }
 
             let outputHandle = try FileHandle(forWritingTo: outputURL)
             let errorHandle = try FileHandle(forWritingTo: errorURL)
-            let inputHandle = try inputURL.map(FileHandle.init(forReadingFrom:))
             defer {
                 try? outputHandle.close()
                 try? errorHandle.close()
-                try? inputHandle?.close()
+                try? inputPipe?.fileHandleForReading.close()
+                try? inputPipe?.fileHandleForWriting.close()
             }
 
             let process = Process()
             process.executableURL = executable
             process.arguments = arguments
-            process.standardInput = inputHandle
+            process.standardInput = inputPipe?.fileHandleForReading
             process.standardOutput = outputHandle
             process.standardError = errorHandle
             try process.run()
+            if let standardInput, let inputPipe {
+                do {
+                    try inputPipe.fileHandleForWriting.write(contentsOf: standardInput)
+                    try inputPipe.fileHandleForWriting.close()
+                } catch {
+                    try? inputPipe.fileHandleForWriting.close()
+                    if process.isRunning {
+                        process.terminate()
+                    }
+                    process.waitUntilExit()
+                    throw error
+                }
+            }
             process.waitUntilExit()
 
             try outputHandle.synchronize()

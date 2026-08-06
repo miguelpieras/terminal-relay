@@ -328,6 +328,34 @@ final class SSHCommandBuilderTests: XCTestCase {
             ).arguments.last,
             "'/usr/local/bin/terminal-relay-session' 'chat-stop-v1' 'codex' 'terminal-relay' '\(instanceToken)'"
         )
+        let requestID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        let attachmentID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        let upload = SSHCommandBuilder.workerChatAttachmentUploadConfiguration(
+            for: server,
+            kind: .codex,
+            repositoryName: "terminal-relay",
+            relayID: instanceToken,
+            requestID: requestID,
+            attachmentID: attachmentID,
+            fileExtension: "pdf",
+            byteCount: 4_096
+        )
+        XCTAssertTrue(upload.arguments.contains("-T"))
+        XCTAssertFalse(upload.arguments.contains("-tt"))
+        XCTAssertEqual(
+            upload.arguments.last,
+            "'/usr/local/bin/terminal-relay-session' 'chat-attachment-upload-v1' 'codex' 'terminal-relay' '\(instanceToken)' '\(requestID)' '\(attachmentID)' 'pdf' '4096'"
+        )
+        XCTAssertEqual(
+            SSHCommandBuilder.workerChatAttachmentDeleteConfiguration(
+                for: server,
+                kind: .codex,
+                repositoryName: "terminal-relay",
+                relayID: instanceToken,
+                requestID: requestID
+            ).arguments.last,
+            "'/usr/local/bin/terminal-relay-session' 'chat-attachment-delete-v1' 'codex' 'terminal-relay' '\(instanceToken)' '\(requestID)'"
+        )
     }
 
     func testNewChatStartOmitsProviderThreadIdentity() {

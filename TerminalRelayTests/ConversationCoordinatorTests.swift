@@ -108,6 +108,94 @@ final class ConversationCoordinatorTests: XCTestCase {
         XCTAssertEqual(store.state.lastErrorMessage, ConversationCoordinatorError.promptTooLarge.localizedDescription)
     }
 
+    func testAttachmentOnlySendUsesCallerRequestIdentityAndFileMetadata() async {
+        let capabilities = ChatCapabilities(
+            features: ["file-attachments-v1", "streaming"]
+        )
+        let transport = ChatFixtureTransport(
+            initialEvents: [
+                ChatTestFixtures.event(
+                    "session.hello",
+                    sequence: 1,
+                    payload: (try? JSONValue.encoded(capabilities)) ?? .object([:])
+                )
+            ]
+        )
+        let store = ConversationStore()
+        let coordinator = makeCoordinator(store: store, transport: transport)
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+        let requestID = "12345678-1234-4234-8234-123456789abc"
+        let attachment = ChatAttachmentReference(
+            id: "abcdefab-cdef-4abc-8def-abcdefabcdef",
+            path: "/worker/private/attachment.pdf",
+            displayName: "Attachment.pdf",
+            mediaType: "application/pdf",
+            kind: .file,
+            byteCount: 4_096
+        )
+
+        let wasSent = await coordinator.send(
+            text: "",
+            attachments: [attachment],
+            requestID: requestID
+        )
+
+        XCTAssertTrue(wasSent)
+        let start = await transport.sentEnvelopes().last { $0.type == "turn.start" }
+        XCTAssertEqual(start?.requestID, requestID)
+        XCTAssertEqual(start?.payload["text"]?.stringValue, "")
+        let encodedAttachment = start?.payload["attachments"]?.arrayValue?.first
+        XCTAssertEqual(encodedAttachment?["kind"]?.stringValue, "file")
+        XCTAssertEqual(encodedAttachment?["byteCount"]?.int64Value, 4_096)
+    }
+
+    func testFileAttachmentsRequireCapabilityAndRespectByteLimits() async {
+        let transport = makeConnectedTransport()
+        let store = ConversationStore()
+        let coordinator = makeCoordinator(store: store, transport: transport)
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+        let file = ChatAttachmentReference(
+            id: "abcdefab-cdef-4abc-8def-abcdefabcdef",
+            path: "/worker/private/attachment.txt",
+            displayName: "Attachment.txt",
+            mediaType: "text/plain",
+            kind: .file,
+            byteCount: 10
+        )
+
+        let unsupportedWasSent = await coordinator.send(
+            text: "Inspect",
+            attachments: [file]
+        )
+        XCTAssertFalse(unsupportedWasSent)
+        XCTAssertEqual(
+            store.state.lastErrorMessage,
+            ConversationCoordinatorError.unsupportedAttachments.localizedDescription
+        )
+
+        let oversizedImage = ChatAttachmentReference(
+            id: "fedcbafe-dcba-4fed-8cba-fedcbafedcba",
+            path: "/worker/private/image.png",
+            displayName: "image.png",
+            mediaType: "image/png",
+            kind: .image,
+            byteCount: ChatAttachmentPolicy.maximumFileBytes + 1
+        )
+        let oversizedWasSent = await coordinator.send(
+            text: "Inspect",
+            attachments: [oversizedImage]
+        )
+        XCTAssertFalse(oversizedWasSent)
+        XCTAssertEqual(
+            store.state.lastErrorMessage,
+            ConversationCoordinatorError.attachmentsTooLarge.localizedDescription
+        )
+        let starts = await transport.sentEnvelopes().filter { $0.type == "turn.start" }
+        XCTAssertTrue(starts.isEmpty)
+    }
+
     func testInferredResumedTurnRejectsNewSendLocallyAndPreservesDraft() async throws {
         let activeTurnID = "10000000-0000-4000-8000-000000000003"
         let snapshot = try ChatTestFixtures.snapshotEvent(

@@ -202,13 +202,20 @@ private final class SSHParentErrorHandler: ChannelInboundHandler {
 
 private final class SSHExecChannelHandler: ChannelInboundHandler {
     typealias InboundIn = SSHChannelData
+    typealias OutboundOut = SSHChannelData
 
     private let command: String
+    private let standardInput: Data?
     private var resultAccumulator = SSHExecResultAccumulator()
     private var completion: ((Result<SSHExecCommandResult, Error>) -> Void)?
 
-    init(command: String, completion: @escaping (Result<SSHExecCommandResult, Error>) -> Void) {
+    init(
+        command: String,
+        standardInput: Data?,
+        completion: @escaping (Result<SSHExecCommandResult, Error>) -> Void
+    ) {
         self.command = command
+        self.standardInput = standardInput
         self.completion = completion
     }
 
@@ -222,6 +229,28 @@ private final class SSHExecChannelHandler: ChannelInboundHandler {
         context.triggerUserOutboundEvent(
             SSHChannelRequestEvent.ExecRequest(command: command, wantReply: false),
             promise: nil
+        )
+        guard let standardInput else { return }
+        if standardInput.isEmpty {
+            context.close(mode: .output, promise: nil)
+            return
+        }
+        var buffer = context.channel.allocator.buffer(capacity: standardInput.count)
+        buffer.writeBytes(standardInput)
+        let promise = context.eventLoop.makePromise(of: Void.self)
+        promise.futureResult.whenComplete { result in
+            switch result {
+            case .success:
+                context.close(mode: .output, promise: nil)
+            case .failure(let error):
+                context.fireErrorCaught(error)
+            }
+        }
+        context.writeAndFlush(
+            wrapOutboundOut(
+                SSHChannelData(type: .channel, data: .byteBuffer(buffer))
+            ),
+            promise: promise
         )
     }
 
@@ -284,16 +313,23 @@ private final class SSHExecOperation {
     private let profile: WorkerProfile
     private let privateKey: NIOSSHPrivateKey
     private let command: String
+    private let standardInput: Data?
     private var group: MultiThreadedEventLoopGroup?
     private var parentChannel: Channel?
     private var childChannel: Channel?
     private var completion: ((Result<Data, Error>) -> Void)?
     private var isFinished = false
 
-    init(profile: WorkerProfile, privateKey: NIOSSHPrivateKey, command: String) {
+    init(
+        profile: WorkerProfile,
+        privateKey: NIOSSHPrivateKey,
+        command: String,
+        standardInput: Data?
+    ) {
         self.profile = profile
         self.privateKey = privateKey
         self.command = command
+        self.standardInput = standardInput
     }
 
     func start(completion: @escaping (Result<Data, Error>) -> Void) {
@@ -347,7 +383,10 @@ private final class SSHExecOperation {
                     }
                     return child.eventLoop.makeCompletedFuture {
                         try child.pipeline.syncOperations.addHandler(
-                            SSHExecChannelHandler(command: self.command) { [weak self] result in
+                            SSHExecChannelHandler(
+                                command: self.command,
+                                standardInput: self.standardInput
+                            ) { [weak self] result in
                                 self?.handleCommandResult(result)
                             }
                         )
@@ -410,18 +449,33 @@ final class SSHWorkerClient {
         self.identityStore = identityStore
     }
 
-    func execute(_ command: String, on profile: WorkerProfile) async throws -> Data {
+    func execute(
+        _ command: String,
+        on profile: WorkerProfile,
+        standardInput: Data? = nil
+    ) async throws -> Data {
         let privateKey = try identityStore.loadOrCreatePrivateKey()
-        return try await execute(command, on: profile, privateKey: privateKey)
+        return try await execute(
+            command,
+            on: profile,
+            privateKey: privateKey,
+            standardInput: standardInput
+        )
     }
 
     func execute(
         _ command: String,
         on profile: WorkerProfile,
-        privateKey: NIOSSHPrivateKey
+        privateKey: NIOSSHPrivateKey,
+        standardInput: Data? = nil
     ) async throws -> Data {
         return try await withCheckedThrowingContinuation { continuation in
-            let operation = SSHExecOperation(profile: profile, privateKey: privateKey, command: command)
+            let operation = SSHExecOperation(
+                profile: profile,
+                privateKey: privateKey,
+                command: command,
+                standardInput: standardInput
+            )
             operation.start { [operation] result in
                 _ = operation
                 continuation.resume(with: result)

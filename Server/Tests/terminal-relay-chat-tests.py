@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -127,6 +128,271 @@ async def wait_attach_surface(broker) -> None:
     raise AssertionError("broker did not open its attach surface")
 
 
+def exercise_attachment_upload(module, root: pathlib.Path) -> None:
+    runtime = root / "upload-runtime"
+    runtime.mkdir(mode=0o700)
+    os.chmod(runtime, 0o700)
+    relay_id = "91919191-9191-4919-8919-919191919191"
+    module.prepare_session_directory(str(runtime), relay_id)
+    request_id = "92929292-9292-4929-8929-929292929292"
+    attachment_id = "93939393-9393-4939-8939-939393939393"
+
+    def upload(data: bytes, declared_size: int, *, item_id: str = attachment_id):
+        original_stdin = module.sys.stdin
+        module.sys.stdin = SimpleNamespace(buffer=io.BytesIO(data))
+        try:
+            return module.upload_attachment(
+                str(runtime),
+                relay_id,
+                request_id,
+                item_id,
+                "txt",
+                declared_size,
+            )
+        finally:
+            module.sys.stdin = original_stdin
+
+    uploaded = pathlib.Path(upload(b"hello", 5))
+    expected = (
+        runtime
+        / f"chat-{relay_id}"
+        / "attachments"
+        / request_id
+        / f"{attachment_id}.txt"
+    )
+    assert uploaded == expected
+    assert uploaded.read_bytes() == b"hello"
+    assert stat.S_IMODE(os.lstat(uploaded).st_mode) == 0o600
+    assert stat.S_IMODE(os.lstat(uploaded.parent).st_mode) == 0o700
+
+    assert pathlib.Path(upload(b"hello", 5)) == uploaded
+    try:
+        upload(b"other", 5)
+    except module.ChatError as error:
+        assert error.code == "uploadConflict"
+    else:
+        raise AssertionError("accepted conflicting attachment bytes")
+    assert uploaded.read_bytes() == b"hello"
+
+    partial_id = "94949494-9494-4949-8949-949494949494"
+    try:
+        upload(b"no", 4, item_id=partial_id)
+    except module.ChatError as error:
+        assert error.code == "invalidAttachments"
+    else:
+        raise AssertionError("accepted a partial attachment upload")
+    assert not (uploaded.parent / f"{partial_id}.txt").exists()
+    assert not any(entry.name.endswith(".tmp") for entry in uploaded.parent.iterdir())
+
+    try:
+        upload(b"extra", 4, item_id=partial_id)
+    except module.ChatError as error:
+        assert error.code == "invalidAttachments"
+    else:
+        raise AssertionError("accepted excess attachment bytes")
+    assert not (uploaded.parent / f"{partial_id}.txt").exists()
+
+    module.discard_attachment_request(str(runtime), relay_id, request_id)
+    module.discard_attachment_request(str(runtime), relay_id, request_id)
+    assert not uploaded.parent.exists()
+
+    outside = root / "upload-symlink-target"
+    outside.mkdir(mode=0o700)
+    request_directory = uploaded.parent
+    request_directory.symlink_to(outside, target_is_directory=True)
+    try:
+        upload(b"hello", 5)
+    except module.ChatError as error:
+        assert error.code == "unsafeState"
+    else:
+        raise AssertionError("accepted a symbolic upload directory")
+    assert list(outside.iterdir()) == []
+    request_directory.unlink()
+
+
+async def exercise_attachment_lifecycle(module, root: pathlib.Path) -> None:
+    runtime = root / "lifecycle-runtime"
+    project = root / "lifecycle-project"
+    runtime.mkdir(mode=0o700)
+    project.mkdir()
+    os.chmod(runtime, 0o700)
+    relay_id = "a1919191-9191-4919-8919-919191919191"
+    provider = module.FakeProvider(str(project), THREAD_ID, {})
+    broker = module.ChatBroker(
+        "codex", "example-repository", str(project), str(runtime), relay_id, provider, {}
+    )
+    module.prepare_session_directory(str(runtime), relay_id)
+    attachment_root = pathlib.Path(broker.attachment_root)
+    attachment_root.mkdir(mode=0o700)
+    os.chmod(attachment_root, 0o700)
+
+    terminal_events = ("turn.completed", "turn.failed", "turn.interrupted")
+    for index, event_type in enumerate(terminal_events, start=1):
+        request_id = f"{index:08x}-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        turn_id = f"{index + 10:08x}-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        request_directory = attachment_root / request_id
+        request_directory.mkdir(mode=0o700)
+        os.chmod(request_directory, 0o700)
+        attachment_path = request_directory / (
+            f"{index + 20:08x}-cccc-4ccc-8ccc-cccccccccccc.txt"
+        )
+        attachment_path.write_bytes(b"temporary")
+        os.chmod(attachment_path, 0o600)
+        broker.turn_attachment_requests[turn_id] = {request_id}
+        await broker._publish(event_type, {"status": "done"}, turn_id=turn_id)
+        assert not request_directory.exists()
+
+    aggregate_request = "e1e1e1e1-e1e1-4e1e-8e1e-e1e1e1e1e1e1"
+    aggregate_directory = attachment_root / aggregate_request
+    aggregate_directory.mkdir(mode=0o700)
+    os.chmod(aggregate_directory, 0o700)
+    aggregate_attachments = []
+    for index in range(5):
+        attachment_id = f"{index + 30:08x}-eeee-4eee-8eee-eeeeeeeeeeee"
+        path = aggregate_directory / f"{attachment_id}.bin"
+        path.touch(mode=0o600)
+        os.chmod(path, 0o600)
+        os.truncate(path, module.MAX_ATTACHMENT_FILE_BYTES)
+        aggregate_attachments.append(
+            {
+                "id": attachment_id,
+                "path": str(path),
+                "displayName": f"file-{index}.bin",
+                "mediaType": "application/octet-stream",
+                "kind": "file",
+                "byteCount": module.MAX_ATTACHMENT_FILE_BYTES,
+            }
+        )
+    aggregate_payload = {"text": "Inspect", "attachments": aggregate_attachments}
+    aggregate_command = {
+        "type": "turn.start",
+        "requestId": aggregate_request,
+        "relayId": relay_id,
+        "provider": "codex",
+        "providerThreadId": THREAD_ID,
+        "payload": aggregate_payload,
+    }
+    try:
+        await broker._execute_command(
+            "turn.start", aggregate_request, aggregate_payload, aggregate_command
+        )
+    except module.ChatError as error:
+        assert error.code == "invalidAttachments"
+    else:
+        raise AssertionError("accepted attachments over the per-turn limit")
+    assert not aggregate_directory.exists()
+
+    unsupported_request = "e2e2e2e2-e2e2-4e2e-8e2e-e2e2e2e2e2e2"
+    unsupported_directory = attachment_root / unsupported_request
+    unsupported_directory.mkdir(mode=0o700)
+    os.chmod(unsupported_directory, 0o700)
+    unsupported_id = "e3e3e3e3-e3e3-4e3e-8e3e-e3e3e3e3e3e3"
+    unsupported_path = unsupported_directory / f"{unsupported_id}.txt"
+    unsupported_path.write_bytes(b"opaque")
+    os.chmod(unsupported_path, 0o600)
+    broker.provider_name = "claude"
+    try:
+        broker.resolve_turn_attachment(
+            {
+                "id": unsupported_id,
+                "path": str(unsupported_path),
+                "displayName": "opaque.txt",
+                "mediaType": "text/plain",
+                "kind": "file",
+                "byteCount": 6,
+            },
+            unsupported_request,
+        )
+    except module.ChatError as error:
+        assert error.code == "unsupportedAttachments"
+    else:
+        raise AssertionError("accepted a generic file for Claude")
+    finally:
+        broker.provider_name = "codex"
+    module.discard_attachment_request(str(runtime), relay_id, unsupported_request)
+
+    image_request = "e4e4e4e4-e4e4-4e4e-8e4e-e4e4e4e4e4e4"
+    image_directory = attachment_root / image_request
+    image_directory.mkdir(mode=0o700)
+    os.chmod(image_directory, 0o700)
+    image_id = "e5e5e5e5-e5e5-4e5e-8e5e-e5e5e5e5e5e5"
+    mismatched_extension_path = image_directory / f"{image_id}.txt"
+    mismatched_extension_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+    os.chmod(mismatched_extension_path, 0o600)
+    try:
+        broker.resolve_turn_attachment(
+            {
+                "id": image_id,
+                "path": str(mismatched_extension_path),
+                "displayName": "opaque.txt",
+                "mediaType": "text/plain",
+                "kind": "file",
+            },
+            image_request,
+        )
+    except module.ChatError as error:
+        assert error.code == "invalidAttachments"
+    else:
+        raise AssertionError("accepted incomplete managed attachment metadata")
+    for path, media_type in (
+        (mismatched_extension_path, "image/png"),
+        (image_directory / f"{image_id}.png", "image/jpeg"),
+    ):
+        if not path.exists():
+            path.write_bytes(b"\x89PNG\r\n\x1a\n")
+            os.chmod(path, 0o600)
+        try:
+            broker.resolve_turn_attachment(
+                {
+                    "id": image_id,
+                    "path": str(path),
+                    "displayName": "image.png",
+                    "mediaType": media_type,
+                    "kind": "image",
+                    "byteCount": 8,
+                },
+                image_request,
+            )
+        except module.ChatError as error:
+            assert error.code == "invalidAttachments"
+        else:
+            raise AssertionError("accepted mismatched PNG attachment metadata")
+    module.discard_attachment_request(str(runtime), relay_id, image_request)
+
+    claimed_request = "d1d1d1d1-d1d1-4d1d-8d1d-d1d1d1d1d1d1"
+    orphan_request = "d2d2d2d2-d2d2-4d2d-8d2d-d2d2d2d2d2d2"
+    for request_id in (claimed_request, orphan_request):
+        request_directory = attachment_root / request_id
+        request_directory.mkdir(mode=0o700)
+        os.chmod(request_directory, 0o700)
+        os.utime(
+            request_directory,
+            (0, 0),
+            follow_symlinks=False,
+        )
+    broker.turn_attachment_requests[
+        "d3d3d3d3-d3d3-4d3d-8d3d-d3d3d3d3d3d3"
+    ] = {claimed_request}
+    broker.last_attachment_sweep = -module.ATTACHMENT_SWEEP_SECONDS
+    broker._sweep_attachment_orphans()
+    assert (attachment_root / claimed_request).exists()
+    assert not (attachment_root / orphan_request).exists()
+
+    other_relay_id = "d4d4d4d4-d4d4-4d4d-8d4d-d4d4d4d4d4d4"
+    other_attachment_root = (
+        runtime / f"chat-{other_relay_id}" / "attachments"
+    )
+    other_attachment_root.mkdir(parents=True, mode=0o700)
+    os.chmod(other_attachment_root.parent, 0o700)
+    os.chmod(other_attachment_root, 0o700)
+    other_attachment = other_attachment_root / "neighbor.txt"
+    other_attachment.write_bytes(b"other relay")
+    os.chmod(other_attachment, 0o600)
+    broker._clear_all_attachments()
+    assert not attachment_root.exists()
+    assert other_attachment.read_bytes() == b"other relay"
+
+
 async def exercise_protocol(module, root: pathlib.Path) -> None:
     runtime = root / "runtime"
     project = root / "workspace" / "example-repository"
@@ -155,19 +421,14 @@ async def exercise_protocol(module, root: pathlib.Path) -> None:
         provider,
         {},
     )
-    attachment_root = root / "attachments" / RELAY_ID
-    attachment_root.mkdir(parents=True, mode=0o700)
-    os.chmod(attachment_root, 0o700)
-    broker.attachment_root = str(attachment_root.resolve())
-    attachment_name = "abababab-abab-4bab-8bab-abababababab.png"
-    attachment_path = attachment_root / attachment_name
-    attachment_path.write_bytes(b"\x89PNG\r\n\x1a\n")
-    os.chmod(attachment_path, 0o600)
+    legacy_attachment_root = root / "attachments" / RELAY_ID
+    broker.legacy_attachment_root = str(legacy_attachment_root.resolve())
+    legacy_attachment_name = "abababab-abab-4bab-8bab-abababababab.png"
+    legacy_attachment_path = legacy_attachment_root / legacy_attachment_name
     symlink_name = "acacacac-acac-4cac-8cac-acacacacacac.png"
-    symlink_path = attachment_root / symlink_name
-    symlink_path.symlink_to(attachment_path)
+    symlink_path = legacy_attachment_root / symlink_name
     cross_relay_root = root / "attachments" / "99999999-9999-4999-8999-999999999999"
-    cross_relay_root.mkdir(mode=0o700)
+    cross_relay_root.mkdir(parents=True, mode=0o700)
     os.chmod(cross_relay_root, 0o700)
     cross_relay_path = cross_relay_root / "adadadad-adad-4dad-8dad-adadadadadad.png"
     cross_relay_path.write_bytes(b"\x89PNG\r\n\x1a\n")
@@ -181,6 +442,12 @@ async def exercise_protocol(module, root: pathlib.Path) -> None:
     os.chmod(outside_attachment_path, 0o600)
     broker_task = asyncio.create_task(broker.run())
     await wait_ready(broker)
+
+    legacy_attachment_root.mkdir(parents=True, mode=0o700)
+    os.chmod(legacy_attachment_root, 0o700)
+    legacy_attachment_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+    os.chmod(legacy_attachment_path, 0o600)
+    symlink_path.symlink_to(legacy_attachment_path)
 
     socket_info = os.lstat(broker.socket_path)
     state_info = os.lstat(broker.state_path)
@@ -242,11 +509,67 @@ async def exercise_protocol(module, root: pathlib.Path) -> None:
         )["payload"]["code"] == expected_code
     assert provider.start_attempts == 0
 
+    isolated_request_id, isolated_turn = first.command(
+        "turn.start", {"text": "Inspect", "attachments": []}
+    )
+    foreign_request_id = "afafafaf-afaf-4faf-8faf-afafafafafaf"
+    foreign_directory = pathlib.Path(broker.attachment_root) / foreign_request_id
+    foreign_directory.mkdir(parents=True, mode=0o700)
+    os.chmod(pathlib.Path(broker.attachment_root), 0o700)
+    os.chmod(foreign_directory, 0o700)
+    foreign_path = foreign_directory / "bcbcbcbc-bcbc-4cbc-8cbc-bcbcbcbcbcbc.txt"
+    foreign_path.write_bytes(b"private")
+    os.chmod(foreign_path, 0o600)
+    isolated_turn["payload"]["attachments"] = [
+        {
+            "id": "bcbcbcbc-bcbc-4cbc-8cbc-bcbcbcbcbcbc",
+            "path": str(foreign_path),
+            "displayName": "notes.txt",
+            "mediaType": "text/plain",
+            "kind": "file",
+            "byteCount": 7,
+        }
+    ]
+    await first.send(isolated_turn)
+    isolated_error = await first.read_type("error", isolated_request_id)
+    assert isolated_error["payload"]["code"] == "pathOutOfScope"
+    assert foreign_path.exists()
+
+    rejected_request_id, rejected_turn = first.command(
+        "turn.start",
+        {
+            "text": "Inspect",
+            "attachments": [],
+            "model": "invalid model",
+        },
+    )
+    rejected_attachment_id = "bebebebe-bebe-4ebe-8ebe-bebebebebebe"
+    rejected_directory = pathlib.Path(broker.attachment_root) / rejected_request_id
+    rejected_directory.mkdir(mode=0o700)
+    os.chmod(rejected_directory, 0o700)
+    rejected_path = rejected_directory / f"{rejected_attachment_id}.txt"
+    rejected_path.write_bytes(b"reject me")
+    os.chmod(rejected_path, 0o600)
+    rejected_turn["payload"]["attachments"] = [
+        {
+            "id": rejected_attachment_id,
+            "path": str(rejected_path),
+            "displayName": "Rejected.txt",
+            "mediaType": "text/plain",
+            "kind": "file",
+            "byteCount": 9,
+        }
+    ]
+    await first.send(rejected_turn)
+    rejected_error = await first.read_type("error", rejected_request_id)
+    assert rejected_error["payload"]["code"] == "invalidOptions"
+    assert not rejected_directory.exists()
+
     turn_request_id, turn = first.command(
         "turn.start",
         {
             "text": "Build it",
-            "attachments": [{"path": str(attachment_path)}],
+            "attachments": [],
             "model": "example-model",
             "reasoningEffort": "high",
             "sandbox": "workspace-write",
@@ -254,6 +577,24 @@ async def exercise_protocol(module, root: pathlib.Path) -> None:
             "fastMode": True,
         },
     )
+    attachment_id = "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd"
+    attachment_directory = pathlib.Path(broker.attachment_root) / turn_request_id
+    attachment_directory.mkdir(parents=True, mode=0o700)
+    os.chmod(pathlib.Path(broker.attachment_root), 0o700)
+    os.chmod(attachment_directory, 0o700)
+    attachment_path = attachment_directory / f"{attachment_id}.txt"
+    attachment_path.write_bytes(b"build notes")
+    os.chmod(attachment_path, 0o600)
+    turn["payload"]["attachments"] = [
+        {
+            "id": attachment_id,
+            "path": str(attachment_path),
+            "displayName": "Build Notes.txt",
+            "mediaType": "text/plain",
+            "kind": "file",
+            "byteCount": 11,
+        }
+    ]
     await asyncio.gather(first.send(turn), second.send(turn))
     turn_ack = await first.read_type("ack", turn_request_id)
     second_turn_ack = await second.read_type("ack", turn_request_id)
@@ -262,11 +603,48 @@ async def exercise_protocol(module, root: pathlib.Path) -> None:
     assert provider.start_attempts == 1
     assert provider.turn_commands == [turn_request_id]
     assert provider.turn_payloads[0]["attachments"] == [
-        {"path": str(attachment_path)}
+        {
+            "id": attachment_id,
+            "path": str(attachment_path),
+            "displayName": "Build Notes.txt",
+            "mediaType": "text/plain",
+            "kind": "file",
+            "byteCount": 11,
+        }
     ]
+    assert attachment_path.exists()
     await first.send(turn)
     await first.read_type("ack", turn_request_id)
     assert provider.turn_commands == [turn_request_id]
+
+    active_rejection_id, active_rejection = first.command(
+        "turn.start", {"text": "Queue this", "attachments": []}
+    )
+    active_attachment_id = "cececece-cece-4ece-8ece-cececececece"
+    active_rejection_directory = (
+        pathlib.Path(broker.attachment_root) / active_rejection_id
+    )
+    active_rejection_directory.mkdir(mode=0o700)
+    os.chmod(active_rejection_directory, 0o700)
+    active_rejection_path = (
+        active_rejection_directory / f"{active_attachment_id}.txt"
+    )
+    active_rejection_path.write_bytes(b"later")
+    os.chmod(active_rejection_path, 0o600)
+    active_rejection["payload"]["attachments"] = [
+        {
+            "id": active_attachment_id,
+            "path": str(active_rejection_path),
+            "displayName": "Later.txt",
+            "mediaType": "text/plain",
+            "kind": "file",
+            "byteCount": 5,
+        }
+    ]
+    await first.send(active_rejection)
+    active_error = await first.read_type("error", active_rejection_id)
+    assert active_error["payload"]["code"] == "turnActive"
+    assert not active_rejection_directory.exists()
 
     interrupt_id, interrupt = first.command(
         "turn.interrupt", {}, turnId=turn_id
@@ -275,6 +653,7 @@ async def exercise_protocol(module, root: pathlib.Path) -> None:
     assert (
         await first.read_type("ack", interrupt_id)
     )["payload"]["interruptRequested"] is True
+    assert not attachment_directory.exists()
     stale_id, stale_interrupt = first.command(
         "turn.interrupt", {}, turnId=turn_id
     )
@@ -426,6 +805,8 @@ async def exercise_protocol(module, root: pathlib.Path) -> None:
     await stopper.read_type("ack", stop_id)
     await asyncio.wait_for(broker_task, 5)
     assert not pathlib.Path(broker.socket_path).exists()
+    assert not pathlib.Path(broker.attachment_root).exists()
+    assert not pathlib.Path(broker.legacy_attachment_root).exists()
 
     # Provider locks cover the whole broker lifetime and are released at stop.
     second_relay = "77777777-7777-4777-8777-777777777777"
@@ -689,10 +1070,35 @@ async def exercise_codex_adapter(module, root: pathlib.Path) -> None:
     assert mapped_plan["payload"]["steps"][0]["title"] == "Ship it"
 
     request_id = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+    image_path = project / "attachment.png"
+    document_path = project / "attachment.txt"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+    document_path.write_text("worker-local", encoding="utf-8")
     result = await adapter.start_turn(
         {
             "requestId": request_id,
-            "payload": {"text": "go", "attachments": [], "options": {}},
+            "payload": {
+                "text": "go",
+                "attachments": [
+                    {
+                        "id": "01010101-0101-4101-8101-010101010101",
+                        "path": str(image_path),
+                        "displayName": "diagram.png",
+                        "mediaType": "image/png",
+                        "kind": "image",
+                        "byteCount": 8,
+                    },
+                    {
+                        "id": "02020202-0202-4202-8202-020202020202",
+                        "path": str(document_path),
+                        "displayName": "Notes.txt",
+                        "mediaType": "text/plain",
+                        "kind": "file",
+                        "byteCount": 12,
+                    },
+                ],
+                "options": {},
+            },
         }
     )
     assert result["turnId"] == "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
@@ -703,6 +1109,24 @@ async def exercise_codex_adapter(module, root: pathlib.Path) -> None:
     assert turn_request["params"]["effort"] == "high"
     assert turn_request["params"]["sandboxPolicy"]["type"] == "workspaceWrite"
     assert turn_request["params"]["serviceTier"] == "fast"
+    assert turn_request["params"]["input"] == [
+        {"type": "text", "text": "go"},
+        {"type": "localImage", "path": str(image_path)},
+    ]
+    attachment_context = turn_request["params"]["additionalContext"][
+        "terminal_relay_attachments"
+    ]
+    assert attachment_context["kind"] == "untrusted"
+    context_value = attachment_context["value"]
+    context_attachments = json.loads(context_value[context_value.index("[") :])
+    assert context_attachments == [
+        {
+            "displayName": "Notes.txt",
+            "mediaType": "text/plain",
+            "byteCount": 12,
+            "path": str(document_path),
+        }
+    ]
 
     transport.incoming.put(
         {
@@ -1608,6 +2032,8 @@ def exercise_validation(module) -> None:
     claude_capabilities = module.chat_capabilities("claude")
     assert codex_capabilities["supportsAttachments"] is True
     assert claude_capabilities["supportsAttachments"] is True
+    assert "file-attachments-v1" in codex_capabilities["features"]
+    assert "file-attachments-v1" not in claude_capabilities["features"]
     assert codex_capabilities["features"] == sorted(
         set(codex_capabilities["features"])
     )
@@ -1999,6 +2425,8 @@ def run() -> None:
         prefix="tr-chat.", dir="/tmp"
     ) as root:
         root_path = pathlib.Path(os.path.realpath(root))
+        exercise_attachment_upload(module, root_path)
+        asyncio.run(exercise_attachment_lifecycle(module, root_path))
         asyncio.run(exercise_protocol(module, root_path))
         asyncio.run(exercise_early_attach(module, root_path))
         exercise_snapshot_trim(module, root_path)

@@ -1,6 +1,7 @@
 import Foundation
 import OSLog
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Sanitized scroll diagnostics: state names and pin commands only, logged on
 /// transitions rather than per frame. `log stream --predicate 'subsystem ==
@@ -506,6 +507,7 @@ struct ConversationView: View {
     let isReadOnly: Bool
     let showsComposer: Bool
     let startsCoordinator: Bool
+    let attachmentActions: ChatAttachmentActions?
 
     @Environment(\.openURL) private var openURL
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -520,13 +522,15 @@ struct ConversationView: View {
         coordinator: ConversationCoordinator,
         isReadOnly: Bool = false,
         showsComposer: Bool = true,
-        startsCoordinator: Bool = true
+        startsCoordinator: Bool = true,
+        attachmentActions: ChatAttachmentActions? = nil
     ) {
         self.coordinator = coordinator
         _store = ObservedObject(wrappedValue: coordinator.store)
         self.isReadOnly = isReadOnly
         self.showsComposer = showsComposer
         self.startsCoordinator = startsCoordinator
+        self.attachmentActions = attachmentActions
         _rowActions = State(
             wrappedValue: ChatRowActions(
                 store: coordinator.store,
@@ -1249,7 +1253,11 @@ struct ConversationView: View {
     }
 
     private var composer: some View {
-        ConversationComposer(store: store, coordinator: coordinator)
+        ConversationComposer(
+            store: store,
+            coordinator: coordinator,
+            attachmentActions: attachmentActions
+        )
             .frame(maxWidth: 760)
             .padding(.horizontal, horizontalTranscriptPadding)
             .padding(.top, 6)
@@ -2896,8 +2904,14 @@ enum MobileComposerLaunchPolicy {
 private struct ConversationComposer: View {
     @ObservedObject var store: ConversationStore
     let coordinator: ConversationCoordinator
+    let attachmentActions: ChatAttachmentActions?
 
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @State private var attachmentDrafts: [ChatAttachmentDraft] = []
+    @State private var attachmentMessage: String?
+    @State private var isImportingAttachments = false
+    @State private var isSubmittingAttachments = false
+    @State private var pendingAttachmentSubmission: ChatAttachmentSubmission?
 
     #if os(iOS)
     @AppStorage(AgentLaunchDefaults.StorageKey.codexModel)
@@ -2911,24 +2925,37 @@ private struct ConversationComposer: View {
     #endif
 
     private var canSend: Bool {
-        !store.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        (!store.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !attachmentDrafts.isEmpty)
             && !store.state.turnState.isActive
+            && !isSubmittingAttachments
             && (store.state.connectionState == .streaming
                 || store.state.connectionState == .interrupted)
     }
 
+    private var supportsFileAttachments: Bool {
+        coordinator.identity.provider == .codex
+            && store.state.capabilities.supportsFileAttachments
+            && attachmentActions != nil
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if !store.attachments.isEmpty {
+            if !attachmentDrafts.isEmpty {
                 ScrollView(.horizontal) {
                     HStack(spacing: 7) {
-                        ForEach(store.attachments) { attachment in
+                        ForEach(attachmentDrafts) { attachment in
                             HStack(spacing: 6) {
-                                Image(systemName: "paperclip")
+                                Image(
+                                    systemName: attachment.kind == .image
+                                        ? "photo" : "doc"
+                                )
                                 Text(attachment.displayName)
                                     .lineLimit(1)
                                 Button {
-                                    store.removeAttachment(id: attachment.id)
+                                    attachmentDrafts.removeAll {
+                                        $0.id == attachment.id
+                                    }
                                 } label: {
                                     Image(systemName: "xmark.circle.fill")
                                 }
@@ -2946,6 +2973,21 @@ private struct ConversationComposer: View {
                 .scrollIndicators(.hidden)
             }
 
+            if isSubmittingAttachments {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Uploading attachments…")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            } else if let attachmentMessage {
+                Text(attachmentMessage)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .lineLimit(2)
+            }
+
             composerInput
             .padding(.leading, 8)
             .padding(.trailing, 6)
@@ -2960,6 +3002,21 @@ private struct ConversationComposer: View {
         .onAppear {
             synchronizeMobileLaunchOptions()
         }
+        .fileImporter(
+            isPresented: $isImportingAttachments,
+            allowedContentTypes: [.item],
+            allowsMultipleSelection: true,
+            onCompletion: importAttachments
+        )
+        .onChange(of: store.attachments) { _, _ in
+            reconcileAttachmentSubmission()
+        }
+        .onChange(of: store.state.activeTurnID) { _, _ in
+            reconcileAttachmentSubmission()
+        }
+        .onChange(of: store.state.turnState) { _, _ in
+            reconcileAttachmentSubmission()
+        }
         #endif
     }
 
@@ -2969,6 +3026,21 @@ private struct ConversationComposer: View {
         VStack(alignment: .leading, spacing: 0) {
             promptEditor
             HStack(spacing: 4) {
+                if supportsFileAttachments {
+                    Button {
+                        isImportingAttachments = true
+                    } label: {
+                        Image(systemName: "paperclip")
+                            .frame(
+                                width: actionHitTargetSize,
+                                height: actionHitTargetSize
+                            )
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isSubmittingAttachments)
+                    .accessibilityLabel("Attach files")
+                }
                 mobileModelControl
                 mobileEffortControl
                 Spacer(minLength: 8)
@@ -3012,7 +3084,7 @@ private struct ConversationComposer: View {
                         return .ignored
                     case .send:
                         Task {
-                            await coordinator.sendDraft()
+                            await submit()
                         }
                         return .handled
                     case .ignore:
@@ -3021,6 +3093,229 @@ private struct ConversationComposer: View {
                 }
         }
     }
+
+    @MainActor
+    private func submit() async {
+        guard canSend else { return }
+        guard !attachmentDrafts.isEmpty else {
+            await coordinator.sendDraft()
+            return
+        }
+        guard let attachmentActions else {
+            attachmentMessage = "This worker does not support file attachments."
+            return
+        }
+
+        let requestID = UUID().uuidString.lowercased()
+        let submittedDraft = store.draft
+        let submittedAttachments = attachmentDrafts
+        store.draft = ""
+        attachmentDrafts.removeAll()
+        attachmentMessage = nil
+        isSubmittingAttachments = true
+
+        var references: [ChatAttachmentReference] = []
+        do {
+            for attachment in submittedAttachments {
+                references.append(
+                    try await attachmentActions.upload(attachment, requestID)
+                )
+            }
+        } catch {
+            await attachmentActions.discard(requestID)
+            restoreAttachmentDraft(
+                text: submittedDraft,
+                attachments: submittedAttachments
+            )
+            attachmentMessage = error.localizedDescription
+            isSubmittingAttachments = false
+            return
+        }
+
+        let trimmed = submittedDraft.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        let prompt = trimmed.isEmpty
+            ? "Please review the attached \(references.count == 1 ? "file" : "files")."
+            : trimmed
+        pendingAttachmentSubmission = ChatAttachmentSubmission(
+            requestID: requestID,
+            prompt: prompt,
+            draft: submittedDraft,
+            attachments: submittedAttachments,
+            references: references
+        )
+        let wasSent = await coordinator.send(
+            text: prompt,
+            attachments: references,
+            requestID: requestID
+        )
+        guard wasSent else {
+            for reference in references {
+                store.removeAttachment(id: reference.id)
+            }
+            store.draft = ""
+            restoreAttachmentDraft(
+                text: submittedDraft,
+                attachments: submittedAttachments
+            )
+            pendingAttachmentSubmission = nil
+            isSubmittingAttachments = false
+            attachmentMessage = "The attachments were not added. Retry to upload them again."
+            await attachmentActions.discard(requestID)
+            return
+        }
+        reconcileAttachmentSubmission()
+    }
+
+    @MainActor
+    private func reconcileAttachmentSubmission() {
+        guard let pending = pendingAttachmentSubmission else { return }
+        if store.state.activeTurnID != nil || store.state.turnState.isActive {
+            pendingAttachmentSubmission = nil
+            isSubmittingAttachments = false
+            return
+        }
+
+        let restoredIDs = store.attachments.map(\.id)
+        let expectedIDs = pending.references.map(\.id)
+        let connectionEnded: Bool
+        switch store.state.connectionState {
+        case .offlineAgentRunning, .failed, .stopped, .unsupportedWorker:
+            connectionEnded = true
+        case .connecting, .streaming, .awaitingApproval, .interrupted, .unknown:
+            connectionEnded = false
+        }
+        guard restoredIDs == expectedIDs || connectionEnded else { return }
+
+        let typedAfterSubmission: String
+        if store.draft == pending.prompt {
+            typedAfterSubmission = ""
+        } else if store.draft.hasPrefix(pending.prompt + "\n\n") {
+            typedAfterSubmission = String(
+                store.draft.dropFirst(pending.prompt.count + 2)
+            )
+        } else {
+            typedAfterSubmission = store.draft
+        }
+        for reference in pending.references {
+            store.removeAttachment(id: reference.id)
+        }
+        store.draft = typedAfterSubmission
+        restoreAttachmentDraft(
+            text: pending.draft,
+            attachments: pending.attachments
+        )
+        pendingAttachmentSubmission = nil
+        isSubmittingAttachments = false
+        attachmentMessage = "The attachments were not added. Retry to upload them again."
+        Task {
+            await attachmentActions?.discard(pending.requestID)
+        }
+    }
+
+    private func restoreAttachmentDraft(
+        text: String,
+        attachments: [ChatAttachmentDraft]
+    ) {
+        if store.draft.isEmpty {
+            store.draft = text
+        } else if !text.isEmpty, store.draft != text {
+            store.draft = "\(text)\n\n\(store.draft)"
+        }
+        let existingIDs = Set(attachmentDrafts.map(\.id))
+        attachmentDrafts.insert(
+            contentsOf: attachments.filter { !existingIDs.contains($0.id) },
+            at: 0
+        )
+    }
+
+    #if os(iOS)
+    @MainActor
+    private func importAttachments(_ result: Result<[URL], Error>) {
+        switch result {
+        case .failure(let error):
+            attachmentMessage = error.localizedDescription
+        case .success(let urls):
+            attachmentMessage = nil
+            for url in urls {
+                let accessed = url.startAccessingSecurityScopedResource()
+                defer {
+                    if accessed {
+                        url.stopAccessingSecurityScopedResource()
+                    }
+                }
+                do {
+                    let values = try url.resourceValues(forKeys: [
+                        .contentTypeKey,
+                        .fileSizeKey,
+                        .isRegularFileKey,
+                        .isSymbolicLinkKey,
+                    ])
+                    guard values.isRegularFile == true,
+                          values.isSymbolicLink != true else {
+                        attachmentMessage = "Only regular files can be attached."
+                        break
+                    }
+                    if let size = values.fileSize,
+                       size > ChatAttachmentPolicy.maximumFileBytes {
+                        attachmentMessage = "Attachments are limited to 25 MiB each."
+                        break
+                    }
+                    let loaded = try Data(contentsOf: url, options: .mappedIfSafe)
+                    let type = values.contentType
+                    let draft: ChatAttachmentDraft
+                    if let type, type.conforms(to: .image),
+                       let pngData = UIImage(data: loaded)?.pngData() {
+                        draft = ChatAttachmentDraft(
+                            displayName: attachmentDisplayName(url.lastPathComponent),
+                            mediaType: "image/png",
+                            kind: .image,
+                            fileExtension: "png",
+                            data: pngData
+                        )
+                    } else {
+                        draft = ChatAttachmentDraft(
+                            displayName: attachmentDisplayName(url.lastPathComponent),
+                            mediaType: type?.preferredMIMEType
+                                ?? "application/octet-stream",
+                            kind: .file,
+                            fileExtension: type?.preferredFilenameExtension
+                                ?? url.pathExtension,
+                            data: Data(loaded)
+                        )
+                    }
+                    let existingBytes = attachmentDrafts.reduce(0) {
+                        $0 + $1.byteCount
+                    }
+                    guard ChatAttachmentPolicy.accepts(
+                        byteCount: draft.byteCount,
+                        existingCount: attachmentDrafts.count,
+                        existingBytes: existingBytes
+                    ) else {
+                        attachmentMessage = "Attach at most 32 files, 25 MiB each and 100 MiB total."
+                        break
+                    }
+                    attachmentDrafts.append(draft)
+                } catch {
+                    attachmentMessage = error.localizedDescription
+                    break
+                }
+            }
+        }
+    }
+
+    private func attachmentDisplayName(_ value: String) -> String {
+        var result = ""
+        for scalar in value.unicodeScalars {
+            let replacement = CharacterSet.controlCharacters.contains(scalar)
+                ? "_" : String(scalar)
+            guard result.utf8.count + replacement.utf8.count <= 512 else { break }
+            result.append(contentsOf: replacement)
+        }
+        return result.isEmpty ? "Attachment" : result
+    }
+    #endif
 
     @ViewBuilder
     private var turnActionButton: some View {
@@ -3044,7 +3339,7 @@ private struct ConversationComposer: View {
         } else {
             Button {
                 Task {
-                    await coordinator.sendDraft()
+                    await submit()
                 }
             } label: {
                 Image(systemName: "arrow.up")
@@ -3198,6 +3493,14 @@ private struct ConversationComposer: View {
         )
     }
     #endif
+}
+
+private struct ChatAttachmentSubmission {
+    let requestID: String
+    let prompt: String
+    let draft: String
+    let attachments: [ChatAttachmentDraft]
+    let references: [ChatAttachmentReference]
 }
 
 private struct FilePreviewSheet: View {

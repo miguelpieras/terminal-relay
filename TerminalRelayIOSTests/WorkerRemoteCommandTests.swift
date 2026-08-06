@@ -208,12 +208,48 @@ final class WorkerRemoteCommandTests: XCTestCase {
             ),
             "'/usr/local/bin/terminal-relay-session' 'chat-stop-v1' 'codex' 'terminal-relay' '\(instanceToken)'"
         )
+        let requestID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        let attachmentID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        XCTAssertEqual(
+            try WorkerRemoteCommand.uploadChatAttachment(
+                kind: .codex,
+                repositoryName: "terminal-relay",
+                relayID: instanceToken,
+                requestID: requestID,
+                attachmentID: attachmentID,
+                fileExtension: "pdf",
+                byteCount: 4_096
+            ),
+            "'/usr/local/bin/terminal-relay-session' 'chat-attachment-upload-v1' 'codex' 'terminal-relay' '\(instanceToken)' '\(requestID)' '\(attachmentID)' 'pdf' '4096'"
+        )
+        XCTAssertEqual(
+            try WorkerRemoteCommand.deleteChatAttachmentUpload(
+                kind: .codex,
+                repositoryName: "terminal-relay",
+                relayID: instanceToken,
+                requestID: requestID
+            ),
+            "'/usr/local/bin/terminal-relay-session' 'chat-attachment-delete-v1' 'codex' 'terminal-relay' '\(instanceToken)' '\(requestID)'"
+        )
 
         XCTAssertThrowsError(
             try WorkerRemoteCommand.attachChat(
                 kind: .codex,
                 repositoryName: "terminal-relay",
                 relayID: "not-a-relay"
+            )
+        ) { error in
+            XCTAssertEqual(error as? WorkerRemoteCommandError, .invalidInstanceToken)
+        }
+        XCTAssertThrowsError(
+            try WorkerRemoteCommand.uploadChatAttachment(
+                kind: .claude,
+                repositoryName: "terminal-relay",
+                relayID: instanceToken,
+                requestID: requestID,
+                attachmentID: attachmentID,
+                fileExtension: "pdf",
+                byteCount: 4_096
             )
         ) { error in
             XCTAssertEqual(error as? WorkerRemoteCommandError, .invalidInstanceToken)

@@ -156,6 +156,48 @@ final class MobileChatSessionControllerTests: XCTestCase {
         XCTAssertEqual(envelopes.first?.type, "session.attach")
     }
 
+    func testAttachmentActionsStreamBytesAndDeleteTheExactRequest() async throws {
+        let recorder = CommandRecorder(
+            capabilityData: capabilityData(available: true),
+            startData: startData()
+        )
+        let controller = makeNewController(recorder: recorder)
+        controller.start()
+        await waitForPhase(.chat, controller: controller)
+        let actions = try XCTUnwrap(controller.attachmentActions)
+        let requestID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        let attachmentID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        let bytes = Data("opaque mobile bytes".utf8)
+        let draft = ChatAttachmentDraft(
+            id: attachmentID,
+            displayName: "Notes.txt",
+            mediaType: "text/plain",
+            kind: .file,
+            fileExtension: "txt",
+            data: bytes
+        )
+
+        let reference = try await actions.upload(draft, requestID)
+
+        XCTAssertEqual(recorder.standardInputs, [bytes])
+        XCTAssertEqual(recorder.inputCommands.count, 1)
+        XCTAssertTrue(
+            recorder.inputCommands[0].contains("chat-attachment-upload-v1")
+        )
+        XCTAssertTrue(recorder.inputCommands[0].contains(requestID))
+        XCTAssertTrue(recorder.inputCommands[0].contains(attachmentID))
+        XCTAssertFalse(recorder.inputCommands[0].contains("Notes.txt"))
+        XCTAssertEqual(reference.path, "/tmp/terminal-relay-attachment")
+        XCTAssertEqual(reference.kind, .file)
+        XCTAssertEqual(reference.byteCount, bytes.count)
+
+        await actions.discard(requestID)
+        XCTAssertTrue(
+            recorder.commands.last?.contains("chat-attachment-delete-v1") == true
+        )
+        XCTAssertTrue(recorder.commands.last?.contains(requestID) == true)
+    }
+
     func testBackgroundDetachAndForegroundResumeSendDistinctAttachLifecycle() async {
         let recorder = CommandRecorder(
             capabilityData: capabilityData(available: true),
@@ -338,6 +380,8 @@ final class MobileChatSessionControllerTests: XCTestCase {
 @MainActor
 private final class CommandRecorder {
     private(set) var commands: [String] = []
+    private(set) var inputCommands: [String] = []
+    private(set) var standardInputs: [Data] = []
     let transport = ChatFixtureTransport()
     private let capabilityData: Data
     private let startData: Data
@@ -369,6 +413,12 @@ private final class CommandRecorder {
                     return startData
                 }
                 return Data()
+            },
+            executeWithInput: { [weak self] command, data in
+                guard let self else { return Data() }
+                inputCommands.append(command)
+                standardInputs.append(data)
+                return Data("/tmp/terminal-relay-attachment".utf8)
             },
             makeTransport: { [transport] _ in transport }
         )
@@ -405,6 +455,7 @@ private final class BackgroundPreparationRecorder {
                 }
                 return Data()
             },
+            executeWithInput: { _, _ in Data() },
             makeTransport: { [transport] _ in transport }
         )
     }

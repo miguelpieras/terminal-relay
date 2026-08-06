@@ -29,6 +29,7 @@ struct AgentComposerView: View {
     @State private var selectedModelSection: ModelPanelSection?
     @State private var pendingNativeSubmissions: [PendingNativeSubmission] = []
     @State private var nativeSubmissionInFlightID: UUID?
+    @State private var nativeSubmissionAttachmentCount = 0
     @StateObject private var modelPanelClickMonitor = ModelPanelClickMonitor()
 
     private static let codexModels = [
@@ -50,7 +51,7 @@ struct AgentComposerView: View {
             draft: draft,
             hasUploadingAttachments: attachments.contains(where: \.isUploading),
             hasFailedAttachments: attachments.contains { $0.errorMessage != nil },
-            hasUploadedAttachments: attachments.contains(where: \.isUploaded),
+            hasUploadedAttachments: !attachments.isEmpty,
             isSubmitting: nativeSubmissionInFlightID != nil
         )
     }
@@ -90,6 +91,18 @@ struct AgentComposerView: View {
                     .padding(.bottom, 8)
             }
 
+            if nativeSubmissionInFlightID != nil,
+               nativeSubmissionAttachmentCount > 0 {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Uploading attachments…")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.bottom, 8)
+            }
+
             if let pasteNotice {
                 Text(pasteNotice)
                     .font(.caption)
@@ -100,6 +113,19 @@ struct AgentComposerView: View {
 
             HStack(spacing: 10) {
                 modelControls
+
+                if supportsFileAttachments {
+                    Button(action: chooseFiles) {
+                        Image(systemName: "paperclip")
+                            .font(.system(size: 13, weight: .medium))
+                            .frame(width: 30, height: 30)
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(session.status != .running || nativeSubmissionInFlightID != nil)
+                    .accessibilityLabel("Attach files")
+                    .help("Attach files")
+                }
 
                 Spacer(minLength: 8)
 
@@ -187,11 +213,18 @@ struct AgentComposerView: View {
             HStack(spacing: 7) {
                 ForEach(attachments) { attachment in
                     HStack(spacing: 6) {
-                        Image(nsImage: attachment.preview)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: 26, height: 26)
-                            .clipShape(RoundedRectangle(cornerRadius: 5))
+                        if let preview = attachment.preview {
+                            Image(nsImage: preview)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: 26, height: 26)
+                                .clipShape(RoundedRectangle(cornerRadius: 5))
+                        } else {
+                            Image(systemName: "doc")
+                                .font(.system(size: 16))
+                                .foregroundStyle(.secondary)
+                                .frame(width: 26, height: 26)
+                        }
 
                         Text(attachment.name)
                             .font(.caption)
@@ -200,9 +233,19 @@ struct AgentComposerView: View {
                             ProgressView()
                                 .controlSize(.mini)
                         } else if attachment.errorMessage != nil {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .foregroundStyle(.orange)
-                                .help(attachment.errorMessage ?? "")
+                            Button {
+                                if let index = attachments.firstIndex(where: {
+                                    $0.id == attachment.id
+                                }) {
+                                    attachments[index].state = .ready
+                                }
+                            } label: {
+                                Image(systemName: "arrow.clockwise.circle.fill")
+                                    .foregroundStyle(.orange)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Retry: \(attachment.errorMessage ?? "Upload failed")")
+                            .accessibilityLabel("Retry \(attachment.name)")
                         }
 
                         Button {
@@ -566,68 +609,42 @@ struct AgentComposerView: View {
         session.kind == .codex ? codexFastModeEnabled : claudeFastModeEnabled
     }
 
+    private var supportsFileAttachments: Bool {
+        session.usesNativeChat
+            && session.kind == .codex
+            && session.chatCoordinator?.store.state.capabilities
+                .supportsFileAttachments == true
+    }
+
     private func send() {
         guard canSend else { return }
 
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        let remotePaths = attachments.compactMap(\.remotePath)
         if session.usesNativeChat {
             guard let coordinator = session.chatCoordinator else { return }
-            var prompt = text
-            if prompt.isEmpty, !remotePaths.isEmpty {
-                prompt = "Please review the attached \(remotePaths.count == 1 ? "image" : "images")."
-            }
+            let requestID = UUID().uuidString.lowercased()
+            let submissionID = UUID()
             let submittedDraft = draft
             let submittedAttachments = attachments
-            let structuredAttachments: [ChatAttachmentReference] = attachments.compactMap {
-                attachment in
-                guard let path = attachment.remotePath else { return nil }
-                return ChatAttachmentReference(
-                    path: path,
-                    displayName: attachment.name,
-                    mediaType: "image/png"
-                )
-            }
-            synchronizeNativeChatLaunchOptions()
-            let submission = PendingNativeSubmission(
-                id: UUID(),
-                prompt: prompt,
-                draft: submittedDraft,
-                attachments: submittedAttachments,
-                structuredAttachments: structuredAttachments
-            )
-            coordinator.store.clearComposer()
-            pendingNativeSubmissions.append(submission)
-            if pendingNativeSubmissions.count > 32 {
-                pendingNativeSubmissions.removeFirst(
-                    pendingNativeSubmissions.count - 32
-                )
-            }
-            nativeSubmissionInFlightID = submission.id
+            nativeSubmissionInFlightID = submissionID
+            nativeSubmissionAttachmentCount = submittedAttachments.count
             draft = ""
             attachments.removeAll()
             pasteNotice = nil
             Task {
-                await coordinator.send(
-                    text: prompt,
-                    attachments: structuredAttachments
-                )
-                guard pendingNativeSubmissions.contains(where: { $0.id == submission.id }) else {
-                    return
-                }
-                reconcileNativeSubmission(
-                    with: NativeComposerStoreSnapshot(
-                        draft: coordinator.store.draft,
-                        attachments: coordinator.store.attachments,
-                        connectionState: coordinator.store.state.connectionState,
-                        turnState: coordinator.store.state.turnState,
-                        activeTurnID: coordinator.store.state.activeTurnID
-                    )
+                await uploadAndSendNative(
+                    coordinator: coordinator,
+                    submissionID: submissionID,
+                    requestID: requestID,
+                    text: text,
+                    submittedDraft: submittedDraft,
+                    submittedAttachments: submittedAttachments
                 )
             }
             return
         }
 
+        let remotePaths = attachments.compactMap(\.remotePath)
         var prompt = text
         if !remotePaths.isEmpty {
             if prompt.isEmpty {
@@ -641,6 +658,125 @@ struct AgentComposerView: View {
         draft = ""
         attachments.removeAll()
         pasteNotice = nil
+    }
+
+    @MainActor
+    private func uploadAndSendNative(
+        coordinator: ConversationCoordinator,
+        submissionID: UUID,
+        requestID: String,
+        text: String,
+        submittedDraft: String,
+        submittedAttachments: [ComposerAttachment]
+    ) async {
+        var structuredAttachments: [ChatAttachmentReference] = []
+        do {
+            for attachment in submittedAttachments {
+                structuredAttachments.append(
+                    try await AgentAttachmentService.upload(
+                        attachment.draft,
+                        requestID: requestID,
+                        session: session,
+                        worker: worker
+                    )
+                )
+            }
+        } catch {
+            await AgentAttachmentService.discardUpload(
+                requestID: requestID,
+                session: session,
+                worker: worker
+            )
+            restoreNativeComposer(
+                draft: submittedDraft,
+                attachments: submittedAttachments.map {
+                    var restored = $0
+                    restored.state = .failed(error.localizedDescription)
+                    return restored
+                }
+            )
+            if nativeSubmissionInFlightID == submissionID {
+                nativeSubmissionInFlightID = nil
+            }
+            return
+        }
+
+        var prompt = text
+        if prompt.isEmpty, !structuredAttachments.isEmpty {
+            prompt = "Please review the attached \(structuredAttachments.count == 1 ? "file" : "files")."
+        }
+        synchronizeNativeChatLaunchOptions()
+        let submission = PendingNativeSubmission(
+            id: submissionID,
+            requestID: requestID,
+            prompt: prompt,
+            draft: submittedDraft,
+            attachments: submittedAttachments,
+            structuredAttachments: structuredAttachments
+        )
+        pendingNativeSubmissions.append(submission)
+        if pendingNativeSubmissions.count > ChatAttachmentPolicy.maximumCount {
+            pendingNativeSubmissions.removeFirst(
+                pendingNativeSubmissions.count - ChatAttachmentPolicy.maximumCount
+            )
+        }
+        let wasSent = await coordinator.send(
+            text: prompt,
+            attachments: structuredAttachments,
+            requestID: requestID
+        )
+        guard wasSent else {
+            pendingNativeSubmissions.removeAll { $0.id == submission.id }
+            coordinator.store.clearComposer()
+            await AgentAttachmentService.discardUpload(
+                requestID: requestID,
+                session: session,
+                worker: worker
+            )
+            restoreNativeComposer(
+                draft: submittedDraft,
+                attachments: submittedAttachments.map {
+                    var restored = $0
+                    restored.state = .ready
+                    return restored
+                }
+            )
+            if nativeSubmissionInFlightID == submissionID {
+                nativeSubmissionInFlightID = nil
+            }
+            pasteNotice = "The attachments were not added. Retry to upload them again."
+            return
+        }
+        guard pendingNativeSubmissions.contains(where: { $0.id == submission.id }) else {
+            return
+        }
+        reconcileNativeSubmission(
+            with: NativeComposerStoreSnapshot(
+                draft: coordinator.store.draft,
+                attachments: coordinator.store.attachments,
+                connectionState: coordinator.store.state.connectionState,
+                turnState: coordinator.store.state.turnState,
+                activeTurnID: coordinator.store.state.activeTurnID
+            )
+        )
+    }
+
+    private func restoreNativeComposer(
+        draft restoredDraft: String,
+        attachments restoredAttachments: [ComposerAttachment]
+    ) {
+        if draft.isEmpty {
+            draft = restoredDraft
+        } else if !restoredDraft.isEmpty, draft != restoredDraft {
+            draft = "\(restoredDraft)\n\n\(draft)"
+        }
+        let existingAttachmentIDs = Set(attachments.map(\.id))
+        attachments.insert(
+            contentsOf: restoredAttachments.filter {
+                !existingAttachmentIDs.contains($0.id)
+            },
+            at: 0
+        )
     }
 
     private func reconcileNativeSubmission(
@@ -666,20 +802,23 @@ struct AgentComposerView: View {
         if let matchingIndex {
             let submission = pendingNativeSubmissions.remove(at: matchingIndex)
             session.chatCoordinator?.store.clearComposer()
+            Task {
+                await AgentAttachmentService.discardUpload(
+                    requestID: submission.requestID,
+                    session: session,
+                    worker: worker
+                )
+            }
             if nativeSubmissionInFlightID == submission.id {
                 nativeSubmissionInFlightID = nil
             }
-            if draft.isEmpty {
-                draft = submission.draft
-            } else if !submission.draft.isEmpty, draft != submission.draft {
-                draft = "\(submission.draft)\n\n\(draft)"
-            }
-            let existingAttachmentIDs = Set(attachments.map(\.id))
-            attachments.insert(
-                contentsOf: submission.attachments.filter {
-                    !existingAttachmentIDs.contains($0.id)
-                },
-                at: 0
+            restoreNativeComposer(
+                draft: submission.draft,
+                attachments: submission.attachments.map {
+                    var restored = $0
+                    restored.state = .ready
+                    return restored
+                }
             )
             return
         }
@@ -689,6 +828,10 @@ struct AgentComposerView: View {
             turnState: snapshot.turnState,
             activeTurnID: snapshot.activeTurnID
         ) {
+            if let activeID = nativeSubmissionInFlightID,
+               snapshot.activeTurnID != nil || snapshot.turnState.isActive {
+                pendingNativeSubmissions.removeAll { $0.id == activeID }
+            }
             nativeSubmissionInFlightID = nil
         }
     }
@@ -765,34 +908,137 @@ struct AgentComposerView: View {
         session.sendCommand(command)
     }
 
+    private func chooseFiles() {
+        guard supportsFileAttachments else { return }
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.resolvesAliases = true
+        panel.begin { response in
+            guard response == .OK else { return }
+            addFiles(panel.urls)
+        }
+    }
+
+    private func addFiles(_ urls: [URL]) {
+        pasteNotice = nil
+        for url in urls {
+            do {
+                let resourceValues = try url.resourceValues(forKeys: [
+                    .isRegularFileKey,
+                    .fileSizeKey,
+                    .isSymbolicLinkKey,
+                ])
+                guard resourceValues.isRegularFile == true,
+                      resourceValues.isSymbolicLink != true else {
+                    throw AgentAttachmentUploadError.failed
+                }
+                if let fileSize = resourceValues.fileSize,
+                   fileSize > ChatAttachmentPolicy.maximumFileBytes {
+                    throw AgentAttachmentUploadError.tooLarge
+                }
+                let type = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType
+                if let type, type.conforms(to: .image),
+                   let image = NSImage(contentsOf: url),
+                   let clipboardImage = ClipboardImage.make(from: image) {
+                    try appendDraft(
+                        ChatAttachmentDraft(
+                            displayName: safeDisplayName(url.lastPathComponent),
+                            mediaType: "image/png",
+                            kind: .image,
+                            fileExtension: "png",
+                            data: clipboardImage.pngData
+                        )
+                    )
+                } else {
+                    let loaded = try Data(contentsOf: url, options: .mappedIfSafe)
+                    let data = Data(loaded)
+                    try appendDraft(
+                        ChatAttachmentDraft(
+                            displayName: safeDisplayName(url.lastPathComponent),
+                            mediaType: type?.preferredMIMEType ?? "application/octet-stream",
+                            kind: .file,
+                            fileExtension: type?.preferredFilenameExtension
+                                ?? url.pathExtension,
+                            data: data
+                        )
+                    )
+                }
+            } catch {
+                pasteNotice = error.localizedDescription
+                break
+            }
+        }
+    }
+
+    private func appendDraft(_ draft: ChatAttachmentDraft) throws {
+        let existingBytes = attachments.reduce(0) { $0 + $1.draft.byteCount }
+        guard ChatAttachmentPolicy.accepts(
+            byteCount: draft.byteCount,
+            existingCount: attachments.count,
+            existingBytes: existingBytes
+        ) else {
+            if draft.byteCount > ChatAttachmentPolicy.maximumFileBytes {
+                throw AgentAttachmentUploadError.tooLarge
+            }
+            throw AgentAttachmentUploadError.failed
+        }
+        attachments.append(ComposerAttachment(draft: draft, state: .ready))
+    }
+
+    private func safeDisplayName(_ value: String) -> String {
+        var result = ""
+        for scalar in value.unicodeScalars {
+            let replacement = CharacterSet.controlCharacters.contains(scalar) ? "_" : String(scalar)
+            guard result.utf8.count + replacement.utf8.count <= 512 else { break }
+            result.append(contentsOf: replacement)
+        }
+        return result.isEmpty ? "Attachment" : result
+    }
+
     private func addImages(_ images: [ClipboardImage]) {
         guard session.status == .running else { return }
         pasteNotice = nil
 
         for image in images {
-            let attachment = ComposerAttachment(
-                name: "Image \(attachments.count + 1)",
-                preview: image.preview
-            )
-            attachments.append(attachment)
-
-            Task {
-                do {
-                    let path = try await AgentAttachmentService.upload(
-                        pngData: image.pngData,
-                        session: session,
-                        worker: worker
+            do {
+                let index = attachments.count + 1
+                try appendDraft(
+                    ChatAttachmentDraft(
+                        displayName: "Image \(index)",
+                        mediaType: "image/png",
+                        kind: .image,
+                        fileExtension: "png",
+                        data: image.pngData
                     )
-                    guard let index = attachments.firstIndex(where: {
-                        $0.id == attachment.id
-                    }) else { return }
-                    attachments[index].state = .uploaded(path)
-                } catch {
-                    guard let index = attachments.firstIndex(where: {
-                        $0.id == attachment.id
-                    }) else { return }
-                    attachments[index].state = .failed(error.localizedDescription)
+                )
+                if !session.usesNativeChat,
+                   let attachment = attachments.last {
+                    attachments[attachments.count - 1].state = .uploading
+                    Task {
+                        do {
+                            let reference = try await AgentAttachmentService.upload(
+                                attachment.draft,
+                                requestID: UUID().uuidString.lowercased(),
+                                session: session,
+                                worker: worker
+                            )
+                            guard let found = attachments.firstIndex(where: {
+                                $0.id == attachment.id
+                            }) else { return }
+                            attachments[found].state = .uploaded(reference)
+                        } catch {
+                            guard let found = attachments.firstIndex(where: {
+                                $0.id == attachment.id
+                            }) else { return }
+                            attachments[found].state = .failed(error.localizedDescription)
+                        }
+                    }
                 }
+            } catch {
+                pasteNotice = error.localizedDescription
+                break
             }
         }
     }
@@ -896,15 +1142,20 @@ private final class ModelPanelClickMonitor: ObservableObject {
 
 private struct ComposerAttachment: Identifiable {
     enum State {
+        case ready
         case uploading
-        case uploaded(String)
+        case uploaded(ChatAttachmentReference)
         case failed(String)
     }
 
-    let id = UUID()
-    let name: String
-    let preview: NSImage
-    var state: State = .uploading
+    let draft: ChatAttachmentDraft
+    var state: State
+
+    var id: String { draft.id }
+    var name: String { draft.displayName }
+    var preview: NSImage? {
+        draft.kind == .image ? NSImage(data: draft.data) : nil
+    }
 
     var isUploading: Bool {
         if case .uploading = state { return true }
@@ -916,7 +1167,7 @@ private struct ComposerAttachment: Identifiable {
     }
 
     var remotePath: String? {
-        if case .uploaded(let path) = state { return path }
+        if case .uploaded(let reference) = state { return reference.path }
         return nil
     }
 
@@ -928,6 +1179,7 @@ private struct ComposerAttachment: Identifiable {
 
 private struct PendingNativeSubmission {
     let id: UUID
+    let requestID: String
     let prompt: String
     let draft: String
     let attachments: [ComposerAttachment]
@@ -1003,7 +1255,7 @@ private struct ClipboardImage {
         return [converted]
     }
 
-    private static func make(from image: NSImage) -> ClipboardImage? {
+    static func make(from image: NSImage) -> ClipboardImage? {
         guard let tiffData = image.tiffRepresentation,
               let bitmap = NSBitmapImageRep(data: tiffData),
               let pngData = bitmap.representation(using: .png, properties: [:]) else {

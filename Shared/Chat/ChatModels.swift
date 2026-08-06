@@ -148,6 +148,10 @@ struct ChatCapabilities: Codable, Equatable, Sendable {
         self.supportsQuestions = supportsQuestions
         self.supportsAttachments = supportsAttachments
     }
+
+    var supportsFileAttachments: Bool {
+        features.contains("file-attachments-v1")
+    }
 }
 
 enum ChatMessageRole: String, Codable, Equatable, Sendable {
@@ -1135,17 +1139,123 @@ struct ConversationSnapshot: Codable, Equatable, Sendable {
     }
 }
 
+enum ChatAttachmentKind: String, Codable, Equatable, Sendable {
+    case image
+    case file
+}
+
+enum ChatAttachmentPolicy {
+    static let maximumCount = 32
+    static let maximumFileBytes = 25 * 1_024 * 1_024
+    static let maximumTurnBytes = 100 * 1_024 * 1_024
+
+    static func accepts(
+        byteCount: Int,
+        existingCount: Int,
+        existingBytes: Int
+    ) -> Bool {
+        byteCount >= 0
+            && byteCount <= maximumFileBytes
+            && existingCount < maximumCount
+            && existingBytes >= 0
+            && existingBytes <= maximumTurnBytes - byteCount
+    }
+}
+
+struct ChatAttachmentDraft: Equatable, Identifiable, Sendable {
+    let id: String
+    let displayName: String
+    let mediaType: String
+    let kind: ChatAttachmentKind
+    let fileExtension: String
+    let data: Data
+
+    init(
+        id: String = UUID().uuidString.lowercased(),
+        displayName: String,
+        mediaType: String,
+        kind: ChatAttachmentKind,
+        fileExtension: String,
+        data: Data
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.mediaType = mediaType
+        self.kind = kind
+        self.fileExtension = String(
+            fileExtension.lowercased().filter {
+                $0.isASCII && ($0.isLetter || $0.isNumber)
+            }.prefix(10)
+        )
+        self.data = data
+    }
+
+    var byteCount: Int { data.count }
+
+    func reference(path: String) -> ChatAttachmentReference {
+        ChatAttachmentReference(
+            id: id,
+            path: path,
+            displayName: displayName,
+            mediaType: mediaType,
+            kind: kind,
+            byteCount: byteCount
+        )
+    }
+}
+
+struct ChatAttachmentActions {
+    let upload: (
+        _ attachment: ChatAttachmentDraft,
+        _ requestID: String
+    ) async throws -> ChatAttachmentReference
+    let discard: (_ requestID: String) async -> Void
+}
+
 struct ChatAttachmentReference: Codable, Equatable, Identifiable, Sendable {
     let id: String
     let path: String
     let displayName: String
     let mediaType: String?
+    let kind: ChatAttachmentKind
+    let byteCount: Int?
 
-    init(id: String = UUID().uuidString.lowercased(), path: String, displayName: String, mediaType: String? = nil) {
+    init(
+        id: String = UUID().uuidString.lowercased(),
+        path: String,
+        displayName: String,
+        mediaType: String? = nil,
+        kind: ChatAttachmentKind = .image,
+        byteCount: Int? = nil
+    ) {
         self.id = id
         self.path = path
         self.displayName = displayName
         self.mediaType = mediaType
+        self.kind = kind
+        self.byteCount = byteCount
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case path
+        case displayName
+        case mediaType
+        case kind
+        case byteCount
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id)
+            ?? UUID().uuidString.lowercased()
+        path = try container.decode(String.self, forKey: .path)
+        displayName = try container.decodeIfPresent(String.self, forKey: .displayName)
+            ?? URL(fileURLWithPath: path).lastPathComponent
+        mediaType = try container.decodeIfPresent(String.self, forKey: .mediaType)
+        kind = try container.decodeIfPresent(ChatAttachmentKind.self, forKey: .kind)
+            ?? .image
+        byteCount = try container.decodeIfPresent(Int.self, forKey: .byteCount)
     }
 }
 

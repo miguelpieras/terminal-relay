@@ -45,8 +45,9 @@ def protocol_command(
     relay_id: str,
     thread_id: str,
     payload: dict,
+    request_id: str | None = None,
 ) -> tuple[str, dict]:
-    request_id = str(uuid.uuid4())
+    request_id = request_id or str(uuid.uuid4())
     return request_id, {
         "v": 1,
         "type": kind,
@@ -144,6 +145,17 @@ except BlockingIOError:
                 check=check,
             )
 
+        def helper_with_input(*arguments: str, data: bytes, check: bool = True):
+            return subprocess.run(
+                ["/bin/bash", str(HELPER), *arguments],
+                env=environment,
+                input=data,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=15,
+                check=check,
+            )
+
         try:
             capability = helper(
                 "chat-capabilities-v1", "codex", "example-repository"
@@ -155,6 +167,10 @@ except BlockingIOError:
             assert capability_value["available"] is True
             assert capability_value["capabilities"]["protocolVersion"] == 1
             assert capability_value["capabilities"]["supportsAttachments"] is True
+            assert (
+                "file-attachments-v1"
+                in capability_value["capabilities"]["features"]
+            )
 
             start = helper(
                 "chat-start-v1",
@@ -239,6 +255,63 @@ except BlockingIOError:
             )
             assert restored_record.split("|")[8:] == [thread_id, "chat"]
 
+            attachment_request_id = str(uuid.uuid4())
+            attachment_id = str(uuid.uuid4())
+            attachment_bytes = b"worker-local notes\n"
+            upload_arguments = (
+                "chat-attachment-upload-v1",
+                "codex",
+                "example-repository",
+                relay_id,
+                attachment_request_id,
+                attachment_id,
+                "txt",
+                str(len(attachment_bytes)),
+            )
+            upload = helper_with_input(*upload_arguments, data=attachment_bytes)
+            attachment_path = pathlib.Path(upload.stdout.decode("utf-8"))
+            expected_attachment_path = (
+                runtime
+                / f"chat-{relay_id}"
+                / "attachments"
+                / attachment_request_id
+                / f"{attachment_id}.txt"
+            )
+            assert attachment_path == expected_attachment_path
+            assert attachment_path.read_bytes() == attachment_bytes
+            assert stat.S_IMODE(os.lstat(attachment_path).st_mode) == 0o600
+            duplicate = helper_with_input(*upload_arguments, data=attachment_bytes)
+            assert pathlib.Path(duplicate.stdout.decode("utf-8")) == attachment_path
+            conflict = helper_with_input(
+                *upload_arguments,
+                data=b"different contents\n",
+                check=False,
+            )
+            assert conflict.returncode == 75
+            assert attachment_path.read_bytes() == attachment_bytes
+
+            partial_request_id = str(uuid.uuid4())
+            partial_id = str(uuid.uuid4())
+            partial = helper_with_input(
+                "chat-attachment-upload-v1",
+                "codex",
+                "example-repository",
+                relay_id,
+                partial_request_id,
+                partial_id,
+                "bin",
+                "10",
+                data=b"short",
+                check=False,
+            )
+            assert partial.returncode == 64
+            assert not (
+                runtime
+                / f"chat-{relay_id}"
+                / "attachments"
+                / partial_request_id
+            ).exists()
+
             process = subprocess.Popen(
                 [
                     "/bin/bash",
@@ -271,6 +344,56 @@ except BlockingIOError:
             )
             process.stdin.flush()
             assert read_until(process, "ack", ping_id)["payload"]["pong"] is True
+
+            turn_request_id, turn = protocol_command(
+                "turn.start",
+                relay_id,
+                thread_id,
+                {
+                    "text": "Read the attachment",
+                    "attachments": [
+                        {
+                            "id": attachment_id,
+                            "path": str(attachment_path),
+                            "displayName": "Notes.txt",
+                            "mediaType": "text/plain",
+                            "kind": "file",
+                            "byteCount": len(attachment_bytes),
+                        }
+                    ],
+                },
+                request_id=attachment_request_id,
+            )
+            process.stdin.write(
+                (json.dumps(turn, separators=(",", ":")) + "\n").encode("utf-8")
+            )
+            process.stdin.flush()
+            turn_ack = read_until(process, "ack", turn_request_id)
+            provider_turn_id = turn_ack["payload"]["turnId"]
+            assert attachment_path.exists()
+
+            interrupt_id, interrupt = protocol_command(
+                "turn.interrupt",
+                relay_id,
+                thread_id,
+                {},
+            )
+            interrupt["turnId"] = provider_turn_id
+            process.stdin.write(
+                (json.dumps(interrupt, separators=(",", ":")) + "\n").encode(
+                    "utf-8"
+                )
+            )
+            process.stdin.flush()
+            read_until(process, "ack", interrupt_id)
+            assert not attachment_path.parent.exists()
+            helper(
+                "chat-attachment-delete-v1",
+                "codex",
+                "example-repository",
+                relay_id,
+                attachment_request_id,
+            )
 
             detach_id, detach = protocol_command(
                 "session.detach", relay_id, thread_id, {}
@@ -314,10 +437,23 @@ except BlockingIOError:
                 raise AssertionError("stopped chat remained in status")
 
             # Stopping an already-stopped relay is idempotent and cleans up a
-            # leaked restart intent (e.g. from a broker whose resume failed).
+            # leaked restart intent and exact-relay uploads (e.g. from a
+            # broker killed before its shutdown handler ran).
             leaked_intent = runtime / f"{relay_id}.chat-intent"
             leaked_intent.write_text("intent\n", encoding="utf-8")
             leaked_intent.chmod(0o600)
+            leaked_request = str(uuid.uuid4())
+            leaked_upload = (
+                runtime
+                / f"chat-{relay_id}"
+                / "attachments"
+                / leaked_request
+                / f"{uuid.uuid4()}.txt"
+            )
+            leaked_upload.parent.mkdir(parents=True, mode=0o700)
+            leaked_upload.parent.parent.chmod(0o700)
+            leaked_upload.write_bytes(b"stale")
+            leaked_upload.chmod(0o600)
             stale = helper(
                 "chat-stop-v1",
                 "codex",
@@ -327,6 +463,7 @@ except BlockingIOError:
             )
             assert stale.returncode == 0, stale.stderr
             assert not leaked_intent.exists()
+            assert not leaked_upload.parent.parent.exists()
         finally:
             subprocess.run(
                 [tmux, "-f", "/dev/null", "-L", socket_label, "kill-server"],

@@ -35,6 +35,15 @@ Terminal Relay is a client for infrastructure controlled by its user:
   listener, a bounded per-client queue and replay ring, canonical repository
   validation, provider-thread locking, command idempotency, and exact-instance
   stop protection.
+- Codex attachments use one typed SSH upload operation with bytes on standard
+  input. The worker binds every file to the exact relay, turn request, and
+  attachment UUID; writes it atomically with owner-only permissions; enforces
+  per-file and per-turn bounds; and rejects links, special files, unsafe paths,
+  ownership or mode changes, and byte-count mismatches.
+- Temporary attachment requests are removed after completed, failed, or
+  interrupted turns, rejected provider submissions, explicit cancellation,
+  and broker startup or shutdown. A bounded orphan sweep removes abandoned
+  requests without touching active turns or repository files.
 - Provider history remains authoritative. The broker and clients keep bounded
   conversation state in memory and never add a Terminal Relay transcript
   database. Broker recovery metadata contains identifiers and state, not
@@ -64,7 +73,8 @@ Terminal Relay is a client for infrastructure controlled by its user:
 - App and worker diagnostics contain identifiers, state transitions, counts,
   sizes, and sanitized error categories only. They must never include raw
   structured records, terminal contents, provider objects, secret answers, or
-  fetched file content.
+  fetched file content, attachment names, attachment paths, or attachment
+  bytes.
 
 Users are responsible for their worker operating systems, Tailscale policy,
 SSH authorization, agent accounts, repository permissions, backups, and

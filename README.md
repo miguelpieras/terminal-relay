@@ -12,6 +12,8 @@ apps connect directly over SSH.
 
 - Shared native streaming chat on macOS, iPhone, and iPad, including Markdown,
   code, tables, safe links, tool progress, diffs, approvals, and questions.
+- Ephemeral Codex file attachments sent directly over SSH for one turn, then
+  removed from the worker when that turn ends or is rejected.
 - Persistent Codex and Claude conversations with multi-device handoff and
   fail-closed native-chat capability checks.
 - Inactive and archived Codex and Claude conversations can be searched, resumed
