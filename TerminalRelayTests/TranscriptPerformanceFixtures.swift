@@ -26,7 +26,25 @@ enum TranscriptPerformanceFixtures {
     /// cache key. It remains exactly 1,000 items / 8 MiB: replacing messages
     /// with code, tool, and diff records preserves each replaced item's bytes.
     static let mixedMaximumTranscript: [ConversationItem] = {
-        var items = messages(count: 1_000, totalBytes: 8 * oneMiB)
+        let largeMessageBytes = 512 * 1_024
+        var items = messages(
+            count: 999,
+            totalBytes: (8 * oneMiB) - largeMessageBytes
+        )
+        items.insert(
+            .message(
+                ChatMessage(
+                    id: "fixture-large-message",
+                    role: .assistant,
+                    text: uniqueText(
+                        byteCount: largeMessageBytes,
+                        itemIndex: 10_000
+                    ),
+                    occurredAt: 500
+                )
+            ),
+            at: 500
+        )
 
         for index in [251, 751] {
             guard case .message(var message) = items[index] else { continue }

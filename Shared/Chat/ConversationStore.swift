@@ -71,6 +71,7 @@ struct TranscriptProjectionDiagnostics: Equatable, Sendable {
     fileprivate(set) var maximumIncrementalSourceBytes = 0
     fileprivate(set) var lastFirstRowSourceBytes = 0
     fileprivate(set) var maximumFirstRowSourceBytes = 0
+    fileprivate(set) var preparedCompletionAdoptions = 0
 }
 
 enum ConversationReducerError: LocalizedError, Equatable {
@@ -161,10 +162,11 @@ private func finalizedInactiveSnapshotItem(
     }
 }
 
-/// Mirrors the reducer's authoritative completion mutations so the final
-/// bounded rows can be built off the main actor before the completed item is
-/// published. Keep this intentionally limited to completion records: deltas
-/// continue through the store's incremental tail projection path.
+/// Mirrors the reducer's authoritative transcript mutations so the final
+/// bounded rows can be built off the main actor before the item is published.
+/// Ordinary deltas continue through the store's incremental tail projection
+/// path; compatibility `tool.updated` records qualify only when they carry a
+/// cumulative `output` replacement.
 private func completedTranscriptItem(
     for envelope: ChatEnvelope,
     currentItems: [ConversationItem]
@@ -232,10 +234,19 @@ private func completedTranscriptItem(
             )
         )
 
-    case .toolCompleted:
-        let status: ToolActivityStatus =
-            envelope.payload["status"]?.stringValue.flatMap(ToolActivityStatus.init(rawValue:))
-            ?? (envelope.payload["error"]?.isNonNull == true ? .failed : .completed)
+    case .toolUpdated, .toolCompleted:
+        let status: ToolActivityStatus = {
+            if let raw = envelope.payload["status"]?.stringValue,
+               let parsed = ToolActivityStatus(rawValue: raw) {
+                return parsed
+            }
+            if ChatEventKind(rawValue: envelope.type) == .toolCompleted {
+                return envelope.payload["error"]?.isNonNull == true
+                    ? .failed
+                    : .completed
+            }
+            return .running
+        }()
         let kind = ToolActivityKind(
             rawValue: envelope.payload["kind"]?.stringValue ?? ""
         ) ?? .generic
@@ -299,7 +310,7 @@ private func tailOnlyMessageCompletionContentID(
           let updatedContent = updated.contents.first,
           previousContent.id == updatedContent.id,
           previousContent.kind == updatedContent.kind,
-          previousContent.text == updatedContent.text,
+          previousContent.sharesTextStorage(with: updatedContent),
           previousContent.language == updatedContent.language else {
         return nil
     }
@@ -308,7 +319,8 @@ private func tailOnlyMessageCompletionContentID(
     normalizedUpdated.contents = previous.contents
     normalizedUpdated.isStreaming = previous.isStreaming
     normalizedUpdated.isOptimistic = previous.isOptimistic
-    guard normalizedUpdated == previous else { return nil }
+    guard ConversationItem.message(normalizedUpdated)
+        .hasExactTranscriptIdentity(as: .message(previous)) else { return nil }
     return previousContent.id
 }
 
@@ -341,15 +353,16 @@ private func appendOnlyMessageProjectionContentID(
     var normalizedUpdated = updated
     normalizedUpdated.contents = previous.contents
     normalizedUpdated.isStreaming = previous.isStreaming
-    return normalizedUpdated == previous ? contentID : nil
+    return ConversationItem.message(normalizedUpdated)
+        .hasExactTranscriptIdentity(as: .message(previous)) ? contentID : nil
 }
 
 private func appendOnlyReasoningProjection(
     previous: ChatReasoning,
     updated: ChatReasoning
 ) -> Bool {
-    previous.id == updated.id
-        && previous.turnID == updated.turnID
+    chatStringsHaveIdenticalUTF8(previous.id, updated.id)
+        && chatStringsHaveIdenticalUTF8(previous.turnID, updated.turnID)
         && previous.occurredAt == updated.occurredAt
         && updated.isStreaming
 }
@@ -358,17 +371,20 @@ private func appendOnlyToolOutputProjection(
     previous: ToolActivity,
     updated: ToolActivity
 ) -> Bool {
-    guard previous.output?.isEmpty == false,
+    guard previous.outputUTF8Count > 0,
           previous.errorMessage?.isEmpty != false else {
         return false
     }
-    return previous.id == updated.id
-        && previous.turnID == updated.turnID
+    return chatStringsHaveIdenticalUTF8(previous.id, updated.id)
+        && chatStringsHaveIdenticalUTF8(previous.turnID, updated.turnID)
         && previous.kind == updated.kind
-        && previous.title == updated.title
+        && chatStringsHaveIdenticalUTF8(previous.title, updated.title)
         && previous.status == updated.status
-        && previous.input == updated.input
-        && previous.errorMessage == updated.errorMessage
+        && chatStringsHaveIdenticalUTF8(previous.input, updated.input)
+        && chatStringsHaveIdenticalUTF8(
+            previous.errorMessage,
+            updated.errorMessage
+        )
         && previous.durationMilliseconds == updated.durationMilliseconds
         && previous.exitCode == updated.exitCode
         && previous.occurredAt == updated.occurredAt
@@ -388,14 +404,26 @@ struct ConversationReducer {
     func reduce(
         _ envelope: ChatEnvelope,
         into state: inout ConversationState,
-        itemIndex: inout [String: Int]
+        itemIndex: inout [String: Int],
+        preparedPayload: PreparedConversationReducerPayload? = nil
     ) throws -> Bool {
         let kind = ChatEventKind(rawValue: envelope.type)
 
         if kind == .conversationSnapshot {
-            try applySnapshot(envelope, to: &state)
+            try applySnapshot(
+                envelope,
+                preparedPayload: preparedPayload,
+                to: &state
+            )
             rebuildItemIndex(for: state, into: &itemIndex)
             return true
+        }
+
+        // Reject failed detached authoritative preparation before mutating the
+        // durable sequence/generation cursor. Reducer errors must leave the
+        // working state retryable from the same event.
+        if case .invalid = preparedPayload {
+            throw ConversationReducerError.invalidEvent(envelope.type)
         }
 
         // `session.hello` and a pre-attach `error` are attachment-local control
@@ -475,14 +503,36 @@ struct ConversationReducer {
                 state.connectionState = .failed
             }
         case .historyPage:
-            try applyHistoryPage(envelope, to: &state)
+            try applyHistoryPage(
+                envelope,
+                preparedPayload: preparedPayload,
+                to: &state
+            )
             rebuildItemIndex(for: state, into: &itemIndex)
         case .messageStarted, .messageDelta, .messageCompleted:
-            try applyMessage(envelope, kind: kind, to: &state, itemIndex: &itemIndex)
+            try applyMessage(
+                envelope,
+                kind: kind,
+                preparedPayload: preparedPayload,
+                to: &state,
+                itemIndex: &itemIndex
+            )
         case .reasoningStarted, .reasoningDelta, .reasoningCompleted:
-            try applyReasoning(envelope, kind: kind, to: &state, itemIndex: &itemIndex)
+            try applyReasoning(
+                envelope,
+                kind: kind,
+                preparedPayload: preparedPayload,
+                to: &state,
+                itemIndex: &itemIndex
+            )
         case .toolStarted, .toolUpdated, .toolCompleted:
-            try applyTool(envelope, kind: kind, to: &state, itemIndex: &itemIndex)
+            try applyTool(
+                envelope,
+                kind: kind,
+                preparedPayload: preparedPayload,
+                to: &state,
+                itemIndex: &itemIndex
+            )
         case .fileChangeUpdated, .diffUpdated:
             try applyDiff(envelope, to: &state, itemIndex: &itemIndex)
         case .filePreview:
@@ -540,12 +590,22 @@ struct ConversationReducer {
         return true
     }
 
-    private func applySnapshot(_ envelope: ChatEnvelope, to state: inout ConversationState) throws {
+    private func applySnapshot(
+        _ envelope: ChatEnvelope,
+        preparedPayload: PreparedConversationReducerPayload?,
+        to state: inout ConversationState
+    ) throws {
         let snapshot: ConversationSnapshot
-        do {
-            snapshot = try envelope.decodePayload(ConversationSnapshot.self)
-        } catch {
+        if case .conversationSnapshot(let preparedSnapshot) = preparedPayload {
+            snapshot = preparedSnapshot
+        } else if case .invalid = preparedPayload {
             throw ConversationReducerError.invalidEvent(envelope.type)
+        } else {
+            do {
+                snapshot = try envelope.decodePayload(ConversationSnapshot.self)
+            } catch {
+                throw ConversationReducerError.invalidEvent(envelope.type)
+            }
         }
         // The worker admits attaches before its provider has resumed and
         // answers with an empty "connecting" placeholder snapshot. Adopt its
@@ -605,13 +665,24 @@ struct ConversationReducer {
         state.lastErrorMessage = nil
     }
 
-    private func applyHistoryPage(_ envelope: ChatEnvelope, to state: inout ConversationState) throws {
-        let values = envelope.payload["items"]?.arrayValue ?? []
-        let items = try values.map { value -> ConversationItem in
-            do {
-                return try value.decoded()
-            } catch {
-                throw ConversationReducerError.invalidEvent(envelope.type)
+    private func applyHistoryPage(
+        _ envelope: ChatEnvelope,
+        preparedPayload: PreparedConversationReducerPayload?,
+        to state: inout ConversationState
+    ) throws {
+        let items: [ConversationItem]
+        if case .historyPage(let preparedItems) = preparedPayload {
+            items = preparedItems
+        } else if case .invalid = preparedPayload {
+            throw ConversationReducerError.invalidEvent(envelope.type)
+        } else {
+            let values = envelope.payload["items"]?.arrayValue ?? []
+            items = try values.map { value -> ConversationItem in
+                do {
+                    return try value.decoded()
+                } catch {
+                    throw ConversationReducerError.invalidEvent(envelope.type)
+                }
             }
         }
         let existingIDs = Set(state.items.map(\.id))
@@ -624,6 +695,7 @@ struct ConversationReducer {
     private func applyMessage(
         _ envelope: ChatEnvelope,
         kind: ChatEventKind,
+        preparedPayload: PreparedConversationReducerPayload?,
         to state: inout ConversationState,
         itemIndex: inout [String: Int]
     ) throws {
@@ -642,6 +714,21 @@ struct ConversationReducer {
                 return message.id == "client:\(clientMessageID)" && message.id != itemID
             }
             rebuildItemIndex(for: state, into: &itemIndex)
+        }
+
+        // Detached preparation has already applied and compared the complete
+        // authoritative text. Adopt that exact item so the main actor never
+        // walks a megabyte-scale streamed value a second time at completion.
+        if kind == .messageCompleted,
+           case .completedItem(.message(let preparedMessage)) = preparedPayload,
+           preparedMessage.id == itemID {
+            if let index = itemIndex[itemID], state.items.indices.contains(index) {
+                state.items[index] = .message(preparedMessage)
+            } else {
+                state.items.append(.message(preparedMessage))
+                itemIndex[itemID] = state.items.count - 1
+            }
+            return
         }
 
         if let index = itemIndex[itemID],
@@ -663,7 +750,7 @@ struct ConversationReducer {
                     originalByteCount: envelope.payload["originalByteCount"]?.intValue
                 )
             default:
-                if !text.isEmpty, message.text.isEmpty {
+                if !text.isEmpty, !message.hasText {
                     message.complete(text: text)
                     message.isStreaming = true
                 }
@@ -695,6 +782,7 @@ struct ConversationReducer {
     private func applyReasoning(
         _ envelope: ChatEnvelope,
         kind: ChatEventKind,
+        preparedPayload: PreparedConversationReducerPayload?,
         to state: inout ConversationState,
         itemIndex: inout [String: Int]
     ) throws {
@@ -702,6 +790,19 @@ struct ConversationReducer {
             throw ConversationReducerError.invalidEvent(envelope.type)
         }
         let text = envelope.payload["text"]?.stringValue ?? ""
+
+        if kind == .reasoningCompleted,
+           case .completedItem(.reasoning(let preparedReasoning)) = preparedPayload,
+           preparedReasoning.id == itemID {
+            if let index = itemIndex[itemID], state.items.indices.contains(index) {
+                state.items[index] = .reasoning(preparedReasoning)
+            } else {
+                state.items.append(.reasoning(preparedReasoning))
+                itemIndex[itemID] = state.items.count - 1
+            }
+            return
+        }
+
         if let index = itemIndex[itemID],
            case .reasoning(var reasoning) = state.items[index] {
             if kind == .reasoningCompleted {
@@ -731,6 +832,7 @@ struct ConversationReducer {
     private func applyTool(
         _ envelope: ChatEnvelope,
         kind: ChatEventKind,
+        preparedPayload: PreparedConversationReducerPayload?,
         to state: inout ConversationState,
         itemIndex: inout [String: Int]
     ) throws {
@@ -756,6 +858,19 @@ struct ConversationReducer {
         let title = envelope.payload["title"]?.stringValue
             ?? envelope.payload["name"]?.stringValue
             ?? "Agent activity"
+
+        let hasAuthoritativeOutput = envelope.payload["output"]?.isNonNull == true
+        if (kind == .toolCompleted || (kind == .toolUpdated && hasAuthoritativeOutput)),
+           case .completedItem(.tool(let preparedTool)) = preparedPayload,
+           preparedTool.id == itemID {
+            if let index = itemIndex[itemID], state.items.indices.contains(index) {
+                state.items[index] = .tool(preparedTool)
+            } else {
+                state.items.append(.tool(preparedTool))
+                itemIndex[itemID] = state.items.count - 1
+            }
+            return
+        }
 
         if let index = itemIndex[itemID],
            case .tool(var tool) = state.items[index] {
@@ -1207,6 +1322,35 @@ struct PreparedTranscriptProjection: Sendable {
 
 typealias PreparedTranscriptProjectionBatch = [String: PreparedTranscriptProjection]
 
+/// Typed authoritative payload decoded before the main-actor store applies an
+/// event. Snapshot/history JSON can contain the entire retained transcript, so
+/// re-encoding and decoding it inside `ConversationReducer.reduce` would still
+/// interrupt an active scroll even when transcript publication is frozen.
+enum PreparedConversationReducerPayload: Sendable {
+    case conversationSnapshot(ConversationSnapshot)
+    case historyPage([ConversationItem])
+    case completedItem(ConversationItem)
+    case invalid
+
+    func preservesPaintedTranscript(previousItemCount: Int) -> Bool {
+        guard previousItemCount > 0,
+              case .conversationSnapshot(let snapshot) = self else {
+            return false
+        }
+        return snapshot.connectionState == .connecting
+            && snapshot.items.isEmpty
+            && snapshot.approvals.isEmpty
+            && snapshot.questions.isEmpty
+    }
+}
+
+struct PreparedConversationApplication: Sendable {
+    let transcriptProjections: PreparedTranscriptProjectionBatch
+    let reducerPayload: PreparedConversationReducerPayload?
+    let markdownWarmTexts: [String]
+    let preservedSnapshotItemIDs: Set<String>
+}
+
 @MainActor
 final class ConversationStore: ObservableObject {
     private struct ProjectionCacheEntry {
@@ -1348,9 +1492,15 @@ final class ConversationStore: ObservableObject {
     @discardableResult
     func apply(
         _ envelope: ChatEnvelope,
-        preparedTranscriptProjections: PreparedTranscriptProjectionBatch = [:]
+        preparedTranscriptProjections: PreparedTranscriptProjectionBatch = [:],
+        preparedReducerPayload: PreparedConversationReducerPayload? = nil,
+        preservedSnapshotItemIDs: Set<String> = []
     ) throws -> Bool {
         let previousItemCount = workingState.items.count
+        let preservesPaintedTranscript = preparedReducerPayload?
+            .preservesPaintedTranscript(
+                previousItemCount: previousItemCount
+            ) == true
         let terminalTranscriptChanges = Self.terminalTranscriptChanges(
             for: envelope,
             in: workingState
@@ -1369,16 +1519,35 @@ final class ConversationStore: ObservableObject {
             try reducer.reduce(
                 envelope,
                 into: &workingState,
-                itemIndex: &workingItemIndexByID
+                itemIndex: &workingItemIndexByID,
+                preparedPayload: preparedReducerPayload
             )
         }
         guard didApply else { return false }
+        let adoptedPreparedTranscriptItem: Bool
+        switch (ChatEventKind(rawValue: envelope.type), preparedReducerPayload) {
+        case (.messageCompleted, .completedItem(.message(let item))):
+            adoptedPreparedTranscriptItem = item.id == changedItemID
+        case (.reasoningCompleted, .completedItem(.reasoning(let item))):
+            adoptedPreparedTranscriptItem = item.id == changedItemID
+        case (.toolCompleted, .completedItem(.tool(let item))):
+            adoptedPreparedTranscriptItem = item.id == changedItemID
+        case (.toolUpdated, .completedItem(.tool(let item))):
+            adoptedPreparedTranscriptItem = envelope.payload["output"]?.isNonNull == true
+                && item.id == changedItemID
+        default:
+            adoptedPreparedTranscriptItem = false
+        }
+        if adoptedPreparedTranscriptItem {
+            projectionDiagnostics.preparedCompletionAdoptions += 1
+        }
         if (envelope.sequence ?? 0) > 0
             || ChatEventKind(rawValue: envelope.type) != .sessionHeartbeat {
             hasPendingStatePublication = true
         }
         let isTerminalTurnEvent = Self.isTerminalTurnEvent(envelope)
-        if Self.affectsTranscriptContent(envelope),
+        if !preservesPaintedTranscript,
+           Self.affectsTranscriptContent(envelope),
            !isTerminalTurnEvent || !terminalTranscriptChanges.isEmpty {
             transcriptContentRevision &+= 1
         }
@@ -1387,7 +1556,7 @@ final class ConversationStore: ObservableObject {
             || envelope.type == ChatEventKind.historyPage.rawValue
             || envelope.payload["clientUserMessageId"]?.stringValue != nil
             || workingState.items.count != previousItemCount
-        if requiresFullByteRecount {
+        if requiresFullByteRecount && !preservesPaintedTranscript {
             recountRetainedContentBytes()
         } else if let changedItemID,
                   let changedItemIndex,
@@ -1407,13 +1576,17 @@ final class ConversationStore: ObservableObject {
             changedItemID: changedItemID,
             changedItemWasPresent: changedItemIndex != nil,
             previousItemCount: previousItemCount,
-            terminalTranscriptChanges: terminalTranscriptChanges
+            terminalTranscriptChanges: terminalTranscriptChanges,
+            preservesPaintedTranscript: preservesPaintedTranscript
         )
         synchronizeItemContentRevisions(
             after: envelope,
             changedItemID: changedItemID,
             previousItemCount: previousItemCount,
-            terminalTranscriptChanges: terminalTranscriptChanges
+            terminalTranscriptChanges: terminalTranscriptChanges,
+            preparedReducerPayload: preparedReducerPayload,
+            preservedSnapshotItemIDs: preservedSnapshotItemIDs,
+            preservesPaintedTranscript: preservesPaintedTranscript
         )
         recordProjectionChange(
             for: envelope,
@@ -1468,6 +1641,158 @@ final class ConversationStore: ObservableObject {
         }
     }
 
+    /// Converts only transcript-sized authoritative payloads to typed values on
+    /// a detached executor. Ordinary deltas already expose their small fields
+    /// directly and do not need this extra preparation step.
+    nonisolated static func prepareAuthoritativeReducerPayload(
+        for envelope: ChatEnvelope,
+        retaining currentItem: ConversationItem? = nil
+    ) async -> PreparedConversationReducerPayload? {
+        let kind = ChatEventKind(rawValue: envelope.type)
+        let isCumulativeToolUpdate = kind == .toolUpdated
+            && envelope.payload["output"]?.isNonNull == true
+        guard kind == .conversationSnapshot
+                || kind == .historyPage
+                || kind == .messageCompleted
+                || kind == .reasoningCompleted
+                || kind == .toolCompleted
+                || isCumulativeToolUpdate else {
+            return nil
+        }
+        let task = Task.detached(priority: .userInitiated) {
+            () -> PreparedConversationReducerPayload in
+            switch kind {
+            case .conversationSnapshot:
+                guard let snapshot = try? envelope.decodePayload(
+                    ConversationSnapshot.self
+                ) else {
+                    return .invalid
+                }
+                return .conversationSnapshot(snapshot)
+
+            case .historyPage:
+                let values = envelope.payload["items"]?.arrayValue ?? []
+                var items: [ConversationItem] = []
+                items.reserveCapacity(values.count)
+                for value in values {
+                    guard !Task.isCancelled,
+                          let item: ConversationItem = try? value.decoded() else {
+                        return .invalid
+                    }
+                    items.append(item)
+                }
+                return .historyPage(items)
+
+            case .messageCompleted, .reasoningCompleted,
+                 .toolCompleted, .toolUpdated:
+                guard let item = completedTranscriptItem(
+                    for: envelope,
+                    currentItems: currentItem.map { [$0] } ?? []
+                ) else {
+                    return .invalid
+                }
+                return .completedItem(item)
+
+            default:
+                return .invalid
+            }
+        }
+        return await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    nonisolated static func prepareMarkdownWarmTexts(
+        for payload: PreparedConversationReducerPayload?
+    ) async -> [String] {
+        guard case .conversationSnapshot(let snapshot) = payload else {
+            return []
+        }
+        let task = Task.detached(priority: .utility) {
+            guard !Task.isCancelled else { return [String]() }
+            return Array(
+                SanitizedMarkdownCache.warmableTexts(
+                    items: snapshot.items,
+                    suffixLimit: 50
+                ).reversed()
+            )
+        }
+        return await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    /// Computes authoritative snapshot cache reuse on a detached executor.
+    /// Exact item equality can touch arbitrarily large nested content, so the
+    /// main actor receives only the IDs proven unchanged.
+    nonisolated static func preparePreservedSnapshotItemIDs(
+        for payload: PreparedConversationReducerPayload?,
+        retaining currentItems: [ConversationItem]
+    ) async -> Set<String> {
+        guard case .conversationSnapshot(let snapshot) = payload,
+              !currentItems.isEmpty else {
+            return []
+        }
+        let task = Task.detached(priority: .userInitiated) {
+            () -> Set<String> in
+            guard !Task.isCancelled else { return [] }
+            if payload?.preservesPaintedTranscript(
+                previousItemCount: currentItems.count
+            ) == true {
+                return Set(currentItems.map(\.id))
+            }
+            var previousByID: [String: ConversationItem] = [:]
+            previousByID.reserveCapacity(currentItems.count)
+            for item in currentItems where previousByID[item.id] == nil {
+                previousByID[item.id] = item
+            }
+            var preserved: Set<String> = []
+            let normalizedItems = normalizedSnapshotItems(snapshot)
+            preserved.reserveCapacity(normalizedItems.count)
+            for item in normalizedItems {
+                guard !Task.isCancelled else { return [] }
+                if previousByID[item.id]?.hasExactTranscriptIdentity(as: item) == true {
+                    preserved.insert(item.id)
+                }
+            }
+            return preserved
+        }
+        return await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    nonisolated private static func normalizedSnapshotItems(
+        _ snapshot: ConversationSnapshot
+    ) -> [ConversationItem] {
+        var seen: Set<String> = []
+        var normalized = snapshot.items.filter {
+            seen.insert($0.id).inserted
+        }
+        let reconciled = reconciledSnapshotTurn(
+            turnState: snapshot.turnState,
+            activeTurnID: snapshot.activeTurnID,
+            items: normalized
+        )
+        if reconciled.activeTurnID == nil,
+           !reconciled.state.isActive {
+            let toolStatus = snapshotToolStatus(reconciled.state)
+            normalized = normalized.map {
+                finalizedInactiveSnapshotItem(
+                    $0,
+                    toolStatus: toolStatus
+                )
+            }
+        }
+        return normalized
+    }
+
     /// Decodes and projects an authoritative snapshot/history page entirely
     /// before the store mutates. Adoption is then one synchronous main-actor
     /// transaction: the old published transcript and its cache remain intact
@@ -1478,7 +1803,9 @@ final class ConversationStore: ObservableObject {
         retaining currentItems: [ConversationItem] = [],
         currentState: ConversationState? = nil,
         currentItem: ConversationItem? = nil,
-        stagedProjection: PreparedTranscriptProjection? = nil
+        stagedProjection: PreparedTranscriptProjection? = nil,
+        preparedReducerPayload: PreparedConversationReducerPayload? = nil,
+        preservingSnapshotItemIDs: Set<String> = []
     ) async -> PreparedTranscriptProjectionBatch {
         let task = Task.detached(priority: .userInitiated) {
             () -> PreparedTranscriptProjectionBatch in
@@ -1519,12 +1846,16 @@ final class ConversationStore: ObservableObject {
                     itemIndex: &itemIndex
                 )
                 return simulatedState.items.filter {
-                    previousByID[$0.id] != $0
+                    previousByID[$0.id]?.hasExactTranscriptIdentity(as: $0) != true
                 }
             }
 
             func simulatedTargetItem() -> ConversationItem? {
                 guard let itemID else { return nil }
+                if case .completedItem(let preparedItem) = preparedReducerPayload,
+                   preparedItem.id == itemID {
+                    return preparedItem
+                }
                 var simulatedState = ConversationState()
                 if let retainedItem {
                     simulatedState.items = [retainedItem]
@@ -1582,7 +1913,8 @@ final class ConversationStore: ObservableObject {
                             updated: after
                         )
                 case (.toolUpdated, .tool(let before), .tool(let after)):
-                    return envelope.payload["outputDelta"]?.displayString != nil
+                    return envelope.payload["output"]?.isNonNull != true
+                        && envelope.payload["outputDelta"]?.displayString != nil
                         && appendOnlyToolOutputProjection(
                             previous: before,
                             updated: after
@@ -1598,7 +1930,9 @@ final class ConversationStore: ObservableObject {
             ) -> PreparedTranscriptProjection? {
                 guard let retainedItem,
                       let stagedProjection,
-                      stagedProjection.item == retainedItem else {
+                      stagedProjection.item.hasExactTranscriptIdentity(
+                        as: retainedItem
+                      ) else {
                     return nil
                 }
                 let append: TranscriptProjectionTailAppend
@@ -1620,7 +1954,8 @@ final class ConversationStore: ObservableObject {
                         text: envelope.payload["text"]?.stringValue ?? ""
                     )
                 case (.toolUpdated, .tool, .tool):
-                    guard let outputDelta = envelope.payload["outputDelta"]?.displayString else {
+                    guard envelope.payload["output"]?.isNonNull != true,
+                          let outputDelta = envelope.payload["outputDelta"]?.displayString else {
                         return nil
                     }
                     append = .toolOutput(text: outputDelta)
@@ -1650,42 +1985,42 @@ final class ConversationStore: ObservableObject {
             let envelopeKind = ChatEventKind(rawValue: envelope.type)
             switch envelopeKind {
             case .conversationSnapshot:
-                guard let snapshot = try? envelope.decodePayload(ConversationSnapshot.self) else {
+                let snapshot: ConversationSnapshot
+                if case .conversationSnapshot(let preparedSnapshot) = preparedReducerPayload {
+                    snapshot = preparedSnapshot
+                } else if case .invalid = preparedReducerPayload {
                     return [:]
+                } else {
+                    guard let decoded = try? envelope.decodePayload(
+                        ConversationSnapshot.self
+                    ) else {
+                        return [:]
+                    }
+                    snapshot = decoded
                 }
                 if snapshot.connectionState == .connecting,
                    snapshot.items.isEmpty,
                    snapshot.approvals.isEmpty,
                    snapshot.questions.isEmpty,
                    !retainedItems.isEmpty {
-                    items = retainedItems
+                    return [:]
                 } else {
-                    var seen: Set<String> = []
-                    var normalized = snapshot.items.filter {
-                        seen.insert($0.id).inserted
+                    items = normalizedSnapshotItems(snapshot).filter {
+                        !preservingSnapshotItemIDs.contains($0.id)
                     }
-                    let reconciled = reconciledSnapshotTurn(
-                        turnState: snapshot.turnState,
-                        activeTurnID: snapshot.activeTurnID,
-                        items: normalized
-                    )
-                    if reconciled.activeTurnID == nil,
-                       !reconciled.state.isActive {
-                        let toolStatus = snapshotToolStatus(reconciled.state)
-                        normalized = normalized.map {
-                            finalizedInactiveSnapshotItem(
-                                $0,
-                                toolStatus: toolStatus
-                            )
-                        }
-                    }
-                    items = normalized
                 }
             case .historyPage:
                 let retainedIDs = Set(retainedItems.map(\.id))
-                items = (envelope.payload["items"]?.arrayValue ?? []).compactMap {
-                    try? $0.decoded()
-                }.filter { !retainedIDs.contains($0.id) }
+                let decodedItems: [ConversationItem]
+                if case .historyPage(let preparedItems) = preparedReducerPayload {
+                    decodedItems = preparedItems
+                } else if case .invalid = preparedReducerPayload {
+                    return [:]
+                } else {
+                    decodedItems = (envelope.payload["items"]?.arrayValue ?? [])
+                        .compactMap { try? $0.decoded() }
+                }
+                items = decodedItems.filter { !retainedIDs.contains($0.id) }
             case .messageStarted, .reasoningStarted, .toolStarted,
                  .fileChangeUpdated, .diffUpdated, .planUpdated,
                  .messageCompleted, .reasoningCompleted, .toolCompleted:
@@ -2325,7 +2660,38 @@ final class ConversationStore: ObservableObject {
         var preservedIDs = Set<String>()
         preservedIDs.reserveCapacity(items.count)
         for item in items {
-            if previousItems[item.id] == item,
+            if previousItems[item.id]?.hasExactTranscriptIdentity(as: item) == true,
+               let revision = previousRevisions[item.id] {
+                itemContentRevisions[item.id] = revision
+                preservedIDs.insert(item.id)
+            } else {
+                itemContentRevisions[item.id] = nextItemContentRevision
+                nextItemContentRevision &+= 1
+            }
+        }
+        projectionCache = projectionCache.filter { preservedIDs.contains($0.key) }
+        firstProjectionCache = firstProjectionCache.filter {
+            preservedIDs.contains($0.key)
+        }
+    }
+
+    /// Reuses only the item revisions proven unchanged by detached snapshot
+    /// preparation. The main actor never compares authoritative transcript
+    /// values, while unchanged sections keep their projected rows and wrapper
+    /// arrays across reconnects.
+    private func reconcilePreparedSnapshotItemContentRevisions(
+        for items: [ConversationItem],
+        preserving preparedPreservedIDs: Set<String>
+    ) {
+        let previousRevisions = itemContentRevisions
+        itemContentRevisions.removeAll(keepingCapacity: true)
+        itemContentRevisions.reserveCapacity(items.count)
+        pendingProjectionChanges.removeAll(keepingCapacity: true)
+        pendingPreparedTranscriptProjections.removeAll(keepingCapacity: true)
+        var preservedIDs: Set<String> = []
+        preservedIDs.reserveCapacity(preparedPreservedIDs.count)
+        for item in items {
+            if preparedPreservedIDs.contains(item.id),
                let revision = previousRevisions[item.id] {
                 itemContentRevisions[item.id] = revision
                 preservedIDs.insert(item.id)
@@ -2349,10 +2715,23 @@ final class ConversationStore: ObservableObject {
         after envelope: ChatEnvelope,
         changedItemID: String?,
         previousItemCount: Int,
-        terminalTranscriptChanges: TerminalTranscriptChanges
+        terminalTranscriptChanges: TerminalTranscriptChanges,
+        preparedReducerPayload: PreparedConversationReducerPayload?,
+        preservedSnapshotItemIDs: Set<String>,
+        preservesPaintedTranscript: Bool
     ) {
         let kind = ChatEventKind(rawValue: envelope.type)
         if kind == .conversationSnapshot {
+            if case .conversationSnapshot = preparedReducerPayload {
+                if preservesPaintedTranscript {
+                    return
+                }
+                reconcilePreparedSnapshotItemContentRevisions(
+                    for: workingState.items,
+                    preserving: preservedSnapshotItemIDs
+                )
+                return
+            }
             resetItemContentRevisions(for: workingState.items)
             return
         }
@@ -2409,7 +2788,7 @@ final class ConversationStore: ObservableObject {
                         text: ""
                     )
                 case .tool(let tool):
-                    if tool.output?.isEmpty == false {
+                    if tool.outputUTF8Count > 0 {
                         queueProjectionAppend(
                             itemID: itemID,
                             target: .toolOutput,
@@ -2494,6 +2873,7 @@ final class ConversationStore: ObservableObject {
         case .toolUpdated:
             guard case .tool(let previous) = previousItem,
                   case .tool(let updated) = updatedItem,
+                  envelope.payload["output"]?.isNonNull != true,
                   let outputDelta = envelope.payload["outputDelta"]?.displayString,
                   appendOnlyToolOutput(previous: previous, updated: updated) else {
                 pendingProjectionChanges[itemID] = .rebuild
@@ -2663,11 +3043,13 @@ final class ConversationStore: ObservableObject {
         changedItemID: String?,
         changedItemWasPresent: Bool,
         previousItemCount: Int,
-        terminalTranscriptChanges: TerminalTranscriptChanges
+        terminalTranscriptChanges: TerminalTranscriptChanges,
+        preservesPaintedTranscript: Bool
     ) {
         let kind = ChatEventKind(rawValue: envelope.type)
         guard Self.affectsTranscriptContent(envelope) else { return }
         if kind == .conversationSnapshot {
+            guard !preservesPaintedTranscript else { return }
             pendingTranscriptReset = true
             pendingTranscriptInsertions.removeAll()
             pendingTranscriptPrepends.removeAll()

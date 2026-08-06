@@ -129,13 +129,19 @@ enum TranscriptTextProjection {
             var lineCount = 1
             var lastLineBoundary: String.UTF8View.Index?
             while end < utf8.endIndex, bytes < maximumBytes {
-                let byte = utf8[end]
-                if byte == 0x0A, lineCount >= maximumLines {
-                    break
-                }
-                end = utf8.index(after: end)
-                bytes += 1
-                if byte == 0x0A {
+                let lineBreakBytes = logicalLineBreakLength(
+                    in: utf8,
+                    at: end
+                )
+                if lineBreakBytes > 0 {
+                    guard lineCount < maximumLines,
+                          bytes + lineBreakBytes <= maximumBytes else {
+                        break
+                    }
+                    for _ in 0..<lineBreakBytes {
+                        end = utf8.index(after: end)
+                    }
+                    bytes += lineBreakBytes
                     lineCount += 1
                     lastLineBoundary = end
                     if !startsAtLineBoundary {
@@ -145,7 +151,10 @@ enum TranscriptTextProjection {
                         // independently parsed row.
                         break
                     }
+                    continue
                 }
+                end = utf8.index(after: end)
+                bytes += 1
             }
 
             // Prefer a complete source line when a row must split. Besides
@@ -170,12 +179,12 @@ enum TranscriptTextProjection {
                     index: segmentIndex,
                     text: String(decoding: utf8[start..<end], as: UTF8.self),
                     endsAtPhysicalLineEnd: end == utf8.endIndex
-                        || utf8[utf8.index(before: end)] == 0x0A
+                        || endsWithLogicalLineBreak(utf8, at: end)
                 )
             )
             segmentIndex += 1
             start = end
-            startsAtLineBoundary = utf8[utf8.index(before: end)] == 0x0A
+            startsAtLineBoundary = endsWithLogicalLineBreak(utf8, at: end)
         }
     }
 
@@ -202,19 +211,25 @@ enum TranscriptTextProjection {
         var lineCount = 1
         var lastLineBoundary: String.UTF8View.Index?
         while end < utf8.endIndex, bytes < maximumBytes {
-            let byte = utf8[end]
-            if byte == 0x0A, lineCount >= maximumLines {
-                break
-            }
-            end = utf8.index(after: end)
-            bytes += 1
-            if byte == 0x0A {
+            let lineBreakBytes = logicalLineBreakLength(in: utf8, at: end)
+            if lineBreakBytes > 0 {
+                guard lineCount < maximumLines,
+                      bytes + lineBreakBytes <= maximumBytes else {
+                    break
+                }
+                for _ in 0..<lineBreakBytes {
+                    end = utf8.index(after: end)
+                }
+                bytes += lineBreakBytes
                 lineCount += 1
                 lastLineBoundary = end
                 if !initialStartsAtLineBoundary {
                     break
                 }
+                continue
             }
+            end = utf8.index(after: end)
+            bytes += 1
         }
         if end < utf8.endIndex, let lastLineBoundary {
             end = lastLineBoundary
@@ -230,10 +245,103 @@ enum TranscriptTextProjection {
                 index: startingIndex,
                 text: String(decoding: utf8[start..<end], as: UTF8.self),
                 endsAtPhysicalLineEnd: end == utf8.endIndex
-                    || utf8[utf8.index(before: end)] == 0x0A
+                    || endsWithLogicalLineBreak(utf8, at: end)
             ),
             hasMore: end < utf8.endIndex
         )
+    }
+
+    /// AppKit/Core Text treats these scalar sequences as hard line breaks.
+    /// Count CRLF once and keep every multi-byte separator in one tile so the
+    /// 128-line realization budget matches what the renderer will lay out.
+    static func logicalLineCount(
+        _ source: String,
+        stoppingAt limit: Int = .max
+    ) -> Int {
+        guard !source.isEmpty else { return 1 }
+        let utf8 = source.utf8
+        var index = utf8.startIndex
+        var count = 1
+        while index < utf8.endIndex, count < limit {
+            let lineBreakBytes = logicalLineBreakLength(in: utf8, at: index)
+            if lineBreakBytes > 0 {
+                count += 1
+                for _ in 0..<lineBreakBytes {
+                    index = utf8.index(after: index)
+                }
+            } else {
+                index = utf8.index(after: index)
+            }
+        }
+        return count
+    }
+
+    /// Takes at most `maximumBytes` without traversing the rest of the input
+    /// and never cuts through a UTF-8 scalar. Metadata can contain a single
+    /// enormous extended grapheme, so character-count prefixes are not a
+    /// useful bound for work performed on the scroll path.
+    static func boundedUTF8Prefix(
+        _ source: String,
+        maximumBytes: Int
+    ) -> String {
+        guard maximumBytes > 0, !source.isEmpty else { return "" }
+        let utf8 = source.utf8
+        let start = utf8.startIndex
+        var end = start
+        var byteCount = 0
+        while end < utf8.endIndex, byteCount < maximumBytes {
+            end = utf8.index(after: end)
+            byteCount += 1
+        }
+        guard end < utf8.endIndex else { return source }
+        while end > start, utf8[end] & 0xC0 == 0x80 {
+            end = utf8.index(before: end)
+        }
+        return String(decoding: utf8[start..<end], as: UTF8.self)
+    }
+
+    private static func logicalLineBreakLength(
+        in utf8: String.UTF8View,
+        at index: String.UTF8View.Index
+    ) -> Int {
+        let byte = utf8[index]
+        if byte == 0x0A || byte == 0x0B || byte == 0x0C { return 1 }
+        if byte == 0x0D {
+            let next = utf8.index(after: index)
+            return next < utf8.endIndex && utf8[next] == 0x0A ? 2 : 1
+        }
+        if byte == 0xC2 {
+            let second = utf8.index(after: index)
+            return second < utf8.endIndex && utf8[second] == 0x85 ? 2 : 0
+        }
+        guard byte == 0xE2 else { return 0 }
+        let second = utf8.index(after: index)
+        guard second < utf8.endIndex, utf8[second] == 0x80 else { return 0 }
+        let third = utf8.index(after: second)
+        guard third < utf8.endIndex else { return 0 }
+        return utf8[third] == 0xA8 || utf8[third] == 0xA9 ? 3 : 0
+    }
+
+    private static func endsWithLogicalLineBreak(
+        _ utf8: String.UTF8View,
+        at end: String.UTF8View.Index
+    ) -> Bool {
+        guard end > utf8.startIndex else { return false }
+        let last = utf8.index(before: end)
+        let lastByte = utf8[last]
+        if lastByte == 0x0A || lastByte == 0x0B
+            || lastByte == 0x0C || lastByte == 0x0D {
+            return true
+        }
+        if lastByte == 0x85 {
+            let first = utf8.index(before: last)
+            return first >= utf8.startIndex && utf8[first] == 0xC2
+        }
+        guard lastByte == 0xA8 || lastByte == 0xA9 else { return false }
+        let second = utf8.index(before: last)
+        guard second >= utf8.startIndex, utf8[second] == 0x80 else { return false }
+        let first = utf8.index(before: second)
+        return first >= utf8.startIndex && utf8[first] == 0xE2
     }
 
     /// Keeps fenced code semantically continuous across independently parsed
@@ -246,7 +354,11 @@ enum TranscriptTextProjection {
         startingIndex: Int = 0,
         initialContinuation: TranscriptMarkdownContinuation = .initial
     ) -> [TranscriptTextSegment] {
-        let byteBudget = markdownByteBudget(maximumBytes: maximumBytes)
+        let byteBudget = markdownByteBudget(
+            maximumBytes: maximumBytes,
+            source: source,
+            initialContinuation: initialContinuation
+        )
         precondition(maximumLines >= 3)
         let raw = segments(
             of: source,
@@ -278,7 +390,11 @@ enum TranscriptTextProjection {
         initialContinuation: TranscriptMarkdownContinuation = .initial
     ) -> [TranscriptTextSegment] {
         guard limit > 0 else { return [] }
-        let byteBudget = markdownByteBudget(maximumBytes: maximumBytes)
+        let byteBudget = markdownByteBudget(
+            maximumBytes: maximumBytes,
+            source: source,
+            initialContinuation: initialContinuation
+        )
         precondition(maximumLines >= 3)
         var continuation = initialContinuation
         var suffix: [TranscriptTextSegment] = []
@@ -310,7 +426,11 @@ enum TranscriptTextProjection {
         startingIndex: Int = 0,
         initialContinuation: TranscriptMarkdownContinuation = .initial
     ) -> TranscriptFirstTextSegment {
-        let byteBudget = markdownByteBudget(maximumBytes: maximumBytes)
+        let byteBudget = markdownByteBudget(
+            maximumBytes: maximumBytes,
+            source: source,
+            initialContinuation: initialContinuation
+        )
         precondition(maximumLines >= 3)
         let raw = firstSegment(
             of: source,
@@ -353,7 +473,10 @@ enum TranscriptTextProjection {
                     maximumBytes: maximumSyntheticFenceBytes
                 )
                 renderedText = guardFence + "\n" + segment.text
-                    + (segment.text.hasSuffix("\n") ? "" : "\n")
+                    + (endsWithLogicalLineBreak(
+                        segment.text.utf8,
+                        at: segment.text.utf8.endIndex
+                    ) ? "" : "\n")
                     + guardFence
             } else {
                 renderedText = neutralizingLeadingFence(in: segment.text)
@@ -387,7 +510,10 @@ enum TranscriptTextProjection {
         if let openFence = continuation.openFence {
             suffix = syntheticFence(
                 openFence,
-                prefix: segment.text.hasSuffix("\n") ? "" : "\n",
+                prefix: endsWithLogicalLineBreak(
+                    segment.text.utf8,
+                    at: segment.text.utf8.endIndex
+                ) ? "" : "\n",
                 maximumBytes: maximumSyntheticFenceBytes
             )
         } else {
@@ -408,28 +534,36 @@ enum TranscriptTextProjection {
         continuation: inout TranscriptMarkdownContinuation,
         maximumSyntheticFenceBytes: Int
     ) {
-        for byte in text.utf8 {
-            if byte == 0x0A {
+        let utf8 = text.utf8
+        var index = utf8.startIndex
+        while index < utf8.endIndex {
+            let lineBreakBytes = logicalLineBreakLength(in: utf8, at: index)
+            if lineBreakBytes > 0 {
                 commitPendingFenceLine(
                     continuation: &continuation,
                     maximumSyntheticFenceBytes: maximumSyntheticFenceBytes
                 )
                 continuation.startsAtLineBoundary = true
+                for _ in 0..<lineBreakBytes {
+                    index = utf8.index(after: index)
+                }
                 continue
             }
             consumeFenceByte(
-                byte,
+                utf8[index],
                 continuation: &continuation,
                 maximumSyntheticFenceBytes: maximumSyntheticFenceBytes
             )
             continuation.startsAtLineBoundary = false
+            index = utf8.index(after: index)
         }
 
         // A final source line without a newline is still a complete Markdown
         // line. A later streaming append re-projects the former tail from its
         // saved start continuation, so committing here cannot lose append
         // context.
-        if endsAtPhysicalLineEnd, !text.hasSuffix("\n") {
+        if endsAtPhysicalLineEnd,
+           !endsWithLogicalLineBreak(utf8, at: utf8.endIndex) {
             commitPendingFenceLine(
                 continuation: &continuation,
                 maximumSyntheticFenceBytes: maximumSyntheticFenceBytes
@@ -557,8 +691,16 @@ enum TranscriptTextProjection {
     }
 
     private static func markdownByteBudget(
-        maximumBytes: Int
+        maximumBytes: Int,
+        source: String,
+        initialContinuation: TranscriptMarkdownContinuation
     ) -> (sourceBytes: Int, syntheticFenceBytes: Int) {
+        let canRequireSyntheticFence = initialContinuation.openFence != nil
+            || source.utf8.contains(0x60)
+            || source.utf8.contains(0x7E)
+        guard canRequireSyntheticFence else {
+            return (maximumBytes, 0)
+        }
         // Reserve enough room for both an opening and a closing synthetic
         // delimiter, including their newlines. Making the source allowance no
         // larger than the delimiter allowance guarantees that every fence a
@@ -671,23 +813,27 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
     enum Section: String, Sendable {
         case message
         case reasoning
+        case toolTitle
         case toolHeader
         case toolInput
         case toolOutput
         case toolError
+        case diffPath
         case diff
         case planTitle
         case planStep
+        case genericTitle
+        case genericType
         case generic
     }
 
     // Keep each independently mounted table row below a single scroll-frame
-    // layout budget without exploding an 8 MiB newline-dense transcript into
-    // hundreds of thousands of table records. At 1 KiB / 128 lines a plain
-    // cold Text measures around 4 ms p95 on the supported macOS baseline;
-    // dense attributed artifacts are collapsed to bounded run counts before
-    // mounting. Markdown also reserves space for synthetic fence delimiters.
-    static let maximumDisplayBytes = 1 * 1_024
+    // layout budget without exploding an 8 MiB transcript into thousands of
+    // tiny AppKit cells. Stable text paints through the cheap exact renderer
+    // during a gesture, so a 1 KiB / 128-line tile stays cheap to realize;
+    // rich TextKit artifacts are adopted only after scrolling ends. Markdown
+    // with fences still reserves space for synthetic delimiters.
+    static let maximumDisplayBytes = 1_024
     static let maximumDisplayLines = 128
 
     let id: String
@@ -696,6 +842,10 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
     let section: Section
     let contentRevision: UInt64
     let displayItem: ConversationItem
+    /// Exact authoritative metadata represented by this row. Metadata is
+    /// projected separately from body text so a large title/path/type is held
+    /// by bounded metadata rows once, never copied into every body tile.
+    let metadataText: String?
     let sourceText: String
     let isFirstInItem: Bool
     let isLastInItem: Bool
@@ -706,6 +856,11 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
     let segmentIndex: Int
     let markdownContinuation: TranscriptMarkdownContinuation?
 
+    /// Exact text painted by this row. `sourceText` deliberately remains the
+    /// body-content stream used by copy/reassembly callers, while metadata
+    /// rows paint their separately reassemblable metadata segment.
+    var rowText: String { metadataText ?? sourceText }
+
     private struct Draft {
         let id: String
         let kind: Kind
@@ -713,9 +868,34 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
         let sectionKey: String
         let displayItem: ConversationItem
         let sourceText: String
+        let metadataText: String?
         let accessibilitySummary: String
         let segmentIndex: Int
         let markdownContinuation: TranscriptMarkdownContinuation?
+
+        init(
+            id: String,
+            kind: Kind,
+            section: Section,
+            sectionKey: String,
+            displayItem: ConversationItem,
+            sourceText: String,
+            metadataText: String? = nil,
+            accessibilitySummary: String,
+            segmentIndex: Int,
+            markdownContinuation: TranscriptMarkdownContinuation?
+        ) {
+            self.id = id
+            self.kind = kind
+            self.section = section
+            self.sectionKey = sectionKey
+            self.displayItem = displayItem
+            self.sourceText = sourceText
+            self.metadataText = metadataText
+            self.accessibilitySummary = accessibilitySummary
+            self.segmentIndex = segmentIndex
+            self.markdownContinuation = markdownContinuation
+        }
     }
 
     static func makeRows(item: ConversationItem) -> [TranscriptRowProjection] {
@@ -759,6 +939,20 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
             hasMoreInItem = first.hasMore
 
         case .tool(let tool):
+            if !tool.title.isEmpty {
+                let first = TranscriptTextProjection.firstSegment(of: tool.title)
+                guard let value = toolTitleDrafts(
+                    tool,
+                    segments: [first.segment]
+                ).first else { return nil }
+                draft = value
+                hasMoreInSection = first.hasMore
+                hasMoreInItem = first.hasMore
+                    || tool.input?.isEmpty == false
+                    || tool.output?.isEmpty == false
+                    || tool.errorMessage?.isEmpty == false
+                break
+            }
             let selection: (String, Section, Bool)?
             if let input = tool.input, !input.isEmpty {
                 selection = (
@@ -795,6 +989,17 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
             }
 
         case .diff(let diff):
+            if let path = diff.path, !path.isEmpty {
+                let first = TranscriptTextProjection.firstSegment(of: path)
+                guard let value = diffPathDrafts(
+                    diff,
+                    segments: [first.segment]
+                ).first else { return nil }
+                draft = value
+                hasMoreInSection = first.hasMore
+                hasMoreInItem = first.hasMore || !diff.unifiedDiff.isEmpty
+                break
+            }
             let first = TranscriptTextProjection.firstSegment(of: diff.unifiedDiff)
             guard let value = diffDrafts(diff, segments: [first.segment]).first else {
                 return nil
@@ -804,6 +1009,38 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
             hasMoreInItem = first.hasMore
 
         case .generic(let generic):
+            if !generic.title.isEmpty {
+                let budget = genericTitleBudget(generic)
+                let first = TranscriptTextProjection.firstSegment(
+                    of: generic.title,
+                    maximumBytes: budget.maximumBytes,
+                    maximumLines: budget.maximumLines
+                )
+                guard let value = genericMetadataDrafts(
+                    generic,
+                    section: .genericTitle,
+                    segments: [first.segment]
+                ).first else { return nil }
+                draft = value
+                hasMoreInSection = first.hasMore
+                hasMoreInItem = first.hasMore
+                    || !generic.type.isEmpty
+                    || generic.detail?.isEmpty == false
+                break
+            }
+            if !generic.type.isEmpty {
+                let first = TranscriptTextProjection.firstSegment(of: generic.type)
+                guard let value = genericMetadataDrafts(
+                    generic,
+                    section: .genericType,
+                    segments: [first.segment]
+                ).first else { return nil }
+                draft = value
+                hasMoreInSection = first.hasMore
+                hasMoreInItem = first.hasMore
+                    || generic.detail?.isEmpty == false
+                break
+            }
             let first = TranscriptTextProjection.firstSegment(of: generic.detail ?? "")
             guard let value = genericDrafts(generic, segments: [first.segment]).first else {
                 return nil
@@ -823,7 +1060,7 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
         )
         return TranscriptFirstRowProjectionResult(
             row: row,
-            projectedSourceBytes: row.sourceText.utf8.count
+            projectedSourceBytes: row.rowText.utf8.count
         )
     }
 
@@ -970,6 +1207,7 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
                     isLastInSection: isLastInSection
                 ),
                 displayItem: draft.displayItem,
+                metadataText: draft.metadataText,
                 sourceText: draft.sourceText,
                 isFirstInItem: isFirstInItem,
                 isLastInItem: isLastInItem,
@@ -1078,7 +1316,12 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
     }
 
     private static func toolDrafts(_ source: ToolActivity) -> [Draft] {
-        var result: [Draft] = []
+        var result = source.title.isEmpty
+            ? []
+            : toolTitleDrafts(
+                source,
+                segments: TranscriptTextProjection.segments(of: source.title)
+            )
 
         func append(_ text: String?, section: Section) {
             guard let text, !text.isEmpty else { return }
@@ -1114,6 +1357,31 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
         return result
     }
 
+    private static func toolTitleDrafts(
+        _ source: ToolActivity,
+        segments: [TranscriptTextSegment]
+    ) -> [Draft] {
+        segments.map { segment in
+            var displayed = source
+            displayed.title = segment.text
+            displayed.input = nil
+            displayed.output = nil
+            displayed.errorMessage = nil
+            return Draft(
+                id: rowID(source.id, section: "tool-title", segment.index),
+                kind: .tool,
+                section: .toolTitle,
+                sectionKey: "tool-title",
+                displayItem: .tool(displayed),
+                sourceText: "",
+                metadataText: segment.text,
+                accessibilitySummary: boundedSummary(source.title),
+                segmentIndex: segment.index,
+                markdownContinuation: nil
+            )
+        }
+    }
+
     private static func toolDrafts(
         _ source: ToolActivity,
         section: Section,
@@ -1132,6 +1400,7 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
         }
         return segments.map { segment in
             var displayed = source
+            displayed.title = ""
             displayed.input = section == .toolInput ? segment.text : nil
             displayed.output = section == .toolOutput ? segment.text : nil
             displayed.errorMessage = section == .toolError ? segment.text : nil
@@ -1150,10 +1419,42 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
     }
 
     private static func diffDrafts(_ source: ChatDiff) -> [Draft] {
-        diffDrafts(
-            source,
-            segments: TranscriptTextProjection.segments(of: source.unifiedDiff)
-        )
+        var result = source.path?.isEmpty == false
+            ? diffPathDrafts(
+                source,
+                segments: TranscriptTextProjection.segments(of: source.path ?? "")
+            )
+            : []
+        if !source.unifiedDiff.isEmpty || result.isEmpty {
+            result.append(contentsOf: diffDrafts(
+                source,
+                segments: TranscriptTextProjection.segments(of: source.unifiedDiff)
+            ))
+        }
+        return result
+    }
+
+    private static func diffPathDrafts(
+        _ source: ChatDiff,
+        segments: [TranscriptTextSegment]
+    ) -> [Draft] {
+        segments.map { segment in
+            var displayed = source
+            displayed.path = segment.text
+            displayed.unifiedDiff = ""
+            return Draft(
+                id: rowID(source.id, section: "diff-path", segment.index),
+                kind: .diff,
+                section: .diffPath,
+                sectionKey: "diff-path",
+                displayItem: .diff(displayed),
+                sourceText: "",
+                metadataText: segment.text,
+                accessibilitySummary: boundedSummary(source.path ?? "File changes"),
+                segmentIndex: segment.index,
+                markdownContinuation: nil
+            )
+        }
     }
 
     private static func diffDrafts(
@@ -1162,6 +1463,7 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
     ) -> [Draft] {
         segments.map { segment in
             var displayed = source
+            displayed.path = nil
             displayed.unifiedDiff = segment.text
             return Draft(
                 id: rowID(source.id, section: "diff", segment.index),
@@ -1240,11 +1542,104 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
     }
 
     private static func genericDrafts(_ source: ChatGenericItem) -> [Draft] {
-        let segments = source.detail.map { detail in
-            TranscriptTextProjection.segments(of: detail)
+        var result: [Draft] = []
+        if !source.title.isEmpty {
+            let budget = genericTitleBudget(source)
+            result.append(contentsOf: genericMetadataDrafts(
+                source,
+                section: .genericTitle,
+                segments: TranscriptTextProjection.segments(
+                    of: source.title,
+                    maximumBytes: budget.maximumBytes,
+                    maximumLines: budget.maximumLines
+                )
+            ))
         }
-            ?? [TranscriptTextSegment(index: 0, text: "")]
-        return genericDrafts(source, segments: segments)
+        if !source.type.isEmpty {
+            result.append(contentsOf: genericMetadataDrafts(
+                source,
+                section: .genericType,
+                segments: TranscriptTextProjection.segments(of: source.type)
+            ))
+        }
+        if let detail = source.detail, !detail.isEmpty {
+            result.append(contentsOf: genericDrafts(
+                source,
+                segments: TranscriptTextProjection.segments(of: detail)
+            ))
+        } else if result.isEmpty {
+            result.append(contentsOf: genericDrafts(
+                source,
+                segments: [TranscriptTextSegment(index: 0, text: "")]
+            ))
+        }
+        return result
+    }
+
+    private static func genericMetadataDrafts(
+        _ source: ChatGenericItem,
+        section: Section,
+        segments: [TranscriptTextSegment]
+    ) -> [Draft] {
+        let key: String
+        switch section {
+        case .genericTitle:
+            key = "generic-title"
+        case .genericType:
+            key = "generic-type"
+        default:
+            preconditionFailure("A generic metadata projection requires a metadata section")
+        }
+        return segments.map { segment in
+            var displayed = source
+            displayed.title = section == .genericTitle ? segment.text : ""
+            if section == .genericType {
+                displayed.type = segment.text
+            } else if segment.index == 0 {
+                displayed.type = genericTitleBudget(source).collapsedType
+            } else {
+                displayed.type = ""
+            }
+            displayed.detail = nil
+            return Draft(
+                id: rowID(source.id, section: key, segment.index),
+                kind: .generic,
+                section: section,
+                sectionKey: key,
+                displayItem: .generic(displayed),
+                sourceText: "",
+                metadataText: segment.text,
+                accessibilitySummary: boundedSummary(source.title),
+                segmentIndex: segment.index,
+                markdownContinuation: nil
+            )
+        }
+    }
+
+    private static func genericTitleBudget(
+        _ source: ChatGenericItem
+    ) -> (maximumBytes: Int, maximumLines: Int, collapsedType: String) {
+        let collapsedType: String
+        if source.type.isEmpty {
+            collapsedType = ""
+        } else {
+            collapsedType = TranscriptTextProjection.firstSegment(
+                of: source.type,
+                maximumBytes: 200,
+                maximumLines: 16
+            ).segment.text
+        }
+        let secondaryLines = collapsedType.isEmpty
+            ? 0
+            : TranscriptTextProjection.logicalLineCount(collapsedType)
+        let separatorBytes = collapsedType.isEmpty ? 0 : 1
+        return (
+            maximumBytes: maximumDisplayBytes
+                - collapsedType.utf8.count
+                - separatorBytes,
+            maximumLines: maximumDisplayLines - secondaryLines,
+            collapsedType: collapsedType
+        )
     }
 
     private static func genericDrafts(
@@ -1253,6 +1648,8 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
     ) -> [Draft] {
         return segments.map { segment in
             var displayed = source
+            displayed.title = ""
+            displayed.type = ""
             displayed.detail = source.detail == nil ? nil : segment.text
             return Draft(
                 id: rowID(source.id, section: "generic", segment.index),
@@ -1269,7 +1666,7 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
     }
 
     private static func boundedSummary(_ text: String) -> String {
-        String(text.prefix(200))
+        TranscriptTextProjection.boundedUTF8Prefix(text, maximumBytes: 200)
     }
 
     private static func rowID(_ itemID: String, section: String, _ index: Int) -> String {
@@ -1301,6 +1698,9 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
         combine(isLastInItem ? "last-item" : "middle-item")
         combine(isFirstInSection ? "first-section" : "middle-section")
         combine(isLastInSection ? "last-section" : "middle-section")
+        if let metadataText = draft.metadataText {
+            combine(metadataText)
+        }
         switch draft.displayItem {
         case .message(let message):
             combine(message.role.rawValue)
@@ -1311,7 +1711,9 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
             combine(reasoning.text)
             combine(reasoning.isStreaming ? "streaming" : "complete")
         case .tool(let tool):
-            combine(tool.title)
+            if draft.metadataText == nil {
+                combine(tool.title)
+            }
             combine(tool.status.rawValue)
             combine(tool.input ?? "")
             combine(tool.output ?? "")
@@ -1319,7 +1721,9 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
             combine(String(tool.durationMilliseconds ?? -1))
             combine(String(tool.exitCode ?? Int.min))
         case .diff(let diff):
-            combine(diff.path ?? "")
+            if draft.metadataText == nil {
+                combine(diff.path ?? "")
+            }
             combine(diff.unifiedDiff)
             combine(diff.isTruncated ? "source-truncated" : "complete")
         case .plan(let plan):
@@ -1330,8 +1734,14 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
                 combine(step.isCompleted ? "complete" : "pending")
             }
         case .generic(let generic):
-            combine(generic.title)
-            combine(generic.type)
+            if draft.metadataText == nil {
+                combine(generic.title)
+                combine(generic.type)
+            } else if draft.section == .genericTitle {
+                // The first title row owns the collapsed subtitle. It is a
+                // bounded prefix; the exact type is projected in its own rows.
+                combine(generic.type)
+            }
             combine(generic.detail ?? "")
         }
         return hash

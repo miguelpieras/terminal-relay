@@ -3,7 +3,7 @@ import XCTest
 
 final class TranscriptRowProjectionTests: XCTestCase {
     func testProductionTileBudgetsStayViewportSized() {
-        XCTAssertEqual(TranscriptRowProjection.maximumDisplayBytes, 1 * 1_024)
+        XCTAssertEqual(TranscriptRowProjection.maximumDisplayBytes, 1_024)
         XCTAssertEqual(TranscriptRowProjection.maximumDisplayLines, 128)
     }
 
@@ -20,6 +20,36 @@ final class TranscriptRowProjectionTests: XCTestCase {
             ))
         )
         XCTAssertEqual(segments.map(\.text).joined(), source)
+    }
+
+    func testCoreTextLineSeparatorsStayWithinLogicalLineBudget() {
+        let sources = [
+            String(repeating: "x\r", count: 500),
+            String(repeating: "x\r\n", count: 500),
+            String(repeating: "x\u{000B}", count: 500),
+            String(repeating: "x\u{000C}", count: 500),
+            String(repeating: "x\u{0085}", count: 500),
+            String(repeating: "x\u{2028}", count: 500),
+            String(repeating: "x\u{2029}", count: 500),
+        ]
+
+        for source in sources {
+            let segments = TranscriptTextProjection.segments(of: source)
+            XCTAssertGreaterThan(segments.count, 1)
+            XCTAssertEqual(segments.map(\.text).joined(), source)
+            XCTAssertTrue(segments.allSatisfy {
+                TranscriptTextProjection.logicalLineCount($0.text)
+                    <= TranscriptRowProjection.maximumDisplayLines
+            })
+        }
+
+        let crlfSegments = TranscriptTextProjection.segments(of: sources[1])
+        for index in 0..<(crlfSegments.count - 1) {
+            XCTAssertFalse(
+                crlfSegments[index].text.hasSuffix("\r")
+                    && crlfSegments[index + 1].text.hasPrefix("\n")
+            )
+        }
     }
 
     func testSegmentsPreserveEveryByteWithinRenderingBudgets() {
@@ -86,6 +116,59 @@ final class TranscriptRowProjectionTests: XCTestCase {
                 40
             )
         }
+    }
+
+    func testFencedMarkdownContinuationRecognizesEveryRenderedLineEnding() throws {
+        for separator in ["\r\n", "\r", "\u{2028}"] {
+            let body = (0..<24)
+                .map { "value-\($0)\(separator)" }
+                .joined()
+            let trailing = (0..<12)
+                .map { "after-\($0)\(separator)" }
+                .joined()
+            let source = "Before\(separator)```swift\(separator)"
+                + body
+                + "```\(separator)"
+                + trailing
+            let segments = TranscriptTextProjection.markdownSegments(
+                of: source,
+                maximumBytes: 192,
+                maximumLines: 6
+            )
+
+            XCTAssertEqual(segments.map(\.text).joined(), source)
+            XCTAssertTrue(segments.allSatisfy {
+                $0.renderedText.utf8.count <= 192
+                    && TranscriptTextProjection.logicalLineCount($0.renderedText) <= 6
+            })
+            let bodySegment = try XCTUnwrap(segments.first {
+                $0.text.contains("value-")
+                    && $0.markdownContinuation?.openFence == "```"
+            })
+            XCTAssertTrue(bodySegment.renderedText.hasPrefix("```\n"))
+            let after = try XCTUnwrap(segments.last)
+            XCTAssertTrue(after.text.contains("after-"))
+            XCTAssertNil(after.markdownContinuation?.openFence)
+        }
+    }
+
+    func testFenceFreeMarkdownUsesTheFullTileBudget() {
+        let source = String(repeating: "viewport bounded text ", count: 400)
+        let maximumBytes = 1_024
+        let segments = TranscriptTextProjection.markdownSegments(
+            of: source,
+            maximumBytes: maximumBytes,
+            maximumLines: 128
+        )
+
+        XCTAssertEqual(segments.map(\.text).joined(), source)
+        XCTAssertTrue(segments.allSatisfy {
+            $0.text == $0.renderedText
+                && $0.renderedText.utf8.count <= maximumBytes
+        })
+        XCTAssertTrue(segments.dropLast().allSatisfy {
+            $0.text.utf8.count == maximumBytes
+        })
     }
 
     func testLongerMarkdownFenceIgnoresShortAndSuffixedFenceLikeContent() {
@@ -505,7 +588,7 @@ final class TranscriptRowProjectionTests: XCTestCase {
     }
 
     func testIncrementalAppendResumesFenceCandidateSplitAcrossPriorTile() throws {
-        let original = "```swift " + String(repeating: "x", count: 500)
+        let original = "```swift " + String(repeating: "x", count: 1_000)
         let delta = String(repeating: "y", count: 100)
             + "\n# body\n```\n"
             + String(repeating: "post\n", count: 130)
@@ -633,6 +716,191 @@ final class TranscriptRowProjectionTests: XCTestCase {
         XCTAssertTrue(reasoningRows.count > 1 && diffRows.count > 1 && genericRows.count > 1)
     }
 
+    func testHugeMetadataAndManyBodyTilesStayExactBoundedAndOwnedOnce() throws {
+        let toolTitle = "tool-title:" + String(repeating: "T", count: 512 * 1_024) + "終"
+        let diffPath = "diff-path/" + String(repeating: "p", count: 512 * 1_024) + "/終"
+        let genericTitle = "generic-title:" + String(
+            repeating: "title-☕️-",
+            count: 48_000
+        )
+        let genericType = String(repeating: "generic-type\r\n", count: 40_000)
+        let planTitle = "plan-title:" + String(repeating: "P", count: 512 * 1_024)
+        let body = (0..<4_000)
+            .map { "detail-\($0)-café-☕️" }
+            .joined(separator: "\n")
+
+        let toolRows = TranscriptRowProjection.makeRows(
+            item: .tool(
+                ToolActivity(
+                    id: "huge-metadata-tool",
+                    turnID: "turn",
+                    kind: .shell,
+                    title: toolTitle,
+                    status: .completed,
+                    input: body,
+                    output: body,
+                    errorMessage: body,
+                    durationMilliseconds: 12,
+                    exitCode: 1,
+                    occurredAt: nil,
+                    isTruncated: false,
+                    originalByteCount: nil
+                )
+            )
+        )
+        let diffRows = TranscriptRowProjection.makeRows(
+            item: .diff(
+                ChatDiff(
+                    id: "huge-metadata-diff",
+                    turnID: "turn",
+                    path: diffPath,
+                    unifiedDiff: body,
+                    occurredAt: nil,
+                    isTruncated: false
+                )
+            )
+        )
+        let genericRows = TranscriptRowProjection.makeRows(
+            item: .generic(
+                ChatGenericItem(
+                    id: "huge-metadata-generic",
+                    turnID: "turn",
+                    type: genericType,
+                    title: genericTitle,
+                    detail: body,
+                    occurredAt: nil
+                )
+            )
+        )
+        let planRows = TranscriptRowProjection.makeRows(
+            item: .plan(
+                ChatPlan(
+                    id: "huge-metadata-plan",
+                    turnID: "turn",
+                    title: planTitle,
+                    steps: (0..<400).map {
+                        ChatPlanStep(
+                            id: "step-\($0)",
+                            title: "Step \($0): \(String(repeating: "value ", count: 80))",
+                            isCompleted: $0.isMultiple(of: 2)
+                        )
+                    },
+                    occurredAt: nil
+                )
+            )
+        )
+
+        XCTAssertTrue(chatStringsHaveIdenticalUTF8(
+            metadataText(in: toolRows, section: .toolTitle),
+            toolTitle
+        ))
+        XCTAssertTrue(chatStringsHaveIdenticalUTF8(
+            metadataText(in: diffRows, section: .diffPath),
+            diffPath
+        ))
+        XCTAssertTrue(chatStringsHaveIdenticalUTF8(
+            metadataText(in: genericRows, section: .genericTitle),
+            genericTitle
+        ))
+        XCTAssertTrue(chatStringsHaveIdenticalUTF8(
+            metadataText(in: genericRows, section: .genericType),
+            genericType
+        ))
+        XCTAssertTrue(chatStringsHaveIdenticalUTF8(
+            planRows.filter { $0.section == .planTitle }.map(\.sourceText).joined(),
+            planTitle
+        ))
+        XCTAssertTrue(chatStringsHaveIdenticalUTF8(
+            try toolText(in: toolRows, section: .toolInput),
+            body
+        ))
+        XCTAssertTrue(chatStringsHaveIdenticalUTF8(
+            try toolText(in: toolRows, section: .toolOutput),
+            body
+        ))
+        XCTAssertTrue(chatStringsHaveIdenticalUTF8(
+            try toolText(in: toolRows, section: .toolError),
+            body
+        ))
+        XCTAssertTrue(chatStringsHaveIdenticalUTF8(try diffText(in: diffRows), body))
+        XCTAssertTrue(chatStringsHaveIdenticalUTF8(try genericText(in: genericRows), body))
+
+        for rows in [toolRows, diffRows, genericRows, planRows] {
+            try assertEveryTileIsBounded(rows)
+        }
+
+        for row in toolRows {
+            guard case .tool(let tool) = row.displayItem else {
+                return XCTFail("Expected tool projection")
+            }
+            if row.section == .toolTitle {
+                XCTAssertEqual(tool.title, row.metadataText)
+                XCTAssertNil(tool.input)
+                XCTAssertNil(tool.output)
+                XCTAssertNil(tool.errorMessage)
+            } else {
+                XCTAssertTrue(tool.title.isEmpty)
+            }
+        }
+        for row in diffRows {
+            guard case .diff(let diff) = row.displayItem else {
+                return XCTFail("Expected diff projection")
+            }
+            if row.section == .diffPath {
+                XCTAssertEqual(diff.path, row.metadataText)
+                XCTAssertTrue(diff.unifiedDiff.isEmpty)
+            } else {
+                XCTAssertNil(diff.path)
+            }
+        }
+        for row in genericRows {
+            guard case .generic(let generic) = row.displayItem else {
+                return XCTFail("Expected generic projection")
+            }
+            switch row.section {
+            case .genericTitle:
+                XCTAssertEqual(generic.title, row.metadataText)
+                XCTAssertNil(generic.detail)
+            case .genericType:
+                XCTAssertEqual(generic.type, row.metadataText)
+                XCTAssertTrue(generic.title.isEmpty)
+                XCTAssertNil(generic.detail)
+            case .generic:
+                XCTAssertTrue(generic.title.isEmpty)
+                XCTAssertTrue(generic.type.isEmpty)
+            default:
+                XCTFail("Unexpected generic section")
+            }
+        }
+
+        let collapsedGeneric = try XCTUnwrap(genericRows.first)
+        guard case .generic(let collapsedHeader) = collapsedGeneric.displayItem else {
+            return XCTFail("Expected generic collapsed header")
+        }
+        XCTAssertFalse(collapsedHeader.type.isEmpty)
+        XCTAssertLessThanOrEqual(collapsedHeader.type.utf8.count, 200)
+    }
+
+    func testMetadataSummariesAreBoundedByUTF8BytesNotGraphemes() throws {
+        let hugeGrapheme = "a" + String(repeating: "\u{301}", count: 50_000)
+        let rows = TranscriptRowProjection.makeRows(
+            item: .generic(
+                ChatGenericItem(
+                    id: "generic-metadata",
+                    turnID: nil,
+                    type: "activity",
+                    title: hugeGrapheme,
+                    detail: "body",
+                    occurredAt: nil
+                )
+            )
+        )
+
+        let row = try XCTUnwrap(rows.first)
+        XCTAssertLessThanOrEqual(row.accessibilitySummary.utf8.count, 200)
+        XCTAssertNotNil(row.accessibilitySummary.data(using: .utf8))
+    }
+
     @MainActor
     func testStoreCachesCompleteProjectionRowsForUnchangedItem() throws {
         let source = String(repeating: "café ☕️\n", count: 20_000)
@@ -698,6 +966,15 @@ final class TranscriptRowProjectionTests: XCTestCase {
         }.joined()
     }
 
+    private func metadataText(
+        in rows: [TranscriptRowProjection],
+        section: TranscriptRowProjection.Section
+    ) -> String {
+        rows.filter { $0.section == section }
+            .compactMap(\.metadataText)
+            .joined()
+    }
+
     private func toolText(
         in rows: [TranscriptRowProjection],
         section: TranscriptRowProjection.Section
@@ -739,26 +1016,54 @@ final class TranscriptRowProjectionTests: XCTestCase {
                 file: file,
                 line: line
             )
-
-            let renderedText: String
-            switch row.displayItem {
-            case .message(let message): renderedText = message.text
-            case .reasoning(let reasoning): renderedText = reasoning.text
-            case .tool(let tool):
-                renderedText = tool.input ?? tool.output ?? tool.errorMessage ?? ""
-            case .diff(let diff): renderedText = diff.unifiedDiff
-            case .plan(let plan):
-                renderedText = plan.title ?? plan.steps.first?.title ?? ""
-            case .generic(let generic): renderedText = generic.detail ?? ""
-            }
             XCTAssertLessThanOrEqual(
-                renderedText.utf8.count,
+                row.rowText.utf8.count,
                 TranscriptRowProjection.maximumDisplayBytes,
                 file: file,
                 line: line
             )
             XCTAssertLessThanOrEqual(
-                logicalLineCount(renderedText),
+                logicalLineCount(row.rowText),
+                TranscriptRowProjection.maximumDisplayLines,
+                file: file,
+                line: line
+            )
+
+            let displayedTexts: [String]
+            switch row.displayItem {
+            case .message(let message): displayedTexts = [message.text]
+            case .reasoning(let reasoning): displayedTexts = [reasoning.text]
+            case .tool(let tool):
+                displayedTexts = [
+                    tool.title,
+                    tool.input ?? "",
+                    tool.output ?? "",
+                    tool.errorMessage ?? "",
+                ]
+            case .diff(let diff):
+                displayedTexts = [diff.path ?? "", diff.unifiedDiff]
+            case .plan(let plan):
+                displayedTexts = [
+                    plan.title ?? "",
+                    plan.steps.first?.title ?? "",
+                ]
+            case .generic(let generic):
+                displayedTexts = [
+                    generic.title,
+                    generic.type,
+                    generic.detail ?? "",
+                ]
+            }
+            XCTAssertLessThanOrEqual(
+                displayedTexts.reduce(0) { $0 + $1.utf8.count },
+                TranscriptRowProjection.maximumDisplayBytes,
+                file: file,
+                line: line
+            )
+            XCTAssertLessThanOrEqual(
+                displayedTexts.filter { !$0.isEmpty }.reduce(0) {
+                    $0 + logicalLineCount($1)
+                },
                 TranscriptRowProjection.maximumDisplayLines,
                 file: file,
                 line: line
@@ -767,9 +1072,7 @@ final class TranscriptRowProjectionTests: XCTestCase {
     }
 
     private func logicalLineCount(_ text: String) -> Int {
-        1 + text.utf8.reduce(into: 0) { count, byte in
-            if byte == 0x0A { count += 1 }
-        }
+        TranscriptTextProjection.logicalLineCount(text)
     }
 }
 

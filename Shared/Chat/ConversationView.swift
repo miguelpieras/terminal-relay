@@ -125,10 +125,235 @@ enum MacTranscriptRow: MacConversationTableRow {
         }
     }
 
-    /// Stable message tiles bypass SwiftUI hosting entirely. Interactive rows,
-    /// streaming tails, code/image content, and disclosure headers stay hosted;
-    /// a completed message footer is a separate small native control row, so the
+    /// Stable text tiles bypass SwiftUI hosting entirely. Interactive rows,
+    /// streaming tails, image content, and disclosure headers stay hosted; a
+    /// completed message footer is a separate small native control row, so the
     /// final large-message text tile can use TextKit.
+    @MainActor
+    func liveScrollTextPresentation(
+        dynamicTypeSize: DynamicTypeSize,
+        colorScheme: ColorScheme
+    ) -> MacConversationNativeTextPresentation? {
+        guard case .item(let projection, let isExpanded, _) = self else {
+            return nil
+        }
+        if let native = nativeTextPresentation(
+            dynamicTypeSize: dynamicTypeSize,
+            colorScheme: colorScheme
+        ) {
+            return native.liveScrollCopy(
+                fallbackString: projection.rowText,
+                accessibilityLabel: projection.accessibilitySummary
+            )
+        }
+        let fontScale = dynamicTypeSize.macTranscriptFontScale
+        let isMonospaced: Bool
+        switch projection.kind {
+        case .diff:
+            isMonospaced = projection.section != .diffPath
+        case .generic:
+            isMonospaced = projection.section == .generic
+        case .tool:
+            isMonospaced = projection.section != .toolTitle
+                && projection.section != .toolError
+        case .message:
+            if case .message(let message) = projection.displayItem {
+                isMonospaced = message.contents.first?.kind == .code
+            } else {
+                isMonospaced = false
+            }
+        case .reasoning, .plan:
+            isMonospaced = false
+        }
+        let font = isMonospaced
+            ? NSFont.monospacedSystemFont(
+                ofSize: NSFont.systemFontSize * fontScale,
+                weight: .regular
+            )
+            : NSFont.systemFont(
+                ofSize: NSFont.systemFontSize * fontScale
+            )
+        let genericHeaderType: String? = {
+            guard projection.section == .genericTitle,
+                  projection.isFirstInItem,
+                  case .generic(let generic) = projection.displayItem,
+                  !generic.type.isEmpty else { return nil }
+            return generic.type
+        }()
+        let semanticHeader = genericHeaderType == nil
+            ? Self.liveScrollSemanticHeader(for: projection)
+            : nil
+        let isAlwaysVisibleDisclosureMetadata: Bool
+        switch projection.section {
+        case .toolTitle, .diffPath, .genericTitle, .genericType:
+            isAlwaysVisibleDisclosureMetadata = true
+        default:
+            isAlwaysVisibleDisclosureMetadata = false
+        }
+        let source = projection.kind.isDisclosure
+                && !isExpanded
+                && !isAlwaysVisibleDisclosureMetadata
+            ? ""
+            : projection.rowText
+        let displayText: String
+        if let genericHeaderType {
+            // The first generic disclosure row owns both bounded header
+            // fields. Preserve their exact bytes and idle title-then-type
+            // order; semantic-header normalization must never hide provider
+            // whitespace or consume the final byte reserved for the join.
+            displayText = projection.rowText + "\n" + genericHeaderType
+        } else {
+            displayText = Self.boundedLiveScrollText(
+                source: source,
+                semanticHeader: semanticHeader
+            )
+        }
+        return MacConversationNativeTextPresentation(
+            fallbackString: displayText,
+            contentInsets: NSEdgeInsets(
+                top: projection.isFirstInItem ? 7 : 0,
+                left: 28,
+                bottom: projection.isLastInItem ? 7 : 0,
+                right: 28
+            ),
+            firstRowTopInsetAdjustment: 15,
+            lastRowBottomInsetAdjustment: 9,
+            minimumTextContainerHeight:
+                semanticHeader == nil && genericHeaderType == nil ? 0 : 44,
+            maximumContentWidth: 760,
+            fallbackFont: font,
+            fallbackColor: projection.kind == .reasoning
+                ? .secondaryLabelColor
+                : .labelColor,
+            accessibilityLabel: projection.accessibilitySummary,
+            accessibilityIdentifier: projection.isFirstInItem
+                ? "conversation.item.\(projection.sourceItemID)"
+                : "conversation.item.\(projection.sourceItemID).segment.\(projection.id)",
+            usesFastPlainTextRenderer: true
+        )
+    }
+
+    private static func liveScrollSemanticHeader(
+        for projection: TranscriptRowProjection
+    ) -> String? {
+        switch projection.displayItem {
+        case .message(let message):
+            guard projection.sourceText.isEmpty,
+                  message.contents.first?.kind == .imagePlaceholder else {
+                return nil
+            }
+            return "Image"
+        case .reasoning(let reasoning):
+            guard projection.isFirstInItem else { return nil }
+            return reasoning.isStreaming ? "Thinking…" : "Reasoning summary"
+        case .tool(let tool):
+            var components: [String] = []
+            if projection.isFirstInItem {
+                if projection.section != .toolTitle {
+                    components.append(projection.accessibilitySummary)
+                }
+                components.append(tool.status.rawValue.capitalized)
+            }
+            if projection.isFirstInSection {
+                switch projection.section {
+                case .toolInput:
+                    components.append("Input")
+                case .toolOutput:
+                    components.append("Output")
+                case .toolError:
+                    components.append("Error")
+                case .toolHeader:
+                    break
+                default:
+                    break
+                }
+            }
+            if projection.rowText.isEmpty,
+               projection.section != .toolTitle {
+                components.append(
+                    tool.status == .running
+                        ? "Waiting for output…"
+                        : "No additional output"
+                )
+            }
+            return components.isEmpty ? nil : components.joined(separator: " · ")
+        case .diff(let diff):
+            guard projection.isFirstInItem else { return nil }
+            if projection.section == .diffPath {
+                return diff.isTruncated ? "Source truncated" : nil
+            }
+            return diff.isTruncated
+                ? "\(projection.accessibilitySummary) · Source truncated"
+                : projection.accessibilitySummary
+        case .plan:
+            return projection.sourceText.isEmpty ? "Plan" : nil
+        case .generic(let generic):
+            guard projection.isFirstInItem else { return nil }
+            if projection.section == .genericTitle
+                || projection.section == .genericType {
+                return nil
+            }
+            var components = [projection.accessibilitySummary]
+            if !generic.type.isEmpty {
+                components.append(
+                    TranscriptTextProjection.boundedUTF8Prefix(
+                        generic.type,
+                        maximumBytes: 200
+                    )
+                )
+            }
+            if projection.sourceText.isEmpty {
+                components.append("No additional details")
+            }
+            return components.joined(separator: " · ")
+        }
+    }
+
+    /// Header metadata shares the same bounded Core Text input as the exact
+    /// source. Source bytes always win; a semantic header uses only the spare
+    /// budget so the live renderer never hides or truncates retained content.
+    private static func boundedLiveScrollText(
+        source: String,
+        semanticHeader: String?
+    ) -> String {
+        guard let semanticHeader, !semanticHeader.isEmpty else { return source }
+        let normalizedHeader = TranscriptTextProjection.boundedUTF8Prefix(
+            semanticHeader,
+            maximumBytes: TranscriptRowProjection.maximumDisplayBytes
+        )
+            .components(separatedBy: .controlCharacters)
+            .joined(separator: " ")
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        guard !normalizedHeader.isEmpty else { return source }
+        if !source.isEmpty {
+            guard TranscriptTextProjection.logicalLineCount(
+                source,
+                stoppingAt: TranscriptRowProjection.maximumDisplayLines
+            ) < TranscriptRowProjection.maximumDisplayLines else {
+                return source
+            }
+        }
+        let separator = source.isEmpty ? "" : "\n"
+        let remainingBytes = TranscriptRowProjection.maximumDisplayBytes
+            - source.utf8.count
+            - separator.utf8.count
+        guard remainingBytes > 0 else { return source }
+
+        var boundedHeader = ""
+        boundedHeader.reserveCapacity(min(normalizedHeader.count, remainingBytes))
+        var byteCount = 0
+        for character in normalizedHeader {
+            let characterBytes = String(character).utf8.count
+            guard byteCount + characterBytes <= remainingBytes else { break }
+            boundedHeader.append(character)
+            byteCount += characterBytes
+        }
+        guard !boundedHeader.isEmpty else { return source }
+        return boundedHeader + separator + source
+    }
+
     @MainActor
     func nativeTextPresentation(
         dynamicTypeSize: DynamicTypeSize,
@@ -152,7 +377,15 @@ enum MacTranscriptRow: MacConversationTableRow {
                 return nil
             }
             switch content.kind {
-            case .code, .imagePlaceholder:
+            case .code:
+                guard message.role != .user else { return nil }
+                return Self.codeNativePresentation(
+                    text: projection.sourceText,
+                    projection: projection,
+                    identifier: identifier,
+                    fontScale: fontScale
+                )
+            case .imagePlaceholder:
                 return nil
             case .markdown, .plainText, .generic:
                 break
@@ -168,7 +401,14 @@ enum MacTranscriptRow: MacConversationTableRow {
                 )
             }
             let source = content.text
-            let cached = SanitizedMarkdownCache.shared.lookupPrepared(raw: source)
+            // Assistant rows paint exact text first and adopt rich Markdown
+            // only after scrolling. Avoid even a warm AppKit artifact lookup
+            // while a gesture is realizing cells; user bubbles keep their
+            // immediate rich presentation because they are not the worker
+            // output hot path.
+            let cached = message.role == .user
+                ? SanitizedMarkdownCache.shared.lookupPrepared(raw: source)
+                : nil
             let immediate = cached?.cachedAppKitAttributedText(
                 fontScale: fontScale,
                 colorScheme: colorScheme
@@ -224,7 +464,9 @@ enum MacTranscriptRow: MacConversationTableRow {
                 fallbackColor: .labelColor,
                 accessibilityLabel: projection.accessibilitySummary,
                 accessibilityIdentifier: identifier,
-                deferredAttributedString: deferred
+                deferredAttributedString: deferred,
+                usesFastPlainTextRenderer: true,
+                promotesFastRendererWhenIdle: true
             )
 
         case .reasoning(let reasoning):
@@ -246,6 +488,20 @@ enum MacTranscriptRow: MacConversationTableRow {
             )
 
         case .generic(let generic):
+            if let metadataText = projection.metadataText {
+                guard isExpanded, !projection.isFirstInItem else { return nil }
+                return Self.plainNativePresentation(
+                    text: metadataText,
+                    projection: projection,
+                    identifier: identifier,
+                    color: .labelColor,
+                    isMonospaced: false,
+                    topInset: 0,
+                    bottomInset: 4 + itemBottomInset,
+                    leadingTextInset: 23,
+                    fontScale: fontScale
+                )
+            }
             guard isExpanded,
                   !projection.isFirstInItem,
                   let detail = generic.detail else {
@@ -263,7 +519,71 @@ enum MacTranscriptRow: MacConversationTableRow {
                 fontScale: fontScale
             )
 
-        case .tool, .diff, .plan:
+        case .tool(let tool):
+            if let metadataText = projection.metadataText {
+                guard isExpanded, !projection.isFirstInItem else { return nil }
+                return Self.plainNativePresentation(
+                    text: metadataText,
+                    projection: projection,
+                    identifier: identifier,
+                    color: .labelColor,
+                    isMonospaced: false,
+                    topInset: 0,
+                    bottomInset: 4 + itemBottomInset,
+                    leadingTextInset: 23,
+                    fontScale: fontScale
+                )
+            }
+            guard isExpanded,
+                  !projection.isFirstInItem,
+                  !projection.isFirstInSection,
+                  tool.status != .pending,
+                  tool.status != .running else {
+                return nil
+            }
+            return Self.plainNativePresentation(
+                text: projection.sourceText,
+                projection: projection,
+                identifier: identifier,
+                color: projection.section == .toolError
+                    ? .systemRed
+                    : .labelColor,
+                isMonospaced: projection.section != .toolError,
+                topInset: 0,
+                bottomInset: 4 + itemBottomInset,
+                leadingTextInset: 23,
+                fontScale: fontScale
+            )
+
+        case .diff:
+            if let metadataText = projection.metadataText {
+                guard isExpanded, !projection.isFirstInItem else { return nil }
+                return Self.plainNativePresentation(
+                    text: metadataText,
+                    projection: projection,
+                    identifier: identifier,
+                    color: .labelColor,
+                    isMonospaced: false,
+                    topInset: 0,
+                    bottomInset: 4 + itemBottomInset,
+                    leadingTextInset: 23,
+                    fontScale: fontScale
+                )
+            }
+            guard isExpanded, !projection.isFirstInItem else { return nil }
+            return Self.plainNativePresentation(
+                text: projection.sourceText,
+                projection: projection,
+                identifier: identifier,
+                color: .labelColor,
+                isMonospaced: true,
+                topInset: 0,
+                bottomInset: 4 + itemBottomInset,
+                leadingTextInset: 23,
+                fontScale: fontScale
+            )
+
+        case .plan:
             return nil
         }
     }
@@ -402,8 +722,70 @@ enum MacTranscriptRow: MacConversationTableRow {
             maximumContentWidth: 760,
             fallbackFont: font,
             fallbackColor: color,
+            fallbackParagraphStyle: paragraph,
             accessibilityLabel: projection.accessibilitySummary,
-            accessibilityIdentifier: identifier
+            accessibilityIdentifier: identifier,
+            usesFastPlainTextRenderer: true
+        )
+    }
+
+    @MainActor
+    private static func codeNativePresentation(
+        text: String,
+        projection: TranscriptRowProjection,
+        identifier: String,
+        fontScale: CGFloat
+    ) -> MacConversationNativeTextPresentation {
+        var corners: MacConversationNativeTextPresentation.RoundedCorners = []
+        if projection.isFirstInSection {
+            corners.formUnion([.topLeading, .topTrailing])
+        }
+        if projection.isLastInSection {
+            corners.formUnion([.bottomLeading, .bottomTrailing])
+        }
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 3
+        paragraph.lineBreakMode = .byCharWrapping
+        let font = NSFont.monospacedSystemFont(
+            ofSize: NSFont.systemFontSize * fontScale,
+            weight: .regular
+        )
+        let color = NSColor.labelColor
+        let attributed = NSAttributedString(
+            string: text,
+            attributes: [
+                .font: font,
+                .foregroundColor: color,
+                .paragraphStyle: paragraph,
+            ]
+        )
+        return MacConversationNativeTextPresentation(
+            attributedString: attributed,
+            fallbackString: text,
+            contentInsets: NSEdgeInsets(
+                top: projection.isFirstInItem ? 7 : 0,
+                left: 28,
+                bottom: 0,
+                right: 28
+            ),
+            firstRowTopInsetAdjustment: 15,
+            lastRowBottomInsetAdjustment: 9,
+            textEdgeInsets: NSEdgeInsets(
+                top: projection.isFirstInSection ? 12 : 0,
+                left: 12,
+                bottom: projection.isLastInSection ? 12 : 0,
+                right: 12
+            ),
+            maximumContentWidth: 760,
+            backgroundColor: NSColor.secondaryLabelColor.withAlphaComponent(0.065),
+            backgroundCornerRadius: 12,
+            roundedCorners: corners,
+            fallbackFont: font,
+            fallbackColor: color,
+            fallbackParagraphStyle: paragraph,
+            accessibilityLabel: projection.accessibilitySummary,
+            accessibilityIdentifier: identifier,
+            usesFastPlainTextRenderer: true
         )
     }
 }
@@ -424,7 +806,7 @@ func makeMacTranscriptRows(
     }
     if case .message(let message) = item,
        !message.isStreaming,
-       !message.text.isEmpty {
+       message.hasText {
         rows.append(
             .messageFooter(
                 MacMessageFooter(
@@ -862,7 +1244,7 @@ struct ConversationView: View {
             if case .item(let projection, let isExpanded, _) = row {
                 if case .message(let message) = projection.displayItem,
                    !message.isStreaming,
-                   !message.text.isEmpty {
+                   message.hasText {
                     // The copy/timestamp footer is its own following row, so
                     // the final native text tile must not add item spacing.
                     return false
@@ -1595,7 +1977,7 @@ private struct ChatMessageView: View {
                 if showsFooter,
                    isLastSegment,
                    !message.isStreaming,
-                   !message.text.isEmpty {
+                   message.hasText {
                     messageFooter
                 }
             }
@@ -1896,7 +2278,18 @@ private struct ToolActivityCard: View {
 
     @ViewBuilder
     var body: some View {
-        if segment?.isFirstInItem == false {
+        if segment?.section == .toolTitle,
+           segment?.isFirstInItem == false,
+           let metadataText = segment?.metadataText {
+            if isExpanded {
+                Text(verbatim: metadataText)
+                    .font(.subheadline)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 23)
+                    .padding(.bottom, 4)
+            }
+        } else if segment?.isFirstInItem == false {
             if isExpanded {
                 toolContent
                     .padding(.leading, 23)
@@ -1911,7 +2304,9 @@ private struct ToolActivityCard: View {
                 isExpanded: isExpanded,
                 toggle: { actions.toggleExpanded(itemID: tool.id) }
             ) {
-                toolContent
+                if segment?.section != .toolTitle {
+                    toolContent
+                }
             }
         }
     }
@@ -2050,7 +2445,18 @@ private struct DiffCard: View {
 
     @ViewBuilder
     var body: some View {
-        if segment?.isFirstInItem == false {
+        if segment?.section == .diffPath,
+           segment?.isFirstInItem == false,
+           let metadataText = segment?.metadataText {
+            if isExpanded {
+                Text(verbatim: metadataText)
+                    .font(.subheadline)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 23)
+                    .padding(.bottom, 4)
+            }
+        } else if segment?.isFirstInItem == false {
             if isExpanded {
                 DiffTextView(diff: diff.unifiedDiff)
                     .padding(.leading, 23)
@@ -2065,7 +2471,9 @@ private struct DiffCard: View {
                 isExpanded: isExpanded,
                 toggle: { actions.toggleExpanded(itemID: diff.id) }
             ) {
-                DiffTextView(diff: diff.unifiedDiff)
+                if segment?.section != .diffPath {
+                    DiffTextView(diff: diff.unifiedDiff)
+                }
             }
         }
     }
@@ -2247,7 +2655,19 @@ private struct GenericActivityCard: View {
 
     @ViewBuilder
     var body: some View {
-        if segment?.isFirstInItem == false {
+        if (segment?.section == .genericTitle
+                || segment?.section == .genericType),
+           segment?.isFirstInItem == false,
+           let metadataText = segment?.metadataText {
+            if isExpanded {
+                Text(verbatim: metadataText)
+                    .font(.subheadline)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 23)
+                    .padding(.bottom, 4)
+            }
+        } else if segment?.isFirstInItem == false {
             if isExpanded {
                 detailContent
                     .padding(.leading, 23)
@@ -2262,7 +2682,10 @@ private struct GenericActivityCard: View {
                 isExpanded: isExpanded,
                 toggle: { actions.toggleExpanded(itemID: item.id) }
             ) {
-                detailContent
+                if segment?.section != .genericTitle
+                    && segment?.section != .genericType {
+                    detailContent
+                }
             }
         }
     }

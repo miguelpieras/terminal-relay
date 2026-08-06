@@ -24,12 +24,6 @@ enum TranscriptPerformance {
         return body()
     }
 
-    static func measureRowConfigure<Result>(_ body: () -> Result) -> Result {
-        let state = signposter.beginInterval("TranscriptRowConfigure")
-        defer { signposter.endInterval("TranscriptRowConfigure", state) }
-        return body()
-    }
-
     /// Numeric counters only. Never add transcript text, IDs, paths, command
     /// strings, worker identities, or any other user-controlled value here.
     static func emitCounters(

@@ -1478,6 +1478,133 @@ final class ConversationCoordinatorTests: XCTestCase {
         await coordinator.detach()
     }
 
+    func testConnectingPlaceholderSuppressesScheduledAndDetachCacheWrites() async throws {
+        let cache = ControlledConversationStateCache(
+            loadResult: nil,
+            suspendsLoad: false
+        )
+        let transport = ChatFixtureTransport(initialEvents: [Self.hello(sequence: 1)])
+        let store = ConversationStore()
+        let coordinator = ConversationCoordinator(
+            store: store,
+            transport: transport,
+            identity: ChatTestFixtures.identity,
+            retryPolicy: .immediate,
+            stopPolicy: .immediate,
+            cache: cache
+        )
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+
+        let painted = ConversationItem.message(
+            ChatMessage(id: "painted", role: .assistant, text: "painted history")
+        )
+        await transport.yield(.envelope(
+            try Self.snapshotEnvelope(
+                generation: ChatTestFixtures.generation,
+                baseSequence: 2,
+                items: [painted],
+                connectionState: .streaming
+            )
+        ))
+        await waitUntil { await cache.savedStates().count == 1 }
+
+        let rebuiltGeneration = "00000000-0000-4000-8000-00000000000e"
+        await transport.yield(.envelope(
+            try Self.snapshotEnvelope(
+                generation: rebuiltGeneration,
+                baseSequence: 1,
+                items: [],
+                connectionState: .connecting
+            )
+        ))
+        await waitUntil {
+            store.state.snapshotGeneration == rebuiltGeneration
+                && store.state.connectionState == .connecting
+        }
+        await transport.yield(.envelope(
+            ChatTestFixtures.event(
+                "session.heartbeat",
+                sequence: 2,
+                snapshotGeneration: rebuiltGeneration
+            )
+        ))
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        let savesAfterHeartbeat = await cache.savedStates().count
+        XCTAssertEqual(savesAfterHeartbeat, 1)
+
+        await coordinator.detach()
+        let savesAfterDetach = await cache.savedStates().count
+        XCTAssertEqual(
+            savesAfterDetach,
+            1,
+            "Detach must not persist old painted rows under a placeholder generation/cursor."
+        )
+    }
+
+    func testAuthoritativeSnapshotResumesCacheWritesAfterPlaceholder() async throws {
+        let cache = ControlledConversationStateCache(
+            loadResult: nil,
+            suspendsLoad: false
+        )
+        let transport = ChatFixtureTransport(initialEvents: [Self.hello(sequence: 1)])
+        let store = ConversationStore()
+        let coordinator = ConversationCoordinator(
+            store: store,
+            transport: transport,
+            identity: ChatTestFixtures.identity,
+            retryPolicy: .immediate,
+            stopPolicy: .immediate,
+            cache: cache
+        )
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+        await transport.yield(.envelope(
+            try Self.snapshotEnvelope(
+                generation: ChatTestFixtures.generation,
+                baseSequence: 2,
+                items: [
+                    .message(ChatMessage(
+                        id: "painted",
+                        role: .assistant,
+                        text: "painted history"
+                    )),
+                ],
+                connectionState: .streaming
+            )
+        ))
+        await waitUntil { await cache.savedStates().count == 1 }
+
+        let rebuiltGeneration = "00000000-0000-4000-8000-00000000000f"
+        await transport.yield(.envelope(
+            try Self.snapshotEnvelope(
+                generation: rebuiltGeneration,
+                baseSequence: 1,
+                items: [],
+                connectionState: .connecting
+            )
+        ))
+        let rebuilt = ConversationItem.message(
+            ChatMessage(id: "rebuilt", role: .assistant, text: "rebuilt history")
+        )
+        await transport.yield(.envelope(
+            try Self.snapshotEnvelope(
+                generation: rebuiltGeneration,
+                baseSequence: 2,
+                items: [rebuilt],
+                connectionState: .streaming
+            )
+        ))
+        await waitUntil { await cache.savedStates().count == 2 }
+
+        let savedStates = await cache.savedStates()
+        let saved = try XCTUnwrap(savedStates.last)
+        XCTAssertEqual(saved.snapshotGeneration, rebuiltGeneration)
+        XCTAssertEqual(saved.lastAppliedSequence, 2)
+        XCTAssertEqual(saved.items, [rebuilt])
+        await coordinator.detach()
+    }
+
     func testFirstMessageAndReasoningDeltasArePreparedBeforePublication() async throws {
         try await assertFirstDeltaIsPreparedOffMain(
             type: "message.delta",
@@ -1662,6 +1789,26 @@ final class ConversationCoordinatorTests: XCTestCase {
             sequence: sequence,
             payload: (try? JSONValue.encoded(ChatCapabilities(features: ["streaming"])))
                 ?? .object([:])
+        )
+    }
+
+    private static func snapshotEnvelope(
+        generation: String,
+        baseSequence: Int64,
+        items: [ConversationItem],
+        connectionState: ChatConnectionState
+    ) throws -> ChatEnvelope {
+        let snapshot = ConversationSnapshot(
+            snapshotGeneration: generation,
+            baseSequence: baseSequence,
+            items: items,
+            connectionState: connectionState
+        )
+        return ChatTestFixtures.event(
+            "conversation.snapshot",
+            sequence: baseSequence,
+            payload: try JSONValue.encoded(snapshot),
+            snapshotGeneration: generation
         )
     }
 

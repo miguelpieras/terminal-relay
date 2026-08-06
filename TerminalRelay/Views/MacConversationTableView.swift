@@ -1,4 +1,6 @@
 import AppKit
+import CoreText
+import QuartzCore
 import SwiftUI
 
 @MainActor
@@ -15,7 +17,7 @@ private final class MacConversationTranscriptScrollView: NSScrollView {
 /// text preparation waits here while the user or scroll momentum owns the
 /// viewport, so a completed artifact cannot trigger an intrinsic-height pass
 /// in the middle of a gesture.
-final class MacTranscriptScrollActivity {
+final class MacTranscriptScrollActivity: @unchecked Sendable {
     private final class CancellationToken: @unchecked Sendable {
         private enum State {
             case pending
@@ -61,8 +63,10 @@ final class MacTranscriptScrollActivity {
     }
 
     @MainActor private var isLiveScrolling = false
+    @MainActor private var isIncrementalRestorationActive = false
     @MainActor private var idleAdoptions: [IdleAdoption] = []
     @MainActor private var isIdleAdoptionScheduled = false
+    @MainActor private var idleAdoptionTimer: Timer?
     @MainActor private var onHeightChangingContentWillAdopt: (() -> Void)?
 
     @MainActor
@@ -74,9 +78,25 @@ final class MacTranscriptScrollActivity {
     func setLiveScrolling(_ value: Bool) {
         guard isLiveScrolling != value else { return }
         isLiveScrolling = value
+        if value {
+            idleAdoptionTimer?.invalidate()
+            idleAdoptionTimer = nil
+            isIdleAdoptionScheduled = false
+            return
+        }
+        scheduleNextIdleAdoption()
+    }
+
+    @MainActor
+    func setIncrementalRestorationActive(_ value: Bool) {
+        guard isIncrementalRestorationActive != value else { return }
+        isIncrementalRestorationActive = value
         guard !value else { return }
         scheduleNextIdleAdoption()
     }
+
+    @MainActor
+    var isLiveScrollActive: Bool { isLiveScrolling }
 
     /// Runs a row-local content swap atomically while the viewport is idle.
     /// Cancellation removes recycled rows from the queue, and a new gesture
@@ -126,6 +146,9 @@ final class MacTranscriptScrollActivity {
 
     @MainActor
     func cancelPendingAdoptions() {
+        idleAdoptionTimer?.invalidate()
+        idleAdoptionTimer = nil
+        isIdleAdoptionScheduled = false
         let pending = idleAdoptions
         idleAdoptions.removeAll(keepingCapacity: true)
         for adoption in pending {
@@ -135,8 +158,9 @@ final class MacTranscriptScrollActivity {
 
     @MainActor
     private func performNextIdleAdoption() {
+        idleAdoptionTimer = nil
         isIdleAdoptionScheduled = false
-        guard !isLiveScrolling else { return }
+        guard !isLiveScrolling, !isIncrementalRestorationActive else { return }
         while !idleAdoptions.isEmpty,
               idleAdoptions[0].cancellationToken.isCancelled {
             idleAdoptions.removeFirst().continuation.resume()
@@ -157,16 +181,21 @@ final class MacTranscriptScrollActivity {
     @MainActor
     private func scheduleNextIdleAdoption() {
         guard !isLiveScrolling,
+              !isIncrementalRestorationActive,
               !idleAdoptions.isEmpty,
               !isIdleAdoptionScheduled else { return }
         isIdleAdoptionScheduled = true
-        // One prepared row is allowed to build and adopt its final TextKit
-        // artifact per main-loop turn. This applies to already-idle initial
-        // mounts too, so a warm viewport cannot release a burst of conversions
-        // before the first frame is presented.
-        DispatchQueue.main.async { [weak self] in
-            self?.performNextIdleAdoption()
+        // Plain content is already visible. Pace selectable/rich promotion to
+        // one bounded row per 60 Hz interval so a warm viewport cannot drain
+        // several TextKit height changes before the next display frame.
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: false) {
+            [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.performNextIdleAdoption()
+            }
         }
+        idleAdoptionTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
 }
 
@@ -235,6 +264,7 @@ struct MacConversationNativeTextPresentation {
     let lastRowBottomInsetAdjustment: CGFloat
     let textContainerInset: NSSize
     let textEdgeInsets: NSEdgeInsets
+    let minimumTextContainerHeight: CGFloat
     let maximumContentWidth: CGFloat?
     let maximumTextWidth: CGFloat?
     let backgroundColor: NSColor?
@@ -243,10 +273,13 @@ struct MacConversationNativeTextPresentation {
     let horizontalAlignment: HorizontalAlignment
     let fallbackFont: NSFont?
     let fallbackColor: NSColor?
+    let fallbackParagraphStyle: NSParagraphStyle?
     let accessibilityLabel: String?
     let accessibilityIdentifier: String?
     let linkHandler: LinkHandler?
     let deferredAttributedString: DeferredAttributedString?
+    let usesFastPlainTextRenderer: Bool
+    let promotesFastRendererWhenIdle: Bool
 
     init(
         attributedString: NSAttributedString? = nil,
@@ -266,6 +299,7 @@ struct MacConversationNativeTextPresentation {
             bottom: 0,
             right: 0
         ),
+        minimumTextContainerHeight: CGFloat = 0,
         maximumContentWidth: CGFloat? = nil,
         maximumTextWidth: CGFloat? = nil,
         backgroundColor: NSColor? = nil,
@@ -274,10 +308,13 @@ struct MacConversationNativeTextPresentation {
         horizontalAlignment: HorizontalAlignment = .fill,
         fallbackFont: NSFont? = nil,
         fallbackColor: NSColor? = nil,
+        fallbackParagraphStyle: NSParagraphStyle? = nil,
         accessibilityLabel: String? = nil,
         accessibilityIdentifier: String? = nil,
         linkHandler: LinkHandler? = nil,
-        deferredAttributedString: DeferredAttributedString? = nil
+        deferredAttributedString: DeferredAttributedString? = nil,
+        usesFastPlainTextRenderer: Bool = false,
+        promotesFastRendererWhenIdle: Bool = false
     ) {
         // Prepared transcript artifacts are immutable and cache-owned. Keep
         // their identity so mounting a native cell does not allocate/copy the
@@ -293,6 +330,9 @@ struct MacConversationNativeTextPresentation {
             : 0
         self.textContainerInset = textContainerInset
         self.textEdgeInsets = textEdgeInsets
+        self.minimumTextContainerHeight = minimumTextContainerHeight.isFinite
+            ? max(0, minimumTextContainerHeight)
+            : 0
         self.maximumContentWidth = maximumContentWidth.flatMap {
             $0.isFinite && $0 > 0 ? $0 : nil
         }
@@ -307,10 +347,50 @@ struct MacConversationNativeTextPresentation {
         self.horizontalAlignment = horizontalAlignment
         self.fallbackFont = fallbackFont
         self.fallbackColor = fallbackColor
+        self.fallbackParagraphStyle = fallbackParagraphStyle?.copy()
+            as? NSParagraphStyle
         self.accessibilityLabel = accessibilityLabel
         self.accessibilityIdentifier = accessibilityIdentifier
         self.linkHandler = linkHandler
         self.deferredAttributedString = deferredAttributedString
+        self.usesFastPlainTextRenderer = usesFastPlainTextRenderer
+        self.promotesFastRendererWhenIdle = promotesFastRendererWhenIdle
+    }
+
+    /// Copies only layout and plain styling into the frame-critical scroll
+    /// presentation. Rich artifacts, links, and deferred work deliberately do
+    /// not cross this boundary; the exact source is restored to the ordinary
+    /// selectable presentation when the gesture ends.
+    @MainActor
+    func liveScrollCopy(
+        fallbackString: String,
+        accessibilityLabel: String?,
+        minimumTextContainerHeight: CGFloat? = nil
+    ) -> Self {
+        Self(
+            fallbackString: fallbackString,
+            contentInsets: contentInsets,
+            firstRowTopInsetAdjustment: firstRowTopInsetAdjustment,
+            lastRowBottomInsetAdjustment: lastRowBottomInsetAdjustment,
+            textContainerInset: textContainerInset,
+            textEdgeInsets: textEdgeInsets,
+            minimumTextContainerHeight: max(
+                self.minimumTextContainerHeight,
+                minimumTextContainerHeight ?? 0
+            ),
+            maximumContentWidth: maximumContentWidth,
+            maximumTextWidth: maximumTextWidth,
+            backgroundColor: backgroundColor,
+            backgroundCornerRadius: backgroundCornerRadius,
+            roundedCorners: roundedCorners,
+            horizontalAlignment: horizontalAlignment,
+            fallbackFont: fallbackFont,
+            fallbackColor: fallbackColor,
+            fallbackParagraphStyle: fallbackParagraphStyle,
+            accessibilityLabel: accessibilityLabel,
+            accessibilityIdentifier: accessibilityIdentifier,
+            usesFastPlainTextRenderer: true
+        )
     }
 }
 
@@ -336,6 +416,14 @@ protocol MacConversationTableRow: Equatable, Identifiable where ID == String {
         dynamicTypeSize: DynamicTypeSize,
         colorScheme: ColorScheme
     ) -> MacConversationNativeTextPresentation?
+    /// Exact, noninteractive text used only while a live gesture owns the
+    /// viewport. Rows may replace richer controls with this presentation and
+    /// restore their ordinary content after scrolling ends.
+    @MainActor
+    func liveScrollTextPresentation(
+        dynamicTypeSize: DynamicTypeSize,
+        colorScheme: ColorScheme
+    ) -> MacConversationNativeTextPresentation?
     /// Non-nil completed-message footers use one reusable AppKit button/label
     /// cell instead of paying a SwiftUI hosting transition at every message.
     @MainActor
@@ -357,6 +445,17 @@ extension MacConversationTableRow {
         colorScheme: ColorScheme
     ) -> MacConversationNativeTextPresentation? {
         nil
+    }
+
+    @MainActor
+    func liveScrollTextPresentation(
+        dynamicTypeSize: DynamicTypeSize,
+        colorScheme: ColorScheme
+    ) -> MacConversationNativeTextPresentation? {
+        nativeTextPresentation(
+            dynamicTypeSize: dynamicTypeSize,
+            colorScheme: colorScheme
+        )
     }
 
     @MainActor
@@ -442,9 +541,13 @@ enum MacConversationTableDiagnostics {
         let ordinaryMountConfigurations: Int
         let explicitReconfigurations: Int
         let measuredRows: Int
-        let maximumMountedRows: Int
         let heightInvalidationPasses: Int
         let scrollOriginCorrections: Int
+        let watchedSourceConfigurations: Int
+        let liveScrollRestorationPasses: Int
+        let maximumLiveScrollRestorationsPerPass: Int
+        let maximumLiveScrollRestorationMilliseconds: Double
+        let maximumLiveScrollEndMilliseconds: Double
     }
 
     private(set) static var reloadDataCalls = 0
@@ -454,9 +557,14 @@ enum MacConversationTableDiagnostics {
     private(set) static var ordinaryMountConfigurations = 0
     private(set) static var explicitReconfigurations = 0
     private(set) static var measuredRows = 0
-    private(set) static var maximumMountedRows = 0
     private(set) static var heightInvalidationPasses = 0
     private(set) static var scrollOriginCorrections = 0
+    private(set) static var watchedSourceConfigurations = 0
+    private(set) static var liveScrollRestorationPasses = 0
+    private(set) static var maximumLiveScrollRestorationsPerPass = 0
+    private(set) static var maximumLiveScrollRestorationMilliseconds = 0.0
+    private(set) static var maximumLiveScrollEndMilliseconds = 0.0
+    private static var watchedMutationSourceID: String?
 
     static func reset() {
         reloadDataCalls = 0
@@ -466,9 +574,14 @@ enum MacConversationTableDiagnostics {
         ordinaryMountConfigurations = 0
         explicitReconfigurations = 0
         measuredRows = 0
-        maximumMountedRows = 0
         heightInvalidationPasses = 0
         scrollOriginCorrections = 0
+        watchedSourceConfigurations = 0
+        liveScrollRestorationPasses = 0
+        maximumLiveScrollRestorationsPerPass = 0
+        maximumLiveScrollRestorationMilliseconds = 0
+        maximumLiveScrollEndMilliseconds = 0
+        watchedMutationSourceID = nil
     }
 
     static func snapshot() -> Snapshot {
@@ -480,10 +593,21 @@ enum MacConversationTableDiagnostics {
             ordinaryMountConfigurations: ordinaryMountConfigurations,
             explicitReconfigurations: explicitReconfigurations,
             measuredRows: measuredRows,
-            maximumMountedRows: maximumMountedRows,
             heightInvalidationPasses: heightInvalidationPasses,
-            scrollOriginCorrections: scrollOriginCorrections
+            scrollOriginCorrections: scrollOriginCorrections,
+            watchedSourceConfigurations: watchedSourceConfigurations,
+            liveScrollRestorationPasses: liveScrollRestorationPasses,
+            maximumLiveScrollRestorationsPerPass:
+                maximumLiveScrollRestorationsPerPass,
+            maximumLiveScrollRestorationMilliseconds:
+                maximumLiveScrollRestorationMilliseconds,
+            maximumLiveScrollEndMilliseconds: maximumLiveScrollEndMilliseconds
         )
+    }
+
+    static func watchConfigurations(for mutationSourceID: String?) {
+        watchedMutationSourceID = mutationSourceID
+        watchedSourceConfigurations = 0
     }
 
     static func recordedReload() { reloadDataCalls += 1 }
@@ -491,18 +615,43 @@ enum MacConversationTableDiagnostics {
         targetedRowReloads += count
     }
     static func recordedPreciseMutation() { preciseMutationPasses += 1 }
-    static func recordedConfiguration(mountedRows: Int, isExplicit: Bool) {
+    static func recordedConfiguration(
+        mutationSourceID: String,
+        isExplicit: Bool
+    ) {
         rowConfigurations += 1
+        if mutationSourceID == watchedMutationSourceID {
+            watchedSourceConfigurations += 1
+        }
         if isExplicit {
             explicitReconfigurations += 1
         } else {
             ordinaryMountConfigurations += 1
         }
         measuredRows += 1
-        maximumMountedRows = max(maximumMountedRows, mountedRows)
     }
     static func recordedHeightInvalidation() { heightInvalidationPasses += 1 }
     static func recordedScrollOriginCorrection() { scrollOriginCorrections += 1 }
+    static func recordedLiveScrollRestoration(
+        restoredRows: Int,
+        milliseconds: Double
+    ) {
+        liveScrollRestorationPasses += 1
+        maximumLiveScrollRestorationsPerPass = max(
+            maximumLiveScrollRestorationsPerPass,
+            restoredRows
+        )
+        maximumLiveScrollRestorationMilliseconds = max(
+            maximumLiveScrollRestorationMilliseconds,
+            milliseconds
+        )
+    }
+    static func recordedLiveScrollEnd(milliseconds: Double) {
+        maximumLiveScrollEndMilliseconds = max(
+            maximumLiveScrollEndMilliseconds,
+            milliseconds
+        )
+    }
 }
 
 /// A view-based AppKit transcript. The table owns scrolling and row geometry;
@@ -624,6 +773,15 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         private var stabilizationGeneration: UInt64 = 0
         private var isLiveScrolling = false
         private var pendingLiveScrollHeightInvalidations = IndexSet()
+        private let liveScrollCells = NSHashTable<MacConversationReusableCell>
+            .weakObjects()
+        private var liveScrollRestorationQueue: [LiveScrollRestoration] = []
+        private var liveScrollRestorationIndex = 0
+        private var liveScrollRestorationDisplayLink: CADisplayLink?
+        private var liveScrollRestorationTimer: Timer?
+        private var pendingLiveScrollRestorationAnchor: Anchor?
+        private var pendingLiveScrollRestorationFollowsBottom = false
+        private var pendingLiveScrollRestorationExpectedOriginY: CGFloat?
         private var lastViewportWidth: CGFloat?
         private var prefetchedRange: Range<Int>?
         private var lastPrefetchVisibleLowerBound: Int?
@@ -634,6 +792,25 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             let rowID: String
             let localRowIndex: Int
             let offset: CGFloat
+        }
+
+        private final class LiveScrollRestoration {
+            weak var cell: MacConversationReusableCell?
+            let rowID: String
+            let originalIndex: Int
+            let reloadsCell: Bool
+
+            init(
+                cell: MacConversationReusableCell?,
+                rowID: String,
+                originalIndex: Int,
+                reloadsCell: Bool
+            ) {
+                self.cell = cell
+                self.rowID = rowID
+                self.originalIndex = originalIndex
+                self.reloadsCell = reloadsCell
+            }
         }
 
         func attach(scrollView: NSScrollView, tableView: NSTableView) {
@@ -703,6 +880,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             // teardown cannot briefly mount stale content or measure its row.
             scrollActivity.cancelPendingAdoptions()
             scrollActivity.setLiveScrolling(false)
+            scrollActivity.setIncrementalRestorationActive(false)
             (scrollView as? MacConversationTranscriptScrollView)?.onLayout = nil
             for observer in observers {
                 NotificationCenter.default.removeObserver(observer)
@@ -719,6 +897,8 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             stabilizationScheduled = false
             isLiveScrolling = false
             pendingLiveScrollHeightInvalidations.removeAll()
+            liveScrollCells.removeAllObjects()
+            cancelLiveScrollRestoration(requeueMountedCells: false)
             viewportPrefetchTask?.cancel()
             viewportPrefetchTask = nil
             lastViewportWidth = nil
@@ -782,6 +962,16 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 return
             }
             let isInitialPopulation = snapshot.count == 0 && newSnapshot.count > 0
+            if isInitialPopulation {
+                tableView.rowHeight = estimatedAutomaticRowHeight(
+                    in: newSnapshot,
+                    viewportWidth: max(
+                        800,
+                        scrollView?.contentView.bounds.width
+                            ?? tableView.bounds.width
+                    )
+                )
+            }
             if generationChanged || styleChanged
                 || snapshot.count != newSnapshot.count
                 || snapshot.sections.first?.id != newSnapshot.sections.first?.id {
@@ -890,7 +1080,19 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             guard let location = snapshot.location(ofFlatIndex: index) else { return nil }
             let section = snapshot.sections[location.section]
             let row = section.rows[location.row]
-            let kind = cellKind(for: row)
+            let isFirst = index == 0
+            let isLast = index == snapshot.count - 1
+            let preparedContent = cellContent(
+                for: row,
+                isFirst: isFirst,
+                isLast: isLast
+            )
+            let kind: MacConversationReusableCell.Kind = if isLiveScrolling,
+                preparedContent.kind == .native {
+                .nativeScroll
+            } else {
+                preparedContent.kind
+            }
             let identifier = NSUserInterfaceItemIdentifier(
                 "\(row.reuseIdentifier).\(kind.rawValue)"
             )
@@ -905,6 +1107,8 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                     cell = MacConversationHostedCell()
                 case .native:
                     cell = MacConversationNativeTextCell()
+                case .nativeScroll:
+                    cell = MacConversationScrollTextCell()
                 case .nativeFooter:
                     cell = MacConversationNativeFooterCell()
                 }
@@ -913,10 +1117,14 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             configure(
                 cell,
                 with: row,
-                isFirst: index == 0,
-                isLast: index == snapshot.count - 1,
+                isFirst: isFirst,
+                isLast: isLast,
+                preparedContent: preparedContent,
                 isExplicit: false
             )
+            if kind == .nativeScroll {
+                liveScrollCells.add(cell)
+            }
             return cell
         }
 
@@ -1057,6 +1265,23 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 tableView.endUpdates()
             }
 
+            // Live-scroll display cells are a viewport mode, not a model
+            // property. A row that was already visible when the gesture began
+            // can therefore have the right old/new model kind but the wrong
+            // currently mounted cell class. Replace it before configuration
+            // so streaming updates never send native content to a hosted cell.
+            for index in changedIndexes
+            where snapshot.location(ofFlatIndex: index) != nil {
+                guard let cell = tableView.view(
+                    atColumn: 0,
+                    row: index,
+                    makeIfNecessary: false
+                ) as? MacConversationReusableCell else { continue }
+                if cell.kind != cellKind(for: snapshot[index]) {
+                    cellClassChanges.insert(index)
+                }
+            }
+
             if !cellClassChanges.isEmpty {
                 tableView.reloadData(
                     forRowIndexes: cellClassChanges,
@@ -1160,6 +1385,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             isFirst: Bool,
             isLast: Bool,
             force: Bool = false,
+            preparedContent: MacConversationReusableCell.Content? = nil,
             isExplicit: Bool
         ) {
             guard force || cell.representedRowID != row.id
@@ -1168,57 +1394,65 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                     || cell.isLast != isLast else {
                 return
             }
-            TranscriptPerformance.measureRowConfigure {
-                cell.representedRowID = row.id
-                cell.contentRevision = row.contentRevision
-                cell.isFirst = isFirst
-                cell.isLast = isLast
-                if let presentation = row.nativeFooterPresentation(
-                    dynamicTypeSize: environment.dynamicTypeSize,
-                    colorScheme: environment.colorScheme
-                ) {
-                    cell.setContent(
-                        .nativeFooter(presentation),
-                        scrollActivity: scrollActivity,
-                        nativeLinkHandler: onNativeLink,
-                        nativeCopyMessageHandler: onNativeCopyMessage
-                    )
-                } else if let presentation = row.nativeTextPresentation(
-                    dynamicTypeSize: environment.dynamicTypeSize,
-                    colorScheme: environment.colorScheme
-                ) {
-                    cell.setContent(
-                        .native(presentation),
-                        scrollActivity: scrollActivity,
-                        nativeLinkHandler: onNativeLink,
-                        nativeCopyMessageHandler: onNativeCopyMessage
-                    )
-                } else {
-                    cell.setContent(
-                        .hosted(AnyView(
-                            makeRow(row, isFirst, isLast)
-                                .id(row.id)
-                                .environment(\.self, environment)
-                                .environment(
-                                    \.macTranscriptScrollActivity,
-                                    scrollActivity
-                                )
-                        )),
-                        scrollActivity: scrollActivity,
-                        nativeLinkHandler: onNativeLink,
-                        nativeCopyMessageHandler: onNativeCopyMessage
-                    )
-                }
-            }
-            TranscriptPerformance.emitCounters(
-                changedRows: 1,
-                mountedRows: visibleMountedRowCount,
-                measuredRows: 1
+            // This is the frame-critical realization path. Store/projection
+            // and table-mutation signposts retain end-to-end observability;
+            // a begin/end signpost around every individual cell measurably
+            // consumed the same frame budget it was intended to diagnose.
+            cell.representedRowID = row.id
+            cell.contentRevision = row.contentRevision
+            cell.isFirst = isFirst
+            cell.isLast = isLast
+            cell.setContent(
+                preparedContent ?? cellContent(
+                    for: row,
+                    isFirst: isFirst,
+                    isLast: isLast
+                ),
+                scrollActivity: scrollActivity,
+                nativeLinkHandler: onNativeLink,
+                nativeCopyMessageHandler: onNativeCopyMessage
             )
             MacConversationTableDiagnostics.recordedConfiguration(
-                mountedRows: visibleMountedRowCount,
+                mutationSourceID: row.mutationSourceID,
                 isExplicit: isExplicit
             )
+        }
+
+        private func cellContent(
+            for row: Row,
+            isFirst: Bool,
+            isLast: Bool
+        ) -> MacConversationReusableCell.Content {
+            if let presentation = row.nativeFooterPresentation(
+                dynamicTypeSize: environment.dynamicTypeSize,
+                colorScheme: environment.colorScheme
+            ) {
+                return isLiveScrolling
+                    ? .native(liveScrollPresentation(for: presentation))
+                    : .nativeFooter(presentation)
+            }
+            if isLiveScrolling,
+               let presentation = row.liveScrollTextPresentation(
+                    dynamicTypeSize: environment.dynamicTypeSize,
+                    colorScheme: environment.colorScheme
+               ) {
+                return .native(presentation)
+            }
+            if let presentation = row.nativeTextPresentation(
+                dynamicTypeSize: environment.dynamicTypeSize,
+                colorScheme: environment.colorScheme
+            ) {
+                return .native(presentation)
+            }
+            return .hosted(AnyView(
+                makeRow(row, isFirst, isLast)
+                    .id(row.id)
+                    .environment(\.self, environment)
+                    .environment(
+                        \.macTranscriptScrollActivity,
+                        scrollActivity
+                    )
+            ))
         }
 
         private func cellKind(for row: Row) -> MacConversationReusableCell.Kind {
@@ -1226,12 +1460,142 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 dynamicTypeSize: environment.dynamicTypeSize,
                 colorScheme: environment.colorScheme
             ) != nil {
-                return .nativeFooter
+                return isLiveScrolling ? .nativeScroll : .nativeFooter
             }
-            return row.nativeTextPresentation(
+            let presentation = isLiveScrolling
+                ? row.liveScrollTextPresentation(
+                    dynamicTypeSize: environment.dynamicTypeSize,
+                    colorScheme: environment.colorScheme
+                )
+                : row.nativeTextPresentation(
+                    dynamicTypeSize: environment.dynamicTypeSize,
+                    colorScheme: environment.colorScheme
+                )
+            guard presentation != nil else { return .hosted }
+            return isLiveScrolling ? .nativeScroll : .native
+        }
+
+        private func liveScrollPresentation(
+            for footer: MacConversationNativeFooterPresentation
+        ) -> MacConversationNativeTextPresentation {
+            MacConversationNativeTextPresentation(
+                fallbackString: footer.timestampLabel ?? "",
+                contentInsets: NSEdgeInsets(
+                    top: 7,
+                    left: 28,
+                    bottom: 7,
+                    right: 28
+                ),
+                firstRowTopInsetAdjustment: 15,
+                lastRowBottomInsetAdjustment: 9,
+                minimumTextContainerHeight: 44,
+                maximumContentWidth: 760,
+                maximumTextWidth: 220,
+                horizontalAlignment: footer.isTrailing ? .trailing : .leading,
+                fallbackFont: NSFont.systemFont(
+                    ofSize: 11 * footer.fontScale
+                ),
+                fallbackColor: .secondaryLabelColor,
+                accessibilityLabel: footer.timestampAccessibilityLabel,
+                accessibilityIdentifier: footer.accessibilityIdentifier,
+                usesFastPlainTextRenderer: true
+            )
+        }
+
+        private func estimatedAutomaticRowHeight(
+            in snapshot: MacConversationTableSnapshot<Row>,
+            viewportWidth: CGFloat
+        ) -> CGFloat {
+            guard snapshot.count > 0, viewportWidth > 1 else { return 56 }
+            let sampleCount = min(128, snapshot.count)
+            var total: CGFloat = 0
+            for sample in 0..<sampleCount {
+                let index = sampleCount == 1
+                    ? 0
+                    : sample * (snapshot.count - 1) / (sampleCount - 1)
+                total += estimatedHeight(
+                    for: snapshot[index],
+                    viewportWidth: viewportWidth
+                )
+            }
+            // Automatic-height tables realize a burst of speculative cells
+            // when their estimate is low. A deliberate upward bias costs only
+            // provisional scroll-range accuracy; realized rows immediately
+            // replace it with their exact intrinsic heights.
+            let biasedMean = (total / CGFloat(sampleCount)) * 1.30
+            return min(320, max(44, biasedMean.rounded()))
+        }
+
+        private func estimatedHeight(
+            for row: Row,
+            viewportWidth: CGFloat
+        ) -> CGFloat {
+            if row.nativeFooterPresentation(
                 dynamicTypeSize: environment.dynamicTypeSize,
                 colorScheme: environment.colorScheme
-            ) == nil ? .hosted : .native
+            ) != nil {
+                return 58
+            }
+            guard let presentation = row.nativeTextPresentation(
+                dynamicTypeSize: environment.dynamicTypeSize,
+                colorScheme: environment.colorScheme
+            ) else {
+                return 56
+            }
+            let availableWidth = max(
+                1,
+                viewportWidth - presentation.contentInsets.left
+                    - presentation.contentInsets.right
+            )
+            let containerWidth = min(
+                availableWidth,
+                presentation.maximumContentWidth ?? availableWidth
+            )
+            let alignedWidth = presentation.horizontalAlignment == .fill
+                ? containerWidth
+                : min(
+                    containerWidth,
+                    presentation.maximumTextWidth
+                        ?? presentation.maximumContentWidth
+                        ?? containerWidth
+                )
+            let textWidth = max(
+                1,
+                alignedWidth - presentation.textEdgeInsets.left
+                    - presentation.textEdgeInsets.right
+                    - (presentation.textContainerInset.width * 2)
+            )
+            let attributed = presentation.attributedString
+                ?? NSAttributedString(
+                    string: presentation.fallbackString,
+                    attributes: [
+                        .font: presentation.fallbackFont
+                            ?? NSFont.systemFont(ofSize: NSFont.systemFontSize),
+                        .foregroundColor: presentation.fallbackColor
+                            ?? NSColor.labelColor,
+                        .paragraphStyle: presentation.fallbackParagraphStyle
+                            ?? NSParagraphStyle.default,
+                    ]
+                )
+            let measured = attributed.boundingRect(
+                with: NSSize(
+                    width: textWidth,
+                    height: CGFloat.greatestFiniteMagnitude
+                ),
+                options: [.usesLineFragmentOrigin, .usesFontLeading]
+            )
+            return max(
+                44,
+                ceil(max(
+                    measured.height
+                        + presentation.textEdgeInsets.top
+                        + presentation.textEdgeInsets.bottom
+                        + (presentation.textContainerInset.height * 2),
+                    presentation.minimumTextContainerHeight
+                ))
+                    + presentation.contentInsets.top
+                    + presentation.contentInsets.bottom
+            )
         }
 
         private func rebuildSectionIndex() {
@@ -1245,6 +1609,13 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             anchor: Anchor?
         ) {
             guard !isLiveScrolling else { return }
+            // General model/style mutations own the viewport first. A
+            // display-linked row restoration resumes only after that batch's
+            // anchor has settled, so two independent correction owners can
+            // never rewrite each other's expected clip origin.
+            pendingLiveScrollRestorationAnchor = nil
+            pendingLiveScrollRestorationFollowsBottom = false
+            pendingLiveScrollRestorationExpectedOriginY = nil
             if followsBottom {
                 pendingMutationFollowsBottom = true
                 pendingMutationAnchor = nil
@@ -1257,46 +1628,270 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         }
 
         private func liveScrollDidBegin() {
-            isLiveScrolling = true
+            guard !isLiveScrolling else { return }
             scrollActivity.setLiveScrolling(true)
+            scrollActivity.setIncrementalRestorationActive(false)
+            let carriedCells = cancelLiveScrollRestoration(
+                requeueMountedCells: true
+            )
+            // Already-mounted rows have completed layout and can move without
+            // any configuration work. Replacing them here would front-load a
+            // full visible-page reload into the first gesture frame. Only
+            // rows newly realized (or changed) while scrolling use the cheap
+            // display cell and are recorded for exact restoration below.
+            liveScrollCells.removeAllObjects()
+            for cell in carriedCells {
+                liveScrollCells.add(cell)
+            }
+            isLiveScrolling = true
             cancelMutationStabilization()
             onLiveScrollingChange(true)
         }
 
         private func liveScrollDidEnd() {
-            isLiveScrolling = false
+            guard isLiveScrolling else { return }
+            let startedAt = CACurrentMediaTime()
             defer {
-                sampleNearBottom()
-                onLiveScrollingChange(false)
-                scrollActivity.setLiveScrolling(false)
-                scheduleViewportPrefetch()
-            }
-            guard let tableView, let scrollView,
-                  !pendingLiveScrollHeightInvalidations.isEmpty else {
-                return
-            }
-            let followsBottom = isAtBottom
-            prepareMutationStabilization(
-                followsBottom: followsBottom,
-                anchor: followsBottom ? nil : captureAnchor()
-            )
-            let visible = tableView.rows(in: scrollView.contentView.bounds)
-            if visible.location != NSNotFound {
-                pendingLiveScrollHeightInvalidations.formUnion(
-                    IndexSet(integersIn: visible.location..<NSMaxRange(visible))
+                MacConversationTableDiagnostics.recordedLiveScrollEnd(
+                    milliseconds: (CACurrentMediaTime() - startedAt) * 1_000
                 )
             }
-            var validIndexes = IndexSet()
+            isLiveScrolling = false
+            scrollActivity.setIncrementalRestorationActive(true)
+            scrollActivity.setLiveScrolling(false)
+            guard let tableView else {
+                liveScrollCells.removeAllObjects()
+                pendingLiveScrollHeightInvalidations.removeAll()
+                cancelLiveScrollRestoration(requeueMountedCells: false)
+                scrollActivity.setIncrementalRestorationActive(false)
+                onLiveScrollingChange(false)
+                return
+            }
+
+            var transitionedIndexes = IndexSet()
+            var restorations: [LiveScrollRestoration] = []
+            let mountedCells = liveScrollCells.allObjects
+            liveScrollCells.removeAllObjects()
+            restorations.reserveCapacity(
+                mountedCells.count + pendingLiveScrollHeightInvalidations.count
+            )
+            for cell in mountedCells where cell.kind == .nativeScroll {
+                let index = tableView.row(for: cell)
+                guard index >= 0,
+                      snapshot.location(ofFlatIndex: index) != nil else {
+                    continue
+                }
+                transitionedIndexes.insert(index)
+                restorations.append(LiveScrollRestoration(
+                    cell: cell,
+                    rowID: snapshot[index].id,
+                    originalIndex: index,
+                    reloadsCell: true
+                ))
+            }
             for index in pendingLiveScrollHeightInvalidations
-            where snapshot.location(ofFlatIndex: index) != nil {
-                validIndexes.insert(index)
+            where !transitionedIndexes.contains(index)
+                && snapshot.location(ofFlatIndex: index) != nil {
+                restorations.append(LiveScrollRestoration(
+                    cell: nil,
+                    rowID: snapshot[index].id,
+                    originalIndex: index,
+                    reloadsCell: false
+                ))
             }
             pendingLiveScrollHeightInvalidations.removeAll()
-            if !validIndexes.isEmpty {
-                tableView.noteHeightOfRows(withIndexesChanged: validIndexes)
-                MacConversationTableDiagnostics.recordedHeightInvalidation()
-                scheduleMutationStabilization()
+
+            let visible = tableView.rows(
+                in: scrollView?.contentView.bounds ?? tableView.visibleRect
+            )
+            let visibleMiddle = visible.location == NSNotFound
+                ? 0
+                : visible.location + (visible.length / 2)
+            restorations.sort {
+                abs($0.originalIndex - visibleMiddle)
+                    < abs($1.originalIndex - visibleMiddle)
             }
+            liveScrollRestorationQueue = restorations
+            liveScrollRestorationIndex = 0
+            sampleNearBottom()
+            onLiveScrollingChange(false)
+            scheduleViewportPrefetch()
+            scheduleLiveScrollRestorationIfNeeded()
+        }
+
+        private func scheduleLiveScrollRestorationIfNeeded() {
+            guard !isLiveScrolling,
+                  liveScrollRestorationIndex < liveScrollRestorationQueue.count
+                    || pendingLiveScrollRestorationAnchor != nil
+                    || pendingLiveScrollRestorationFollowsBottom,
+                  liveScrollRestorationDisplayLink == nil,
+                  liveScrollRestorationTimer == nil else {
+                if liveScrollRestorationIndex >= liveScrollRestorationQueue.count,
+                   pendingLiveScrollRestorationAnchor == nil,
+                   !pendingLiveScrollRestorationFollowsBottom {
+                    finishLiveScrollRestoration()
+                }
+                return
+            }
+            if let window = scrollView?.window {
+                let link = window.displayLink(
+                    target: self,
+                    selector: #selector(restoreNextLiveScrollRow(_:))
+                )
+                liveScrollRestorationDisplayLink = link
+                link.add(to: .main, forMode: .common)
+            } else {
+                let timer = Timer(
+                    timeInterval: 1.0 / 60.0,
+                    target: self,
+                    selector: #selector(restoreNextLiveScrollRow(_:)),
+                    userInfo: nil,
+                    repeats: true
+                )
+                liveScrollRestorationTimer = timer
+                RunLoop.main.add(timer, forMode: .common)
+            }
+        }
+
+        @objc
+        private func restoreNextLiveScrollRow(_ sender: Any) {
+            guard !isLiveScrolling else { return }
+            guard !stabilizationScheduled,
+                  pendingMutationAnchor == nil,
+                  !pendingMutationFollowsBottom else {
+                return
+            }
+            let startedAt = CACurrentMediaTime()
+            applyPendingLiveScrollRestorationCorrection()
+
+            var restoredRows = 0
+            while liveScrollRestorationIndex < liveScrollRestorationQueue.count {
+                let restoration = liveScrollRestorationQueue[
+                    liveScrollRestorationIndex
+                ]
+                liveScrollRestorationIndex += 1
+                guard let tableView,
+                      let index = currentIndex(for: restoration, in: tableView) else {
+                    continue
+                }
+
+                let followsBottom = isAtBottom
+                pendingLiveScrollRestorationFollowsBottom = followsBottom
+                pendingLiveScrollRestorationAnchor = followsBottom
+                    ? nil
+                    : captureAnchor()
+                pendingLiveScrollRestorationExpectedOriginY = scrollView?
+                    .contentView.bounds.origin.y
+                if restoration.reloadsCell {
+                    tableView.reloadData(
+                        forRowIndexes: IndexSet(integer: index),
+                        columnIndexes: IndexSet(integer: 0)
+                    )
+                    MacConversationTableDiagnostics.recordedTargetedRowReload(
+                        count: 1
+                    )
+                }
+                tableView.noteHeightOfRows(
+                    withIndexesChanged: IndexSet(integer: index)
+                )
+                MacConversationTableDiagnostics.recordedHeightInvalidation()
+                scrollView?.layoutSubtreeIfNeeded()
+                tableView.layoutSubtreeIfNeeded()
+                applyPendingLiveScrollRestorationCorrection(keepPending: true)
+                restoredRows = 1
+                break
+            }
+
+            MacConversationTableDiagnostics.recordedLiveScrollRestoration(
+                restoredRows: restoredRows,
+                milliseconds: (CACurrentMediaTime() - startedAt) * 1_000
+            )
+            if liveScrollRestorationIndex >= liveScrollRestorationQueue.count,
+               pendingLiveScrollRestorationAnchor == nil,
+               !pendingLiveScrollRestorationFollowsBottom {
+                finishLiveScrollRestoration()
+            }
+        }
+
+        private func currentIndex(
+            for restoration: LiveScrollRestoration,
+            in tableView: NSTableView
+        ) -> Int? {
+            let index: Int
+            if let cell = restoration.cell {
+                guard cell.kind == .nativeScroll else { return nil }
+                index = tableView.row(for: cell)
+            } else {
+                index = restoration.originalIndex
+            }
+            guard index >= 0,
+                  snapshot.location(ofFlatIndex: index) != nil,
+                  snapshot[index].id == restoration.rowID else {
+                return nil
+            }
+            return index
+        }
+
+        private func applyPendingLiveScrollRestorationCorrection(
+            keepPending: Bool = false
+        ) {
+            guard pendingLiveScrollRestorationFollowsBottom
+                    || pendingLiveScrollRestorationAnchor != nil else { return }
+            if !keepPending,
+               let scrollView,
+               let expected = pendingLiveScrollRestorationExpectedOriginY,
+               abs(scrollView.contentView.bounds.origin.y - expected) > 0.5 {
+                pendingLiveScrollRestorationAnchor = nil
+                pendingLiveScrollRestorationFollowsBottom = false
+                pendingLiveScrollRestorationExpectedOriginY = nil
+                return
+            }
+            if pendingLiveScrollRestorationFollowsBottom {
+                pinToBottom()
+            } else if let anchor = pendingLiveScrollRestorationAnchor {
+                restore(anchor)
+            }
+            if keepPending {
+                pendingLiveScrollRestorationExpectedOriginY = scrollView?
+                    .contentView.bounds.origin.y
+            } else {
+                pendingLiveScrollRestorationAnchor = nil
+                pendingLiveScrollRestorationFollowsBottom = false
+                pendingLiveScrollRestorationExpectedOriginY = nil
+            }
+        }
+
+        @discardableResult
+        private func cancelLiveScrollRestoration(
+            requeueMountedCells: Bool
+        ) -> [MacConversationReusableCell] {
+            liveScrollRestorationDisplayLink?.invalidate()
+            liveScrollRestorationDisplayLink = nil
+            liveScrollRestorationTimer?.invalidate()
+            liveScrollRestorationTimer = nil
+            let cells = requeueMountedCells
+                ? liveScrollRestorationQueue[liveScrollRestorationIndex...]
+                    .compactMap(\.cell)
+                    .filter { $0.kind == .nativeScroll }
+                : []
+            liveScrollRestorationQueue.removeAll(keepingCapacity: true)
+            liveScrollRestorationIndex = 0
+            pendingLiveScrollRestorationAnchor = nil
+            pendingLiveScrollRestorationFollowsBottom = false
+            pendingLiveScrollRestorationExpectedOriginY = nil
+            return cells
+        }
+
+        private func finishLiveScrollRestoration() {
+            liveScrollRestorationDisplayLink?.invalidate()
+            liveScrollRestorationDisplayLink = nil
+            liveScrollRestorationTimer?.invalidate()
+            liveScrollRestorationTimer = nil
+            liveScrollRestorationQueue.removeAll(keepingCapacity: true)
+            liveScrollRestorationIndex = 0
+            scrollActivity.setIncrementalRestorationActive(false)
+            sampleNearBottom()
+            scheduleViewportPrefetch()
         }
 
         /// A row-local render artifact can change intrinsic height without a
@@ -1431,12 +2026,6 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                     _ = self.applyPendingScrollCorrectionIfReady()
                 }
             }
-        }
-
-        private var visibleMountedRowCount: Int {
-            guard let tableView, let scrollView else { return 0 }
-            let range = tableView.rows(in: scrollView.contentView.bounds)
-            return range.location == NSNotFound ? 0 : range.length
         }
 
         private func captureAnchor() -> Anchor? {
@@ -1622,6 +2211,12 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             lastViewportWidth = width
             guard snapshot.count > 0 else { return }
             let followsBottom = isAtBottom
+            if !isLiveScrolling {
+                tableView.rowHeight = estimatedAutomaticRowHeight(
+                    in: snapshot,
+                    viewportWidth: width
+                )
+            }
             prepareMutationStabilization(
                 followsBottom: followsBottom,
                 anchor: followsBottom ? nil : captureAnchor()
@@ -1647,6 +2242,7 @@ private class MacConversationReusableCell: NSTableCellView {
     enum Kind: String {
         case hosted
         case native
+        case nativeScroll = "native-scroll"
         case nativeFooter = "native-footer"
     }
 
@@ -1654,6 +2250,14 @@ private class MacConversationReusableCell: NSTableCellView {
         case hosted(AnyView)
         case native(MacConversationNativeTextPresentation)
         case nativeFooter(MacConversationNativeFooterPresentation)
+
+        var kind: Kind {
+            switch self {
+            case .hosted: .hosted
+            case .native: .native
+            case .nativeFooter: .nativeFooter
+            }
+        }
     }
 
     let kind: Kind
@@ -1838,10 +2442,21 @@ private final class MacConversationNativeFooterCell: MacConversationReusableCell
 
         topConstraint.constant = isFirst ? 22 : 7
         bottomConstraint.constant = -(isLast ? 16 : 7)
-        controlsLeadingConstraint.isActive = false
-        controlsTrailingConstraint.isActive = false
-        controlsLeadingConstraint.isActive = !presentation.isTrailing
-        controlsTrailingConstraint.isActive = presentation.isTrailing
+        if presentation.isTrailing {
+            if controlsLeadingConstraint.isActive {
+                controlsLeadingConstraint.isActive = false
+            }
+            if !controlsTrailingConstraint.isActive {
+                controlsTrailingConstraint.isActive = true
+            }
+        } else {
+            if controlsTrailingConstraint.isActive {
+                controlsTrailingConstraint.isActive = false
+            }
+            if !controlsLeadingConstraint.isActive {
+                controlsLeadingConstraint.isActive = true
+            }
+        }
 
         timestampLabel.font = NSFont.systemFont(
             ofSize: NSFont.smallSystemFontSize * max(0.5, presentation.fontScale)
@@ -1899,6 +2514,237 @@ private final class MacConversationNativeFooterCell: MacConversationReusableCell
     }
 }
 
+/// The cell used for rows that enter the viewport during a live gesture. It
+/// intentionally has no Auto Layout graph and no selectable AppKit text
+/// control: NSTableView can realize it with one Core Text measurement and
+/// direct frames. Visible rows are replaced by the selectable/rich native cell
+/// immediately after scrolling ends.
+@MainActor
+private final class MacConversationScrollTextCell: MacConversationReusableCell {
+    private struct Geometry {
+        let containerFrame: NSRect
+        let textFrame: NSRect
+        let height: CGFloat
+    }
+
+    private let textContainerView = NSView(frame: .zero)
+    private let scrollTextView = MacConversationScrollTextView(frame: .zero)
+    private var presentation: MacConversationNativeTextPresentation?
+    private var lastWidth: CGFloat = -1
+
+    init() {
+        super.init(kind: .nativeScroll)
+        addSubview(textContainerView)
+        textContainerView.addSubview(scrollTextView)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var isFlipped: Bool { true }
+
+    override func setContent(
+        _ content: Content,
+        scrollActivity: MacTranscriptScrollActivity,
+        nativeLinkHandler: @escaping MacConversationNativeTextPresentation.LinkHandler,
+        nativeCopyMessageHandler: @escaping @MainActor (String) -> Void
+    ) {
+        guard case let .native(presentation) = content else {
+            assertionFailure("Scroll transcript cell received non-text content")
+            return
+        }
+        self.presentation = presentation
+        scrollTextView.attributedString = presentation.attributedString
+            ?? Self.fallbackAttributedString(
+                presentation.fallbackString,
+                font: presentation.fallbackFont,
+                color: presentation.fallbackColor,
+                paragraphStyle: presentation.fallbackParagraphStyle
+            )
+        scrollTextView.setAccessibilityLabel(presentation.accessibilityLabel)
+        scrollTextView.setAccessibilityIdentifier(
+            presentation.accessibilityIdentifier
+        )
+        let usesDecoratedContainer = presentation.backgroundColor != nil
+            || presentation.backgroundCornerRadius > 0
+        textContainerView.wantsLayer = usesDecoratedContainer
+        if usesDecoratedContainer {
+            textContainerView.layer?.backgroundColor = (
+                presentation.backgroundColor ?? .clear
+            ).cgColor
+            textContainerView.layer?.cornerRadius = presentation
+                .backgroundCornerRadius
+            textContainerView.layer?.maskedCorners = Self.layerCorners(
+                presentation.roundedCorners
+            )
+            textContainerView.layer?.masksToBounds = presentation
+                .backgroundCornerRadius > 0
+        }
+        invalidateIntrinsicContentSize()
+        needsLayout = true
+    }
+
+    override var fittingSize: NSSize {
+        guard presentation != nil else {
+            return NSSize(width: max(1, bounds.width), height: 44)
+        }
+        let width = bounds.width > 1 ? bounds.width : 800
+        return NSSize(
+            width: width,
+            height: geometry(for: width).height
+        )
+    }
+
+    override var intrinsicContentSize: NSSize { fittingSize }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        let widthChanged = abs(newSize.width - lastWidth) > 0.5
+        super.setFrameSize(newSize)
+        guard widthChanged else { return }
+        lastWidth = newSize.width
+        invalidateIntrinsicContentSize()
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        guard bounds.width > 0, presentation != nil else { return }
+        let geometry = geometry(for: bounds.width)
+        textContainerView.frame = geometry.containerFrame
+        scrollTextView.frame = geometry.textFrame
+    }
+
+    override func prepareForReuse() {
+        presentation = nil
+        scrollTextView.setAccessibilityLabel(nil)
+        scrollTextView.setAccessibilityIdentifier(nil)
+        textContainerView.layer?.backgroundColor = NSColor.clear.cgColor
+        textContainerView.layer?.cornerRadius = 0
+        textContainerView.layer?.maskedCorners = []
+        super.prepareForReuse()
+    }
+
+    private func geometry(for width: CGFloat) -> Geometry {
+        guard let presentation else {
+            return Geometry(
+                containerFrame: .zero,
+                textFrame: .zero,
+                height: 44
+            )
+        }
+        let top = presentation.contentInsets.top
+            + (isFirst ? presentation.firstRowTopInsetAdjustment : 0)
+        let bottom = presentation.contentInsets.bottom
+            + (isLast ? presentation.lastRowBottomInsetAdjustment : 0)
+        let availableContentWidth = max(
+            1,
+            width - presentation.contentInsets.left
+                - presentation.contentInsets.right
+        )
+        let contentWidth = min(
+            availableContentWidth,
+            presentation.maximumContentWidth ?? availableContentWidth
+        )
+        let contentX = presentation.contentInsets.left
+            + ((availableContentWidth - contentWidth) / 2)
+        let maximumTextContainerWidth = min(
+            contentWidth,
+            presentation.maximumTextWidth
+                ?? presentation.maximumContentWidth
+                ?? contentWidth
+        )
+        let textContainerWidth = presentation.horizontalAlignment == .fill
+            ? contentWidth
+            : maximumTextContainerWidth
+        let textContainerX: CGFloat
+        switch presentation.horizontalAlignment {
+        case .fill, .leading:
+            textContainerX = contentX
+        case .trailing:
+            textContainerX = contentX + contentWidth - textContainerWidth
+        case .center:
+            textContainerX = contentX
+                + ((contentWidth - textContainerWidth) / 2)
+        }
+        let horizontalTextInset = presentation.textContainerInset.width
+        let verticalTextInset = presentation.textContainerInset.height
+        let textWidth = max(
+            1,
+            textContainerWidth - presentation.textEdgeInsets.left
+                - presentation.textEdgeInsets.right
+                - (horizontalTextInset * 2)
+        )
+        let textHeight = scrollTextView.textHeight(for: textWidth)
+        let measuredContainerHeight = presentation.textEdgeInsets.top
+            + verticalTextInset
+            + textHeight
+            + verticalTextInset
+            + presentation.textEdgeInsets.bottom
+        let containerHeight = max(
+            presentation.minimumTextContainerHeight,
+            measuredContainerHeight
+        )
+        let verticalCentering = max(
+            0,
+            (containerHeight - measuredContainerHeight) / 2
+        )
+        return Geometry(
+            containerFrame: NSRect(
+                x: textContainerX,
+                y: top,
+                width: textContainerWidth,
+                height: containerHeight
+            ),
+            textFrame: NSRect(
+                x: presentation.textEdgeInsets.left + horizontalTextInset,
+                y: presentation.textEdgeInsets.top
+                    + verticalTextInset
+                    + verticalCentering,
+                width: textWidth,
+                height: textHeight
+            ),
+            height: max(1, ceil(top + containerHeight + bottom))
+        )
+    }
+
+    private static func layerCorners(
+        _ corners: MacConversationNativeTextPresentation.RoundedCorners
+    ) -> CACornerMask {
+        var result: CACornerMask = []
+        if corners.contains(.topLeading) {
+            result.insert(.layerMinXMaxYCorner)
+        }
+        if corners.contains(.topTrailing) {
+            result.insert(.layerMaxXMaxYCorner)
+        }
+        if corners.contains(.bottomLeading) {
+            result.insert(.layerMinXMinYCorner)
+        }
+        if corners.contains(.bottomTrailing) {
+            result.insert(.layerMaxXMinYCorner)
+        }
+        return result
+    }
+
+    private static func fallbackAttributedString(
+        _ string: String,
+        font: NSFont?,
+        color: NSColor?,
+        paragraphStyle: NSParagraphStyle?
+    ) -> NSAttributedString {
+        NSAttributedString(
+            string: string,
+            attributes: [
+                .font: font ?? NSFont.systemFont(ofSize: NSFont.systemFontSize),
+                .foregroundColor: color ?? NSColor.labelColor,
+                .paragraphStyle: paragraphStyle ?? NSParagraphStyle.default,
+            ]
+        )
+    }
+}
+
 @MainActor
 private final class MacConversationNativeTextCell:
     MacConversationReusableCell,
@@ -1907,6 +2753,7 @@ private final class MacConversationNativeTextCell:
     private let layoutContainer = NSView(frame: .zero)
     private let textContainerView = NSView(frame: .zero)
     private let nativeTextView = MacConversationIntrinsicTextView(frame: .zero)
+    private let fastTextField = MacConversationWrappingTextField(frame: .zero)
     private var leadingLimitConstraint: NSLayoutConstraint!
     private var trailingLimitConstraint: NSLayoutConstraint!
     private var fillLeadingConstraint: NSLayoutConstraint!
@@ -1926,6 +2773,10 @@ private final class MacConversationNativeTextCell:
     private var textBottomConstraint: NSLayoutConstraint!
     private var textContentLeadingConstraint: NSLayoutConstraint!
     private var textContentTrailingConstraint: NSLayoutConstraint!
+    private var fastTextTopConstraint: NSLayoutConstraint!
+    private var fastTextBottomConstraint: NSLayoutConstraint!
+    private var fastTextLeadingConstraint: NSLayoutConstraint!
+    private var fastTextTrailingConstraint: NSLayoutConstraint!
     private var linkHandler: MacConversationNativeTextPresentation.LinkHandler?
     private var deferredPreparationTask: Task<Void, Never>?
     private var presentationGeneration: UInt64 = 0
@@ -1936,10 +2787,13 @@ private final class MacConversationNativeTextCell:
         layoutContainer.translatesAutoresizingMaskIntoConstraints = false
         textContainerView.translatesAutoresizingMaskIntoConstraints = false
         nativeTextView.translatesAutoresizingMaskIntoConstraints = false
+        fastTextField.translatesAutoresizingMaskIntoConstraints = false
+        fastTextField.isHidden = true
         nativeTextView.delegate = self
         addSubview(layoutContainer)
         layoutContainer.addSubview(textContainerView)
         textContainerView.addSubview(nativeTextView)
+        textContainerView.addSubview(fastTextField)
 
         leadingLimitConstraint = layoutContainer.leadingAnchor.constraint(
             greaterThanOrEqualTo: leadingAnchor
@@ -1994,6 +2848,18 @@ private final class MacConversationNativeTextCell:
             equalTo: textContainerView.leadingAnchor
         )
         textContentTrailingConstraint = nativeTextView.trailingAnchor.constraint(
+            equalTo: textContainerView.trailingAnchor
+        )
+        fastTextTopConstraint = fastTextField.topAnchor.constraint(
+            equalTo: textContainerView.topAnchor
+        )
+        fastTextBottomConstraint = fastTextField.bottomAnchor.constraint(
+            equalTo: textContainerView.bottomAnchor
+        )
+        fastTextLeadingConstraint = fastTextField.leadingAnchor.constraint(
+            equalTo: textContainerView.leadingAnchor
+        )
+        fastTextTrailingConstraint = fastTextField.trailingAnchor.constraint(
             equalTo: textContainerView.trailingAnchor
         )
         NSLayoutConstraint.activate([
@@ -2051,62 +2917,117 @@ private final class MacConversationNativeTextCell:
         bottomConstraint.constant = -(presentation.contentInsets.bottom
             + (isLast ? presentation.lastRowBottomInsetAdjustment : 0))
         if let maximumContentWidth = presentation.maximumContentWidth {
-            fillLeadingConstraint.isActive = false
-            fillTrailingConstraint.isActive = false
+            setActive(fillLeadingConstraint, false)
+            setActive(fillTrailingConstraint, false)
             maximumWidthConstraint.constant = maximumContentWidth
             preferredWidthConstraint.constant = maximumContentWidth
-            centerXConstraint.isActive = true
-            maximumWidthConstraint.isActive = true
-            preferredWidthConstraint.isActive = true
+            setActive(centerXConstraint, true)
+            setActive(maximumWidthConstraint, true)
+            setActive(preferredWidthConstraint, true)
         } else {
-            centerXConstraint.isActive = false
-            maximumWidthConstraint.isActive = false
-            preferredWidthConstraint.isActive = false
-            fillLeadingConstraint.isActive = true
-            fillTrailingConstraint.isActive = true
+            setActive(centerXConstraint, false)
+            setActive(maximumWidthConstraint, false)
+            setActive(preferredWidthConstraint, false)
+            setActive(fillLeadingConstraint, true)
+            setActive(fillTrailingConstraint, true)
         }
 
-        textFillLeadingConstraint.isActive = false
-        textFillTrailingConstraint.isActive = false
-        textAlignedLeadingConstraint.isActive = false
-        textAlignedTrailingConstraint.isActive = false
-        textCenterXConstraint.isActive = false
-        maximumTextWidthConstraint.isActive = false
-        switch presentation.horizontalAlignment {
-        case .fill:
-            textFillLeadingConstraint.isActive = true
-            textFillTrailingConstraint.isActive = true
-        case .leading:
-            textAlignedLeadingConstraint.isActive = true
-        case .center:
-            textCenterXConstraint.isActive = true
-        case .trailing:
-            textAlignedTrailingConstraint.isActive = true
+        let fillsText = presentation.horizontalAlignment == .fill
+        let alignsTextLeading = presentation.horizontalAlignment == .leading
+        let alignsTextTrailing = presentation.horizontalAlignment == .trailing
+        let centersText = presentation.horizontalAlignment == .center
+        let limitsTextWidth = !fillsText
+        let textConstraints: [(NSLayoutConstraint, Bool)] = [
+            (textFillLeadingConstraint, fillsText),
+            (textFillTrailingConstraint, fillsText),
+            (textAlignedLeadingConstraint, alignsTextLeading),
+            (textAlignedTrailingConstraint, alignsTextTrailing),
+            (textCenterXConstraint, centersText),
+            (maximumTextWidthConstraint, limitsTextWidth),
+        ]
+        // Deactivate conflicts before activating the desired alignment, but
+        // keep an unchanged constraint installed across cell reuse. Tearing
+        // down and rebuilding the same Auto Layout graph for every tile was a
+        // measurable part of cold-row scroll callbacks.
+        for (constraint, shouldBeActive) in textConstraints
+        where !shouldBeActive {
+            setActive(constraint, false)
         }
-        if presentation.horizontalAlignment != .fill {
+        if limitsTextWidth {
             maximumTextWidthConstraint.constant = presentation.maximumTextWidth
                 ?? presentation.maximumContentWidth
                 ?? 760
-            maximumTextWidthConstraint.isActive = true
+        }
+        for (constraint, shouldBeActive) in textConstraints
+        where shouldBeActive {
+            setActive(constraint, true)
         }
 
+        let usesFastRenderer = presentation.usesFastPlainTextRenderer
+        if usesFastRenderer {
+            precondition(
+                presentation.horizontalAlignment == .fill
+                    && presentation.maximumTextWidth == nil
+                    && (presentation.promotesFastRendererWhenIdle
+                        || (presentation.deferredAttributedString == nil
+                            && presentation.linkHandler == nil)),
+                "Fast transcript text is only for immutable, noninteractive tiles."
+            )
+        }
+        precondition(
+            !presentation.promotesFastRendererWhenIdle || usesFastRenderer,
+            "Only the fast renderer can defer rich-text adoption."
+        )
+        setRendererMode(
+            usesFastRenderer ? .selectableFast : .rich
+        )
         textTopConstraint.constant = presentation.textEdgeInsets.top
         textBottomConstraint.constant = -presentation.textEdgeInsets.bottom
         textContentLeadingConstraint.constant = presentation.textEdgeInsets.left
         textContentTrailingConstraint.constant = -presentation.textEdgeInsets.right
-        nativeTextView.textContainerInset = presentation.textContainerInset
-        nativeTextView.maximumIntrinsicWidth = presentation.maximumTextWidth.map {
-            max(
+        fastTextTopConstraint.constant = presentation.textEdgeInsets.top
+        fastTextBottomConstraint.constant = -presentation.textEdgeInsets.bottom
+        fastTextLeadingConstraint.constant = presentation.textEdgeInsets.left
+        fastTextTrailingConstraint.constant = -presentation.textEdgeInsets.right
+        if usesFastRenderer {
+            linkHandler = nil
+            nativeTextView.maximumIntrinsicWidth = nil
+            let provisionalContainerWidth = presentation.maximumContentWidth
+                ?? max(
+                    1,
+                    bounds.width - presentation.contentInsets.left
+                        - presentation.contentInsets.right
+                )
+            fastTextField.provisionalIntrinsicWidth = max(
                 1,
-                $0 - presentation.textEdgeInsets.left
+                provisionalContainerWidth - presentation.textEdgeInsets.left
                     - presentation.textEdgeInsets.right
             )
+            nativeTextView.setAccessibilityLabel(nil)
+            nativeTextView.setAccessibilityIdentifier(nil)
+            fastTextField.setAccessibilityLabel(
+                presentation.accessibilityLabel
+            )
+            fastTextField.setAccessibilityIdentifier(
+                presentation.accessibilityIdentifier
+            )
+        } else {
+            nativeTextView.textContainerInset = presentation.textContainerInset
+            nativeTextView.maximumIntrinsicWidth = presentation.maximumTextWidth.map {
+                max(
+                    1,
+                    $0 - presentation.textEdgeInsets.left
+                        - presentation.textEdgeInsets.right
+                )
+            }
+            linkHandler = presentation.linkHandler ?? nativeLinkHandler
+            nativeTextView.setAccessibilityLabel(presentation.accessibilityLabel)
+            nativeTextView.setAccessibilityIdentifier(
+                presentation.accessibilityIdentifier
+            )
+            fastTextField.setAccessibilityLabel(nil)
+            fastTextField.setAccessibilityIdentifier(nil)
         }
-        linkHandler = presentation.linkHandler ?? nativeLinkHandler
-        nativeTextView.setAccessibilityLabel(presentation.accessibilityLabel)
-        nativeTextView.setAccessibilityIdentifier(
-            presentation.accessibilityIdentifier
-        )
 
         let usesDecoratedContainer = presentation.backgroundColor != nil
             || presentation.backgroundCornerRadius > 0
@@ -2126,9 +3047,42 @@ private final class MacConversationNativeTextCell:
             presentation.attributedString ?? Self.fallbackAttributedString(
                 presentation.fallbackString,
                 font: presentation.fallbackFont,
-                color: presentation.fallbackColor
-            )
+                color: presentation.fallbackColor,
+                paragraphStyle: presentation.fallbackParagraphStyle
+            ),
+            renderer: usesFastRenderer ? .selectableFast : .rich
         )
+
+        if usesFastRenderer {
+            guard presentation.promotesFastRendererWhenIdle else { return }
+            guard !scrollActivity.isLiveScrollActive else { return }
+            let representedRowID = representedRowID
+            let immediate = presentation.attributedString
+            let deferred = presentation.deferredAttributedString
+            deferredPreparationTask = Task { @MainActor [weak self] in
+                let deferredArtifact: MacConversationNativeTextPresentation.DeferredArtifact?
+                if let deferred {
+                    deferredArtifact = await deferred()
+                } else {
+                    deferredArtifact = nil
+                }
+                guard !Task.isCancelled,
+                      immediate != nil || deferredArtifact != nil else { return }
+                await scrollActivity.adoptHeightChangingContentWhenIdle { [weak self] in
+                    guard let self,
+                          self.presentationGeneration == generation,
+                          self.representedRowID == representedRowID else { return }
+                    let resolved = deferredArtifact?.resolve() ?? immediate
+                    guard let resolved else { return }
+                    self.adoptRichText(
+                        resolved,
+                        presentation: presentation,
+                        nativeLinkHandler: nativeLinkHandler
+                    )
+                }
+            }
+            return
+        }
 
         guard let deferredAttributedString = presentation.deferredAttributedString else {
             return
@@ -2142,9 +3096,33 @@ private final class MacConversationNativeTextCell:
                       self.presentationGeneration == generation,
                       self.representedRowID == representedRowID else { return }
                 guard let prepared = deferredArtifact.resolve() else { return }
-                self.setAttributedString(prepared)
+                self.setAttributedString(prepared, renderer: .rich)
             }
         }
+    }
+
+    private func adoptRichText(
+        _ attributedString: NSAttributedString,
+        presentation: MacConversationNativeTextPresentation,
+        nativeLinkHandler: @escaping MacConversationNativeTextPresentation.LinkHandler
+    ) {
+        setRendererMode(.rich)
+        nativeTextView.textContainerInset = presentation.textContainerInset
+        nativeTextView.maximumIntrinsicWidth = presentation.maximumTextWidth.map {
+            max(
+                1,
+                $0 - presentation.textEdgeInsets.left
+                    - presentation.textEdgeInsets.right
+            )
+        }
+        linkHandler = presentation.linkHandler ?? nativeLinkHandler
+        nativeTextView.setAccessibilityLabel(presentation.accessibilityLabel)
+        nativeTextView.setAccessibilityIdentifier(
+            presentation.accessibilityIdentifier
+        )
+        fastTextField.setAccessibilityLabel(nil)
+        fastTextField.setAccessibilityIdentifier(nil)
+        setAttributedString(attributedString, renderer: .rich)
     }
 
     func textView(
@@ -2174,18 +3152,75 @@ private final class MacConversationNativeTextCell:
         linkHandler = nil
         nativeTextView.setAccessibilityLabel(nil)
         nativeTextView.setAccessibilityIdentifier(nil)
-        nativeTextView.textStorage?.setAttributedString(NSAttributedString())
+        fastTextField.setAccessibilityLabel(nil)
+        fastTextField.setAccessibilityIdentifier(nil)
+        // `viewFor` immediately replaces this bounded storage. Clearing first
+        // invalidates TextKit twice for every cold tile and never presents an
+        // observable empty state.
         nativeTextView.maximumIntrinsicWidth = nil
+        fastTextField.provisionalIntrinsicWidth = nil
         textContainerView.layer?.backgroundColor = NSColor.clear.cgColor
         textContainerView.layer?.cornerRadius = 0
         textContainerView.layer?.maskedCorners = []
         super.prepareForReuse()
     }
 
-    private func setAttributedString(_ attributedString: NSAttributedString) {
-        nativeTextView.textStorage?.setAttributedString(attributedString)
-        nativeTextView.invalidateIntrinsicContentSize()
+    private func setAttributedString(
+        _ attributedString: NSAttributedString,
+        renderer: Renderer
+    ) {
+        switch renderer {
+        case .selectableFast:
+            fastTextField.attributedStringValue = attributedString
+            fastTextField.invalidateIntrinsicContentSize()
+        case .rich:
+            nativeTextView.textStorage?.setAttributedString(attributedString)
+            nativeTextView.invalidateIntrinsicContentSize()
+        }
         invalidateIntrinsicContentSize()
+    }
+
+    private enum Renderer: Equatable {
+        case rich
+        case selectableFast
+    }
+
+    private func setRendererMode(_ renderer: Renderer) {
+        let nativeConstraints = [
+            textTopConstraint,
+            textBottomConstraint,
+            textContentLeadingConstraint,
+            textContentTrailingConstraint,
+        ].compactMap { $0 }
+        let fastConstraints = [
+            fastTextTopConstraint,
+            fastTextBottomConstraint,
+            fastTextLeadingConstraint,
+            fastTextTrailingConstraint,
+        ].compactMap { $0 }
+        let constraintsByRenderer: [(Renderer, [NSLayoutConstraint])] = [
+            (.rich, nativeConstraints),
+            (.selectableFast, fastConstraints),
+        ]
+        for (candidate, constraints) in constraintsByRenderer
+        where candidate != renderer {
+            for constraint in constraints { setActive(constraint, false) }
+        }
+        let selectedConstraints = constraintsByRenderer.first {
+            $0.0 == renderer
+        }?.1 ?? []
+        for constraint in selectedConstraints { setActive(constraint, true) }
+        nativeTextView.isHidden = renderer != .rich
+        fastTextField.isHidden = renderer != .selectableFast
+        invalidateIntrinsicContentSize()
+    }
+
+    private func setActive(
+        _ constraint: NSLayoutConstraint,
+        _ active: Bool
+    ) {
+        guard constraint.isActive != active else { return }
+        constraint.isActive = active
     }
 
     private static func layerCorners(
@@ -2210,15 +3245,199 @@ private final class MacConversationNativeTextCell:
     private static func fallbackAttributedString(
         _ string: String,
         font: NSFont?,
-        color: NSColor?
+        color: NSColor?,
+        paragraphStyle: NSParagraphStyle?
     ) -> NSAttributedString {
         NSAttributedString(
             string: string,
             attributes: [
                 .font: font ?? NSFont.systemFont(ofSize: NSFont.systemFontSize),
                 .foregroundColor: color ?? NSColor.labelColor,
+                .paragraphStyle: paragraphStyle ?? NSParagraphStyle.default,
             ]
         )
+    }
+}
+
+@MainActor
+private final class MacConversationWrappingTextField: NSTextField {
+    private var lastMeasuredWidth: CGFloat = -1
+    var provisionalIntrinsicWidth: CGFloat? {
+        didSet {
+            if oldValue != provisionalIntrinsicWidth {
+                invalidateIntrinsicContentSize()
+            }
+        }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        isEditable = false
+        isSelectable = true
+        isBordered = false
+        drawsBackground = false
+        focusRingType = .none
+        usesSingleLineMode = false
+        maximumNumberOfLines = 0
+        lineBreakMode = .byCharWrapping
+        cell?.wraps = true
+        cell?.isScrollable = false
+        setContentHuggingPriority(.required, for: .vertical)
+        setContentCompressionResistancePriority(.required, for: .vertical)
+        setContentHuggingPriority(.defaultLow, for: .horizontal)
+        setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var intrinsicContentSize: NSSize {
+        let measurementWidth = bounds.width > 1
+            ? bounds.width
+            : (provisionalIntrinsicWidth ?? 0)
+        guard measurementWidth > 1 else {
+            return NSSize(
+                width: NSView.noIntrinsicMetric,
+                height: NSView.noIntrinsicMetric
+            )
+        }
+        let measured = attributedStringValue.boundingRect(
+            with: NSSize(
+                width: measurementWidth,
+                height: CGFloat.greatestFiniteMagnitude
+            ),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        )
+        return NSSize(
+            width: NSView.noIntrinsicMetric,
+            height: max(1, ceil(measured.height))
+        )
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        let widthChanged = abs(newSize.width - lastMeasuredWidth) > 0.5
+        super.setFrameSize(newSize)
+        guard widthChanged else { return }
+        lastMeasuredWidth = newSize.width
+        invalidateIntrinsicContentSize()
+    }
+}
+
+/// A scroll-only Core Text surface. It keeps exact text visible while the
+/// gesture owns the viewport, but avoids NSTextFieldCell/TextKit fitting and
+/// selection machinery in the synchronous NSTableView realization callback.
+/// The visible rows return to selectable controls as soon as scrolling ends.
+@MainActor
+final class MacConversationScrollTextView: NSView {
+    private var framesetter: CTFramesetter?
+    private var measuredWidth: CGFloat = -1
+    private var measuredHeight: CGFloat = 0
+    var provisionalIntrinsicWidth: CGFloat? {
+        didSet {
+            guard oldValue != provisionalIntrinsicWidth else { return }
+            resetMeasurement()
+        }
+    }
+    var attributedString = NSAttributedString() {
+        didSet {
+            framesetter = CTFramesetterCreateWithAttributedString(
+                attributedString as CFAttributedString
+            )
+            setAccessibilityValue(attributedString.string)
+            resetMeasurement()
+            needsDisplay = true
+        }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.staticText)
+        setContentHuggingPriority(.required, for: .vertical)
+        setContentCompressionResistancePriority(.required, for: .vertical)
+        setContentHuggingPriority(.defaultLow, for: .horizontal)
+        setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var isFlipped: Bool { true }
+
+    override var intrinsicContentSize: NSSize {
+        let width = bounds.width > 1
+            ? bounds.width
+            : (provisionalIntrinsicWidth ?? 0)
+        guard width > 1 else {
+            return NSSize(
+                width: NSView.noIntrinsicMetric,
+                height: NSView.noIntrinsicMetric
+            )
+        }
+        return NSSize(
+            width: NSView.noIntrinsicMetric,
+            height: textHeight(for: width)
+        )
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        let widthChanged = abs(newSize.width - bounds.width) > 0.5
+        super.setFrameSize(newSize)
+        guard widthChanged else { return }
+        resetMeasurement()
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let framesetter,
+              let context = NSGraphicsContext.current?.cgContext,
+              bounds.width > 0,
+              bounds.height > 0 else { return }
+        context.saveGState()
+        context.textMatrix = .identity
+        context.translateBy(x: 0, y: bounds.height)
+        context.scaleBy(x: 1, y: -1)
+        let path = CGPath(
+            rect: CGRect(origin: .zero, size: bounds.size),
+            transform: nil
+        )
+        let frame = CTFramesetterCreateFrame(
+            framesetter,
+            CFRange(location: 0, length: 0),
+            path,
+            nil
+        )
+        CTFrameDraw(frame, context)
+        context.restoreGState()
+    }
+
+    func textHeight(for width: CGFloat) -> CGFloat {
+        guard let framesetter else { return 1 }
+        if abs(width - measuredWidth) <= 0.5 {
+            return measuredHeight
+        }
+        let suggested = CTFramesetterSuggestFrameSizeWithConstraints(
+            framesetter,
+            CFRange(location: 0, length: 0),
+            nil,
+            CGSize(
+                width: width,
+                height: CGFloat.greatestFiniteMagnitude
+            ),
+            nil
+        )
+        measuredWidth = width
+        measuredHeight = max(1, ceil(suggested.height))
+        return measuredHeight
+    }
+
+    private func resetMeasurement() {
+        measuredWidth = -1
+        measuredHeight = 0
+        invalidateIntrinsicContentSize()
     }
 }
 

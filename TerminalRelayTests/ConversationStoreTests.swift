@@ -333,9 +333,15 @@ final class ConversationStoreTests: XCTestCase {
                 "text": .string(source),
             ])
         )
+        let reducerPayload = await ConversationStore
+            .prepareAuthoritativeReducerPayload(
+                for: completion,
+                retaining: store.itemsForTranscriptProjectionPreparation.first
+            )
         let prepared = await ConversationStore.prepareTranscriptProjections(
             for: completion,
-            retaining: store.itemsForTranscriptProjectionPreparation
+            retaining: store.itemsForTranscriptProjectionPreparation,
+            preparedReducerPayload: reducerPayload
         )
         XCTAssertTrue(
             prepared.isEmpty,
@@ -343,7 +349,8 @@ final class ConversationStoreTests: XCTestCase {
         )
         try store.apply(
             completion,
-            preparedTranscriptProjections: prepared
+            preparedTranscriptProjections: prepared,
+            preparedReducerPayload: reducerPayload
         )
 
         let completedRows = store.transcriptProjections(
@@ -360,11 +367,16 @@ final class ConversationStoreTests: XCTestCase {
             store.projectionDiagnostics.lastIncrementalSourceBytes,
             TranscriptRowProjection.maximumDisplayBytes
         )
+        XCTAssertEqual(
+            store.projectionDiagnostics.preparedCompletionAdoptions,
+            1
+        )
     }
 
     func testAuthoritativeMessageCompletionAdoptsPreparedRowsWithoutMainActorBuild() async throws {
         let streamingSource = String(repeating: "streaming-line\n", count: 2_000)
-        let authoritativeSource = String(repeating: "authoritative-line\n", count: 3_000)
+        let authoritativeSource = String(streamingSource.dropLast()) + "X"
+        XCTAssertEqual(authoritativeSource.utf8.count, streamingSource.utf8.count)
         let store = ConversationStore(streamingPublishNanoseconds: 0)
         try store.apply(
             ChatTestFixtures.event(
@@ -392,14 +404,21 @@ final class ConversationStoreTests: XCTestCase {
                 "text": .string(authoritativeSource),
             ])
         )
+        let reducerPayload = await ConversationStore
+            .prepareAuthoritativeReducerPayload(
+                for: completion,
+                retaining: store.itemsForTranscriptProjectionPreparation.first
+            )
         let prepared = await ConversationStore.prepareTranscriptProjections(
             for: completion,
-            retaining: store.itemsForTranscriptProjectionPreparation
+            retaining: store.itemsForTranscriptProjectionPreparation,
+            preparedReducerPayload: reducerPayload
         )
 
         try store.apply(
             completion,
-            preparedTranscriptProjections: prepared
+            preparedTranscriptProjections: prepared,
+            preparedReducerPayload: reducerPayload
         )
 
         let completedRows = store.transcriptProjections(
@@ -411,6 +430,445 @@ final class ConversationStoreTests: XCTestCase {
             fullBuilds,
             "The first published final rows must use the off-main prepared artifact."
         )
+        XCTAssertEqual(
+            store.projectionDiagnostics.preparedCompletionAdoptions,
+            1,
+            "The main actor must adopt the detached completion without comparing full text again."
+        )
+    }
+
+    func testAuthoritativeCompletionPreservesExactUnicodeBytes() async throws {
+        let prefix = String(repeating: "unicode-line\n", count: 2_000)
+        let streamingSource = prefix + "\u{00E9}"
+        let authoritativeSource = prefix + "e\u{0301}"
+        XCTAssertEqual(streamingSource, authoritativeSource)
+        XCTAssertNotEqual(Array(streamingSource.utf8), Array(authoritativeSource.utf8))
+
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.started",
+                sequence: 1,
+                itemID: "unicode-message",
+                turnID: "turn",
+                payload: .object([
+                    "role": .string("assistant"),
+                    "text": .string(streamingSource),
+                ])
+            )
+        )
+        let completion = ChatTestFixtures.event(
+            "message.completed",
+            sequence: 2,
+            itemID: "unicode-message",
+            turnID: "turn",
+            payload: .object([
+                "role": .string("assistant"),
+                "text": .string(authoritativeSource),
+            ])
+        )
+        let reducerPayload = await ConversationStore
+            .prepareAuthoritativeReducerPayload(
+                for: completion,
+                retaining: store.itemsForTranscriptProjectionPreparation.first
+            )
+        let prepared = await ConversationStore.prepareTranscriptProjections(
+            for: completion,
+            retaining: store.itemsForTranscriptProjectionPreparation,
+            preparedReducerPayload: reducerPayload
+        )
+        XCTAssertNotNil(prepared["unicode-message"])
+
+        try store.apply(
+            completion,
+            preparedTranscriptProjections: prepared,
+            preparedReducerPayload: reducerPayload
+        )
+        let completed = try XCTUnwrap(store.state.messages.first)
+        let rows = store.transcriptProjections(
+            for: try XCTUnwrap(store.state.items.first)
+        )
+        XCTAssertEqual(Array(completed.text.utf8), Array(authoritativeSource.utf8))
+        XCTAssertEqual(
+            Array(rows.map(\.sourceText).joined().utf8),
+            Array(authoritativeSource.utf8)
+        )
+        XCTAssertEqual(store.projectionDiagnostics.preparedCompletionAdoptions, 1)
+    }
+
+    func testAuthoritativeReasoningCompletionAdoptsPreparedItemAndRows() async throws {
+        let chunk = String(repeating: "reasoning-0123456789", count: 220) + "\n"
+        let chunkCount = 128
+        let streamedSource = String(repeating: chunk, count: chunkCount) + "\u{00E9}"
+        let authoritativeSource = String(repeating: chunk, count: chunkCount)
+            + "e\u{0301}"
+        XCTAssertEqual(streamedSource, authoritativeSource)
+        XCTAssertNotEqual(Array(streamedSource.utf8), Array(authoritativeSource.utf8))
+
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        store.setTranscriptLiveScrolling(true)
+        try store.apply(
+            ChatTestFixtures.event(
+                "reasoning.started",
+                sequence: 1,
+                itemID: "large-reasoning",
+                turnID: "turn",
+                payload: .object(["text": .string("")])
+            )
+        )
+        for offset in 0..<chunkCount {
+            try store.apply(
+                ChatTestFixtures.event(
+                    "reasoning.delta",
+                    sequence: Int64(offset + 2),
+                    itemID: "large-reasoning",
+                    turnID: "turn",
+                    payload: .object(["text": .string(chunk)])
+                )
+            )
+        }
+        try store.apply(
+            ChatTestFixtures.event(
+                "reasoning.delta",
+                sequence: Int64(chunkCount + 2),
+                itemID: "large-reasoning",
+                turnID: "turn",
+                payload: .object(["text": .string("\u{00E9}")])
+            )
+        )
+        guard case .reasoning(let capturedReasoning)? = store
+            .itemsForTranscriptProjectionPreparation.first else {
+            return XCTFail("Expected chunked reasoning before completion")
+        }
+        XCTAssertEqual(capturedReasoning.textUTF8Count, streamedSource.utf8.count)
+        XCTAssertFalse(capturedReasoning.isTextStorageMaterialized)
+
+        let completion = ChatTestFixtures.event(
+            "reasoning.completed",
+            sequence: Int64(chunkCount + 3),
+            itemID: "large-reasoning",
+            turnID: "turn",
+            payload: .object(["text": .string(authoritativeSource)])
+        )
+        let reducerPayload = await ConversationStore
+            .prepareAuthoritativeReducerPayload(
+                for: completion,
+                retaining: .reasoning(capturedReasoning)
+            )
+        let prepared = await ConversationStore.prepareTranscriptProjections(
+            for: completion,
+            retaining: store.itemsForTranscriptProjectionPreparation,
+            preparedReducerPayload: reducerPayload
+        )
+        XCTAssertNotNil(prepared["large-reasoning"])
+
+        try store.apply(
+            completion,
+            preparedTranscriptProjections: prepared,
+            preparedReducerPayload: reducerPayload
+        )
+        store.setTranscriptLiveScrolling(false)
+
+        guard case .reasoning(let completedReasoning)? = store.state.items.first else {
+            return XCTFail("Expected completed reasoning")
+        }
+        let rows = store.transcriptProjections(for: store.state.items[0])
+        XCTAssertFalse(completedReasoning.isStreaming)
+        XCTAssertEqual(
+            Array(completedReasoning.text.utf8),
+            Array(authoritativeSource.utf8)
+        )
+        XCTAssertEqual(
+            Array(rows.map(\.sourceText).joined().utf8),
+            Array(authoritativeSource.utf8)
+        )
+        XCTAssertEqual(store.projectionDiagnostics.fullItemBuilds, 0)
+        XCTAssertEqual(store.projectionDiagnostics.preparedCompletionAdoptions, 1)
+        XCTAssertFalse(
+            capturedReasoning.isTextStorageMaterialized,
+            "Detached completion must not flatten the previous streamed storage."
+        )
+    }
+
+    func testAuthoritativeToolCompletionAdoptsPreparedItemAndRows() async throws {
+        let chunk = String(repeating: "tool-output-0123456789", count: 190) + "\n"
+        let chunkCount = 128
+        let streamedSource = String(repeating: chunk, count: chunkCount) + "\u{00E9}"
+        let authoritativeSource = String(repeating: chunk, count: chunkCount)
+            + "e\u{0301}"
+
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        store.setTranscriptLiveScrolling(true)
+        try store.apply(
+            ChatTestFixtures.event(
+                "tool.started",
+                sequence: 1,
+                itemID: "large-tool-completion",
+                turnID: "turn",
+                payload: .object([
+                    "kind": .string("shell"),
+                    "title": .string("Original command"),
+                    "status": .string("running"),
+                    "input": .string("original input"),
+                    "output": .string(""),
+                ])
+            )
+        )
+        for offset in 0..<chunkCount {
+            try store.apply(
+                ChatTestFixtures.event(
+                    "tool.updated",
+                    sequence: Int64(offset + 2),
+                    itemID: "large-tool-completion",
+                    turnID: "turn",
+                    payload: .object([
+                        "kind": .string("shell"),
+                        "title": .string("Original command"),
+                        "status": .string("running"),
+                        "outputDelta": .string(chunk),
+                    ])
+                )
+            )
+        }
+        try store.apply(
+            ChatTestFixtures.event(
+                "tool.updated",
+                sequence: Int64(chunkCount + 2),
+                itemID: "large-tool-completion",
+                turnID: "turn",
+                payload: .object([
+                    "kind": .string("shell"),
+                    "title": .string("Original command"),
+                    "status": .string("running"),
+                    "outputDelta": .string("\u{00E9}"),
+                ])
+            )
+        )
+        guard case .tool(let capturedTool)? = store
+            .itemsForTranscriptProjectionPreparation.first else {
+            return XCTFail("Expected chunked tool before completion")
+        }
+        XCTAssertEqual(capturedTool.outputUTF8Count, streamedSource.utf8.count)
+        XCTAssertFalse(capturedTool.isOutputStorageMaterialized)
+
+        let completion = ChatTestFixtures.event(
+            "tool.completed",
+            sequence: Int64(chunkCount + 3),
+            itemID: "large-tool-completion",
+            turnID: "turn",
+            payload: .object([
+                "title": .string("Completed command"),
+                "output": .string(authoritativeSource),
+                "error": .string("command failed"),
+                "durationMs": .number(42),
+                "exitCode": .number(7),
+            ])
+        )
+        let reducerPayload = await ConversationStore
+            .prepareAuthoritativeReducerPayload(
+                for: completion,
+                retaining: .tool(capturedTool)
+            )
+        let prepared = await ConversationStore.prepareTranscriptProjections(
+            for: completion,
+            retaining: store.itemsForTranscriptProjectionPreparation,
+            preparedReducerPayload: reducerPayload
+        )
+        XCTAssertNotNil(prepared["large-tool-completion"])
+
+        try store.apply(
+            completion,
+            preparedTranscriptProjections: prepared,
+            preparedReducerPayload: reducerPayload
+        )
+        store.setTranscriptLiveScrolling(false)
+
+        let completedTool = try XCTUnwrap(store.state.tools.first)
+        let rows = store.transcriptProjections(for: store.state.items[0])
+        XCTAssertEqual(completedTool.kind, .shell)
+        XCTAssertEqual(completedTool.title, "Completed command")
+        XCTAssertEqual(completedTool.status, .failed)
+        XCTAssertEqual(completedTool.input, "original input")
+        XCTAssertEqual(completedTool.durationMilliseconds, 42)
+        XCTAssertEqual(completedTool.exitCode, 7)
+        XCTAssertEqual(
+            Array(try XCTUnwrap(completedTool.output).utf8),
+            Array(authoritativeSource.utf8)
+        )
+        XCTAssertEqual(
+            Array(
+                rows.filter { $0.section == .toolOutput }
+                    .map(\.sourceText).joined().utf8
+            ),
+            Array(authoritativeSource.utf8)
+        )
+        XCTAssertEqual(store.projectionDiagnostics.fullItemBuilds, 0)
+        XCTAssertEqual(store.projectionDiagnostics.preparedCompletionAdoptions, 1)
+        XCTAssertFalse(
+            capturedTool.isOutputStorageMaterialized,
+            "Detached completion must not flatten the previous streamed output."
+        )
+    }
+
+    func testCumulativeToolUpdateAdoptsPreparedItemWithReducerDefaults() async throws {
+        let chunk = String(repeating: "compat-output-0123456789", count: 175) + "\n"
+        let chunkCount = 128
+        let streamedSource = String(repeating: chunk, count: chunkCount)
+        let authoritativeSource = streamedSource + "authoritative replacement"
+
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        store.setTranscriptLiveScrolling(true)
+        try store.apply(
+            ChatTestFixtures.event(
+                "tool.started",
+                sequence: 1,
+                itemID: "compat-tool",
+                turnID: "turn",
+                payload: .object([
+                    "kind": .string("search"),
+                    "title": .string("Original search"),
+                    "status": .string("running"),
+                    "input": .string("search input"),
+                    "output": .string(""),
+                ])
+            )
+        )
+        for offset in 0..<chunkCount {
+            try store.apply(
+                ChatTestFixtures.event(
+                    "tool.updated",
+                    sequence: Int64(offset + 2),
+                    itemID: "compat-tool",
+                    turnID: "turn",
+                    payload: .object([
+                        "kind": .string("search"),
+                        "title": .string("Original search"),
+                        "status": .string("running"),
+                        "outputDelta": .string(chunk),
+                    ])
+                )
+            )
+        }
+        guard case .tool(let capturedTool)? = store
+            .itemsForTranscriptProjectionPreparation.first else {
+            return XCTFail("Expected chunked compatibility tool")
+        }
+        XCTAssertEqual(capturedTool.outputUTF8Count, streamedSource.utf8.count)
+        XCTAssertFalse(capturedTool.isOutputStorageMaterialized)
+
+        let deltaOnly = ChatTestFixtures.event(
+            "tool.updated",
+            sequence: Int64(chunkCount + 1),
+            itemID: "compat-tool",
+            turnID: "turn",
+            payload: .object(["outputDelta": .string("ordinary delta")])
+        )
+        let deltaOnlyPayload = await ConversationStore
+            .prepareAuthoritativeReducerPayload(
+                for: deltaOnly,
+                retaining: .tool(capturedTool)
+            )
+        XCTAssertNil(
+            deltaOnlyPayload,
+            "Output deltas must remain on the bounded incremental path."
+        )
+
+        let update = ChatTestFixtures.event(
+            "tool.updated",
+            sequence: Int64(chunkCount + 2),
+            itemID: "compat-tool",
+            turnID: "turn",
+            payload: .object([
+                "output": .string(authoritativeSource),
+                "outputDelta": .string("must not override cumulative output"),
+            ])
+        )
+        let reducerPayload = await ConversationStore
+            .prepareAuthoritativeReducerPayload(
+                for: update,
+                retaining: .tool(capturedTool)
+            )
+        let prepared = await ConversationStore.prepareTranscriptProjections(
+            for: update,
+            retaining: store.itemsForTranscriptProjectionPreparation,
+            preparedReducerPayload: reducerPayload
+        )
+        XCTAssertNotNil(prepared["compat-tool"])
+
+        try store.apply(
+            update,
+            preparedTranscriptProjections: prepared,
+            preparedReducerPayload: reducerPayload
+        )
+        store.setTranscriptLiveScrolling(false)
+
+        let updatedTool = try XCTUnwrap(store.state.tools.first)
+        let rows = store.transcriptProjections(for: store.state.items[0])
+        XCTAssertEqual(updatedTool.kind, .search)
+        XCTAssertEqual(updatedTool.title, "Agent activity")
+        XCTAssertEqual(updatedTool.status, .running)
+        XCTAssertEqual(updatedTool.input, "search input")
+        XCTAssertEqual(
+            Array(try XCTUnwrap(updatedTool.output).utf8),
+            Array(authoritativeSource.utf8)
+        )
+        XCTAssertEqual(
+            Array(
+                rows.filter { $0.section == .toolOutput }
+                    .map(\.sourceText).joined().utf8
+            ),
+            Array(authoritativeSource.utf8)
+        )
+        XCTAssertEqual(store.projectionDiagnostics.fullItemBuilds, 0)
+        XCTAssertEqual(store.projectionDiagnostics.preparedCompletionAdoptions, 1)
+        XCTAssertFalse(
+            capturedTool.isOutputStorageMaterialized,
+            "Cumulative compatibility adoption must not flatten streamed output."
+        )
+    }
+
+    func testInvalidPreparedTranscriptAuthorityDoesNotAdvanceSequence() throws {
+        let events: [ChatEnvelope] = [
+            ChatTestFixtures.event(
+                "reasoning.completed",
+                sequence: 2,
+                itemID: "item",
+                payload: .object(["text": .string("authoritative")])
+            ),
+            ChatTestFixtures.event(
+                "tool.completed",
+                sequence: 2,
+                itemID: "item",
+                payload: .object(["output": .string("authoritative")])
+            ),
+            ChatTestFixtures.event(
+                "tool.updated",
+                sequence: 2,
+                itemID: "item",
+                payload: .object(["output": .string("authoritative")])
+            ),
+        ]
+
+        for event in events {
+            let original = ConversationItem.message(
+                ChatMessage(id: "item", role: .assistant, text: "original")
+            )
+            let store = ConversationStore()
+            store.replaceWithSnapshot(
+                ConversationSnapshot(
+                    snapshotGeneration: ChatTestFixtures.generation,
+                    baseSequence: 1,
+                    items: [original]
+                )
+            )
+
+            XCTAssertThrowsError(
+                try store.apply(event, preparedReducerPayload: .invalid),
+                "\(event.type) must reject failed detached preparation."
+            )
+            XCTAssertEqual(store.lastAppliedSequence, 1)
+            XCTAssertEqual(store.state.items, [original])
+        }
     }
 
     func testLargeStartedAndReplacementEventsPublishPreparedRowsWithoutMainActorBuild() async throws {
@@ -814,6 +1272,361 @@ final class ConversationStoreTests: XCTestCase {
         XCTAssertEqual(store.projectionDiagnostics.fullItemBuilds, 0)
     }
 
+    func testPreparedAuthoritativePayloadsApplyWithoutMainActorJSONDecode() throws {
+        let snapshotItem = ConversationItem.message(
+            ChatMessage(id: "prepared-snapshot", role: .assistant, text: "snapshot")
+        )
+        let snapshot = ConversationSnapshot(
+            snapshotGeneration: ChatTestFixtures.generation,
+            baseSequence: 1,
+            items: [snapshotItem]
+        )
+        let snapshotStore = ConversationStore()
+        try snapshotStore.apply(
+            ChatTestFixtures.event(
+                "conversation.snapshot",
+                sequence: 1,
+                payload: .string("intentionally not a snapshot")
+            ),
+            preparedReducerPayload: .conversationSnapshot(snapshot)
+        )
+        XCTAssertEqual(snapshotStore.state.items, [snapshotItem])
+        let preservedRevision = snapshotStore.transcriptItemContentRevision(
+            for: snapshotItem.id
+        )
+        let repeatedSnapshot = ConversationSnapshot(
+            snapshotGeneration: ChatTestFixtures.generation,
+            baseSequence: 2,
+            items: [snapshotItem]
+        )
+        try snapshotStore.apply(
+            ChatTestFixtures.event(
+                "conversation.snapshot",
+                sequence: 2,
+                payload: .string("prepared repeated snapshot")
+            ),
+            preparedReducerPayload: .conversationSnapshot(repeatedSnapshot),
+            preservedSnapshotItemIDs: [snapshotItem.id]
+        )
+        XCTAssertEqual(
+            snapshotStore.transcriptItemContentRevision(for: snapshotItem.id),
+            preservedRevision
+        )
+
+        let current = ConversationItem.message(
+            ChatMessage(id: "current", role: .assistant, text: "current")
+        )
+        let older = ConversationItem.message(
+            ChatMessage(id: "older", role: .assistant, text: "older")
+        )
+        let historyStore = ConversationStore()
+        historyStore.replaceWithSnapshot(
+            ConversationSnapshot(
+                snapshotGeneration: ChatTestFixtures.generation,
+                baseSequence: 1,
+                items: [current],
+                hasOlderHistory: true,
+                oldestItemID: current.id
+            )
+        )
+        try historyStore.apply(
+            ChatTestFixtures.event(
+                "history.page",
+                sequence: 2,
+                payload: .object([
+                    "items": .string("intentionally not an item array"),
+                    "hasOlderHistory": .bool(false),
+                    "oldestItemId": .string(older.id),
+                ])
+            ),
+            preparedReducerPayload: .historyPage([older])
+        )
+        XCTAssertEqual(historyStore.state.items.map(\.id), [older.id, current.id])
+        XCTAssertFalse(historyStore.state.hasOlderHistory)
+    }
+
+    func testInvalidPreparedHistoryDoesNotAdvanceDurableCursor() throws {
+        let current = ConversationItem.message(
+            ChatMessage(id: "current", role: .assistant, text: "current")
+        )
+        let store = ConversationStore()
+        store.replaceWithSnapshot(
+            ConversationSnapshot(
+                snapshotGeneration: ChatTestFixtures.generation,
+                baseSequence: 1,
+                items: [current]
+            )
+        )
+
+        XCTAssertThrowsError(
+            try store.apply(
+                ChatTestFixtures.event(
+                    "history.page",
+                    sequence: 2,
+                    payload: .object(["items": .string("invalid")])
+                ),
+                preparedReducerPayload: .invalid
+            )
+        )
+        XCTAssertEqual(store.lastAppliedSequence, 1)
+        XCTAssertEqual(store.snapshotGeneration, ChatTestFixtures.generation)
+        XCTAssertEqual(store.state.items, [current])
+    }
+
+    func testPreparedSnapshotDoesNotCompareOrMaterializePreviousLargeText() throws {
+        let chunk = String(repeating: "z", count: 1_024)
+        let deltaCount = 8
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        store.setTranscriptLiveScrolling(true)
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.started",
+                sequence: 1,
+                itemID: "large-message",
+                turnID: "turn",
+                payload: .object([
+                    "role": .string("assistant"),
+                    "text": .string(""),
+                ])
+            )
+        )
+        for sequence in 2...(deltaCount + 1) {
+            try store.apply(
+                ChatTestFixtures.event(
+                    "message.delta",
+                    sequence: Int64(sequence),
+                    itemID: "large-message",
+                    turnID: "turn",
+                    payload: .object(["text": .string(chunk)])
+                )
+            )
+        }
+        guard case .message(let previousMessage)? = store
+            .stateForTranscriptProjectionPreparation.items.first,
+              let previousContent = previousMessage.contents.first else {
+            return XCTFail("Expected the working streaming message")
+        }
+        XCTAssertFalse(previousContent.isTextStorageMaterialized)
+
+        let replacement = ConversationItem.message(
+            ChatMessage(
+                id: "large-message",
+                turnID: "turn",
+                role: .assistant,
+                text: String(repeating: chunk, count: deltaCount),
+                occurredAt: 1,
+                isStreaming: true
+            )
+        )
+        let snapshot = ConversationSnapshot(
+            snapshotGeneration: ChatTestFixtures.generation,
+            baseSequence: Int64(deltaCount + 1),
+            items: [replacement],
+            connectionState: .streaming,
+            turnState: .running,
+            activeTurnID: "turn"
+        )
+        try store.apply(
+            ChatTestFixtures.event(
+                "conversation.snapshot",
+                sequence: snapshot.baseSequence,
+                payload: .string("prepared payload must bypass this JSON")
+            ),
+            preparedReducerPayload: .conversationSnapshot(snapshot),
+            preservedSnapshotItemIDs: ["large-message"]
+        )
+
+        XCTAssertFalse(
+            previousContent.isTextStorageMaterialized,
+            "Adopting an authoritative snapshot must not compare its text with the old transcript."
+        )
+    }
+
+    func testPreparedSnapshotDoesNotPreserveCanonicallyEqualDifferentBytes() async throws {
+        let oldText = "\u{00E9}"
+        let authoritativeText = "e\u{0301}"
+        let oldItem = ConversationItem.message(
+            ChatMessage(id: "unicode-message", role: .assistant, text: oldText)
+        )
+        let authoritativeItem = ConversationItem.message(
+            ChatMessage(
+                id: "unicode-message",
+                role: .assistant,
+                text: authoritativeText
+            )
+        )
+        let store = ConversationStore()
+        store.replaceWithSnapshot(
+            ConversationSnapshot(
+                snapshotGeneration: ChatTestFixtures.generation,
+                baseSequence: 1,
+                items: [oldItem]
+            )
+        )
+        _ = store.transcriptProjections(for: oldItem)
+        let oldRevision = store.transcriptItemContentRevision(for: oldItem.id)
+        let snapshot = ConversationSnapshot(
+            snapshotGeneration: ChatTestFixtures.generation,
+            baseSequence: 2,
+            items: [authoritativeItem]
+        )
+        let payload = PreparedConversationReducerPayload.conversationSnapshot(snapshot)
+        let preserved = await ConversationStore.preparePreservedSnapshotItemIDs(
+            for: payload,
+            retaining: store.state.items
+        )
+        XCTAssertFalse(preserved.contains(oldItem.id))
+
+        let envelope = ChatTestFixtures.event(
+            "conversation.snapshot",
+            sequence: 2,
+            payload: .string("prepared payload must bypass this JSON")
+        )
+        let prepared = await ConversationStore.prepareTranscriptProjections(
+            for: envelope,
+            retaining: store.state.items,
+            currentState: store.stateForTranscriptProjectionPreparation,
+            preparedReducerPayload: payload,
+            preservingSnapshotItemIDs: preserved
+        )
+        try store.apply(
+            envelope,
+            preparedTranscriptProjections: prepared,
+            preparedReducerPayload: payload,
+            preservedSnapshotItemIDs: preserved
+        )
+
+        let applied = try XCTUnwrap(store.state.items.first)
+        guard case .message(let appliedMessage) = applied else {
+            return XCTFail("Expected authoritative message")
+        }
+        let appliedText = appliedMessage.text
+        let projectedText = store.transcriptProjections(for: applied)
+            .map(\.sourceText)
+            .joined()
+        XCTAssertEqual(Array(appliedText.utf8), Array(authoritativeText.utf8))
+        XCTAssertEqual(Array(projectedText.utf8), Array(authoritativeText.utf8))
+        XCTAssertNotEqual(
+            store.transcriptItemContentRevision(for: oldItem.id),
+            oldRevision
+        )
+    }
+
+    func testPreparedSnapshotDoesNotPreserveGenericCanonicalByteChange() async throws {
+        let oldText = "\u{00E9}"
+        let authoritativeText = "e\u{0301}"
+        let oldItem = ConversationItem.generic(
+            ChatGenericItem(
+                id: "unicode-generic",
+                turnID: nil,
+                type: "activity",
+                title: "Status",
+                detail: oldText,
+                occurredAt: nil
+            )
+        )
+        let authoritativeItem = ConversationItem.generic(
+            ChatGenericItem(
+                id: "unicode-generic",
+                turnID: nil,
+                type: "activity",
+                title: "Status",
+                detail: authoritativeText,
+                occurredAt: nil
+            )
+        )
+        let store = ConversationStore()
+        store.replaceWithSnapshot(
+            ConversationSnapshot(
+                snapshotGeneration: ChatTestFixtures.generation,
+                baseSequence: 1,
+                items: [oldItem]
+            )
+        )
+        _ = store.transcriptProjections(for: oldItem)
+        let snapshot = ConversationSnapshot(
+            snapshotGeneration: ChatTestFixtures.generation,
+            baseSequence: 2,
+            items: [authoritativeItem]
+        )
+        let payload = PreparedConversationReducerPayload.conversationSnapshot(snapshot)
+        let preserved = await ConversationStore.preparePreservedSnapshotItemIDs(
+            for: payload,
+            retaining: store.state.items
+        )
+        XCTAssertFalse(preserved.contains(oldItem.id))
+
+        let envelope = ChatTestFixtures.event(
+            "conversation.snapshot",
+            sequence: 2,
+            payload: .string("prepared payload must bypass this JSON")
+        )
+        let prepared = await ConversationStore.prepareTranscriptProjections(
+            for: envelope,
+            retaining: store.state.items,
+            currentState: store.stateForTranscriptProjectionPreparation,
+            preparedReducerPayload: payload,
+            preservingSnapshotItemIDs: preserved
+        )
+        try store.apply(
+            envelope,
+            preparedTranscriptProjections: prepared,
+            preparedReducerPayload: payload,
+            preservedSnapshotItemIDs: preserved
+        )
+
+        let applied = try XCTUnwrap(store.state.items.first)
+        guard case .generic(let generic) = applied else {
+            return XCTFail("Expected authoritative generic item")
+        }
+        let projectedText = store.transcriptProjections(for: applied)
+            .map(\.sourceText)
+            .joined()
+        XCTAssertEqual(Array(generic.detail?.utf8 ?? "".utf8), Array(authoritativeText.utf8))
+        XCTAssertEqual(Array(projectedText.utf8), Array(authoritativeText.utf8))
+    }
+
+    func testMessageCompletionDoesNotMaterializeChunkedStreamingText() throws {
+        let chunk = String(repeating: "z", count: 1_024)
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        store.setTranscriptLiveScrolling(true)
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.started",
+                sequence: 1,
+                itemID: "message",
+                turnID: "turn"
+            )
+        )
+        for sequence in 2...9 {
+            try store.apply(
+                ChatTestFixtures.event(
+                    "message.delta",
+                    sequence: Int64(sequence),
+                    itemID: "message",
+                    turnID: "turn",
+                    payload: .object(["text": .string(chunk)])
+                )
+            )
+        }
+        guard case .message(let streaming)? = store
+            .stateForTranscriptProjectionPreparation.items.first,
+              let capturedContent = streaming.contents.first else {
+            return XCTFail("Expected a streaming message")
+        }
+        XCTAssertFalse(capturedContent.isTextStorageMaterialized)
+
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.completed",
+                sequence: 10,
+                itemID: "message",
+                turnID: "turn"
+            )
+        )
+        XCTAssertFalse(capturedContent.isTextStorageMaterialized)
+    }
+
     func testConnectingPlaceholderPreservesPublishedRowsWithoutReprojection() async throws {
         let source = String(repeating: "painted\n", count: 10_000)
         let item = ConversationItem.message(
@@ -842,12 +1655,20 @@ final class ConversationStoreTests: XCTestCase {
         )
         let prepared = await ConversationStore.prepareTranscriptProjections(
             for: envelope,
-            retaining: store.state.items
+            retaining: store.state.items,
+            preparedReducerPayload: .conversationSnapshot(placeholder),
+            preservingSnapshotItemIDs: [item.id]
         )
+        let contentRevisionBefore = store.transcriptContentRevision
+        let mutationBefore = store.transcriptMutation
+        let itemRevisionBefore = store.transcriptItemContentRevision(for: item.id)
+        XCTAssertTrue(prepared.isEmpty)
 
         try store.apply(
             envelope,
-            preparedTranscriptProjections: prepared
+            preparedTranscriptProjections: prepared,
+            preparedReducerPayload: .conversationSnapshot(placeholder),
+            preservedSnapshotItemIDs: [item.id]
         )
 
         let retained = try XCTUnwrap(store.state.items.first)
@@ -856,6 +1677,12 @@ final class ConversationStoreTests: XCTestCase {
             source
         )
         XCTAssertEqual(store.projectionDiagnostics.fullItemBuilds, buildsBefore)
+        XCTAssertEqual(store.transcriptContentRevision, contentRevisionBefore)
+        XCTAssertEqual(store.transcriptMutation, mutationBefore)
+        XCTAssertEqual(
+            store.transcriptItemContentRevision(for: item.id),
+            itemRevisionBefore
+        )
     }
 
     func testLiveScrollingDefersStreamingPublicationAndCatchesUpOnce() throws {
@@ -1966,6 +2793,8 @@ final class ConversationStoreTests: XCTestCase {
     func testNearLimitStreamsAppendChunksWithoutMaterializingAccumulatedText() throws {
         let chunk = String(repeating: "z", count: 1_024)
         let deltaCount = 900
+        let expectedUTF8Count = chunk.utf8.count * deltaCount
+        let maximumChunkCount = (expectedUTF8Count + (4 * 1_024) - 1) / (4 * 1_024)
 
         let messageStore = ConversationStore(streamingPublishNanoseconds: 0)
         messageStore.setTranscriptLiveScrolling(true)
@@ -1997,8 +2826,8 @@ final class ConversationStoreTests: XCTestCase {
               let content = message.contents.first else {
             return XCTFail("Expected the working streaming message")
         }
-        XCTAssertEqual(content.textUTF8Count, chunk.utf8.count * deltaCount)
-        XCTAssertEqual(content.textStorageChunkCount, deltaCount + 1)
+        XCTAssertEqual(content.textUTF8Count, expectedUTF8Count)
+        XCTAssertLessThanOrEqual(content.textStorageChunkCount, maximumChunkCount)
         XCTAssertFalse(
             content.isTextStorageMaterialized,
             "Applying deltas must not rebuild the accumulated String on the main actor."
@@ -2041,13 +2870,76 @@ final class ConversationStoreTests: XCTestCase {
             .stateForTranscriptProjectionPreparation.items.first else {
             return XCTFail("Expected the working streaming tool")
         }
-        XCTAssertEqual(tool.outputUTF8Count, chunk.utf8.count * deltaCount)
-        XCTAssertEqual(tool.outputStorageChunkCount, deltaCount + 1)
+        XCTAssertEqual(tool.outputUTF8Count, expectedUTF8Count)
+        XCTAssertLessThanOrEqual(tool.outputStorageChunkCount, maximumChunkCount)
         XCTAssertFalse(
             tool.isOutputStorageMaterialized,
             "Tool output deltas must remain immutable chunks until exact text is requested."
         )
         XCTAssertEqual(tool.output, String(repeating: chunk, count: deltaCount))
+    }
+
+    func testPersistentChatTextCoalescesManySmallDeltasExactly() throws {
+        let delta = "🙂"
+        let deltaCount = 5_000
+        let expectedText = String(repeating: delta, count: deltaCount)
+        let expectedUTF8Count = delta.utf8.count * deltaCount
+        let maximumChunkCount = (expectedUTF8Count + (4 * 1_024) - 1) / (4 * 1_024)
+
+        var content = MessageContent(id: "small-delta-message", text: "")
+        var tool = ToolActivity(
+            id: "small-delta-tool",
+            turnID: "turn",
+            kind: .shell,
+            title: "Command",
+            status: .running,
+            input: nil,
+            output: "",
+            errorMessage: nil,
+            durationMilliseconds: nil,
+            exitCode: nil,
+            occurredAt: nil,
+            isTruncated: false,
+            originalByteCount: nil
+        )
+
+        for _ in 0..<deltaCount {
+            content.appendText(delta)
+            tool.appendOutput(delta)
+        }
+
+        XCTAssertEqual(content.textUTF8Count, expectedUTF8Count)
+        XCTAssertLessThanOrEqual(content.textStorageChunkCount, maximumChunkCount)
+        XCTAssertFalse(content.isTextStorageMaterialized)
+        XCTAssertEqual(tool.outputUTF8Count, expectedUTF8Count)
+        XCTAssertLessThanOrEqual(tool.outputStorageChunkCount, maximumChunkCount)
+        XCTAssertFalse(tool.isOutputStorageMaterialized)
+
+        XCTAssertEqual(content.text, expectedText)
+        XCTAssertEqual(tool.output, expectedText)
+        XCTAssertTrue(content.isTextStorageMaterialized)
+        XCTAssertTrue(tool.isOutputStorageMaterialized)
+
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+        XCTAssertEqual(
+            try decoder.decode(MessageContent.self, from: encoder.encode(content)),
+            content
+        )
+        XCTAssertEqual(
+            try decoder.decode(ToolActivity.self, from: encoder.encode(tool)),
+            tool
+        )
+    }
+
+    func testPersistentChatTextKeepsLargeInitialValueAsOneMaterializedChunk() {
+        let initialText = String(repeating: "initial🙂", count: 1_024)
+        let content = MessageContent(id: "initial-message", text: initialText)
+
+        XCTAssertGreaterThan(content.textUTF8Count, 4 * 1_024)
+        XCTAssertEqual(content.textStorageChunkCount, 1)
+        XCTAssertTrue(content.isTextStorageMaterialized)
+        XCTAssertEqual(content.text, initialText)
     }
 
     func testIncrementalContentAccountingEnforcesByteLimitAfterStreamingGrowth() throws {

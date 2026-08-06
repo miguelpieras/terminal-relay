@@ -21,6 +21,12 @@ final class TranscriptPerformanceFixtureTests: XCTestCase {
         XCTAssertEqual(allContentBytes(mixed), 8 * 1_048_576)
         XCTAssertEqual(mixed.filter { if case .tool = $0 { true } else { false } }.count, 1)
         XCTAssertEqual(mixed.filter { if case .diff = $0 { true } else { false } }.count, 1)
+        guard case .message(let largeMessage)? = mixed.first(where: {
+            $0.id == "fixture-large-message"
+        }) else {
+            return XCTFail("Expected the cold large-message benchmark sentinel.")
+        }
+        XCTAssertEqual(largeMessage.text.utf8.count, 512 * 1_024)
         XCTAssertEqual(
             Set(mixed.prefix(20).compactMap { item -> String? in
                 guard case .message(let message) = item else { return nil }

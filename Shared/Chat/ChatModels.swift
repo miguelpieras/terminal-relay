@@ -168,102 +168,245 @@ enum MessageContentKind: String, Codable, Equatable, Sendable {
     case generic
 }
 
-/// Immutable append-chain storage keeps published transcript snapshots cheap:
-/// a streaming delta adds one small node instead of copying the accumulated
-/// String. Materialization is cached and only needed for wire/cache encoding,
-/// exact copy, or one-time full projection work.
+/// Transcript identity is byte-preserving. Swift `String` equality treats
+/// canonically equivalent Unicode as equal, which is correct for normal UI
+/// comparisons but not for deciding whether authoritative worker bytes may
+/// reuse a projected/copyable transcript cache.
+func chatStringsHaveIdenticalUTF8(_ lhs: String, _ rhs: String) -> Bool {
+    lhs.utf8.count == rhs.utf8.count
+        && lhs.utf8.elementsEqual(rhs.utf8)
+}
+
+func chatStringsHaveIdenticalUTF8(_ lhs: String?, _ rhs: String?) -> Bool {
+    switch (lhs, rhs) {
+    case (.none, .none):
+        true
+    case (.some(let lhs), .some(let rhs)):
+        chatStringsHaveIdenticalUTF8(lhs, rhs)
+    default:
+        false
+    }
+}
+
+/// Persistent chunk storage keeps published transcript snapshots cheap. Small
+/// deltas accumulate in a bounded value tail; once full, that tail becomes an
+/// immutable shared chunk. Appending therefore copies at most one 4 KiB tail
+/// plus the incoming delta, regardless of the accumulated transcript size.
 private struct PersistentChatText: Equatable, Sendable {
-    private final class Node: @unchecked Sendable {
-        let previous: Node?
+    private static let maximumTailUTF8Count = 4 * 1_024
+
+    private final class SealedChunk: @unchecked Sendable {
+        let previous: SealedChunk?
         let chunk: String
-        let utf8Count: Int
         let chunkCount: Int
 
-        private let cacheLock = NSLock()
-        private var cachedText: String?
-
-        init(previous: Node?, chunk: String) {
+        init(previous: SealedChunk?, chunk: String) {
             self.previous = previous
             self.chunk = chunk
-            utf8Count = (previous?.utf8Count ?? 0) + chunk.utf8.count
             chunkCount = (previous?.chunkCount ?? 0) + 1
-            cachedText = previous == nil ? chunk : nil
+        }
+    }
+
+    private final class MaterializationCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cachedText: String?
+
+        init(_ cachedText: String? = nil) {
+            self.cachedText = cachedText
         }
 
-        func materialized() -> String {
-            cacheLock.lock()
-            if let cachedText {
-                cacheLock.unlock()
-                return cachedText
-            }
-            cacheLock.unlock()
+        var value: String? {
+            lock.lock()
+            let value = cachedText
+            lock.unlock()
+            return value
+        }
 
-            var chunks: [String] = []
-            chunks.reserveCapacity(chunkCount)
-            var node: Node? = self
-            while let current = node {
-                chunks.append(current.chunk)
-                node = current.previous
-            }
-            var result = ""
-            result.reserveCapacity(utf8Count)
-            for chunk in chunks.reversed() {
-                result.append(contentsOf: chunk)
-            }
-
-            cacheLock.lock()
+        func store(_ text: String) -> String {
+            lock.lock()
             if cachedText == nil {
-                cachedText = result
+                cachedText = text
             }
-            let resolved = cachedText ?? result
-            cacheLock.unlock()
+            let resolved = cachedText ?? text
+            lock.unlock()
             return resolved
         }
 
-        var isMaterialized: Bool {
-            cacheLock.lock()
-            let result = cachedText != nil
-            cacheLock.unlock()
-            return result
+        /// When detached preparation proves that an authoritative value is
+        /// unchanged, retain that exact String representation. The prepared
+        /// completed item can then be adopted and later encoded without
+        /// rebuilding the accumulated append chain on the main actor.
+        func adoptEquivalent(_ text: String) {
+            lock.lock()
+            cachedText = text
+            lock.unlock()
         }
     }
 
-    private let tail: Node
+    private let sealedTail: SealedChunk?
+    private let valueTail: String
+    private let valueTailUTF8Count: Int
+    private let totalUTF8Count: Int
+    private let materializationCache: MaterializationCache
 
     init(_ value: String) {
-        tail = Node(previous: nil, chunk: value)
+        let utf8Count = value.utf8.count
+        if utf8Count > Self.maximumTailUTF8Count {
+            sealedTail = SealedChunk(previous: nil, chunk: value)
+            valueTail = ""
+            valueTailUTF8Count = 0
+        } else {
+            sealedTail = nil
+            valueTail = value
+            valueTailUTF8Count = utf8Count
+        }
+        totalUTF8Count = utf8Count
+        materializationCache = MaterializationCache(value)
     }
 
-    var string: String { tail.materialized() }
-    var utf8Count: Int { tail.utf8Count }
-    var chunkCount: Int { tail.chunkCount }
-    var isMaterialized: Bool { tail.isMaterialized }
+    var string: String {
+        if let cachedText = materializationCache.value {
+            return cachedText
+        }
+
+        let result: String
+        if sealedTail == nil {
+            result = valueTail
+        } else if valueTail.isEmpty,
+                  sealedTail?.previous == nil,
+                  let onlyChunk = sealedTail?.chunk {
+            result = onlyChunk
+        } else {
+            var chunks: [String] = []
+            chunks.reserveCapacity(sealedTail?.chunkCount ?? 0)
+            var chunk = sealedTail
+            while let current = chunk {
+                chunks.append(current.chunk)
+                chunk = current.previous
+            }
+
+            var accumulated = ""
+            accumulated.reserveCapacity(totalUTF8Count)
+            for chunk in chunks.reversed() {
+                accumulated.append(contentsOf: chunk)
+            }
+            accumulated.append(contentsOf: valueTail)
+            result = accumulated
+        }
+        return materializationCache.store(result)
+    }
+
+    var utf8Count: Int { totalUTF8Count }
+    var chunkCount: Int {
+        (sealedTail?.chunkCount ?? 0) + (valueTail.isEmpty ? 0 : 1)
+    }
+    var isMaterialized: Bool { materializationCache.value != nil }
+
+    /// Exact append lineage check used by main-actor streaming bookkeeping.
+    /// A false result means callers must rebuild from a prepared snapshot; it
+    /// never falls back to materializing or comparing the accumulated text.
+    func sharesStorage(with other: PersistentChatText) -> Bool {
+        sealedTail === other.sealedTail
+            && Self.hasIdenticalUTF8(valueTail, other.valueTail)
+    }
+
+    /// Performs the authoritative equality check where the caller chooses to
+    /// run it (normally detached transcript preparation), while preserving the
+    /// existing append lineage only when the completed UTF-8 payload did not
+    /// change. Swift String equality is canonically normalized, but transcript
+    /// projection/copy must preserve the worker's exact authoritative bytes.
+    func matches(_ value: String) -> Bool {
+        let valueUTF8Count = value.utf8.count
+        guard valueUTF8Count == totalUTF8Count,
+              string.utf8.elementsEqual(value.utf8) else { return false }
+        materializationCache.adoptEquivalent(value)
+        return true
+    }
 
     func appending(_ value: String) -> PersistentChatText {
         guard !value.isEmpty else { return self }
-        return PersistentChatText(tail: Node(previous: tail, chunk: value))
+        let valueUTF8Count = value.utf8.count
+
+        if valueTailUTF8Count + valueUTF8Count <= Self.maximumTailUTF8Count {
+            var appendedTail = valueTail
+            appendedTail.append(contentsOf: value)
+            return PersistentChatText(
+                sealedTail: sealedTail,
+                valueTail: appendedTail,
+                valueTailUTF8Count: valueTailUTF8Count + valueUTF8Count,
+                totalUTF8Count: totalUTF8Count + valueUTF8Count
+            )
+        }
+
+        var appendedSealedTail = sealedTail
+        if !valueTail.isEmpty {
+            appendedSealedTail = SealedChunk(
+                previous: appendedSealedTail,
+                chunk: valueTail
+            )
+        }
+
+        if valueUTF8Count > Self.maximumTailUTF8Count {
+            appendedSealedTail = SealedChunk(
+                previous: appendedSealedTail,
+                chunk: value
+            )
+            return PersistentChatText(
+                sealedTail: appendedSealedTail,
+                valueTail: "",
+                valueTailUTF8Count: 0,
+                totalUTF8Count: totalUTF8Count + valueUTF8Count
+            )
+        }
+
+        return PersistentChatText(
+            sealedTail: appendedSealedTail,
+            valueTail: value,
+            valueTailUTF8Count: valueUTF8Count,
+            totalUTF8Count: totalUTF8Count + valueUTF8Count
+        )
     }
 
-    private init(tail: Node) {
-        self.tail = tail
+    private init(
+        sealedTail: SealedChunk?,
+        valueTail: String,
+        valueTailUTF8Count: Int,
+        totalUTF8Count: Int
+    ) {
+        self.sealedTail = sealedTail
+        self.valueTail = valueTail
+        self.valueTailUTF8Count = valueTailUTF8Count
+        self.totalUTF8Count = totalUTF8Count
+        materializationCache = MaterializationCache()
     }
 
     static func == (lhs: PersistentChatText, rhs: PersistentChatText) -> Bool {
-        if lhs.tail === rhs.tail { return true }
+        if lhs.sealedTail === rhs.sealedTail,
+           hasIdenticalUTF8(lhs.valueTail, rhs.valueTail) {
+            return true
+        }
         guard lhs.utf8Count == rhs.utf8Count else { return false }
+        guard hasIdenticalUTF8(lhs.valueTail, rhs.valueTail) else {
+            return hasIdenticalUTF8(lhs.string, rhs.string)
+        }
 
-        var left: Node? = lhs.tail
-        var right: Node? = rhs.tail
+        var left = lhs.sealedTail
+        var right = rhs.sealedTail
         while let leftNode = left, let rightNode = right {
             if leftNode === rightNode { return true }
-            guard leftNode.chunk == rightNode.chunk else {
-                return lhs.string == rhs.string
+            guard hasIdenticalUTF8(leftNode.chunk, rightNode.chunk) else {
+                // Equal text can have different append chunk boundaries.
+                return hasIdenticalUTF8(lhs.string, rhs.string)
             }
             left = leftNode.previous
             right = rightNode.previous
         }
         if left == nil, right == nil { return true }
-        return lhs.string == rhs.string
+        return hasIdenticalUTF8(lhs.string, rhs.string)
+    }
+
+    private static func hasIdenticalUTF8(_ lhs: String, _ rhs: String) -> Bool {
+        chatStringsHaveIdenticalUTF8(lhs, rhs)
     }
 }
 
@@ -306,8 +449,17 @@ struct MessageContent: Codable, Equatable, Identifiable, Sendable {
         textStorage = textStorage.appending(delta)
     }
 
+    mutating func replaceTextUnlessEqual(_ text: String) {
+        guard !textStorage.matches(text) else { return }
+        textStorage = PersistentChatText(text)
+    }
+
     func hasSameText(as other: MessageContent) -> Bool {
         textStorage == other.textStorage
+    }
+
+    func sharesTextStorage(with other: MessageContent) -> Bool {
+        textStorage.sharesStorage(with: other.textStorage)
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -385,6 +537,12 @@ struct ChatMessage: Codable, Equatable, Identifiable, Sendable {
         contents.map(\.text).joined()
     }
 
+    /// Structural emptiness check that never materializes persistent streaming
+    /// text. Footer/layout decisions only need to know whether content exists.
+    var hasText: Bool {
+        contents.contains { $0.textUTF8Count > 0 }
+    }
+
     mutating func append(_ delta: String, contentID: String? = nil) {
         let resolvedID = contentID ?? contents.last?.id ?? "\(id):content:0"
         if let index = contents.firstIndex(where: { $0.id == resolvedID }) {
@@ -407,7 +565,7 @@ struct ChatMessage: Codable, Equatable, Identifiable, Sendable {
             if contents.isEmpty {
                 contents = [MessageContent(id: "\(id):content:0", text: text)]
             } else {
-                contents[0].text = text
+                contents[0].replaceTextUnlessEqual(text)
                 if contents.count > 1 {
                     contents.removeSubrange(1...)
                 }
@@ -895,6 +1053,64 @@ enum ConversationItem: Codable, Equatable, Identifiable, Sendable {
         case .diff(let item): item.occurredAt
         case .plan(let item): item.occurredAt
         case .generic(let item): item.occurredAt
+        }
+    }
+
+    /// Stronger than synthesized `Equatable`: every String that can affect a
+    /// row, action, accessibility label, or copied source must have identical
+    /// UTF-8 before an authoritative snapshot may retain the old projection.
+    func hasExactTranscriptIdentity(as other: ConversationItem) -> Bool {
+        guard self == other else { return false }
+        switch (self, other) {
+        case (.message(let lhs), .message(let rhs)):
+            guard chatStringsHaveIdenticalUTF8(lhs.id, rhs.id),
+                  chatStringsHaveIdenticalUTF8(lhs.turnID, rhs.turnID),
+                  lhs.contents.count == rhs.contents.count else {
+                return false
+            }
+            return zip(lhs.contents, rhs.contents).allSatisfy { lhs, rhs in
+                chatStringsHaveIdenticalUTF8(lhs.id, rhs.id)
+                    && chatStringsHaveIdenticalUTF8(lhs.language, rhs.language)
+            }
+
+        case (.reasoning(let lhs), .reasoning(let rhs)):
+            return chatStringsHaveIdenticalUTF8(lhs.id, rhs.id)
+                && chatStringsHaveIdenticalUTF8(lhs.turnID, rhs.turnID)
+
+        case (.tool(let lhs), .tool(let rhs)):
+            return chatStringsHaveIdenticalUTF8(lhs.id, rhs.id)
+                && chatStringsHaveIdenticalUTF8(lhs.turnID, rhs.turnID)
+                && chatStringsHaveIdenticalUTF8(lhs.title, rhs.title)
+                && chatStringsHaveIdenticalUTF8(lhs.input, rhs.input)
+                && chatStringsHaveIdenticalUTF8(lhs.errorMessage, rhs.errorMessage)
+
+        case (.diff(let lhs), .diff(let rhs)):
+            return chatStringsHaveIdenticalUTF8(lhs.id, rhs.id)
+                && chatStringsHaveIdenticalUTF8(lhs.turnID, rhs.turnID)
+                && chatStringsHaveIdenticalUTF8(lhs.path, rhs.path)
+                && chatStringsHaveIdenticalUTF8(lhs.unifiedDiff, rhs.unifiedDiff)
+
+        case (.plan(let lhs), .plan(let rhs)):
+            guard chatStringsHaveIdenticalUTF8(lhs.id, rhs.id),
+                  chatStringsHaveIdenticalUTF8(lhs.turnID, rhs.turnID),
+                  chatStringsHaveIdenticalUTF8(lhs.title, rhs.title),
+                  lhs.steps.count == rhs.steps.count else {
+                return false
+            }
+            return zip(lhs.steps, rhs.steps).allSatisfy { lhs, rhs in
+                chatStringsHaveIdenticalUTF8(lhs.id, rhs.id)
+                    && chatStringsHaveIdenticalUTF8(lhs.title, rhs.title)
+            }
+
+        case (.generic(let lhs), .generic(let rhs)):
+            return chatStringsHaveIdenticalUTF8(lhs.id, rhs.id)
+                && chatStringsHaveIdenticalUTF8(lhs.turnID, rhs.turnID)
+                && chatStringsHaveIdenticalUTF8(lhs.type, rhs.type)
+                && chatStringsHaveIdenticalUTF8(lhs.title, rhs.title)
+                && chatStringsHaveIdenticalUTF8(lhs.detail, rhs.detail)
+
+        default:
+            return false
         }
     }
 

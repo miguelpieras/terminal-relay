@@ -33,6 +33,9 @@ final class MacConversationTableViewTests: XCTestCase {
         var horizontalAlignment:
             MacConversationNativeTextPresentation.HorizontalAlignment = .fill
         var backgroundCornerRadius: CGFloat = 0
+        var usesFastPlainTextRenderer = false
+        var promotesFastRendererWhenIdle = false
+        var usesLiveScrollText = false
 
         var reuseIdentifier: String { "test.mixed-row" }
 
@@ -60,7 +63,35 @@ final class MacConversationTableViewTests: XCTestCase {
                 backgroundCornerRadius: backgroundCornerRadius,
                 horizontalAlignment: horizontalAlignment,
                 accessibilityLabel: "Native transcript text",
-                accessibilityIdentifier: nativeAccessibilityIdentifier
+                accessibilityIdentifier: nativeAccessibilityIdentifier,
+                usesFastPlainTextRenderer: usesFastPlainTextRenderer,
+                promotesFastRendererWhenIdle: promotesFastRendererWhenIdle
+            )
+        }
+
+        func liveScrollTextPresentation(
+            dynamicTypeSize: DynamicTypeSize,
+            colorScheme: ColorScheme
+        ) -> MacConversationNativeTextPresentation? {
+            guard usesLiveScrollText else {
+                return nativeTextPresentation(
+                    dynamicTypeSize: dynamicTypeSize,
+                    colorScheme: colorScheme
+                )
+            }
+            return MacConversationNativeTextPresentation(
+                fallbackString: text,
+                contentInsets: NSEdgeInsets(
+                    top: 8,
+                    left: 12,
+                    bottom: 8,
+                    right: 12
+                ),
+                fallbackFont: NSFont.systemFont(ofSize: 14),
+                fallbackColor: .labelColor,
+                accessibilityLabel: "Live scroll transcript text",
+                accessibilityIdentifier: nativeAccessibilityIdentifier,
+                usesFastPlainTextRenderer: true
             )
         }
     }
@@ -145,6 +176,221 @@ final class MacConversationTableViewTests: XCTestCase {
         XCTAssertEqual(nativeTextView?.accessibilityIdentifier(), "native.segment")
     }
 
+    func testFastPlainNativeRowUsesSelectableWrappingTextField() {
+        let source = String(repeating: "fast selectable code line\n", count: 40)
+        let rows = [
+            MixedRow(
+                id: "native-fast",
+                contentRevision: 1,
+                text: source,
+                usesNativeText: true,
+                backgroundCornerRadius: 12,
+                usesFastPlainTextRenderer: true
+            )
+        ]
+        let mounted = mountMixed(rows: rows)
+        let cell = mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: true
+        )!
+        let textField = descendant(of: cell, type: NSTextField.self)
+        let textView = descendant(of: cell, type: NSTextView.self)
+
+        XCTAssertTrue(cell.identifier?.rawValue.hasSuffix(".native") == true)
+        XCTAssertNil(descendant(of: cell, type: NSHostingView<AnyView>.self))
+        XCTAssertEqual(textView?.isHidden, true)
+        XCTAssertEqual(textField?.isHidden, false)
+        XCTAssertEqual(textField?.attributedStringValue.string, source)
+        XCTAssertEqual(textField?.isSelectable, true)
+        XCTAssertEqual(textField?.isEditable, false)
+        XCTAssertGreaterThan(textField?.frame.height ?? 0, 0)
+    }
+
+    func testFastRichTextPromotesOnlyAfterLiveScrollEnds() {
+        let initial = MixedRow(
+            id: "promoted-native",
+            contentRevision: 1,
+            text: "Initial native text",
+            usesNativeText: true
+        )
+        let mounted = mountMixed(rows: [initial])
+        let scrollView = mounted.table.enclosingScrollView!
+        NotificationCenter.default.post(
+            name: NSScrollView.willStartLiveScrollNotification,
+            object: scrollView
+        )
+
+        let scrolling = MixedRow(
+            id: "promoted-native",
+            contentRevision: 2,
+            text: "Exact text while scrolling",
+            usesNativeText: true,
+            usesFastPlainTextRenderer: true,
+            promotesFastRendererWhenIdle: true
+        )
+        mounted.hosting.rootView = mixedTable(rows: [scrolling])
+        mounted.hosting.needsLayout = true
+        mounted.hosting.layoutSubtreeIfNeeded()
+        let cell = mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: true
+        )!
+        let textField = descendant(of: cell, type: NSTextField.self)
+        let textView = descendant(of: cell, type: NSTextView.self)
+        let scrollTextView = descendant(
+            of: cell,
+            type: MacConversationScrollTextView.self
+        )
+        XCTAssertNil(textField)
+        XCTAssertNil(textView)
+        XCTAssertEqual(
+            scrollTextView?.attributedString.string,
+            "Exact text while scrolling"
+        )
+        XCTAssertEqual(scrollTextView?.isHidden, false)
+
+        NotificationCenter.default.post(
+            name: NSScrollView.didEndLiveScrollNotification,
+            object: scrollView
+        )
+        settle(mounted.hosting)
+        let idleCell = mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: true
+        )!
+        let idleTextField = descendant(of: idleCell, type: NSTextField.self)
+        let idleTextView = descendant(of: idleCell, type: NSTextView.self)
+        XCTAssertEqual(idleTextField?.isHidden, true)
+        XCTAssertNil(descendant(
+            of: idleCell,
+            type: MacConversationScrollTextView.self
+        ))
+        XCTAssertEqual(idleTextView?.isHidden, false)
+        XCTAssertEqual(idleTextView?.string, "Exact text while scrolling")
+    }
+
+    func testHostedRowUsesExactLightweightCellOnlyDuringLiveScroll() {
+        let initial = MixedRow(
+            id: "live-display-row",
+            contentRevision: 1,
+            text: "Interactive hosted content",
+            usesNativeText: false,
+            nativeAccessibilityIdentifier: "live-display-row",
+            usesLiveScrollText: true
+        )
+        let mounted = mountMixed(rows: [initial])
+        let scrollView = mounted.table.enclosingScrollView!
+        XCTAssertTrue(mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: true
+        )?.identifier?.rawValue.hasSuffix(".hosted") == true)
+
+        NotificationCenter.default.post(
+            name: NSScrollView.willStartLiveScrollNotification,
+            object: scrollView
+        )
+        XCTAssertTrue(mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: false
+        )?.identifier?.rawValue.hasSuffix(".hosted") == true)
+        let changed = MixedRow(
+            id: "live-display-row",
+            contentRevision: 2,
+            text: "Every exact character remains visible",
+            usesNativeText: false,
+            nativeAccessibilityIdentifier: "live-display-row",
+            usesLiveScrollText: true
+        )
+        mounted.hosting.rootView = mixedTable(rows: [changed])
+        settle(mounted.hosting)
+
+        var cell = mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: true
+        )!
+        let scrollTextView = descendant(
+            of: cell,
+            type: MacConversationScrollTextView.self
+        )
+        XCTAssertTrue(cell.identifier?.rawValue.hasSuffix(".native-scroll") == true)
+        XCTAssertNil(descendant(of: cell, type: NSHostingView<AnyView>.self))
+        XCTAssertEqual(
+            scrollTextView?.attributedString.string,
+            "Every exact character remains visible"
+        )
+
+        NotificationCenter.default.post(
+            name: NSScrollView.didEndLiveScrollNotification,
+            object: scrollView
+        )
+        settle(mounted.hosting)
+        cell = mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: true
+        )!
+        XCTAssertTrue(cell.identifier?.rawValue.hasSuffix(".hosted") == true)
+        XCTAssertNotNil(descendant(of: cell, type: NSHostingView<AnyView>.self))
+    }
+
+    func testLiveScrollEndRestoresTransitionedCellOutsideVisibleBounds() throws {
+        let rows = (0..<30).map { index in
+            MixedRow(
+                id: "offscreen-live-\(index)",
+                contentRevision: 1,
+                text: "Exact offscreen row \(index)",
+                usesNativeText: false,
+                usesLiveScrollText: true
+            )
+        }
+        let mounted = mountMixed(rows: rows)
+        let scrollView = try XCTUnwrap(mounted.table.enclosingScrollView)
+        let visible = mounted.table.rows(in: scrollView.contentView.bounds)
+        XCTAssertFalse(NSLocationInRange(0, visible))
+
+        NotificationCenter.default.post(
+            name: NSScrollView.willStartLiveScrollNotification,
+            object: scrollView
+        )
+        let transitioned = try XCTUnwrap(mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: true
+        ))
+        XCTAssertTrue(
+            transitioned.identifier?.rawValue.hasSuffix(".native-scroll") == true
+        )
+
+        NotificationCenter.default.post(
+            name: NSScrollView.didEndLiveScrollNotification,
+            object: scrollView
+        )
+        let pending = try XCTUnwrap(mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: false
+        ))
+        XCTAssertTrue(
+            pending.identifier?.rawValue.hasSuffix(".native-scroll") == true,
+            "Gesture end must enqueue restoration instead of rebuilding the row synchronously."
+        )
+        settle(mounted.hosting)
+        let restored = try XCTUnwrap(mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: true
+        ))
+        XCTAssertTrue(restored.identifier?.rawValue.hasSuffix(".hosted") == true)
+        XCTAssertNotNil(descendant(of: restored, type: NSHostingView<AnyView>.self))
+        XCTAssertFalse(restored === transitioned)
+    }
+
     func testCompletedAssistantUsesNativeTextForEveryTileAndASeparateNativeFooter() {
         let source = String(repeating: "bounded assistant line\n", count: 400)
         let item = ConversationItem.message(
@@ -179,6 +425,14 @@ final class MacConversationTableViewTests: XCTestCase {
                 ),
                 "Completed assistant text must bypass NSHostingView, including its final tile."
             )
+            XCTAssertTrue(row.nativeTextPresentation(
+                dynamicTypeSize: .large,
+                colorScheme: .light
+            )?.usesFastPlainTextRenderer == true)
+            XCTAssertTrue(row.nativeTextPresentation(
+                dynamicTypeSize: .large,
+                colorScheme: .light
+            )?.promotesFastRendererWhenIdle == true)
         }
         guard case .messageFooter(let footer, let revision) = rows.last else {
             return XCTFail("Expected a separate small assistant action footer.")
@@ -195,6 +449,671 @@ final class MacConversationTableViewTests: XCTestCase {
             projections.map(\.sourceText).joined(),
             source,
             "Separating the footer must not hide or duplicate message text."
+        )
+    }
+
+    func testLiveScrollMessagePresentationAlwaysUsesExactPlainSource() throws {
+        let source = "[Rendered label](https://example.com/path) and **bold source**"
+        let item = ConversationItem.message(
+            ChatMessage(id: "markdown-user", role: .user, text: source)
+        )
+        let row = try XCTUnwrap(makeMacTranscriptRows(
+            item: item,
+            projections: TranscriptRowProjection.makeRows(item: item),
+            isExpanded: false,
+            copiedItemID: nil,
+            sectionRevision: 1
+        ).first)
+
+        let live = try XCTUnwrap(row.liveScrollTextPresentation(
+            dynamicTypeSize: .large,
+            colorScheme: .light
+        ))
+        XCTAssertNil(live.attributedString)
+        XCTAssertNil(live.deferredAttributedString)
+        XCTAssertNil(live.linkHandler)
+        XCTAssertEqual(live.fallbackString, source)
+        XCTAssertLessThanOrEqual(
+            live.fallbackString.utf8.count,
+            TranscriptRowProjection.maximumDisplayBytes
+        )
+    }
+
+    func testHostedCodeRowsKeepMonospacedFontDuringLiveScroll() throws {
+        for (id, role, isStreaming) in [
+            ("streaming-code", ChatMessageRole.assistant, true),
+            ("user-code", ChatMessageRole.user, false),
+        ] {
+            var message = ChatMessage(
+                id: id,
+                role: role,
+                text: "let value = 42",
+                isStreaming: isStreaming
+            )
+            message.contents = [
+                MessageContent(
+                    id: "\(id):content:0",
+                    kind: .code,
+                    text: "let value = 42",
+                    language: "swift",
+                    isComplete: !isStreaming
+                )
+            ]
+            let item = ConversationItem.message(message)
+            let row = try XCTUnwrap(makeMacTranscriptRows(
+                item: item,
+                projections: TranscriptRowProjection.makeRows(item: item),
+                isExpanded: false,
+                copiedItemID: nil,
+                sectionRevision: 1
+            ).first)
+
+            let live = try XCTUnwrap(row.liveScrollTextPresentation(
+                dynamicTypeSize: .large,
+                colorScheme: .light
+            ))
+            let font = try XCTUnwrap(live.fallbackFont)
+            XCTAssertTrue(font.fontDescriptor.symbolicTraits.contains(.monoSpace))
+        }
+    }
+
+    func testLiveScrollHeaderOnlyToolStaysVisibleAndControlSized() throws {
+        let tool = ToolActivity(
+            id: "waiting-tool",
+            turnID: "turn",
+            kind: .shell,
+            title: "Run command",
+            status: .running,
+            input: nil,
+            output: nil,
+            errorMessage: nil,
+            durationMilliseconds: nil,
+            exitCode: nil,
+            occurredAt: nil,
+            isTruncated: false,
+            originalByteCount: nil
+        )
+        let item = ConversationItem.tool(tool)
+        let row = try XCTUnwrap(makeMacTranscriptRows(
+            item: item,
+            projections: TranscriptRowProjection.makeRows(item: item),
+            isExpanded: true,
+            copiedItemID: nil,
+            sectionRevision: 1
+        ).first)
+
+        let live = try XCTUnwrap(row.liveScrollTextPresentation(
+            dynamicTypeSize: .large,
+            colorScheme: .light
+        ))
+        XCTAssertTrue(live.fallbackString.contains("Run command"))
+        XCTAssertTrue(live.fallbackString.contains("Running"))
+        XCTAssertGreaterThanOrEqual(live.minimumTextContainerHeight, 44)
+        XCTAssertLessThanOrEqual(
+            live.fallbackString.utf8.count,
+            TranscriptRowProjection.maximumDisplayBytes
+        )
+    }
+
+    func testCollapsedDisclosureLiveScrollDoesNotRealizeHiddenBody() throws {
+        let hiddenOutput = String(repeating: "hidden line\n", count: 127)
+        let tool = ToolActivity(
+            id: "collapsed-tool",
+            turnID: "turn",
+            kind: .shell,
+            title: "Run bounded command",
+            status: .completed,
+            input: nil,
+            output: hiddenOutput,
+            errorMessage: nil,
+            durationMilliseconds: nil,
+            exitCode: 0,
+            occurredAt: nil,
+            isTruncated: false,
+            originalByteCount: nil
+        )
+        let item = ConversationItem.tool(tool)
+        let projection = try XCTUnwrap(
+            TranscriptRowProjection.makeFirstRow(item: item)
+        ).row
+        let row = try XCTUnwrap(makeMacTranscriptRows(
+            item: item,
+            projections: [projection],
+            isExpanded: false,
+            copiedItemID: nil,
+            sectionRevision: 1
+        ).first)
+
+        let live = try XCTUnwrap(row.liveScrollTextPresentation(
+            dynamicTypeSize: .large,
+            colorScheme: .light
+        ))
+        XCTAssertTrue(live.fallbackString.contains("Run bounded command"))
+        XCTAssertFalse(live.fallbackString.contains("hidden line"))
+        XCTAssertLessThanOrEqual(
+            TranscriptTextProjection.logicalLineCount(live.fallbackString),
+            3
+        )
+        XCTAssertGreaterThanOrEqual(live.minimumTextContainerHeight, 44)
+    }
+
+    func testLiveScrollSemanticHeaderNeverExceedsProjectionLineBudget() throws {
+        let source = String(repeating: "line\n", count: 127)
+        let tool = ToolActivity(
+            id: "line-dense-tool",
+            turnID: "turn",
+            kind: .shell,
+            title: String(repeating: "provider title\n", count: 40),
+            status: .completed,
+            input: source,
+            output: nil,
+            errorMessage: nil,
+            durationMilliseconds: nil,
+            exitCode: 0,
+            occurredAt: nil,
+            isTruncated: false,
+            originalByteCount: nil
+        )
+        let item = ConversationItem.tool(tool)
+        let projection = try XCTUnwrap(
+            TranscriptRowProjection.makeRows(item: item).first {
+                $0.section == .toolInput
+            }
+        )
+        let row = try XCTUnwrap(makeMacTranscriptRows(
+            item: item,
+            projections: [projection],
+            isExpanded: true,
+            copiedItemID: nil,
+            sectionRevision: 1
+        ).first)
+
+        let live = try XCTUnwrap(row.liveScrollTextPresentation(
+            dynamicTypeSize: .large,
+            colorScheme: .light
+        ))
+        XCTAssertEqual(live.fallbackString, projection.sourceText)
+        XCTAssertLessThanOrEqual(
+            1 + live.fallbackString.utf8.filter { $0 == 0x0A }.count,
+            TranscriptRowProjection.maximumDisplayLines
+        )
+    }
+
+    func testLiveScrollSemanticHeaderBoundsHugeExtendedGraphemeByBytes() throws {
+        let hugeGrapheme = "a" + String(repeating: "\u{301}", count: 50_000)
+        let item = ConversationItem.generic(
+            ChatGenericItem(
+                id: "huge-generic-header",
+                turnID: nil,
+                type: hugeGrapheme,
+                title: hugeGrapheme,
+                detail: "exact body",
+                occurredAt: nil
+            )
+        )
+        let projection = try XCTUnwrap(
+            TranscriptRowProjection.makeRows(item: item).first
+        )
+        let row = try XCTUnwrap(makeMacTranscriptRows(
+            item: item,
+            projections: [projection],
+            isExpanded: true,
+            copiedItemID: nil,
+            sectionRevision: 1
+        ).first)
+
+        let live = try XCTUnwrap(row.liveScrollTextPresentation(
+            dynamicTypeSize: .large,
+            colorScheme: .light
+        ))
+        guard case .generic(let displayed) = projection.displayItem else {
+            return XCTFail("Expected bounded generic header")
+        }
+        XCTAssertFalse(displayed.type.isEmpty)
+        XCTAssertEqual(
+            live.fallbackString,
+            projection.rowText + "\n" + displayed.type
+        )
+        XCTAssertLessThanOrEqual(
+            live.fallbackString.utf8.count,
+            TranscriptRowProjection.maximumDisplayBytes
+        )
+        XCTAssertLessThanOrEqual(
+            TranscriptTextProjection.logicalLineCount(live.fallbackString),
+            TranscriptRowProjection.maximumDisplayLines
+        )
+    }
+
+    func testLiveGenericHeaderPreservesExactBoundaryAndControlBytes() throws {
+        let type = "  provider\ttype\u{000B}"
+        let titleBudget = TranscriptRowProjection.maximumDisplayBytes
+            - type.utf8.count
+            - 1
+        let titlePrefix = " title\twith\u{000B}controls\n"
+        let title = titlePrefix
+            + String(repeating: "x", count: titleBudget - titlePrefix.utf8.count)
+        let item = ConversationItem.generic(
+            ChatGenericItem(
+                id: "exact-generic-header",
+                turnID: nil,
+                type: type,
+                title: title,
+                detail: "exact body",
+                occurredAt: nil
+            )
+        )
+        let projection = try XCTUnwrap(
+            TranscriptRowProjection.makeRows(item: item).first
+        )
+        guard case .generic(let displayed) = projection.displayItem else {
+            return XCTFail("Expected bounded generic header")
+        }
+        let row = try XCTUnwrap(makeMacTranscriptRows(
+            item: item,
+            projections: [projection],
+            isExpanded: true,
+            copiedItemID: nil,
+            sectionRevision: 1
+        ).first)
+        let live = try XCTUnwrap(row.liveScrollTextPresentation(
+            dynamicTypeSize: .large,
+            colorScheme: .light
+        ))
+
+        XCTAssertEqual(projection.rowText, title)
+        XCTAssertEqual(displayed.type, type)
+        XCTAssertEqual(live.fallbackString, title + "\n" + type)
+        XCTAssertEqual(
+            live.fallbackString.utf8.count,
+            TranscriptRowProjection.maximumDisplayBytes
+        )
+        XCTAssertLessThanOrEqual(
+            TranscriptTextProjection.logicalLineCount(live.fallbackString),
+            TranscriptRowProjection.maximumDisplayLines
+        )
+    }
+
+    func testLiveScrollCopyPreservesNativeParagraphGeometry() throws {
+        let codeText = String(repeating: "let value = 42\n", count: 80)
+        var codeMessage = ChatMessage(
+            id: "paragraph-code",
+            role: .assistant,
+            text: codeText
+        )
+        codeMessage.contents = [
+            MessageContent(
+                id: "paragraph-code:content:0",
+                kind: .code,
+                text: codeText,
+                language: "swift"
+            )
+        ]
+        let codeItem = ConversationItem.message(codeMessage)
+        let codeRow = try XCTUnwrap(makeMacTranscriptRows(
+            item: codeItem,
+            projections: TranscriptRowProjection.makeRows(item: codeItem),
+            isExpanded: false,
+            copiedItemID: nil,
+            sectionRevision: 1
+        ).first)
+        let ordinaryCode = try XCTUnwrap(codeRow.nativeTextPresentation(
+            dynamicTypeSize: .large,
+            colorScheme: .light
+        ))
+        let liveCode = try XCTUnwrap(codeRow.liveScrollTextPresentation(
+            dynamicTypeSize: .large,
+            colorScheme: .light
+        ))
+        XCTAssertEqual(liveCode.fallbackParagraphStyle?.lineSpacing, 3)
+        XCTAssertEqual(
+            liveCode.fallbackParagraphStyle?.lineBreakMode,
+            .byCharWrapping
+        )
+        XCTAssertEqual(
+            measuredTextHeight(liveCode),
+            measuredTextHeight(ordinaryCode),
+            accuracy: 1
+        )
+
+        let detail = String(repeating: "wrapping generic detail ", count: 80)
+        let genericItem = ConversationItem.generic(
+            ChatGenericItem(
+                id: "paragraph-generic",
+                turnID: nil,
+                type: "activity",
+                title: "Activity",
+                detail: detail,
+                occurredAt: nil
+            )
+        )
+        let detailProjection = try XCTUnwrap(
+            TranscriptRowProjection.makeRows(item: genericItem).first {
+                $0.section == .generic
+            }
+        )
+        let detailRow = try XCTUnwrap(makeMacTranscriptRows(
+            item: genericItem,
+            projections: [detailProjection],
+            isExpanded: true,
+            copiedItemID: nil,
+            sectionRevision: 1
+        ).first)
+        let ordinaryDetail = try XCTUnwrap(detailRow.nativeTextPresentation(
+            dynamicTypeSize: .large,
+            colorScheme: .light
+        ))
+        let liveDetail = try XCTUnwrap(detailRow.liveScrollTextPresentation(
+            dynamicTypeSize: .large,
+            colorScheme: .light
+        ))
+        XCTAssertEqual(liveDetail.fallbackParagraphStyle?.headIndent, 23)
+        XCTAssertEqual(liveDetail.fallbackParagraphStyle?.firstLineHeadIndent, 23)
+        XCTAssertEqual(
+            measuredTextHeight(liveDetail),
+            measuredTextHeight(ordinaryDetail),
+            accuracy: 1
+        )
+    }
+
+    func testStreamingTailHasExactDisplayOnlyPresentationDuringLiveScroll() throws {
+        let source = String(repeating: "streaming exact text ", count: 200)
+        let item = ConversationItem.message(
+            ChatMessage(
+                id: "streaming-display",
+                role: .assistant,
+                text: source,
+                isStreaming: true
+            )
+        )
+        let projections = TranscriptRowProjection.makeRows(item: item)
+        let rows = makeMacTranscriptRows(
+            item: item,
+            projections: projections,
+            isExpanded: false,
+            copiedItemID: nil,
+            sectionRevision: 1
+        )
+        for (index, row) in rows.enumerated() {
+            guard case .item = row else { continue }
+            if row.nativeTextPresentation(
+                dynamicTypeSize: .large,
+                colorScheme: .dark
+            ) == nil {
+                let live = try XCTUnwrap(row.liveScrollTextPresentation(
+                    dynamicTypeSize: .large,
+                    colorScheme: .dark
+                ))
+                XCTAssertEqual(live.fallbackString, projections[index].sourceText)
+                XCTAssertTrue(live.usesFastPlainTextRenderer)
+            }
+        }
+        XCTAssertEqual(projections.map(\.sourceText).joined(), source)
+    }
+
+    func testCompletedCodeUsesSelectableNativeTilesWithoutDroppingSourceText() throws {
+        let source = String(repeating: "let value = 42 // bounded code\n", count: 300)
+        var message = ChatMessage(
+            id: "assistant-code",
+            role: .assistant,
+            text: source,
+            occurredAt: 1
+        )
+        message.contents = [
+            MessageContent(
+                id: "assistant-code:content:0",
+                kind: .code,
+                text: source,
+                language: "swift"
+            )
+        ]
+        let item = ConversationItem.message(message)
+        let projections = TranscriptRowProjection.makeRows(item: item)
+        XCTAssertGreaterThan(projections.count, 2)
+
+        let rows = makeMacTranscriptRows(
+            item: item,
+            projections: projections,
+            isExpanded: false,
+            copiedItemID: nil,
+            sectionRevision: 1
+        )
+        XCTAssertEqual(rows.count, projections.count + 1)
+        for (index, row) in rows.dropLast().enumerated() {
+            let presentation = try XCTUnwrap(row.nativeTextPresentation(
+                dynamicTypeSize: .large,
+                colorScheme: .light
+            ))
+            XCTAssertEqual(presentation.attributedString?.string, projections[index].sourceText)
+            XCTAssertEqual(presentation.fallbackString, projections[index].sourceText)
+            XCTAssertNotNil(presentation.backgroundColor)
+            XCTAssertEqual(presentation.backgroundCornerRadius, 12)
+            XCTAssertEqual(presentation.horizontalAlignment, .fill)
+            XCTAssertTrue(presentation.usesFastPlainTextRenderer)
+            XCTAssertEqual(presentation.textEdgeInsets.left, 12)
+            XCTAssertEqual(presentation.textEdgeInsets.right, 12)
+            XCTAssertEqual(
+                presentation.roundedCorners.contains(.topLeading),
+                index == 0
+            )
+            XCTAssertEqual(
+                presentation.roundedCorners.contains(.bottomLeading),
+                index == projections.count - 1
+            )
+        }
+        XCTAssertEqual(projections.map(\.sourceText).joined(), source)
+    }
+
+    func testStreamingCodeKeepsOnlyChangingTailHosted() {
+        let source = String(repeating: "streaming code line\n", count: 500)
+        var message = ChatMessage(
+            id: "streaming-code",
+            role: .assistant,
+            text: source,
+            isStreaming: true
+        )
+        message.contents = [
+            MessageContent(
+                id: "streaming-code:content:0",
+                kind: .code,
+                text: source,
+                language: "swift",
+                isComplete: false
+            )
+        ]
+        let item = ConversationItem.message(message)
+        let rows = makeMacTranscriptRows(
+            item: item,
+            projections: TranscriptRowProjection.makeRows(item: item),
+            isExpanded: false,
+            copiedItemID: nil,
+            sectionRevision: 1
+        )
+        XCTAssertGreaterThan(rows.count, 2)
+        XCTAssertTrue(rows.dropLast().allSatisfy {
+            $0.nativeTextPresentation(
+                dynamicTypeSize: .large,
+                colorScheme: .light
+            ) != nil
+        })
+        XCTAssertNil(rows.last?.nativeTextPresentation(
+            dynamicTypeSize: .large,
+            colorScheme: .light
+        ))
+    }
+
+    func testCompletedUserCodeKeepsHostedBubbleComposition() {
+        let source = String(repeating: "user code line\n", count: 200)
+        var message = ChatMessage(
+            id: "user-code",
+            role: .user,
+            text: source,
+            occurredAt: 1
+        )
+        message.contents = [
+            MessageContent(
+                id: "user-code:content:0",
+                kind: .code,
+                text: source,
+                language: "swift"
+            )
+        ]
+        let item = ConversationItem.message(message)
+        let projections = TranscriptRowProjection.makeRows(item: item)
+        let rows = makeMacTranscriptRows(
+            item: item,
+            projections: projections,
+            isExpanded: false,
+            copiedItemID: nil,
+            sectionRevision: 1
+        )
+
+        XCTAssertEqual(rows.count, projections.count + 1)
+        XCTAssertTrue(rows.dropLast().allSatisfy {
+            $0.nativeTextPresentation(
+                dynamicTypeSize: .large,
+                colorScheme: .light
+            ) == nil
+        })
+        XCTAssertNotNil(rows.last?.nativeFooterPresentation(
+            dynamicTypeSize: .large,
+            colorScheme: .light
+        ))
+    }
+
+    func testStableExpandedToolAndDiffBodiesUseNativeTailTiles() {
+        let source = String(repeating: "bounded output line\n", count: 250)
+        let input = String(repeating: "bounded input line\n", count: 250)
+        let tool = ConversationItem.tool(
+            ToolActivity(
+                id: "tool-native-tail",
+                turnID: "turn",
+                kind: .shell,
+                title: "Run command",
+                status: .completed,
+                input: input,
+                output: source,
+                errorMessage: nil,
+                durationMilliseconds: 1,
+                exitCode: 0,
+                occurredAt: 1,
+                isTruncated: false,
+                originalByteCount: nil
+            )
+        )
+        let diff = ConversationItem.diff(
+            ChatDiff(
+                id: "diff-native-tail",
+                turnID: "turn",
+                path: "Fixture.swift",
+                unifiedDiff: source,
+                occurredAt: 1,
+                isTruncated: false
+            )
+        )
+
+        for item in [tool, diff] {
+            let projections = TranscriptRowProjection.makeRows(item: item)
+            XCTAssertGreaterThan(projections.count, 2)
+            let expanded = makeMacTranscriptRows(
+                item: item,
+                projections: projections,
+                isExpanded: true,
+                copiedItemID: nil,
+                sectionRevision: 1
+            )
+            for (index, row) in expanded.enumerated() {
+                let presentation = row.nativeTextPresentation(
+                    dynamicTypeSize: .large,
+                    colorScheme: .light
+                )
+                let projection = projections[index]
+                let shouldUseNativeText: Bool
+                switch item {
+                case .tool:
+                    shouldUseNativeText = !projection.isFirstInItem
+                        && !projection.isFirstInSection
+                case .diff:
+                    shouldUseNativeText = !projection.isFirstInItem
+                default:
+                    shouldUseNativeText = false
+                }
+                if shouldUseNativeText {
+                    XCTAssertNotNil(presentation)
+                    XCTAssertEqual(
+                        presentation?.fallbackString,
+                        projection.sourceText
+                    )
+                } else {
+                    XCTAssertNil(
+                        presentation,
+                        "Disclosure and tool-section headers must retain their hosted controls."
+                    )
+                }
+            }
+
+            let collapsed = makeMacTranscriptRows(
+                item: item,
+                projections: projections,
+                isExpanded: false,
+                copiedItemID: nil,
+                sectionRevision: 1
+            )
+            XCTAssertTrue(collapsed.allSatisfy {
+                $0.nativeTextPresentation(
+                    dynamicTypeSize: .large,
+                    colorScheme: .light
+                ) == nil
+            })
+        }
+
+        guard case .tool(var runningTool) = tool else {
+            return XCTFail("Expected tool fixture.")
+        }
+        runningTool.status = .running
+        let runningItem = ConversationItem.tool(runningTool)
+        let runningRows = makeMacTranscriptRows(
+            item: runningItem,
+            projections: TranscriptRowProjection.makeRows(item: runningItem),
+            isExpanded: true,
+            copiedItemID: nil,
+            sectionRevision: 1
+        )
+        XCTAssertTrue(runningRows.allSatisfy {
+            $0.nativeTextPresentation(
+                dynamicTypeSize: .large,
+                colorScheme: .light
+            ) == nil
+        })
+    }
+
+    func testFooterDecisionDoesNotMaterializeAChunkedMessage() throws {
+        var message = ChatMessage(
+            id: "chunked-footer",
+            role: .assistant,
+            text: "",
+            isStreaming: true
+        )
+        for _ in 0..<128 {
+            message.append(String(repeating: "f", count: 1_024))
+        }
+        message.complete(text: nil)
+        XCTAssertFalse(try XCTUnwrap(message.contents.first).isTextStorageMaterialized)
+
+        let rows = makeMacTranscriptRows(
+            item: .message(message),
+            projections: [],
+            isExpanded: false,
+            copiedItemID: nil,
+            sectionRevision: 1
+        )
+
+        XCTAssertEqual(rows.count, 1)
+        guard case .messageFooter = rows.first else {
+            return XCTFail("Expected the structural footer row.")
+        }
+        XCTAssertFalse(
+            try XCTUnwrap(message.contents.first).isTextStorageMaterialized,
+            "Discovering a footer must not join the complete message on the UI actor."
         )
     }
 
@@ -1111,6 +2030,64 @@ final class MacConversationTableViewTests: XCTestCase {
         XCTAssertEqual(newOffset, offset, accuracy: 1)
     }
 
+    func testDeferredPrependOwnsAnchorBeforeLiveScrollRestoration() throws {
+        let original = (0..<200).map { index in
+            MixedRow(
+                id: "deferred-row-\(index)",
+                contentRevision: 1,
+                text: "Row \(index)",
+                usesNativeText: false,
+                usesLiveScrollText: true
+            )
+        }
+        let mounted = mountMixed(rows: original)
+        let scrollView = try XCTUnwrap(mounted.table.enclosingScrollView)
+        NotificationCenter.default.post(
+            name: NSScrollView.willStartLiveScrollNotification,
+            object: scrollView
+        )
+        var proposed = scrollView.contentView.bounds
+        proposed.origin.y = max(0, proposed.origin.y - 1_200)
+        scrollView.contentView.setBoundsOrigin(
+            scrollView.contentView.constrainBoundsRect(proposed).origin
+        )
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        settle(mounted.hosting)
+
+        let visible = mounted.table.rows(in: scrollView.contentView.bounds)
+        XCTAssertNotEqual(visible.location, NSNotFound)
+        let anchoredID = original[visible.location].id
+        let anchoredOffset = mounted.table.rect(ofRow: visible.location).minY
+            - scrollView.contentView.bounds.minY
+        NotificationCenter.default.post(
+            name: NSScrollView.didEndLiveScrollNotification,
+            object: scrollView
+        )
+
+        let prepended = (0..<50).map { index in
+            MixedRow(
+                id: "deferred-older-\(index)",
+                contentRevision: 1,
+                text: "Older \(index)",
+                usesNativeText: false,
+                usesLiveScrollText: true
+            )
+        } + original
+        mounted.hosting.rootView = mixedTable(rows: prepended)
+        settle(mounted.hosting)
+        waitForLiveScrollRestoration(
+            in: mounted.table,
+            hosting: mounted.hosting
+        )
+
+        let newIndex = try XCTUnwrap(
+            prepended.firstIndex { $0.id == anchoredID }
+        )
+        let restoredOffset = mounted.table.rect(ofRow: newIndex).minY
+            - scrollView.contentView.bounds.minY
+        XCTAssertEqual(restoredOffset, anchoredOffset, accuracy: 1)
+    }
+
     func testPinnedInsertRemainsAtBottom() {
         var rows = makeRows(count: 200)
         let mounted = mount(rows: rows)
@@ -1301,12 +2278,15 @@ final class MacConversationTableViewTests: XCTestCase {
             0,
             table.bounds.height - scrollView.contentView.bounds.height
         )
-        XCTAssertGreaterThan(table.numberOfRows, 8_000)
+        XCTAssertGreaterThan(table.numberOfRows, 4_000)
         scrollView.contentView.scroll(to: NSPoint(x: 0, y: maximumOrigin))
         scrollView.reflectScrolledClipView(scrollView.contentView)
         settle(hosting)
 
         MacConversationTableDiagnostics.reset()
+        MacConversationTableDiagnostics.watchConfigurations(
+            for: "fixture-large-message"
+        )
         NotificationCenter.default.post(
             name: NSScrollView.willStartLiveScrollNotification,
             object: scrollView
@@ -1323,33 +2303,136 @@ final class MacConversationTableViewTests: XCTestCase {
         }
         driver.start(in: window)
         await fulfillment(of: [completed], timeout: 120)
+        let diagnostics = MacConversationTableDiagnostics.snapshot()
         NotificationCenter.default.post(
             name: NSScrollView.didEndLiveScrollNotification,
             object: scrollView
         )
+        let endDiagnostics = MacConversationTableDiagnostics.snapshot()
+        XCTAssertEqual(
+            endDiagnostics.targetedRowReloads,
+            diagnostics.targetedRowReloads,
+            "didEndLiveScroll must not synchronously rebuild the mounted page."
+        )
+        waitForLiveScrollRestoration(in: table, hosting: hosting)
+        let restoredDiagnostics = MacConversationTableDiagnostics.snapshot()
 
         let measured = try XCTUnwrap(result)
-        let diagnostics = MacConversationTableDiagnostics.snapshot()
         let visible = visibleRowCount(in: table)
         let mounted = mountedRowCount(in: table)
+        let rowAtMaximum = table.row(at: NSPoint(
+            x: table.bounds.midX,
+            y: measured.originAtMaximumCallback + 1
+        ))
+        let diagnosticRows = items.flatMap { item -> [MacTranscriptRow] in
+            let rows = makeMacTranscriptRows(
+                item: item,
+                projections: prepared[item.id]?.rows
+                    ?? TranscriptRowProjection.makeRows(item: item),
+                isExpanded: {
+                    switch item {
+                    case .tool, .diff: true
+                    default: false
+                    }
+                }(),
+                copiedItemID: nil,
+                sectionRevision: 1
+            )
+            return rows
+        }
+        let sourceIDsByRow = diagnosticRows.map(\.mutationSourceID)
+        let sourceAtMaximum = sourceIDsByRow.indices.contains(rowAtMaximum)
+            ? sourceIDsByRow[rowAtMaximum]
+            : "unknown"
         print(
             "TranscriptMixedRelease samples=\(measured.callbackMilliseconds.count) "
                 + "p95_ms=\(measured.p95Milliseconds) "
                 + "p99_ms=\(measured.p99Milliseconds) "
                 + "max_ms=\(measured.maximumMilliseconds) "
                 + "hitch_ratio=\(measured.hitchRatio) "
-                + "mounted=\(mounted) visible=\(visible)"
+                + "driver=\(measured.driverKind.rawValue) "
+                + "max_mount_ms=\(measured.maximumMountCallbackMilliseconds) "
+                + "max_no_mount_ms=\(measured.maximumNoMountCallbackMilliseconds) "
+                + "max_mounts_per_tick=\(measured.maximumConfigurationsPerCallback) "
+                + "max_index=\(measured.maximumCallbackIndex) "
+                + "mounts_at_max=\(measured.configurationsAtMaximumCallback) "
+                + "origin_at_max=\(measured.originAtMaximumCallback) "
+                + "row_at_max=\(rowAtMaximum) "
+                + "source_at_max=\(sourceAtMaximum) "
+                + "estimated_row_height=\(table.rowHeight) "
+                + "table_rows=\(table.numberOfRows) "
+                + "source_rows=\(sourceIDsByRow.count) "
+                + "document_height=\(table.bounds.height) "
+                + "mounted=\(mounted) visible=\(visible) "
+                + "end_ms=\(restoredDiagnostics.maximumLiveScrollEndMilliseconds) "
+                + "restore_max_ms=\(restoredDiagnostics.maximumLiveScrollRestorationMilliseconds) "
+                + "restore_max_rows=\(restoredDiagnostics.maximumLiveScrollRestorationsPerPass)"
         )
+        let performanceSummary = "p95=\(measured.p95Milliseconds) "
+            + "p99=\(measured.p99Milliseconds) max=\(measured.maximumMilliseconds) "
+            + "hitch=\(measured.hitchRatio) "
+            + "driver=\(measured.driverKind.rawValue) "
+            + "maxMount=\(measured.maximumMountCallbackMilliseconds) "
+            + "maxNoMount=\(measured.maximumNoMountCallbackMilliseconds) "
+            + "mountsAtMax=\(measured.configurationsAtMaximumCallback) "
+            + "rowAtMax=\(rowAtMaximum) sourceAtMax=\(sourceAtMaximum) "
+            + "endMs=\(restoredDiagnostics.maximumLiveScrollEndMilliseconds) "
+            + "restoreMaxMs=\(restoredDiagnostics.maximumLiveScrollRestorationMilliseconds) "
+            + "restoreMaxRows=\(restoredDiagnostics.maximumLiveScrollRestorationsPerPass)"
+        XCTContext.runActivity(
+            named: "TranscriptMixedRelease \(performanceSummary)"
+        ) { _ in }
         XCTAssertGreaterThan(measured.callbackMilliseconds.count, 120)
-        XCTAssertLessThan(measured.p95Milliseconds, 4)
-        XCTAssertLessThan(measured.p99Milliseconds, 8.3)
-        XCTAssertLessThan(measured.hitchRatio, 0.01)
-        XCTAssertLessThan(measured.maximumMilliseconds, 50)
+        XCTAssertLessThan(measured.p95Milliseconds, 4, performanceSummary)
+        XCTAssertLessThan(measured.p99Milliseconds, 8.3, performanceSummary)
+        XCTAssertLessThan(measured.hitchRatio, 0.01, performanceSummary)
+        XCTAssertLessThan(
+            measured.maximumMilliseconds,
+            16.7,
+            "No scroll callback may consume an entire 60 Hz frame. "
+                + performanceSummary
+        )
         XCTAssertEqual(diagnostics.reloadDataCalls, 0)
         XCTAssertEqual(diagnostics.explicitReconfigurations, 0)
         XCTAssertEqual(diagnostics.heightInvalidationPasses, 0)
         XCTAssertEqual(diagnostics.scrollOriginCorrections, 0)
+        XCTAssertGreaterThan(
+            diagnostics.watchedSourceConfigurations,
+            0,
+            "The timed pass must actually cross the 512 KiB logical message."
+        )
         XCTAssertLessThanOrEqual(mounted, visible + 12)
+        XCTAssertGreaterThan(
+            restoredDiagnostics.targetedRowReloads,
+            diagnostics.targetedRowReloads,
+            "Rows realized through the display-only scroll cell must restore after the gesture."
+        )
+        XCTAssertLessThan(
+            restoredDiagnostics.maximumLiveScrollEndMilliseconds,
+            16.7,
+            "Ending the gesture must stay within one 60 Hz frame."
+        )
+        XCTAssertEqual(
+            restoredDiagnostics.maximumLiveScrollRestorationsPerPass,
+            1,
+            "Restoration must rebuild at most one bounded row per display frame."
+        )
+        XCTAssertLessThan(
+            restoredDiagnostics.maximumLiveScrollRestorationMilliseconds,
+            16.7,
+            "Every incremental restoration pass must stay within one 60 Hz frame."
+        )
+        for index in 0..<table.numberOfRows {
+            guard let cell = table.view(
+                atColumn: 0,
+                row: index,
+                makeIfNecessary: false
+            ) else { continue }
+            XCTAssertFalse(
+                cell.identifier?.rawValue.hasSuffix(".native-scroll") == true,
+                "No mounted display-only cell may survive the end of live scrolling."
+            )
+        }
         #endif
     }
 
@@ -1580,6 +2663,54 @@ final class MacConversationTableViewTests: XCTestCase {
         }
     }
 
+    private func measuredTextHeight(
+        _ presentation: MacConversationNativeTextPresentation,
+        width: CGFloat = 320
+    ) -> CGFloat {
+        let attributed = presentation.attributedString ?? NSAttributedString(
+            string: presentation.fallbackString,
+            attributes: [
+                .font: presentation.fallbackFont
+                    ?? NSFont.systemFont(ofSize: NSFont.systemFontSize),
+                .foregroundColor: presentation.fallbackColor
+                    ?? NSColor.labelColor,
+                .paragraphStyle: presentation.fallbackParagraphStyle
+                    ?? NSParagraphStyle.default,
+            ]
+        )
+        return ceil(attributed.boundingRect(
+            with: NSSize(width: width, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        ).height)
+    }
+
+    private func waitForLiveScrollRestoration(
+        in table: NSTableView,
+        hosting: NSView,
+        timeout: TimeInterval = 3
+    ) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let hasLiveCell = (0..<table.numberOfRows).contains { row in
+                table.view(
+                    atColumn: 0,
+                    row: row,
+                    makeIfNecessary: false
+                )?.identifier?.rawValue.hasSuffix(".native-scroll") == true
+            }
+            if !hasLiveCell {
+                RunLoop.main.run(
+                    until: Date().addingTimeInterval(1.0 / 60.0)
+                )
+                hosting.layoutSubtreeIfNeeded()
+                return
+            }
+            RunLoop.main.run(until: Date().addingTimeInterval(1.0 / 60.0))
+            hosting.layoutSubtreeIfNeeded()
+        }
+        XCTFail("Timed out waiting for incremental live-scroll restoration.")
+    }
+
     private func sections(_ rows: [Row]) -> [MacConversationTableSection<Row>] {
         rows.map {
             MacConversationTableSection(
@@ -1637,12 +2768,24 @@ final class MacConversationTableViewTests: XCTestCase {
 
 @MainActor
 private final class TranscriptDisplayLinkDriver: NSObject {
+    enum DriverKind: String {
+        case displayLink
+        case timerFallback
+    }
+
     struct Result {
         let callbackMilliseconds: [Double]
         let p95Milliseconds: Double
         let p99Milliseconds: Double
         let maximumMilliseconds: Double
         let hitchRatio: Double
+        let driverKind: DriverKind
+        let maximumMountCallbackMilliseconds: Double
+        let maximumNoMountCallbackMilliseconds: Double
+        let maximumConfigurationsPerCallback: Int
+        let maximumCallbackIndex: Int
+        let configurationsAtMaximumCallback: Int
+        let originAtMaximumCallback: CGFloat
     }
 
     private weak var scrollView: NSScrollView?
@@ -1652,12 +2795,15 @@ private final class TranscriptDisplayLinkDriver: NSObject {
     private var displayLink: CADisplayLink?
     private var fallbackTimer: Timer?
     private var callbackMilliseconds: [Double] = []
+    private var configurationCounts: [Int] = []
+    private var callbackOrigins: [CGFloat] = []
     private var lastTimestamp: CFTimeInterval?
     private var lastNominalDuration: CFTimeInterval?
     private var deliveredFrameIntervals = 0
     private var missedFrames = 0
     private var awaitsFinalDisplayTick = false
     private var didFinish = false
+    private var driverKind = DriverKind.displayLink
 
     init(
         scrollView: NSScrollView,
@@ -1689,6 +2835,7 @@ private final class TranscriptDisplayLinkDriver: NSObject {
         guard !didFinish, callbackMilliseconds.isEmpty, fallbackTimer == nil else { return }
         displayLink?.invalidate()
         displayLink = nil
+        driverKind = .timerFallback
         let timer = Timer(timeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.tickFrame(
@@ -1733,12 +2880,19 @@ private final class TranscriptDisplayLinkDriver: NSObject {
         let clipView = scrollView.contentView
         let currentY = clipView.bounds.origin.y
         let nextY = max(destinationY, currentY - pointsPerFrame)
+        let diagnosticsBefore = MacConversationTableDiagnostics.snapshot()
         let started = CACurrentMediaTime()
         var proposed = clipView.bounds
         proposed.origin.y = nextY
         clipView.scroll(to: clipView.constrainBoundsRect(proposed).origin)
         scrollView.reflectScrolledClipView(clipView)
         callbackMilliseconds.append((CACurrentMediaTime() - started) * 1_000)
+        let diagnosticsAfter = MacConversationTableDiagnostics.snapshot()
+        configurationCounts.append(
+            diagnosticsAfter.rowConfigurations
+                - diagnosticsBefore.rowConfigurations
+        )
+        callbackOrigins.append(currentY)
 
         if nextY <= destinationY + 0.5 {
             awaitsFinalDisplayTick = true
@@ -1753,6 +2907,18 @@ private final class TranscriptDisplayLinkDriver: NSObject {
         fallbackTimer?.invalidate()
         fallbackTimer = nil
         let sorted = callbackMilliseconds.sorted()
+        var mountCallbacks: [Double] = []
+        var noMountCallbacks: [Double] = []
+        for (index, milliseconds) in callbackMilliseconds.enumerated() {
+            if configurationCounts[index] > 0 {
+                mountCallbacks.append(milliseconds)
+            } else {
+                noMountCallbacks.append(milliseconds)
+            }
+        }
+        let maximumCallbackIndex = callbackMilliseconds.indices.max {
+            callbackMilliseconds[$0] < callbackMilliseconds[$1]
+        } ?? 0
         completion(
             Result(
                 callbackMilliseconds: callbackMilliseconds,
@@ -1762,7 +2928,20 @@ private final class TranscriptDisplayLinkDriver: NSObject {
                 hitchRatio: deliveredFrameIntervals + missedFrames > 0
                     ? Double(missedFrames)
                         / Double(deliveredFrameIntervals + missedFrames)
-                    : 0
+                    : 0,
+                driverKind: driverKind,
+                maximumMountCallbackMilliseconds: mountCallbacks.max() ?? 0,
+                maximumNoMountCallbackMilliseconds: noMountCallbacks.max() ?? 0,
+                maximumConfigurationsPerCallback: configurationCounts.max() ?? 0,
+                maximumCallbackIndex: maximumCallbackIndex,
+                configurationsAtMaximumCallback:
+                    configurationCounts.indices.contains(maximumCallbackIndex)
+                        ? configurationCounts[maximumCallbackIndex]
+                        : 0,
+                originAtMaximumCallback:
+                    callbackOrigins.indices.contains(maximumCallbackIndex)
+                        ? callbackOrigins[maximumCallbackIndex]
+                        : 0
             )
         )
     }

@@ -101,6 +101,7 @@ final class ConversationCoordinator {
     private var previewHydrationTask: Task<Void, Never>?
     private var previewHydrationToken: UInt64 = 0
     private var cacheSaveTask: Task<Void, Never>?
+    private var suppressCachePersistenceUntilAuthoritativeSnapshot = false
     private var lifecycleTask: Task<Void, Never>?
     private var lifecycleEpoch: UInt64 = 0
     private var lifecycleTransition: LifecycleTransition?
@@ -249,13 +250,19 @@ final class ConversationCoordinator {
     /// Persists the current state after live updates, debounced so streaming
     /// deltas coalesce into one write when the stream quiets.
     private func scheduleCacheSave(immediate: Bool = false) {
-        guard cache != nil else { return }
+        guard cache != nil,
+              !suppressCachePersistenceUntilAuthoritativeSnapshot else {
+            return
+        }
         cacheSaveTask?.cancel()
         cacheSaveTask = Task { [weak self] in
             if !immediate {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
             guard !Task.isCancelled, let self, let cache = self.cache else {
+                return
+            }
+            guard !self.suppressCachePersistenceUntilAuthoritativeSnapshot else {
                 return
             }
             let snapshot = self.store.stateForCachePersistence
@@ -322,7 +329,8 @@ final class ConversationCoordinator {
         }
         store.setConnectionState(.offlineAgentRunning)
         cacheSaveTask?.cancel()
-        if let cache {
+        if let cache,
+           !suppressCachePersistenceUntilAuthoritativeSnapshot {
             let snapshot = store.stateForCachePersistence
             await cache.save(snapshot, for: identity)
         }
@@ -756,7 +764,7 @@ final class ConversationCoordinator {
     ) async -> Bool {
         guard canContinueLifecycle(epoch) else { return true }
         let kind = ChatEventKind(rawValue: envelope.type)
-        let projectionPreparation: Task<PreparedTranscriptProjectionBatch, Never>?
+        let projectionPreparation: Task<PreparedConversationApplication, Never>?
         let requiresProjectionPreparation: Bool
         switch kind {
         case .conversationSnapshot, .historyPage,
@@ -785,12 +793,34 @@ final class ConversationCoordinator {
                 for: envelope
             )
             projectionPreparation = Task {
-                await ConversationStore.prepareTranscriptProjections(
+                let reducerPayload = await ConversationStore
+                    .prepareAuthoritativeReducerPayload(
+                        for: envelope,
+                        retaining: currentItem
+                    )
+                let preservedSnapshotItemIDs = await ConversationStore
+                    .preparePreservedSnapshotItemIDs(
+                        for: reducerPayload,
+                        retaining: currentState?.items ?? []
+                    )
+                async let projections = ConversationStore.prepareTranscriptProjections(
                     for: envelope,
                     retaining: currentState?.items ?? [],
                     currentState: currentState,
                     currentItem: currentItem,
-                    stagedProjection: stagedProjection
+                    stagedProjection: stagedProjection,
+                    preparedReducerPayload: reducerPayload,
+                    preservingSnapshotItemIDs: preservedSnapshotItemIDs
+                )
+                async let markdownWarmTexts = ConversationStore
+                    .prepareMarkdownWarmTexts(for: reducerPayload)
+                let preparedProjections = await projections
+                let warmTexts = await markdownWarmTexts
+                return PreparedConversationApplication(
+                    transcriptProjections: preparedProjections,
+                    reducerPayload: reducerPayload,
+                    markdownWarmTexts: warmTexts,
+                    preservedSnapshotItemIDs: preservedSnapshotItemIDs
                 )
             }
         } else {
@@ -801,13 +831,23 @@ final class ConversationCoordinator {
             let existingItemIDs = envelope.type == ChatEventKind.historyPage.rawValue
                 ? Set(store.state.items.map(\.id))
                 : []
-            await warmMarkdownCacheIfNeeded(for: envelope)
+            let preparedApplication = await projectionPreparation?.value
+            await warmMarkdownCacheIfNeeded(
+                texts: preparedApplication?.markdownWarmTexts ?? []
+            )
             guard canContinueLifecycle(epoch) else { return true }
-            let preparedProjections = await projectionPreparation?.value ?? [:]
-            guard canContinueLifecycle(epoch) else { return true }
+            let preservesPaintedTranscript = preparedApplication?.reducerPayload?
+                .preservesPaintedTranscript(
+                    previousItemCount: store
+                        .itemsForTranscriptProjectionPreparation.count
+                ) == true
             try store.apply(
                 envelope,
-                preparedTranscriptProjections: preparedProjections
+                preparedTranscriptProjections:
+                    preparedApplication?.transcriptProjections ?? [:],
+                preparedReducerPayload: preparedApplication?.reducerPayload,
+                preservedSnapshotItemIDs:
+                    preparedApplication?.preservedSnapshotItemIDs ?? []
             )
             scheduleMarkdownWarmAfterApply(
                 envelope,
@@ -815,7 +855,14 @@ final class ConversationCoordinator {
             )
             if envelope.type == ChatEventKind.conversationSnapshot.rawValue {
                 reconcileSnapshotTransients()
-                scheduleCacheSave(immediate: true)
+                if preservesPaintedTranscript {
+                    suppressCachePersistenceUntilAuthoritativeSnapshot = true
+                    cacheSaveTask?.cancel()
+                    cacheSaveTask = nil
+                } else {
+                    suppressCachePersistenceUntilAuthoritativeSnapshot = false
+                    scheduleCacheSave(immediate: true)
+                }
             } else if envelope.type == ChatEventKind.turnStarted.rawValue {
                 releasePendingTurnLatchPreservingRestoration()
                 scheduleCacheSave()
@@ -883,26 +930,7 @@ final class ConversationCoordinator {
     /// Prepares the final Markdown artifacts for the restored viewport before
     /// it publishes. Older rows are warmed directionally by the table instead
     /// of scanning the complete retained transcript on the UI actor.
-    private func warmMarkdownCacheIfNeeded(for envelope: ChatEnvelope) async {
-        guard envelope.type == ChatEventKind.conversationSnapshot.rawValue else {
-            return
-        }
-        let task = Task.detached(priority: .utility) {
-            guard let snapshot = try? envelope.decodePayload(ConversationSnapshot.self),
-                  !Task.isCancelled else { return [String]() }
-            return Array(
-                SanitizedMarkdownCache.warmableTexts(
-                    items: snapshot.items,
-                    suffixLimit: 50
-                )
-                    .reversed()
-            )
-        }
-        let texts = await withTaskCancellationHandler {
-            await task.value
-        } onCancel: {
-            task.cancel()
-        }
+    private func warmMarkdownCacheIfNeeded(texts: [String]) async {
         guard !texts.isEmpty, !Task.isCancelled else { return }
         await SanitizedMarkdownCache.shared.warm(texts: texts)
     }
