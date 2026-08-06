@@ -55,6 +55,18 @@ private enum MacTranscriptRow: MacConversationTableRow {
         case .question: "transcript.question"
         }
     }
+
+    /// Store mutations are expressed in logical conversation-item IDs while
+    /// one item may project into many table tiles. The table uses this value
+    /// to route a logical update to the visible tiles that belong to it.
+    var mutationSourceID: String {
+        switch self {
+        case .item(let projection, _, _):
+            projection.sourceItemID
+        default:
+            id
+        }
+    }
 }
 #endif
 
@@ -258,10 +270,20 @@ struct ConversationView: View {
         }
         for item in store.state.items {
             let isExpanded = store.expandedItemIDs.contains(item.id)
-            let projections = store.transcriptProjections(for: item)
-            let visibleProjections = projections.first.map { first in
-                first.kind.isDisclosure && !isExpanded ? [first] : projections
-            } ?? []
+            let isDisclosure: Bool
+            switch item {
+            case .reasoning, .tool, .diff, .generic:
+                isDisclosure = true
+            case .message, .plan:
+                isDisclosure = false
+            }
+            let visibleProjections: [TranscriptRowProjection]
+            if isDisclosure && !isExpanded {
+                visibleProjections = store.transcriptFirstProjection(for: item)
+                    .map { [$0] } ?? []
+            } else {
+                visibleProjections = store.transcriptProjections(for: item)
+            }
             rows.append(contentsOf: visibleProjections.map { projection in
                 .item(
                     projection,
@@ -312,6 +334,7 @@ struct ConversationView: View {
             reduceMotion: reduceMotion,
             commandHandle: macTableCommandHandle,
             onNearBottomChange: { store.setNearBottom($0) },
+            onLiveScrollingChange: { store.setTranscriptLiveScrolling($0) },
             onAnchoredChange: { isTranscriptAnchored = $0 },
             makeRow: { row in
                 AnyView(
@@ -1052,7 +1075,6 @@ private struct ChatMessageView: View {
 
     @Environment(\.chatRowActions) private var actions
     @State private var didCopy = false
-    @State private var isHovering = false
 
     var body: some View {
         HStack(alignment: .top) {
@@ -1097,7 +1119,6 @@ private struct ChatMessageView: View {
                 Spacer(minLength: 0)
             }
         }
-        .onHover { isHovering = $0 }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(message.role == .user ? "You" : "Assistant")
     }
@@ -1106,15 +1127,13 @@ private struct ChatMessageView: View {
     private var isLastSegment: Bool { segment?.isLastInItem ?? true }
 
     private var messageTopPadding: CGFloat {
-        guard message.role == .user else {
-            return isFirstSegment ? 0 : 8
-        }
-        return isFirstSegment ? 12 : (segment?.isFirstInSection == true ? 10 : 4)
+        guard message.role == .user else { return 0 }
+        return isFirstSegment ? 12 : (segment?.isFirstInSection == true ? 10 : 0)
     }
 
     private var messageBottomPadding: CGFloat {
         guard message.role == .user else { return 0 }
-        return isLastSegment ? 12 : 4
+        return isLastSegment ? 12 : 0
     }
 
     private var messageFooter: some View {
@@ -1150,11 +1169,7 @@ private struct ChatMessageView: View {
     }
 
     private var showsMessageFooter: Bool {
-        #if os(macOS)
-        isHovering || didCopy
-        #else
         true
-        #endif
     }
 
     @ViewBuilder
@@ -1534,9 +1549,12 @@ private struct DiffTextView: View {
     }
 
     private let lines: [Line]
+    #if os(macOS)
+    private let attributedText: AttributedString
+    #endif
 
     init(diff: String) {
-        lines = diff
+        let lines = diff
             .split(separator: "\n", omittingEmptySubsequences: false)
             .enumerated()
             .map { index, substring in
@@ -1551,13 +1569,40 @@ private struct DiffTextView: View {
                 }
                 return Line(id: index, text: text, kind: kind)
             }
+        self.lines = lines
+        #if os(macOS)
+        var attributed = AttributedString()
+        for (index, line) in lines.enumerated() {
+            var value = AttributedString(line.text)
+            switch line.kind {
+            case .addition:
+                value.foregroundColor = .green
+                value.backgroundColor = .green.opacity(0.1)
+            case .removal:
+                value.foregroundColor = .red
+                value.backgroundColor = .red.opacity(0.1)
+            case .context:
+                value.foregroundColor = .primary
+            }
+            attributed.append(value)
+            if index < lines.count - 1 {
+                attributed.append(AttributedString("\n"))
+            }
+        }
+        attributedText = attributed
+        #endif
     }
 
     var body: some View {
         // On macOS diff lines wrap rather than nesting a live NSScrollView
         // per diff card inside the transcript.
         #if os(macOS)
-        diffLines
+        Text(attributedText)
+            .font(.system(.caption, design: .monospaced))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 1)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .textSelection(.enabled)
             .background(Color.secondary.opacity(0.05))
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         #else

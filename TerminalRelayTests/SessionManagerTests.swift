@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 @testable import TerminalRelay
 
@@ -348,6 +349,51 @@ final class SessionManagerTests: XCTestCase {
         terminal.feed(text: "\u{1B}]9;4;0;\u{7}")
         await Task.yield()
         XCTAssertFalse(session.isWorking)
+    }
+
+    func testStableWorkingStateDoesNotPublishAndCompletionEdgeCountsOnce() async {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let session = TerminalSession(
+            project: project,
+            server: server,
+            kind: .claude,
+            sequenceNumber: 1,
+            instanceToken: "01234567-89ab-" + "4def-8abc-0123456789ab",
+            initialStatus: .running
+        )
+        let terminal = session.terminalView.getTerminal()
+        var publicationCount = 0
+        let observation = session.objectWillChange.sink {
+            publicationCount += 1
+        }
+        defer { observation.cancel() }
+
+        terminal.feed(text: "\u{1B}]9;4;3;\u{7}")
+        await Task.yield()
+        XCTAssertTrue(session.isWorking)
+        XCTAssertEqual(session.taskCompletionCount, 0)
+
+        let publicationsAfterStarting = publicationCount
+        terminal.feed(text: "\u{1B}]9;4;3;\u{7}")
+        await Task.yield()
+
+        XCTAssertTrue(session.isWorking)
+        XCTAssertEqual(session.taskCompletionCount, 0)
+        XCTAssertEqual(publicationCount, publicationsAfterStarting)
+
+        terminal.feed(text: "\u{1B}]9;4;0;\u{7}")
+        await Task.yield()
+        XCTAssertFalse(session.isWorking)
+        XCTAssertEqual(session.taskCompletionCount, 1)
+
+        let publicationsAfterCompleting = publicationCount
+        terminal.feed(text: "\u{1B}]9;4;0;\u{7}")
+        await Task.yield()
+
+        XCTAssertFalse(session.isWorking)
+        XCTAssertEqual(session.taskCompletionCount, 1)
+        XCTAssertEqual(publicationCount, publicationsAfterCompleting)
     }
 
     func testSequenceNumberDoesNotResetWhenHistoryIsExplicitlyClosed() async {

@@ -225,6 +225,488 @@ final class ConversationStoreTests: XCTestCase {
         XCTAssertEqual(store.transcriptMutation.insertions.map(\.id), ["message-3"])
     }
 
+    func testStreamingProjectionResegmentsOnlyMutableTailIndependentOfPrefix() throws {
+        let prefix = String(repeating: "prefix-value-0123456789\n", count: 20_000)
+        let firstDelta = String(repeating: "first-delta\n", count: 80)
+        let secondDelta = String(repeating: "second-delta\n", count: 80)
+        let store = ConversationStore(streamingPublishNanoseconds: 1_000_000_000)
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.started",
+                sequence: 1,
+                itemID: "message",
+                turnID: "turn",
+                payload: .object([
+                    "role": .string("assistant"),
+                    "text": .string(prefix),
+                ])
+            )
+        )
+        let initialItem = try XCTUnwrap(store.state.items.first)
+        let initialRows = store.transcriptProjections(for: initialItem)
+        XCTAssertGreaterThan(initialRows.count, 100)
+        XCTAssertEqual(store.projectionDiagnostics.fullItemBuilds, 1)
+
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.delta",
+                sequence: 2,
+                itemID: "message",
+                turnID: "turn",
+                payload: .object(["text": .string(firstDelta)])
+            )
+        )
+        store.flushStreamingUpdates()
+        let firstRows = store.transcriptProjections(
+            for: try XCTUnwrap(store.state.items.first)
+        )
+        XCTAssertEqual(firstRows.map(\.sourceText).joined(), prefix + firstDelta)
+        XCTAssertEqual(
+            Array(initialRows.dropLast()),
+            Array(firstRows.prefix(initialRows.count - 1))
+        )
+        XCTAssertEqual(store.projectionDiagnostics.fullItemBuilds, 1)
+        XCTAssertEqual(store.projectionDiagnostics.incrementalTailBuilds, 1)
+        XCTAssertEqual(
+            store.projectionDiagnostics.lastIncrementalSourceBytes,
+            try XCTUnwrap(initialRows.last).sourceText.utf8.count + firstDelta.utf8.count
+        )
+        XCTAssertLessThan(
+            store.projectionDiagnostics.lastIncrementalSourceBytes,
+            prefix.utf8.count / 10
+        )
+
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.delta",
+                sequence: 3,
+                itemID: "message",
+                turnID: "turn",
+                payload: .object(["text": .string(secondDelta)])
+            )
+        )
+        store.flushStreamingUpdates()
+        let secondRows = store.transcriptProjections(
+            for: try XCTUnwrap(store.state.items.first)
+        )
+        XCTAssertEqual(
+            secondRows.map(\.sourceText).joined(),
+            prefix + firstDelta + secondDelta
+        )
+        XCTAssertEqual(store.projectionDiagnostics.fullItemBuilds, 1)
+        XCTAssertEqual(store.projectionDiagnostics.incrementalTailBuilds, 2)
+        XCTAssertLessThanOrEqual(
+            store.projectionDiagnostics.lastIncrementalSourceBytes,
+            TranscriptRowProjection.maximumDisplayBytes + secondDelta.utf8.count
+        )
+    }
+
+    func testLiveScrollingDefersStreamingPublicationAndCatchesUpOnce() throws {
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.started",
+                sequence: 1,
+                itemID: "message",
+                turnID: "turn",
+                payload: .object([
+                    "role": .string("assistant"),
+                    "text": .string("prefix"),
+                ])
+            )
+        )
+        _ = store.transcriptProjections(
+            for: try XCTUnwrap(store.state.items.first)
+        )
+        let publishedMutationRevision = store.transcriptMutation.revision
+
+        var publishCount = 0
+        let subscription = store.objectWillChange.sink { publishCount += 1 }
+        defer { subscription.cancel() }
+
+        store.setTranscriptLiveScrolling(true)
+        for (sequence, delta) in [(2, "-one"), (3, "-two")] {
+            try store.apply(
+                ChatTestFixtures.event(
+                    "message.delta",
+                    sequence: Int64(sequence),
+                    itemID: "message",
+                    turnID: "turn",
+                    payload: .object(["text": .string(delta)])
+                )
+            )
+        }
+
+        XCTAssertEqual(store.lastAppliedSequence, 3)
+        XCTAssertEqual(store.state.messages.first?.text, "prefix")
+        XCTAssertEqual(store.state.lastAppliedSequence, 1)
+        XCTAssertEqual(store.transcriptMutation.revision, publishedMutationRevision)
+        XCTAssertEqual(store.projectionDiagnostics.incrementalTailBuilds, 0)
+        XCTAssertEqual(publishCount, 0)
+
+        store.setTranscriptLiveScrolling(false)
+
+        XCTAssertEqual(store.state.messages.first?.text, "prefix-one-two")
+        XCTAssertEqual(store.state.lastAppliedSequence, 3)
+        XCTAssertEqual(store.transcriptMutation.revision, publishedMutationRevision + 1)
+        XCTAssertEqual(store.projectionDiagnostics.incrementalTailBuilds, 1)
+        XCTAssertEqual(publishCount, 1)
+    }
+
+    func testBrowsingHistoryDefersStreamingPublicationUntilJumpToLatest() throws {
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.started",
+                sequence: 1,
+                itemID: "message",
+                turnID: "turn",
+                payload: .object([
+                    "role": .string("assistant"),
+                    "text": .string("visible"),
+                ])
+            )
+        )
+        store.setNearBottom(false)
+
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.delta",
+                sequence: 2,
+                itemID: "message",
+                turnID: "turn",
+                payload: .object(["text": .string("-deferred")])
+            )
+        )
+
+        XCTAssertEqual(store.lastAppliedSequence, 2)
+        XCTAssertEqual(store.state.lastAppliedSequence, 1)
+        XCTAssertEqual(store.state.messages.first?.text, "visible")
+
+        store.jumpToLatest()
+
+        XCTAssertTrue(store.isNearBottom)
+        XCTAssertEqual(store.state.lastAppliedSequence, 2)
+        XCTAssertEqual(store.state.messages.first?.text, "visible-deferred")
+    }
+
+    func testCompletionDuringLiveScrollPublishesAfterGestureEvenWhenBrowsing() throws {
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.started",
+                sequence: 1,
+                itemID: "message",
+                turnID: "turn",
+                payload: .object([
+                    "role": .string("assistant"),
+                    "text": .string("initial"),
+                ])
+            )
+        )
+        store.setTranscriptLiveScrolling(true)
+        store.setNearBottom(false)
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.delta",
+                sequence: 2,
+                itemID: "message",
+                turnID: "turn",
+                payload: .object(["text": .string("-streaming")])
+            )
+        )
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.completed",
+                sequence: 3,
+                itemID: "message",
+                turnID: "turn",
+                payload: .object([
+                    "role": .string("assistant"),
+                    "text": .string("authoritative-final"),
+                ])
+            )
+        )
+
+        XCTAssertEqual(store.lastAppliedSequence, 3)
+        XCTAssertEqual(store.state.lastAppliedSequence, 1)
+        XCTAssertEqual(store.state.messages.first?.text, "initial")
+
+        store.setTranscriptLiveScrolling(false)
+
+        XCTAssertFalse(store.isNearBottom)
+        XCTAssertEqual(store.state.lastAppliedSequence, 3)
+        XCTAssertEqual(store.state.messages.first?.text, "authoritative-final")
+        XCTAssertFalse(try XCTUnwrap(store.state.messages.first).isStreaming)
+    }
+
+    func testTerminalTurnDoesNotRebuildAlreadyFinalizedItems() throws {
+        let text = String(repeating: "sealed-prefix-line\n", count: 2_000)
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.started",
+                sequence: 1,
+                itemID: "message",
+                turnID: "turn",
+                payload: .object([
+                    "role": .string("assistant"),
+                    "text": .string(text),
+                ])
+            )
+        )
+        _ = store.transcriptProjections(
+            for: try XCTUnwrap(store.state.items.first)
+        )
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.completed",
+                sequence: 2,
+                itemID: "message",
+                turnID: "turn",
+                payload: .object([
+                    "role": .string("assistant"),
+                    "text": .string(text),
+                ])
+            )
+        )
+        _ = store.transcriptProjections(
+            for: try XCTUnwrap(store.state.items.first)
+        )
+        let fullBuilds = store.projectionDiagnostics.fullItemBuilds
+        let contentRevision = store.transcriptContentRevision
+        let mutationRevision = store.transcriptMutation.revision
+
+        try store.apply(
+            ChatTestFixtures.event(
+                "turn.completed",
+                sequence: 3,
+                turnID: "turn"
+            )
+        )
+
+        _ = store.transcriptProjections(
+            for: try XCTUnwrap(store.state.items.first)
+        )
+        XCTAssertEqual(store.state.turnState, .completed)
+        XCTAssertEqual(store.transcriptContentRevision, contentRevision)
+        XCTAssertEqual(store.transcriptMutation.revision, mutationRevision)
+        XCTAssertEqual(store.projectionDiagnostics.fullItemBuilds, fullBuilds)
+    }
+
+    func testTerminalTurnFinalizesOnlyStreamingTailWithoutFullProjection() throws {
+        let text = String(repeating: "streaming-prefix-line\n", count: 2_000)
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.started",
+                sequence: 1,
+                itemID: "message",
+                turnID: "turn",
+                payload: .object([
+                    "role": .string("assistant"),
+                    "text": .string(text),
+                ])
+            )
+        )
+        let initialRows = store.transcriptProjections(
+            for: try XCTUnwrap(store.state.items.first)
+        )
+        XCTAssertGreaterThan(initialRows.count, 1)
+
+        try store.apply(
+            ChatTestFixtures.event(
+                "turn.completed",
+                sequence: 2,
+                turnID: "turn"
+            )
+        )
+
+        let finalMessage = try XCTUnwrap(store.state.messages.first)
+        let finalRows = store.transcriptProjections(
+            for: try XCTUnwrap(store.state.items.first)
+        )
+        XCTAssertFalse(finalMessage.isStreaming)
+        XCTAssertEqual(finalMessage.text, text)
+        XCTAssertEqual(finalRows.map(\.sourceText).joined(), text)
+        XCTAssertEqual(Array(initialRows.dropLast()), Array(finalRows.dropLast()))
+        XCTAssertEqual(store.projectionDiagnostics.fullItemBuilds, 1)
+        XCTAssertEqual(store.projectionDiagnostics.incrementalTailBuilds, 1)
+        XCTAssertLessThanOrEqual(
+            store.projectionDiagnostics.lastIncrementalSourceBytes,
+            TranscriptRowProjection.maximumDisplayBytes
+        )
+    }
+
+    func testReasoningAndToolOutputDeltasUseTailProjectionButReplacementsRebuild() throws {
+        let reasoningStore = ConversationStore(
+            streamingPublishNanoseconds: 1_000_000_000
+        )
+        let reasoningPrefix = String(repeating: "thought\n", count: 2_000)
+        try reasoningStore.apply(
+            ChatTestFixtures.event(
+                "reasoning.started",
+                sequence: 1,
+                itemID: "reasoning",
+                turnID: "turn",
+                payload: .object(["text": .string(reasoningPrefix)])
+            )
+        )
+        _ = reasoningStore.transcriptProjections(
+            for: try XCTUnwrap(reasoningStore.state.items.first)
+        )
+        try reasoningStore.apply(
+            ChatTestFixtures.event(
+                "reasoning.delta",
+                sequence: 2,
+                itemID: "reasoning",
+                turnID: "turn",
+                payload: .object(["text": .string("more")])
+            )
+        )
+        reasoningStore.flushStreamingUpdates()
+        let reasoningRows = reasoningStore.transcriptProjections(
+            for: try XCTUnwrap(reasoningStore.state.items.first)
+        )
+        XCTAssertEqual(reasoningRows.map(\.sourceText).joined(), reasoningPrefix + "more")
+        XCTAssertEqual(reasoningStore.projectionDiagnostics.fullItemBuilds, 1)
+        XCTAssertEqual(reasoningStore.projectionDiagnostics.incrementalTailBuilds, 1)
+
+        let toolStore = ConversationStore(streamingPublishNanoseconds: 1_000_000_000)
+        let toolPrefix = String(repeating: "output\n", count: 2_000)
+        try toolStore.apply(
+            ChatTestFixtures.event(
+                "tool.started",
+                sequence: 1,
+                itemID: "tool",
+                turnID: "turn",
+                payload: .object([
+                    "kind": .string("shell"),
+                    "title": .string("Command"),
+                    "status": .string("running"),
+                    "output": .string(toolPrefix),
+                ])
+            )
+        )
+        _ = toolStore.transcriptProjections(
+            for: try XCTUnwrap(toolStore.state.items.first)
+        )
+        try toolStore.apply(
+            ChatTestFixtures.event(
+                "tool.updated",
+                sequence: 2,
+                itemID: "tool",
+                turnID: "turn",
+                payload: .object([
+                    "kind": .string("shell"),
+                    "title": .string("Command"),
+                    "status": .string("running"),
+                    "outputDelta": .string("tail"),
+                ])
+            )
+        )
+        toolStore.flushStreamingUpdates()
+        let toolRows = toolStore.transcriptProjections(
+            for: try XCTUnwrap(toolStore.state.items.first)
+        )
+        XCTAssertEqual(
+            toolRows.filter { $0.section == .toolOutput }.map(\.sourceText).joined(),
+            toolPrefix + "tail"
+        )
+        XCTAssertEqual(toolStore.projectionDiagnostics.fullItemBuilds, 1)
+        XCTAssertEqual(toolStore.projectionDiagnostics.incrementalTailBuilds, 1)
+
+        try toolStore.apply(
+            ChatTestFixtures.event(
+                "tool.updated",
+                sequence: 3,
+                itemID: "tool",
+                turnID: "turn",
+                payload: .object([
+                    "kind": .string("shell"),
+                    "title": .string("Command"),
+                    "status": .string("running"),
+                    "output": .string("authoritative"),
+                ])
+            )
+        )
+        toolStore.flushStreamingUpdates()
+        let replacedRows = toolStore.transcriptProjections(
+            for: try XCTUnwrap(toolStore.state.items.first)
+        )
+        XCTAssertEqual(replacedRows.map(\.sourceText).joined(), "authoritative")
+        XCTAssertEqual(toolStore.projectionDiagnostics.fullItemBuilds, 2)
+        XCTAssertEqual(toolStore.projectionDiagnostics.incrementalTailBuilds, 1)
+    }
+
+    func testCollapsedMegabyteToolAndDiffBuildOnlyOneBoundedTile() throws {
+        let nearMegabyte = String(repeating: "0123456789abcdef", count: 56_000)
+        XCTAssertGreaterThan(nearMegabyte.utf8.count, 850_000)
+        let diff = ConversationItem.diff(
+            ChatDiff(
+                id: "diff",
+                turnID: "turn",
+                path: "Example.swift",
+                unifiedDiff: nearMegabyte,
+                occurredAt: nil,
+                isTruncated: false
+            )
+        )
+        let tool = ConversationItem.tool(
+            ToolActivity(
+                id: "tool",
+                turnID: "turn",
+                kind: .shell,
+                title: "Command",
+                status: .completed,
+                input: nil,
+                output: nearMegabyte,
+                errorMessage: nil,
+                durationMilliseconds: nil,
+                exitCode: 0,
+                occurredAt: nil,
+                isTruncated: false,
+                originalByteCount: nil
+            )
+        )
+        let store = ConversationStore()
+        store.replaceWithSnapshot(
+            ConversationSnapshot(
+                snapshotGeneration: ChatTestFixtures.generation,
+                baseSequence: 1,
+                items: [diff, tool]
+            )
+        )
+
+        let diffFirst = try XCTUnwrap(store.transcriptFirstProjection(for: diff))
+        let toolFirst = try XCTUnwrap(store.transcriptFirstProjection(for: tool))
+        XCTAssertTrue(nearMegabyte.hasPrefix(diffFirst.sourceText))
+        XCTAssertTrue(nearMegabyte.hasPrefix(toolFirst.sourceText))
+        XCTAssertLessThanOrEqual(
+            diffFirst.sourceText.utf8.count,
+            TranscriptRowProjection.maximumDisplayBytes
+        )
+        XCTAssertLessThanOrEqual(
+            toolFirst.sourceText.utf8.count,
+            TranscriptRowProjection.maximumDisplayBytes
+        )
+        XCTAssertEqual(store.projectionDiagnostics.boundedFirstRowBuilds, 2)
+        XCTAssertEqual(store.projectionDiagnostics.fullItemBuilds, 0)
+        XCTAssertLessThanOrEqual(
+            store.projectionDiagnostics.maximumFirstRowSourceBytes,
+            TranscriptRowProjection.maximumDisplayBytes
+        )
+
+        _ = store.transcriptFirstProjection(for: diff)
+        _ = store.transcriptFirstProjection(for: tool)
+        XCTAssertEqual(store.projectionDiagnostics.boundedFirstRowBuilds, 2)
+        XCTAssertEqual(store.projectionDiagnostics.fullItemBuilds, 0)
+
+        let expandedDiff = store.transcriptProjections(for: diff)
+        XCTAssertEqual(expandedDiff.first, diffFirst)
+        XCTAssertEqual(store.projectionDiagnostics.fullItemBuilds, 1)
+    }
+
     func testAppliesFlatSnapshotAndUsesBaseSeqCodingKey() throws {
         let flatItems: JSONValue = .array([
             .object([

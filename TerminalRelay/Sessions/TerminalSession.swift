@@ -789,48 +789,43 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
 
     private func updateWorkingState() {
         let wasWorking = isWorking
+        let nextWorking: Bool
         if presentation == .chat {
             switch status {
             case .connecting, .running:
-                isWorking = chatIndicatesWorking
+                nextWorking = chatIndicatesWorking
             case .remoteRunning, .disconnected:
-                isWorking = remoteIndicatesWorking
+                nextWorking = remoteIndicatesWorking
             case .stopping, .exited:
-                isWorking = false
+                nextWorking = false
             }
-            if wasWorking,
-               !isWorking,
-               !explicitDisconnectRequested,
-               !remoteStopRequested,
-               status == .running || status == .remoteRunning {
-                taskCompletionCount += 1
-            }
-            if wasWorking != isWorking {
-                lastActivityAt = Date()
-            }
-            return
-        }
-        switch status {
-        case .connecting, .running:
-            isWorking = titleIndicatesWorking
+        } else {
+            switch status {
+            case .connecting, .running:
+                nextWorking = titleIndicatesWorking
                 || progressIndicatesWorking
                 || remoteIndicatesWorking
-        case .remoteRunning, .disconnected:
-            isWorking = remoteIndicatesWorking
-        case .stopping, .exited:
-            isWorking = false
+            case .remoteRunning, .disconnected:
+                nextWorking = remoteIndicatesWorking
+            case .stopping, .exited:
+                nextWorking = false
+            }
         }
 
+        // @Published emits even when assigned the same value. Chat snapshots
+        // arrive while a response streams, so an unconditional assignment
+        // here used to invalidate SessionManager and the whole workspace at
+        // the transport publication cadence despite no session-state change.
+        guard nextWorking != wasWorking else { return }
+        isWorking = nextWorking
         if wasWorking,
-           !isWorking,
+           !nextWorking,
            !explicitDisconnectRequested,
            !remoteStopRequested,
            status == .running || status == .remoteRunning {
            taskCompletionCount += 1
         }
-        if wasWorking != isWorking {
-            lastActivityAt = Date()
-        }
+        lastActivityAt = Date()
     }
 
     private func applyChatState(_ state: ConversationState) {

@@ -208,6 +208,7 @@ enum MarkdownSafety {
     }
 
     private static func neutralizingImages(in source: String) -> String {
+        guard source.contains("![") else { return source }
         var collector = MarkdownImageCollector()
         collector.visit(Document(parsing: source))
         guard !collector.images.isEmpty else { return source }
@@ -607,6 +608,473 @@ enum MarkdownSegmentation {
     }
 }
 
+#if os(macOS)
+/// The final, immutable representation used by completed transcript rows on
+/// macOS. Markdown parsing, sanitization, link classification, and inline
+/// styling all happen before this value reaches SwiftUI, so mounting a cached
+/// row only creates one `Text` view.
+struct PreparedMarkdown: Sendable {
+    let attributedText: AttributedString
+    let sanitizedSource: String
+    let plainText: String
+    let linkURLs: [URL]
+    let performedOnMainThread: Bool
+    let requestedPriority: TaskPriority
+
+    var estimatedCacheCost: Int {
+        // NSCache costs are approximate bytes. Account for the raw prepared
+        // characters, UTF-16-ish attributed backing storage, and run metadata.
+        sanitizedSource.utf8.count
+            + plainText.utf8.count * 2
+            + attributedText.runs.count * 160
+            + 256
+    }
+}
+
+/// Process-wide permit pool for Markdown preparation. Restores, multiple open
+/// conversations, and cold visible rows all share these two slots instead of
+/// each creating their own parser fan-out. Waiters are priority ordered so a
+/// visible tile can run before queued utility warming work.
+actor MarkdownPreparationGate {
+    static let shared = MarkdownPreparationGate(maxConcurrent: 2)
+
+    nonisolated let maximumConcurrent: Int
+
+    private struct Waiter {
+        let priority: TaskPriority
+        let sequence: UInt64
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
+    private var active = 0
+    private var nextSequence: UInt64 = 0
+    private var waiters: [Waiter] = []
+
+    init(maxConcurrent: Int) {
+        precondition(maxConcurrent > 0)
+        self.maximumConcurrent = maxConcurrent
+    }
+
+    nonisolated func run<Value: Sendable>(
+        priority: TaskPriority,
+        operation: @escaping @Sendable () async -> Value
+    ) async -> Value {
+        await acquire(priority: priority)
+        let value = await operation()
+        await release()
+        return value
+    }
+
+    private func acquire(priority: TaskPriority) async {
+        if active < maximumConcurrent {
+            active += 1
+            return
+        }
+        let sequence = nextSequence
+        nextSequence &+= 1
+        await withCheckedContinuation { continuation in
+            waiters.append(
+                Waiter(
+                    priority: priority,
+                    sequence: sequence,
+                    continuation: continuation
+                )
+            )
+        }
+    }
+
+    private func release() {
+        guard !waiters.isEmpty else {
+            active -= 1
+            return
+        }
+        var selected = waiters.startIndex
+        for index in waiters.indices.dropFirst() {
+            let candidate = waiters[index]
+            let current = waiters[selected]
+            if candidate.priority.rawValue > current.priority.rawValue
+                || (candidate.priority == current.priority && candidate.sequence < current.sequence) {
+                selected = index
+            }
+        }
+        let waiter = waiters.remove(at: selected)
+        // The released permit transfers directly to this waiter, so `active`
+        // remains unchanged.
+        waiter.continuation.resume()
+    }
+}
+
+enum PreparedMarkdownRenderer {
+    static func prepareOffMain(
+        _ source: String,
+        priority: TaskPriority = .userInitiated
+    ) async -> PreparedMarkdown {
+        await MarkdownPreparationGate.shared.run(priority: priority) {
+            let task = Task.detached(priority: priority) {
+                prepare(source, requestedPriority: priority)
+            }
+            return await withTaskCancellationHandler {
+                await task.value
+            } onCancel: {
+                task.cancel()
+            }
+        }
+    }
+
+    private static func prepare(
+        _ source: String,
+        requestedPriority: TaskPriority
+    ) -> PreparedMarkdown {
+        let sanitized = MarkdownSafety.sanitizedSource(source)
+        let document = Document(parsing: sanitized)
+        let attributed = renderBlocks(Array(document.children), context: .init())
+        let links = attributed.runs.compactMap(\.link)
+        return PreparedMarkdown(
+            attributedText: attributed,
+            sanitizedSource: sanitized,
+            plainText: String(attributed.characters),
+            linkURLs: links,
+            performedOnMainThread: Thread.isMainThread,
+            requestedPriority: requestedPriority
+        )
+    }
+
+    private struct RenderContext {
+        var intents: InlinePresentationIntent = []
+        var headingLevel: Int?
+        var link: URL?
+        var isCode = false
+        var isQuote = false
+
+        func adding(_ intent: InlinePresentationIntent) -> Self {
+            var copy = self
+            copy.intents.formUnion(intent)
+            return copy
+        }
+    }
+
+    private static func renderBlocks(
+        _ blocks: [Markup],
+        context: RenderContext,
+        separator: String = "\n\n"
+    ) -> AttributedString {
+        joined(
+            blocks.map { renderBlock($0, context: context) },
+            separator: separator
+        )
+    }
+
+    private static func renderBlock(
+        _ markup: Markup,
+        context: RenderContext
+    ) -> AttributedString {
+        switch markup {
+        case let paragraph as Paragraph:
+            return renderInlines(Array(paragraph.children), context: context)
+
+        case let heading as Heading:
+            var headingContext = context.adding(.stronglyEmphasized)
+            headingContext.headingLevel = heading.level
+            return renderInlines(Array(heading.children), context: headingContext)
+
+        case let codeBlock as Markdown.CodeBlock:
+            var codeContext = context
+            codeContext.isCode = true
+            var result = AttributedString()
+            if let language = codeBlock.language, !language.isEmpty {
+                var labelContext = codeContext
+                labelContext.intents.formUnion(.stronglyEmphasized)
+                result.append(styled(language, context: labelContext))
+                result.append(AttributedString("\n"))
+            }
+            result.append(
+                highlightedCode(
+                    codeBlock.code,
+                    language: codeBlock.language,
+                    context: codeContext
+                )
+            )
+            return result
+
+        case let quote as BlockQuote:
+            var quoteContext = context
+            quoteContext.isQuote = true
+            let body = renderBlocks(Array(quote.children), context: quoteContext)
+            return prefixingLines(body, first: "│ ", continuation: "│ ")
+
+        case let list as UnorderedList:
+            return renderList(
+                items: Array(list.children).compactMap { $0 as? ListItem },
+                start: nil,
+                context: context
+            )
+
+        case let list as OrderedList:
+            return renderList(
+                items: Array(list.children).compactMap { $0 as? ListItem },
+                start: Int(list.startIndex),
+                context: context
+            )
+
+        case let table as Markdown.Table:
+            return renderTable(table, context: context)
+
+        case is ThematicBreak:
+            return styled("────────────────", context: context)
+
+        case let html as HTMLBlock:
+            return styled(html.rawHTML, context: context)
+
+        default:
+            return renderBlocks(Array(markup.children), context: context, separator: "\n")
+        }
+    }
+
+    private static func renderList(
+        items: [ListItem],
+        start: Int?,
+        context: RenderContext
+    ) -> AttributedString {
+        let rendered = items.enumerated().map { offset, item -> AttributedString in
+            let checkbox: String
+            switch item.checkbox {
+            case .checked:
+                checkbox = "[x] "
+            case .unchecked:
+                checkbox = "[ ] "
+            case nil:
+                checkbox = ""
+            }
+            let marker = start.map { "\($0 + offset). " } ?? "• "
+            let body = renderBlocks(
+                Array(item.children),
+                context: context,
+                separator: "\n"
+            )
+            return prefixingLines(
+                body,
+                first: marker + checkbox,
+                continuation: String(repeating: " ", count: marker.count + checkbox.count)
+            )
+        }
+        return joined(rendered, separator: "\n")
+    }
+
+    private static func renderTable(
+        _ table: Markdown.Table,
+        context: RenderContext
+    ) -> AttributedString {
+        let headerContext = context.adding(.stronglyEmphasized)
+        let header = renderTableRow(
+            Array(table.head.cells),
+            context: headerContext
+        )
+        let body = Array(table.body.rows).map {
+            renderTableRow(Array($0.cells), context: context)
+        }
+        var rows = [header]
+        if !body.isEmpty {
+            rows.append(styled("────────", context: context))
+            rows.append(contentsOf: body)
+        }
+        return joined(rows, separator: "\n")
+    }
+
+    private static func renderTableRow(
+        _ cells: [Markdown.Table.Cell],
+        context: RenderContext
+    ) -> AttributedString {
+        joined(
+            cells.map { renderInlines(Array($0.children), context: context) },
+            separator: "  │  "
+        )
+    }
+
+    private static func renderInlines(
+        _ inlines: [Markup],
+        context: RenderContext
+    ) -> AttributedString {
+        inlines.reduce(into: AttributedString()) { result, inline in
+            result.append(renderInline(inline, context: context))
+        }
+    }
+
+    private static func renderInline(
+        _ markup: Markup,
+        context: RenderContext
+    ) -> AttributedString {
+        switch markup {
+        case let text as Markdown.Text:
+            return styled(text.string, context: context)
+
+        case is SoftBreak:
+            return styled(" ", context: context)
+
+        case is LineBreak:
+            return styled("\n", context: context)
+
+        case let code as InlineCode:
+            var codeContext = context.adding(.code)
+            codeContext.isCode = true
+            return styled(code.code, context: codeContext)
+
+        case let emphasis as Emphasis:
+            return renderInlines(
+                Array(emphasis.children),
+                context: context.adding(.emphasized)
+            )
+
+        case let strong as Strong:
+            return renderInlines(
+                Array(strong.children),
+                context: context.adding(.stronglyEmphasized)
+            )
+
+        case let strike as Strikethrough:
+            return renderInlines(
+                Array(strike.children),
+                context: context.adding(.strikethrough)
+            )
+
+        case let link as Markdown.Link:
+            var linkContext = context
+            linkContext.link = link.destination.flatMap(safeLinkURL)
+            return renderInlines(Array(link.children), context: linkContext)
+
+        case let image as Markdown.Image:
+            // MarkdownSafety normally rewrites every image before this parse.
+            // Keep this defensive path textual so no renderer can fetch it.
+            return styled("Image: \(image.plainText)", context: context)
+
+        case let html as InlineHTML:
+            return styled(html.rawHTML, context: context)
+
+        default:
+            return renderInlines(Array(markup.children), context: context)
+        }
+    }
+
+    private static func safeLinkURL(_ destination: String) -> URL? {
+        if let direct = URL(string: destination), direct.scheme != nil {
+            switch ChatURLPolicy.classify(direct) {
+            case .external, .repository:
+                return direct
+            case .blocked:
+                return nil
+            }
+        }
+
+        guard ChatURLPolicy.repositoryLink(from: destination) != nil,
+              let base = URL(string: "\(ChatURLPolicy.repositoryScheme):///") else {
+            return nil
+        }
+        let resolved = URL(string: destination, relativeTo: base)?.absoluteURL
+        guard let resolved else { return nil }
+        if case .repository = ChatURLPolicy.classify(resolved) {
+            return resolved
+        }
+        return nil
+    }
+
+    private static func styled(
+        _ string: String,
+        context: RenderContext
+    ) -> AttributedString {
+        var result = AttributedString(string)
+        if !context.intents.isEmpty {
+            result.inlinePresentationIntent = context.intents
+        }
+        if let headingLevel = context.headingLevel {
+            switch headingLevel {
+            case 1:
+                result.font = .title2.bold()
+            case 2:
+                result.font = .title3.bold()
+            case 3:
+                result.font = .headline.bold()
+            default:
+                result.font = .body.bold()
+            }
+        } else if context.isCode {
+            result.font = .system(.body, design: .monospaced)
+        }
+        if context.isQuote {
+            result.foregroundColor = .secondary
+        }
+        if let link = context.link {
+            result.link = link
+        }
+        return result
+    }
+
+    /// Tokenization runs inside the same detached preparation task as the
+    /// Markdown parse. The viewport still receives one immutable `Text` node,
+    /// while completed fenced code keeps the syntax colors used elsewhere in
+    /// the app.
+    private static func highlightedCode(
+        _ code: String,
+        language: String?,
+        context: RenderContext
+    ) -> AttributedString {
+        let tokens = ChatSyntaxHighlighter.tokens(for: code, language: language)
+        guard tokens.count <= ChatSyntaxHighlighter.maximumHighlightedRuns else {
+            return styled(code, context: context)
+        }
+        return tokens.reduce(
+            into: AttributedString()
+        ) { result, token in
+            var piece = styled(token.text, context: context)
+            switch token.kind {
+            case .plain:
+                break
+            case .keyword:
+                piece.foregroundColor = .purple
+            case .string:
+                piece.foregroundColor = .green
+            case .comment:
+                piece.foregroundColor = .secondary
+            case .number:
+                piece.foregroundColor = .blue
+            }
+            result.append(piece)
+        }
+    }
+
+    private static func joined(
+        _ values: [AttributedString],
+        separator: String
+    ) -> AttributedString {
+        values.enumerated().reduce(into: AttributedString()) { result, pair in
+            if pair.offset > 0 {
+                result.append(AttributedString(separator))
+            }
+            result.append(pair.element)
+        }
+    }
+
+    private static func prefixingLines(
+        _ value: AttributedString,
+        first: String,
+        continuation: String
+    ) -> AttributedString {
+        guard !value.characters.isEmpty else { return AttributedString(first) }
+        var result = AttributedString(first)
+        var lineStart = value.startIndex
+        while let newline = value.characters[lineStart...].firstIndex(of: "\n") {
+            result.append(AttributedString(value[lineStart...newline]))
+            lineStart = value.index(afterCharacter: newline)
+            if lineStart < value.endIndex {
+                result.append(AttributedString(continuation))
+            }
+        }
+        if lineStart < value.endIndex {
+            result.append(AttributedString(value[lineStart..<value.endIndex]))
+        }
+        return result
+    }
+}
+#endif
+
 struct RichMarkdownView: View {
     let text: String
     let isStreaming: Bool
@@ -678,23 +1146,34 @@ struct RichMarkdownView: View {
             .textSelection(.enabled)
     }
 
-    /// Completed rows whose sanitized source is already cached parse
-    /// synchronously on their first body pass, so they lay out at final height
-    /// on the first frame. macOS gives this view one bounded table segment;
-    /// every segment remains inline in the transcript.
+    /// Completed macOS rows bind a prepared attributed artifact and never
+    /// parse Markdown while entering the viewport. iOS retains its existing
+    /// sanitized Markdown path.
     @ViewBuilder
     private var markdownContent: some View {
+        #if os(macOS)
+        if !isStreaming {
+            PreparedMarkdownText(source: text)
+        } else {
+            streamingMarkdownContent
+        }
+        #else
         if !isStreaming,
            let sanitized = SanitizedMarkdownCache.shared.lookup(raw: text) {
             SegmentedMarkdownContent(sanitized: sanitized)
         } else {
-            StreamingMarkdownReader(source) { parseResult in
-                MarkdownView(parseResult)
-            }
-            .markdownStreamingRenderThrottle(.milliseconds(33))
-            .task(id: MarkdownRenderInput(text: text, isStreaming: isStreaming)) {
-                await synchronizeSource()
-            }
+            streamingMarkdownContent
+        }
+        #endif
+    }
+
+    private var streamingMarkdownContent: some View {
+        StreamingMarkdownReader(source) { parseResult in
+            MarkdownView(parseResult)
+        }
+        .markdownStreamingRenderThrottle(.milliseconds(33))
+        .task(id: MarkdownRenderInput(text: text, isStreaming: isStreaming)) {
+            await synchronizeSource()
         }
     }
 
@@ -718,9 +1197,45 @@ struct RichMarkdownView: View {
     }
 }
 
-/// Completed markdown rendered in bounded parsing units. The transcript row
-/// projection supplies bounded source chunks on macOS, and this second level
-/// keeps an individual chunk's Markdown hierarchy shallow.
+#if os(macOS)
+private struct PreparedMarkdownText: View {
+    let source: String
+
+    @State private var prepared: PreparedMarkdown?
+    @State private var preparedSource: String?
+
+    var body: some View {
+        Group {
+            if let prepared = resolvedPrepared {
+                Text(prepared.attributedText)
+            } else {
+                // A cold live-completion miss remains fully visible while its
+                // final artifact is prepared. This is verbatim text only: it
+                // cannot parse Markdown or load an image on the main thread.
+                Text(verbatim: source)
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .textSelection(.enabled)
+        .task(id: source) {
+            let result = await SanitizedMarkdownCache.shared.preparedMarkdown(raw: source)
+            guard !Task.isCancelled else { return }
+            prepared = result
+            preparedSource = source
+        }
+    }
+
+    private var resolvedPrepared: PreparedMarkdown? {
+        if preparedSource == source {
+            return prepared
+        }
+        return SanitizedMarkdownCache.shared.lookupPrepared(raw: source)
+    }
+}
+#endif
+
+/// Completed iOS Markdown rendered in bounded parsing units so an individual
+/// hierarchy remains shallow. macOS uses `PreparedMarkdownText` instead.
 private struct SegmentedMarkdownContent: View {
     let sanitized: String
 
@@ -908,6 +1423,8 @@ struct ChatSyntaxHighlightingResult: Equatable, Sendable {
 }
 
 enum ChatSyntaxHighlighter {
+    static let maximumHighlightedRuns = 512
+
     private static let supportedLanguages: Set<String> = [
         "bash", "c", "cpp", "css", "go", "html", "javascript", "js", "json",
         "kotlin", "objective-c", "python", "ruby", "rust", "sh", "shell", "sql",
@@ -941,12 +1458,15 @@ enum ChatSyntaxHighlighter {
         var location = 0
         for match in matches {
             if match.range.location > location {
-                tokens.append(
-                    ChatCodeToken(
-                        text: source.substring(with: NSRange(location: location, length: match.range.location - location)),
-                        kind: .plain
+                let plain = source.substring(
+                    with: NSRange(
+                        location: location,
+                        length: match.range.location - location
                     )
                 )
+                guard appendBounded(plain, kind: .plain, to: &tokens) else {
+                    return [ChatCodeToken(text: code, kind: .plain)]
+                }
             }
             let value = source.substring(with: match.range)
             let kind: ChatCodeToken.Kind
@@ -959,18 +1479,38 @@ enum ChatSyntaxHighlighter {
             } else {
                 kind = .keyword
             }
-            tokens.append(ChatCodeToken(text: value, kind: kind))
+            guard appendBounded(value, kind: kind, to: &tokens) else {
+                return [ChatCodeToken(text: code, kind: .plain)]
+            }
             location = NSMaxRange(match.range)
         }
         if location < source.length {
-            tokens.append(
-                ChatCodeToken(
-                    text: source.substring(from: location),
-                    kind: .plain
-                )
-            )
+            guard appendBounded(
+                source.substring(from: location),
+                kind: .plain,
+                to: &tokens
+            ) else {
+                return [ChatCodeToken(text: code, kind: .plain)]
+            }
         }
         return tokens
+    }
+
+    private static func appendBounded(
+        _ text: String,
+        kind: ChatCodeToken.Kind,
+        to tokens: inout [ChatCodeToken]
+    ) -> Bool {
+        guard !text.isEmpty else { return true }
+        if let last = tokens.last, last.kind == kind {
+            tokens[tokens.count - 1] = ChatCodeToken(
+                text: last.text + text,
+                kind: kind
+            )
+        } else {
+            tokens.append(ChatCodeToken(text: text, kind: kind))
+        }
+        return tokens.count <= maximumHighlightedRuns
     }
 
     static func tokensOffMain(
