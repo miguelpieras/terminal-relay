@@ -67,6 +67,11 @@ enum ConversationCoordinatorError: LocalizedError, Equatable {
 
 @MainActor
 final class ConversationCoordinator {
+    private enum LifecycleTransition: Equatable {
+        case detaching
+        case stopping
+    }
+
     private struct PendingTurn {
         let text: String
         let attachments: [ChatAttachmentReference]
@@ -88,8 +93,12 @@ final class ConversationCoordinator {
     private var didAttemptHydration = false
     private var cacheSaveTask: Task<Void, Never>?
     private var lifecycleTask: Task<Void, Never>?
+    private var lifecycleEpoch: UInt64 = 0
+    private var lifecycleTransition: LifecycleTransition?
+    private var startRequestedAfterDetach = false
     private var retryTask: Task<Void, Never>?
     private var retrySleepTask: Task<Void, Never>?
+    private var retrySleepToken: UUID?
     private var shouldStayConnected = false
     private var isAttached = false
     private var needsFreshSnapshot = false
@@ -128,6 +137,12 @@ final class ConversationCoordinator {
     }
 
     func start() {
+        if lifecycleTransition != nil {
+            if lifecycleTransition == .detaching {
+                startRequestedAfterDetach = true
+            }
+            return
+        }
         guard lifecycleTask == nil, retryTask == nil else {
             expediteReconnectIfWaiting()
             return
@@ -141,9 +156,12 @@ final class ConversationCoordinator {
         }
         shouldStayConnected = true
         store.setConnectionState(.connecting)
+        lifecycleEpoch &+= 1
+        let epoch = lifecycleEpoch
         lifecycleTask = Task { [weak self] in
-            await self?.hydrateFromCacheIfNeeded()
-            await self?.runConnectionLoop()
+            await self?.hydrateFromCacheIfNeeded(lifecycleEpoch: epoch)
+            guard let self, self.canContinueLifecycle(epoch) else { return }
+            await self.runConnectionLoop(lifecycleEpoch: epoch)
         }
     }
 
@@ -167,12 +185,24 @@ final class ConversationCoordinator {
     /// Paints the transcript from the on-disk cache before the first connect,
     /// so opening a known thread shows content immediately. The subsequent
     /// attach resumes from the cached cursor and reconciles with the worker.
-    private func hydrateFromCacheIfNeeded() async {
+    private func hydrateFromCacheIfNeeded(
+        lifecycleEpoch expectedEpoch: UInt64? = nil
+    ) async {
         guard !didAttemptHydration else { return }
         didAttemptHydration = true
         guard let cache, store.lastAppliedSequence == 0 else { return }
         if let cached = await cache.load(for: identity) {
-            store.hydrateFromCache(cached)
+            guard canContinueLifecycle(expectedEpoch) else { return }
+            async let preparedProjections = ConversationStore
+                .prepareTranscriptProjections(for: cached.items)
+            await warmRecentMarkdown(for: cached.items)
+            guard canContinueLifecycle(expectedEpoch) else { return }
+            let prepared = await preparedProjections
+            guard canContinueLifecycle(expectedEpoch) else { return }
+            store.hydrateFromCache(
+                cached,
+                preparedProjections: prepared
+            )
         }
     }
 
@@ -207,17 +237,47 @@ final class ConversationCoordinator {
     }
 
     func detach() async {
+        guard lifecycleTransition == nil else { return }
+        lifecycleTransition = .detaching
+        defer {
+            lifecycleTransition = nil
+            if startRequestedAfterDetach {
+                startRequestedAfterDetach = false
+                start()
+            }
+        }
+
         shouldStayConnected = false
-        retryTask?.cancel()
+        lifecycleEpoch &+= 1
+        let epoch = lifecycleEpoch
+        let previousRetryTask = retryTask
+        previousRetryTask?.cancel()
         retryTask = nil
-        lifecycleTask?.cancel()
+        let previousLifecycleTask = lifecycleTask
+        previousLifecycleTask?.cancel()
         lifecycleTask = nil
+        retrySleepTask?.cancel()
+        retrySleepTask = nil
+        retrySleepToken = nil
+        let shouldSendDetach = isAttached
         resetReconnectScopedState()
-        if isAttached {
+
+        _ = await previousRetryTask?.value
+        _ = await previousLifecycleTask?.value
+        guard lifecycleEpoch == epoch, lifecycleTransition == .detaching else {
+            return
+        }
+        if shouldSendDetach {
             try? await sendCommand(.detach)
+        }
+        guard lifecycleEpoch == epoch, lifecycleTransition == .detaching else {
+            return
         }
         isAttached = false
         await transport.disconnect()
+        guard lifecycleEpoch == epoch, lifecycleTransition == .detaching else {
+            return
+        }
         store.setConnectionState(.offlineAgentRunning)
         cacheSaveTask?.cancel()
         if let cache {
@@ -226,25 +286,43 @@ final class ConversationCoordinator {
     }
 
     func retry() {
-        guard retryTask == nil else { return }
+        guard retryTask == nil, lifecycleTransition == nil else { return }
         shouldStayConnected = false
+        lifecycleEpoch &+= 1
+        let epoch = lifecycleEpoch
         let previousLifecycleTask = lifecycleTask
         previousLifecycleTask?.cancel()
         lifecycleTask = nil
+        retrySleepTask?.cancel()
+        retrySleepTask = nil
+        retrySleepToken = nil
         resetReconnectScopedState()
         store.setConnectionState(.connecting)
-        retryTask = Task { [weak self] in
+        let task = Task { [weak self] in
             guard let self else { return }
             _ = await previousLifecycleTask?.value
+            guard !Task.isCancelled,
+                  lifecycleEpoch == epoch,
+                  lifecycleTransition == nil else {
+                if lifecycleEpoch == epoch {
+                    retryTask = nil
+                }
+                return
+            }
             await transport.disconnect()
-            guard !Task.isCancelled else {
-                retryTask = nil
+            guard !Task.isCancelled,
+                  lifecycleEpoch == epoch,
+                  lifecycleTransition == nil else {
+                if lifecycleEpoch == epoch {
+                    retryTask = nil
+                }
                 return
             }
             shouldStayConnected = true
             retryTask = nil
             start()
         }
+        retryTask = task
     }
 
     func sendDraft() async {
@@ -431,9 +509,17 @@ final class ConversationCoordinator {
     }
 
     func stop() async {
-        guard !isStopping, store.state.connectionState != .stopped else { return }
+        guard !isStopping,
+              lifecycleTransition == nil,
+              store.state.connectionState != .stopped else { return }
+        lifecycleTransition = .stopping
         isStopping = true
-        defer { isStopping = false }
+        defer {
+            isStopping = false
+            if lifecycleTransition == .stopping {
+                lifecycleTransition = nil
+            }
+        }
         let requestID = stopEnvelope?.requestID ?? UUID().uuidString.lowercased()
         stopRequestID = requestID
         stopWasConfirmed = false
@@ -468,40 +554,62 @@ final class ConversationCoordinator {
             return
         }
         shouldStayConnected = false
-        retryTask?.cancel()
+        lifecycleEpoch &+= 1
+        let epoch = lifecycleEpoch
+        let previousRetryTask = retryTask
+        previousRetryTask?.cancel()
         retryTask = nil
-        lifecycleTask?.cancel()
+        let previousLifecycleTask = lifecycleTask
+        previousLifecycleTask?.cancel()
         lifecycleTask = nil
+        retrySleepTask?.cancel()
+        retrySleepTask = nil
+        retrySleepToken = nil
+        _ = await previousRetryTask?.value
+        _ = await previousLifecycleTask?.value
+        guard lifecycleEpoch == epoch, lifecycleTransition == .stopping else {
+            lifecycleTransition = nil
+            return
+        }
         isAttached = false
         await transport.disconnect()
+        guard lifecycleEpoch == epoch, lifecycleTransition == .stopping else {
+            lifecycleTransition = nil
+            return
+        }
         store.setConnectionState(.stopped)
         stopRequestID = nil
     }
 
-    private func runConnectionLoop() async {
+    private func runConnectionLoop(lifecycleEpoch epoch: UInt64) async {
         var retryCount = 0
         defer {
-            lifecycleTask = nil
+            if lifecycleEpoch == epoch {
+                lifecycleTask = nil
+            }
         }
 
-        while shouldStayConnected, !Task.isCancelled {
+        while canContinueLifecycle(epoch) {
             let stream = await transport.events()
+            guard canContinueLifecycle(epoch) else { return }
             do {
                 try await transport.connect()
+                guard canContinueLifecycle(epoch) else { return }
                 let attach = ChatCommand.attach(
                     afterSequence: needsFreshSnapshot ? nil : store.lastAppliedSequence,
                     snapshotGeneration: needsFreshSnapshot ? nil : store.snapshotGeneration
                 )
                 try await sendCommand(attach)
+                guard canContinueLifecycle(epoch) else { return }
                 isAttached = true
                 needsFreshSnapshot = false
                 retryCount = 0
 
                 eventLoop: for await event in stream {
-                    guard shouldStayConnected, !Task.isCancelled else { break eventLoop }
+                    guard canContinueLifecycle(epoch) else { break eventLoop }
                     switch event {
                     case .envelope(let envelope):
-                        if await apply(envelope) {
+                        if await apply(envelope, lifecycleEpoch: epoch) {
                             break eventLoop
                         }
                     case .disconnected(let failure):
@@ -517,13 +625,15 @@ final class ConversationCoordinator {
                     }
                 }
             } catch {
+                guard canContinueLifecycle(epoch) else { return }
                 isAttached = false
                 resetReconnectScopedState()
                 await transport.disconnect()
+                guard canContinueLifecycle(epoch) else { return }
                 store.setConnectionState(.connecting)
             }
 
-            guard shouldStayConnected, !Task.isCancelled else { return }
+            guard canContinueLifecycle(epoch) else { return }
             retryCount += 1
             guard retryCount <= retryPolicy.maximumAutomaticRetries else {
                 store.setConnectionState(
@@ -542,20 +652,60 @@ final class ConversationCoordinator {
                 // A cancellable child so opening the conversation can cut the
                 // backoff short without tearing down the connection loop.
                 let sleeper = Task { _ = try? await Task.sleep(nanoseconds: delay) }
+                let token = UUID()
                 retrySleepTask = sleeper
+                retrySleepToken = token
                 await sleeper.value
-                retrySleepTask = nil
+                if retrySleepToken == token {
+                    retrySleepTask = nil
+                    retrySleepToken = nil
+                }
             }
-            if shouldStayConnected {
+            if canContinueLifecycle(epoch) {
                 store.setConnectionState(.connecting)
             }
         }
     }
 
-    private func apply(_ envelope: ChatEnvelope) async -> Bool {
+    private func apply(
+        _ envelope: ChatEnvelope,
+        lifecycleEpoch epoch: UInt64
+    ) async -> Bool {
+        guard canContinueLifecycle(epoch) else { return true }
+        let kind = ChatEventKind(rawValue: envelope.type)
+        let projectionPreparation: Task<PreparedTranscriptProjectionBatch, Never>?
+        if kind == .conversationSnapshot
+            || kind == .historyPage
+            || kind == .messageCompleted
+            || kind == .reasoningCompleted
+            || kind == .toolCompleted {
+            let currentItems = store.itemsForTranscriptProjectionPreparation
+            projectionPreparation = Task {
+                await ConversationStore.prepareTranscriptProjections(
+                    for: envelope,
+                    retaining: currentItems
+                )
+            }
+        } else {
+            projectionPreparation = nil
+        }
+        defer { projectionPreparation?.cancel() }
         do {
+            let existingItemIDs = envelope.type == ChatEventKind.historyPage.rawValue
+                ? Set(store.state.items.map(\.id))
+                : []
             await warmMarkdownCacheIfNeeded(for: envelope)
-            try store.apply(envelope)
+            guard canContinueLifecycle(epoch) else { return true }
+            let preparedProjections = await projectionPreparation?.value ?? [:]
+            guard canContinueLifecycle(epoch) else { return true }
+            try store.apply(
+                envelope,
+                preparedTranscriptProjections: preparedProjections
+            )
+            scheduleMarkdownWarmAfterApply(
+                envelope,
+                existingItemIDs: existingItemIDs
+            )
             if envelope.type == ChatEventKind.conversationSnapshot.rawValue {
                 reconcileSnapshotTransients()
                 scheduleCacheSave(immediate: true)
@@ -623,27 +773,106 @@ final class ConversationCoordinator {
         }
     }
 
-    /// Sanitizes the markdown of a restored conversation's most recent items
-    /// before they publish, so their rows can parse synchronously and land at
-    /// their final height on the first layout frame. Older history keeps
-    /// warming in the background for stable scroll-up.
+    /// Prepares the final Markdown artifacts for the restored viewport before
+    /// it publishes. Older rows are warmed directionally by the table instead
+    /// of scanning the complete retained transcript on the UI actor.
     private func warmMarkdownCacheIfNeeded(for envelope: ChatEnvelope) async {
-        guard envelope.type == ChatEventKind.conversationSnapshot.rawValue,
-              let snapshot = try? envelope.decodePayload(ConversationSnapshot.self),
-              !snapshot.items.isEmpty else {
+        guard envelope.type == ChatEventKind.conversationSnapshot.rawValue else {
             return
         }
-        let texts = SanitizedMarkdownCache.warmableTexts(items: snapshot.items)
-        let recent = Array(texts.suffix(50))
-        await SanitizedMarkdownCache.shared.warm(texts: recent)
-        let older = texts.dropLast(50)
-        if !older.isEmpty {
-            Task(priority: .utility) { @MainActor in
-                await SanitizedMarkdownCache.shared.warm(
-                    texts: Array(older),
-                    budget: .seconds(30)
+        let task = Task.detached(priority: .utility) {
+            guard let snapshot = try? envelope.decodePayload(ConversationSnapshot.self),
+                  !Task.isCancelled else { return [String]() }
+            return Array(
+                SanitizedMarkdownCache.warmableTexts(
+                    items: snapshot.items,
+                    suffixLimit: 50
                 )
+                    .reversed()
+            )
+        }
+        let texts = await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+        guard !texts.isEmpty, !Task.isCancelled else { return }
+        await SanitizedMarkdownCache.shared.warm(texts: texts)
+    }
+
+    private func canContinueLifecycle(_ expectedEpoch: UInt64?) -> Bool {
+        guard !Task.isCancelled else { return false }
+        guard let expectedEpoch else { return true }
+        return shouldStayConnected && lifecycleEpoch == expectedEpoch
+    }
+
+    private func warmRecentMarkdown(
+        for items: [ConversationItem],
+        budget: Duration = .milliseconds(150)
+    ) async {
+        let texts = await Task.detached(priority: .utility) {
+            Array(
+                SanitizedMarkdownCache.warmableTexts(
+                    items: items,
+                    suffixLimit: 50
+                )
+                    .reversed()
+            )
+        }.value
+        guard !texts.isEmpty else { return }
+        await SanitizedMarkdownCache.shared.warm(
+            texts: texts,
+            budget: budget
+        )
+    }
+
+    /// Snapshot restoration gets a short synchronous warm above. These paths
+    /// cover content that becomes immutable later: disk hydration, history
+    /// pages, and live message completion. Newest tiles are prepared first
+    /// because the transcript opens and normally scrolls upward from latest.
+    private func scheduleMarkdownWarmAfterApply(
+        _ envelope: ChatEnvelope,
+        existingItemIDs: Set<String>
+    ) {
+        switch ChatEventKind(rawValue: envelope.type) {
+        case .messageCompleted:
+            let itemID = envelope.itemID
+                ?? envelope.payload["itemId"]?.stringValue
+                ?? envelope.payload["id"]?.stringValue
+            guard let itemID,
+                  let item = store.state.items.last(where: { $0.id == itemID }) else {
+                return
             }
+            scheduleMarkdownWarm(for: [item])
+
+        case .historyPage:
+            scheduleMarkdownWarm(
+                for: store.state.items.filter { !existingItemIDs.contains($0.id) }
+            )
+
+        default:
+            break
+        }
+    }
+
+    private func scheduleMarkdownWarm(
+        for items: [ConversationItem],
+        priority: TaskPriority = .utility
+    ) {
+        Task.detached(priority: priority) {
+            let texts = Array(
+                SanitizedMarkdownCache.warmableTexts(
+                    items: items,
+                    suffixLimit: 50
+                )
+                    .reversed()
+            )
+            guard !texts.isEmpty, !Task.isCancelled else { return }
+            await SanitizedMarkdownCache.shared.warm(
+                texts: texts,
+                budget: .seconds(30),
+                priority: priority
+            )
         }
     }
 

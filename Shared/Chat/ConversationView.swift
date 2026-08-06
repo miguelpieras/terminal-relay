@@ -17,9 +17,38 @@ import UIKit
 #endif
 
 #if os(macOS)
-private enum MacTranscriptRow: MacConversationTableRow {
+private extension DynamicTypeSize {
+    var macTranscriptFontScale: CGFloat {
+        switch self {
+        case .xSmall: 0.82
+        case .small: 0.88
+        case .medium: 0.94
+        case .large: 1
+        case .xLarge: 1.12
+        case .xxLarge: 1.23
+        case .xxxLarge: 1.35
+        case .accessibility1: 1.64
+        case .accessibility2: 1.95
+        case .accessibility3: 2.35
+        case .accessibility4: 2.76
+        case .accessibility5: 3.12
+        @unknown default: 1
+        }
+    }
+}
+
+struct MacMessageFooter: Equatable {
+    let itemID: String
+    let turnID: String?
+    let occurredAt: Int64?
+
+    var id: String { "\(itemID):footer" }
+}
+
+enum MacTranscriptRow: MacConversationTableRow {
     case history(id: String, revision: UInt64)
     case item(TranscriptRowProjection, isExpanded: Bool, copiedItemID: String?)
+    case messageFooter(MacMessageFooter, revision: UInt64)
     case approval(ApprovalRequest, revision: UInt64)
     case question(QuestionRequest, revision: UInt64)
 
@@ -27,6 +56,7 @@ private enum MacTranscriptRow: MacConversationTableRow {
         switch self {
         case .history(let id, _): id
         case .item(let projection, _, _): projection.id
+        case .messageFooter(let footer, _): footer.id
         case .approval(let approval, _): "approval:\(approval.id)"
         case .question(let question, _): "question:\(question.id)"
         }
@@ -34,7 +64,8 @@ private enum MacTranscriptRow: MacConversationTableRow {
 
     var contentRevision: UInt64 {
         switch self {
-        case .history(_, let revision), .approval(_, let revision), .question(_, let revision):
+        case .history(_, let revision), .messageFooter(_, let revision),
+             .approval(_, let revision), .question(_, let revision):
             return revision
         case .item(let projection, let isExpanded, let copiedItemID):
             var revision = projection.contentRevision &* 1099511628211
@@ -51,6 +82,7 @@ private enum MacTranscriptRow: MacConversationTableRow {
         switch self {
         case .history: "transcript.history"
         case .item(let projection, _, _): "transcript.\(projection.kind.rawValue)"
+        case .messageFooter: "transcript.message-footer"
         case .approval: "transcript.approval"
         case .question: "transcript.question"
         }
@@ -63,9 +95,274 @@ private enum MacTranscriptRow: MacConversationTableRow {
         switch self {
         case .item(let projection, _, _):
             projection.sourceItemID
+        case .messageFooter(let footer, _):
+            footer.itemID
         default:
             id
         }
+    }
+
+    /// Completed Markdown artifact used by the corresponding hosted row.
+    /// The table asks for a bounded band around the viewport, never the full
+    /// transcript, so preparation stays ahead of cell realization.
+    var preparedMarkdownText: String? {
+        guard case .item(let projection, _, _) = self,
+              case .message(let message) = projection.displayItem,
+              !message.isStreaming,
+              let content = message.contents.first,
+              content.isComplete else {
+            return nil
+        }
+        switch content.kind {
+        case .code, .imagePlaceholder:
+            return nil
+        case .plainText, .generic:
+            return message.role == .user ? nil : content.text
+        case .markdown:
+            return content.text
+        }
+    }
+
+    /// Stable text tiles bypass SwiftUI hosting entirely. Interactive rows,
+    /// streaming tails, user bubbles, and disclosure headers stay hosted; a
+    /// completed assistant footer is a separate small hosted row, so even the
+    /// final large-message text tile can use TextKit.
+    @MainActor
+    func nativeTextPresentation(
+        dynamicTypeSize: DynamicTypeSize,
+        colorScheme: ColorScheme
+    ) -> MacConversationNativeTextPresentation? {
+        guard case .item(let projection, let isExpanded, _) = self else {
+            return nil
+        }
+        let fontScale = dynamicTypeSize.macTranscriptFontScale
+        let identifier = projection.isFirstInItem
+            ? "conversation.item.\(projection.sourceItemID)"
+            : "conversation.item.\(projection.sourceItemID).segment.\(projection.id)"
+        let itemTopInset: CGFloat = projection.isFirstInItem ? 7 : 0
+        let itemBottomInset: CGFloat = projection.isLastInItem ? 7 : 0
+
+        switch projection.displayItem {
+        case .message(let message):
+            guard message.role == .assistant,
+                  !message.isStreaming,
+                  let content = message.contents.first,
+                  content.isComplete else {
+                return nil
+            }
+            switch content.kind {
+            case .code, .imagePlaceholder:
+                return nil
+            case .markdown, .plainText, .generic:
+                break
+            }
+            let source = content.text
+            let cached = SanitizedMarkdownCache.shared.lookupPrepared(raw: source)
+            let immediate = cached?.cachedAppKitAttributedText(
+                fontScale: fontScale,
+                colorScheme: colorScheme
+            )
+            let deferred: MacConversationNativeTextPresentation.DeferredAttributedString?
+            if immediate == nil {
+                deferred = {
+                    let prepared: PreparedMarkdown
+                    if let cached {
+                        prepared = cached
+                    } else {
+                        guard let value = await SanitizedMarkdownCache.shared
+                            .preparedMarkdown(raw: source) else {
+                            return nil
+                        }
+                        prepared = value
+                    }
+                    return MacConversationNativeTextPresentation.DeferredArtifact {
+                        prepared.appKitAttributedText(
+                            fontScale: fontScale,
+                            colorScheme: colorScheme
+                        )
+                    }
+                }
+            } else {
+                deferred = nil
+            }
+            return MacConversationNativeTextPresentation(
+                attributedString: immediate,
+                fallbackString: projection.sourceText,
+                contentInsets: NSEdgeInsets(
+                    top: itemTopInset,
+                    left: 28,
+                    bottom: 0,
+                    right: 28
+                ),
+                firstRowTopInsetAdjustment: 15,
+                lastRowBottomInsetAdjustment: 9,
+                maximumContentWidth: 760,
+                fallbackFont: NSFont.systemFont(
+                    ofSize: NSFont.systemFontSize * fontScale
+                ),
+                fallbackColor: .labelColor,
+                accessibilityLabel: projection.accessibilitySummary,
+                accessibilityIdentifier: identifier,
+                deferredAttributedString: deferred
+            )
+
+        case .reasoning(let reasoning):
+            guard isExpanded,
+                  !projection.isFirstInItem,
+                  !reasoning.isStreaming else {
+                return nil
+            }
+            return Self.plainNativePresentation(
+                text: reasoning.text,
+                projection: projection,
+                identifier: identifier,
+                color: .secondaryLabelColor,
+                isMonospaced: false,
+                topInset: 0,
+                bottomInset: 4 + itemBottomInset,
+                leadingTextInset: 23,
+                fontScale: fontScale
+            )
+
+        case .generic(let generic):
+            guard isExpanded,
+                  !projection.isFirstInItem,
+                  let detail = generic.detail else {
+                return nil
+            }
+            return Self.plainNativePresentation(
+                text: detail,
+                projection: projection,
+                identifier: identifier,
+                color: .labelColor,
+                isMonospaced: true,
+                topInset: 0,
+                bottomInset: 4 + itemBottomInset,
+                leadingTextInset: 23,
+                fontScale: fontScale
+            )
+
+        case .tool, .diff, .plan:
+            return nil
+        }
+    }
+
+    @MainActor
+    private static func plainNativePresentation(
+        text: String,
+        projection: TranscriptRowProjection,
+        identifier: String,
+        color: NSColor,
+        isMonospaced: Bool,
+        topInset: CGFloat,
+        bottomInset: CGFloat,
+        leadingTextInset: CGFloat,
+        fontScale: CGFloat
+    ) -> MacConversationNativeTextPresentation {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.headIndent = leadingTextInset
+        paragraph.firstLineHeadIndent = leadingTextInset
+        let font = isMonospaced
+            ? NSFont.monospacedSystemFont(
+                ofSize: NSFont.systemFontSize * fontScale,
+                weight: .regular
+            )
+            : NSFont.systemFont(ofSize: NSFont.systemFontSize * fontScale)
+        let attributed = NSAttributedString(
+            string: text,
+            attributes: [
+                .font: font,
+                .foregroundColor: color,
+                .paragraphStyle: paragraph,
+            ]
+        )
+        return MacConversationNativeTextPresentation(
+            attributedString: attributed,
+            fallbackString: text,
+            contentInsets: NSEdgeInsets(
+                top: topInset,
+                left: 28,
+                bottom: bottomInset,
+                right: 28
+            ),
+            firstRowTopInsetAdjustment: 15,
+            lastRowBottomInsetAdjustment: 9,
+            maximumContentWidth: 760,
+            fallbackFont: font,
+            fallbackColor: color,
+            accessibilityLabel: projection.accessibilitySummary,
+            accessibilityIdentifier: identifier
+        )
+    }
+}
+
+func makeMacTranscriptRows(
+    item: ConversationItem,
+    projections: [TranscriptRowProjection],
+    isExpanded: Bool,
+    copiedItemID: String?,
+    sectionRevision: UInt64
+) -> [MacTranscriptRow] {
+    var rows = projections.map { projection in
+        MacTranscriptRow.item(
+            projection,
+            isExpanded: isExpanded,
+            copiedItemID: copiedItemID
+        )
+    }
+    if case .message(let message) = item,
+       message.role == .assistant,
+       !message.isStreaming,
+       !message.text.isEmpty {
+        rows.append(
+            .messageFooter(
+                MacMessageFooter(
+                    itemID: message.id,
+                    turnID: message.turnID,
+                    occurredAt: message.occurredAt
+                ),
+                revision: sectionRevision
+            )
+        )
+    }
+    return rows
+}
+
+/// Reuses the projected rows for every unchanged logical item. SwiftUI can
+/// reevaluate the transcript for unrelated state, but that must not remap all
+/// 68k bounded rows in a maximum newline-dense retained conversation.
+private final class MacTranscriptSectionCache {
+    private struct Entry {
+        let revision: UInt64
+        let rows: [MacTranscriptRow]
+    }
+
+    private var entries: [String: Entry] = [:]
+    private var retainedItemIDs: Set<String> = []
+
+    func section(
+        for itemID: String,
+        revision: UInt64,
+        makeRows: () -> [MacTranscriptRow]
+    ) -> MacConversationTableSection<MacTranscriptRow> {
+        let rows: [MacTranscriptRow]
+        if let cached = entries[itemID], cached.revision == revision {
+            rows = cached.rows
+        } else {
+            rows = makeRows()
+            entries[itemID] = Entry(revision: revision, rows: rows)
+        }
+        return MacConversationTableSection(
+            id: "item:\(itemID)",
+            revision: revision,
+            rows: rows
+        )
+    }
+
+    func retain(itemIDs: Set<String>) {
+        guard itemIDs != retainedItemIDs else { return }
+        entries = entries.filter { itemIDs.contains($0.key) }
+        retainedItemIDs = itemIDs
     }
 }
 #endif
@@ -253,22 +550,32 @@ struct ConversationView: View {
 
     #if os(macOS)
     @State private var macTableCommandHandle = MacConversationTableCommandHandle()
+    @State private var macTranscriptSectionCache = MacTranscriptSectionCache()
 
-    private var macRows: [MacTranscriptRow] {
-        var rows: [MacTranscriptRow] = []
+    private var macSections: [MacConversationTableSection<MacTranscriptRow>] {
+        var sections: [MacConversationTableSection<MacTranscriptRow>] = []
         if store.state.hasOlderHistory {
             var hasher = Hasher()
             hasher.combine(store.state.oldestItemID)
             hasher.combine(store.state.didTruncateHistory)
             hasher.combine(store.isLoadingOlderHistory)
-            rows.append(
-                .history(
-                    id: "history:\(store.state.oldestItemID ?? "start")",
-                    revision: UInt64(truncatingIfNeeded: hasher.finalize())
+            let revision = UInt64(truncatingIfNeeded: hasher.finalize())
+            let id = "history:\(store.state.oldestItemID ?? "start")"
+            sections.append(
+                MacConversationTableSection(
+                    id: id,
+                    revision: revision,
+                    rows: [.history(
+                        id: "history:\(store.state.oldestItemID ?? "start")",
+                        revision: revision
+                    )]
                 )
             )
         }
+        var retainedItemIDs = Set<String>()
+        retainedItemIDs.reserveCapacity(store.state.items.count)
         for item in store.state.items {
+            retainedItemIDs.insert(item.id)
             let isExpanded = store.expandedItemIDs.contains(item.id)
             let isDisclosure: Bool
             switch item {
@@ -277,56 +584,72 @@ struct ConversationView: View {
             case .message, .plan:
                 isDisclosure = false
             }
-            let visibleProjections: [TranscriptRowProjection]
-            if isDisclosure && !isExpanded {
-                visibleProjections = store.transcriptFirstProjection(for: item)
-                    .map { [$0] } ?? []
-            } else {
-                visibleProjections = store.transcriptProjections(for: item)
+            var sectionRevision = store.transcriptItemContentRevision(for: item.id)
+                &* 1099511628211
+            if isExpanded { sectionRevision ^= 1 }
+            if store.copiedItemID == item.id
+                || store.copiedItemID?.hasPrefix("\(item.id):") == true {
+                sectionRevision ^= 2
             }
-            rows.append(contentsOf: visibleProjections.map { projection in
-                .item(
-                    projection,
-                    isExpanded: isExpanded,
-                    copiedItemID: store.copiedItemID
-                )
-            })
+            sections.append(
+                macTranscriptSectionCache.section(
+                    for: item.id,
+                    revision: sectionRevision
+                ) {
+                    let visibleProjections: [TranscriptRowProjection]
+                    if isDisclosure && !isExpanded {
+                        visibleProjections = store.transcriptFirstProjection(for: item)
+                            .map { [$0] } ?? []
+                    } else {
+                        visibleProjections = store.transcriptProjections(for: item)
+                    }
+                    return makeMacTranscriptRows(
+                        item: item,
+                        projections: visibleProjections,
+                        isExpanded: isExpanded,
+                        copiedItemID: store.copiedItemID,
+                        sectionRevision: sectionRevision
+                    )
+                }
+            )
         }
-        rows.append(contentsOf: store.state.approvals.map { approval in
+        macTranscriptSectionCache.retain(itemIDs: retainedItemIDs)
+        sections.append(contentsOf: store.state.approvals.map { approval in
             var hasher = Hasher()
             hasher.combine(approval.id)
             hasher.combine(approval.status.rawValue)
             hasher.combine(store.respondingInteractionIDs.contains(approval.id))
             hasher.combine(store.pendingDestructiveApprovalConfirmation?.approvalID == approval.id)
-            return .approval(
-                approval,
-                revision: UInt64(truncatingIfNeeded: hasher.finalize())
+            let revision = UInt64(truncatingIfNeeded: hasher.finalize())
+            return MacConversationTableSection(
+                id: "approval:\(approval.id)",
+                revision: revision,
+                rows: [.approval(approval, revision: revision)]
             )
         })
-        rows.append(contentsOf: store.state.questions.map { question in
+        sections.append(contentsOf: store.state.questions.map { question in
             var hasher = Hasher()
             hasher.combine(question.id)
             hasher.combine(question.status.rawValue)
             hasher.combine(store.respondingInteractionIDs.contains(question.id))
             hasher.combine(store.selectedQuestionOptions)
             hasher.combine(store.questionText)
-            return .question(
-                question,
-                revision: UInt64(truncatingIfNeeded: hasher.finalize())
+            let revision = UInt64(truncatingIfNeeded: hasher.finalize())
+            return MacConversationTableSection(
+                id: "question:\(question.id)",
+                revision: revision,
+                rows: [.question(question, revision: revision)]
             )
         })
-        return rows
+        return sections
     }
 
     private var macTranscript: some View {
         var styleHasher = Hasher()
         styleHasher.combine(colorScheme)
         styleHasher.combine(dynamicTypeSize)
-        let rows = macRows
-        let firstRowID = rows.first?.id
-        let lastRowID = rows.last?.id
         return MacConversationTableView(
-            rows: rows,
+            sections: macSections,
             snapshotGeneration: store.state.snapshotGeneration,
             transcriptMutation: store.transcriptMutation,
             dataRevision: transcriptContentRevision,
@@ -336,12 +659,28 @@ struct ConversationView: View {
             onNearBottomChange: { store.setNearBottom($0) },
             onLiveScrollingChange: { store.setTranscriptLiveScrolling($0) },
             onAnchoredChange: { isTranscriptAnchored = $0 },
-            makeRow: { row in
+            prefetchRows: { rows in
+                let texts = rows.compactMap(\.preparedMarkdownText)
+                guard !texts.isEmpty else { return }
+                await SanitizedMarkdownCache.shared.prefetch(texts: texts)
+            },
+            onNativeLink: { url in
+                switch ChatURLPolicy.classify(url) {
+                case .external(let externalURL):
+                    openURL(externalURL)
+                case .repository(let link):
+                    rowActions.openRepository(link)
+                case .blocked:
+                    break
+                }
+                return true
+            },
+            makeRow: { row, isFirst, isLast in
                 AnyView(
                     macRowView(
                         row,
-                        isFirst: row.id == firstRowID,
-                        isLast: row.id == lastRowID
+                        isFirst: isFirst,
+                        isLast: isLast
                     )
                 )
             }
@@ -403,6 +742,14 @@ struct ConversationView: View {
         }()
         let endsItem: Bool = {
             if case .item(let projection, let isExpanded, _) = row {
+                if case .message(let message) = projection.displayItem,
+                   message.role == .assistant,
+                   !message.isStreaming,
+                   !message.text.isEmpty {
+                    // The copy/timestamp footer is its own following row, so
+                    // the final native text tile must not add item spacing.
+                    return false
+                }
                 return projection.isLastInItem
                     || (projection.kind.isDisclosure && !isExpanded)
             }
@@ -418,6 +765,11 @@ struct ConversationView: View {
                         projection.isFirstInItem
                             ? "conversation.item.\(projection.sourceItemID)"
                             : "conversation.item.\(projection.sourceItemID).segment.\(projection.id)"
+                    )
+            case .messageFooter(let footer, _):
+                MacAssistantMessageFooter(footer: footer)
+                    .accessibilityIdentifier(
+                        "conversation.item.\(footer.itemID).footer"
                     )
             case .approval(let approval, _):
                 ApprovalCard(
@@ -643,7 +995,11 @@ struct ConversationView: View {
     private func timelineView(for projection: TranscriptRowProjection) -> some View {
         switch projection.displayItem {
         case .message(let message):
-            ChatMessageView(message: message, segment: projection)
+            ChatMessageView(
+                message: message,
+                segment: projection,
+                showsFooter: message.role != .assistant
+            )
         case .reasoning(let reasoning):
             ReasoningCard(
                 reasoning: reasoning,
@@ -1067,10 +1423,16 @@ private struct ConversationTranscriptScroller<Content: View>: View {
 private struct ChatMessageView: View {
     let message: ChatMessage
     var segment: TranscriptRowProjection?
+    var showsFooter: Bool
 
-    init(message: ChatMessage, segment: TranscriptRowProjection? = nil) {
+    init(
+        message: ChatMessage,
+        segment: TranscriptRowProjection? = nil,
+        showsFooter: Bool = true
+    ) {
         self.message = message
         self.segment = segment
+        self.showsFooter = showsFooter
     }
 
     @Environment(\.chatRowActions) private var actions
@@ -1109,7 +1471,10 @@ private struct ChatMessageView: View {
                     }
                 }
 
-                if isLastSegment, !message.isStreaming, !message.text.isEmpty {
+                if showsFooter,
+                   isLastSegment,
+                   !message.isStreaming,
+                   !message.text.isEmpty {
                     messageFooter
                 }
             }
@@ -1198,11 +1563,51 @@ private struct ChatMessageView: View {
         default:
             RichMarkdownView(
                 text: content.text,
+                exactFallbackText: segment?.sourceText,
                 isStreaming: !content.isComplete
             )
         }
     }
 }
+
+#if os(macOS)
+private struct MacAssistantMessageFooter: View {
+    let footer: MacMessageFooter
+
+    @Environment(\.chatRowActions) private var actions
+    @State private var didCopy = false
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Button {
+                actions.copyMessage(itemID: footer.itemID, fallback: "")
+                didCopy = true
+                Task {
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    didCopy = false
+                }
+            } label: {
+                Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
+                    .frame(width: 14, height: 14)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(didCopy ? "Message copied" : "Copy message")
+
+            if let date = ChatTimestamp.date(
+                milliseconds: footer.occurredAt,
+                fallbackUUIDv7s: [footer.turnID, footer.itemID]
+            ) {
+                Text(ChatTimestamp.label(for: date))
+                    .accessibilityLabel(
+                        date.formatted(date: .complete, time: .shortened)
+                    )
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+}
+#endif
 
 enum ChatTimestamp {
     static func date(
@@ -1572,21 +1977,29 @@ private struct DiffTextView: View {
         self.lines = lines
         #if os(macOS)
         var attributed = AttributedString()
-        for (index, line) in lines.enumerated() {
-            var value = AttributedString(line.text)
-            switch line.kind {
-            case .addition:
-                value.foregroundColor = .green
-                value.backgroundColor = .green.opacity(0.1)
-            case .removal:
-                value.foregroundColor = .red
-                value.backgroundColor = .red.opacity(0.1)
-            case .context:
-                value.foregroundColor = .primary
-            }
-            attributed.append(value)
-            if index < lines.count - 1 {
-                attributed.append(AttributedString("\n"))
+        if lines.count > 32 {
+            // A color/background run per source line makes TextKit's cold
+            // fitting pass exceed a scroll frame for newline-dense diffs.
+            // Keep the exact selectable text and trade decoration for bounded
+            // layout complexity on those pathological tiles.
+            attributed = AttributedString(diff)
+        } else {
+            for (index, line) in lines.enumerated() {
+                var value = AttributedString(line.text)
+                switch line.kind {
+                case .addition:
+                    value.foregroundColor = .green
+                    value.backgroundColor = .green.opacity(0.1)
+                case .removal:
+                    value.foregroundColor = .red
+                    value.backgroundColor = .red.opacity(0.1)
+                case .context:
+                    value.foregroundColor = .primary
+                }
+                attributed.append(value)
+                if index < lines.count - 1 {
+                    attributed.append(AttributedString("\n"))
+                }
             }
         }
         attributedText = attributed

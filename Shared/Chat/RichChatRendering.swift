@@ -609,6 +609,76 @@ enum MarkdownSegmentation {
 }
 
 #if os(macOS)
+private struct PreparedMarkdownNativeStyle: Hashable, Sendable {
+    enum SyntaxColor: Hashable, Sendable {
+        case keyword
+        case string
+        case comment
+        case number
+    }
+
+    var headingLevel: Int?
+    var isBold: Bool
+    var isItalic: Bool
+    var isStrikethrough: Bool
+    var isCode: Bool
+    var isQuote: Bool
+    var syntaxColor: SyntaxColor?
+}
+
+private enum PreparedMarkdownNativeStyleAttribute: AttributedStringKey {
+    typealias Value = PreparedMarkdownNativeStyle
+    static let name = "TerminalRelay.PreparedMarkdownNativeStyle"
+}
+
+private extension AttributeScopes {
+    struct TerminalRelayPreparedMarkdownAttributes: AttributeScope {
+        let nativeStyle: PreparedMarkdownNativeStyleAttribute
+    }
+
+    var terminalRelayPreparedMarkdown: TerminalRelayPreparedMarkdownAttributes.Type {
+        TerminalRelayPreparedMarkdownAttributes.self
+    }
+}
+
+private extension AttributeDynamicLookup {
+    subscript<T>(
+        dynamicMember keyPath: KeyPath<
+            AttributeScopes.TerminalRelayPreparedMarkdownAttributes,
+            T
+        >
+    ) -> T where T: AttributedStringKey {
+        self[T.self]
+    }
+}
+
+private final class PreparedMarkdownNativeTextCache: @unchecked Sendable {
+    @MainActor private var styleKey: Int?
+    @MainActor private var value: NSAttributedString?
+
+    @MainActor
+    func lookup(fontScale: CGFloat) -> NSAttributedString? {
+        styleKey == Self.key(for: fontScale) ? value : nil
+    }
+
+    @MainActor
+    func resolve(
+        fontScale: CGFloat,
+        _ makeValue: () -> NSAttributedString
+    ) -> NSAttributedString {
+        let requestedKey = Self.key(for: fontScale)
+        if styleKey == requestedKey, let value { return value }
+        let prepared = makeValue()
+        styleKey = requestedKey
+        value = prepared
+        return prepared
+    }
+
+    private static func key(for fontScale: CGFloat) -> Int {
+        Int((max(0.5, min(fontScale, 4)) * 1_000).rounded())
+    }
+}
+
 /// The final, immutable representation used by completed transcript rows on
 /// macOS. Markdown parsing, sanitization, link classification, and inline
 /// styling all happen before this value reaches SwiftUI, so mounting a cached
@@ -620,6 +690,7 @@ struct PreparedMarkdown: Sendable {
     let linkURLs: [URL]
     let performedOnMainThread: Bool
     let requestedPriority: TaskPriority
+    private let nativeTextCache = PreparedMarkdownNativeTextCache()
 
     var estimatedCacheCost: Int {
         // NSCache costs are approximate bytes. Account for the raw prepared
@@ -628,6 +699,108 @@ struct PreparedMarkdown: Sendable {
             + plainText.utf8.count * 2
             + attributedText.runs.count * 160
             + 256
+    }
+
+    /// Immutable TextKit artifact used by reusable AppKit transcript cells.
+    /// The Markdown parse remains off-main; this bounded run translation is
+    /// cached once so revisiting a row does no SwiftUI graph construction and
+    /// no repeated attributed-string conversion.
+    @MainActor
+    func cachedAppKitAttributedText(
+        fontScale: CGFloat = 1
+    ) -> NSAttributedString? {
+        nativeTextCache.lookup(fontScale: fontScale)
+    }
+
+    @MainActor
+    func appKitAttributedText(fontScale: CGFloat = 1) -> NSAttributedString {
+        nativeTextCache.resolve(fontScale: fontScale) {
+            let result = NSMutableAttributedString()
+            for run in attributedText.runs {
+                let text = String(attributedText[run.range].characters)
+                let style = run.terminalRelayPreparedMarkdown.nativeStyle
+                    ?? PreparedMarkdownNativeStyle(
+                        headingLevel: nil,
+                        isBold: false,
+                        isItalic: false,
+                        isStrikethrough: false,
+                        isCode: false,
+                        isQuote: false,
+                        syntaxColor: nil
+                )
+                var attributes: [NSAttributedString.Key: Any] = [
+                    .font: Self.appKitFont(for: style, fontScale: fontScale),
+                    .foregroundColor: Self.appKitColor(for: style),
+                ]
+                if style.isStrikethrough {
+                    attributes[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
+                }
+                if style.isCode && style.headingLevel == nil {
+                    attributes[.backgroundColor] = NSColor.secondaryLabelColor
+                        .withAlphaComponent(0.07)
+                }
+                if let link = run.link {
+                    attributes[.link] = link
+                    attributes[.foregroundColor] = NSColor.linkColor
+                    attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
+                }
+                result.append(
+                    NSAttributedString(string: text, attributes: attributes)
+                )
+            }
+            return NSAttributedString(attributedString: result)
+        }
+    }
+
+    @MainActor
+    private static func appKitFont(
+        for style: PreparedMarkdownNativeStyle,
+        fontScale: CGFloat
+    ) -> NSFont {
+        let baseSize: CGFloat
+        let weight: NSFont.Weight
+        switch style.headingLevel {
+        case 1:
+            baseSize = 20
+            weight = .bold
+        case 2:
+            baseSize = 17
+            weight = .bold
+        case 3:
+            baseSize = 15
+            weight = .semibold
+        case .some:
+            baseSize = NSFont.systemFontSize
+            weight = .semibold
+        case nil:
+            baseSize = NSFont.systemFontSize
+            weight = style.isBold ? .semibold : .regular
+        }
+        let size = baseSize * max(0.5, min(fontScale, 4))
+        var font = style.isCode
+            ? NSFont.monospacedSystemFont(ofSize: size, weight: weight)
+            : NSFont.systemFont(ofSize: size, weight: weight)
+        if style.isItalic {
+            font = NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask)
+        }
+        return font
+    }
+
+    private static func appKitColor(
+        for style: PreparedMarkdownNativeStyle
+    ) -> NSColor {
+        switch style.syntaxColor {
+        case .keyword:
+            return .systemPurple
+        case .string:
+            return .systemGreen
+        case .comment:
+            return .secondaryLabelColor
+        case .number:
+            return .systemBlue
+        case nil:
+            return style.isQuote ? .secondaryLabelColor : .labelColor
+        }
     }
 }
 
@@ -641,9 +814,10 @@ actor MarkdownPreparationGate {
     nonisolated let maximumConcurrent: Int
 
     private struct Waiter {
+        let id: UUID
         let priority: TaskPriority
         let sequence: UInt64
-        let continuation: CheckedContinuation<Void, Never>
+        let continuation: CheckedContinuation<Bool, Never>
     }
 
     private var active = 0
@@ -658,29 +832,55 @@ actor MarkdownPreparationGate {
     nonisolated func run<Value: Sendable>(
         priority: TaskPriority,
         operation: @escaping @Sendable () async -> Value
-    ) async -> Value {
-        await acquire(priority: priority)
+    ) async -> Value? {
+        guard await acquire(priority: priority) else {
+            return nil
+        }
+        guard !Task.isCancelled else {
+            await release()
+            return nil
+        }
         let value = await operation()
         await release()
-        return value
+        return Task.isCancelled ? nil : value
     }
 
-    private func acquire(priority: TaskPriority) async {
+    private func acquire(priority: TaskPriority) async -> Bool {
+        guard !Task.isCancelled else { return false }
         if active < maximumConcurrent {
             active += 1
-            return
+            return true
         }
+        let id = UUID()
         let sequence = nextSequence
         nextSequence &+= 1
-        await withCheckedContinuation { continuation in
-            waiters.append(
-                Waiter(
-                    priority: priority,
-                    sequence: sequence,
-                    continuation: continuation
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                waiters.append(
+                    Waiter(
+                        id: id,
+                        priority: priority,
+                        sequence: sequence,
+                        continuation: continuation
+                    )
                 )
-            )
+            }
+        } onCancel: {
+            Task {
+                await self.cancelWaiter(id: id)
+            }
         }
+    }
+
+    private func cancelWaiter(id: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        waiters.remove(at: index).continuation.resume(returning: false)
     }
 
     private func release() {
@@ -700,7 +900,7 @@ actor MarkdownPreparationGate {
         let waiter = waiters.remove(at: selected)
         // The released permit transfers directly to this waiter, so `active`
         // remains unchanged.
-        waiter.continuation.resume()
+        waiter.continuation.resume(returning: true)
     }
 }
 
@@ -708,7 +908,7 @@ enum PreparedMarkdownRenderer {
     static func prepareOffMain(
         _ source: String,
         priority: TaskPriority = .userInitiated
-    ) async -> PreparedMarkdown {
+    ) async -> PreparedMarkdown? {
         await MarkdownPreparationGate.shared.run(priority: priority) {
             let task = Task.detached(priority: priority) {
                 prepare(source, requestedPriority: priority)
@@ -727,8 +927,22 @@ enum PreparedMarkdownRenderer {
     ) -> PreparedMarkdown {
         let sanitized = MarkdownSafety.sanitizedSource(source)
         let document = Document(parsing: sanitized)
-        let attributed = renderBlocks(Array(document.children), context: .init())
-        let links = attributed.runs.compactMap(\.link)
+        let rendered = renderBlocks(Array(document.children), context: .init())
+        let logicalLines = sanitized.utf8.reduce(into: 1) { count, byte in
+            if byte == 0x0A { count += 1 }
+        }
+        // SwiftUI Text layout scales sharply with attributed-run density.
+        // Preserve full styling for ordinary tiles, but collapse pathological
+        // dense formatting to the exact rendered characters so a cold mount
+        // stays bounded even when the source contains many short rich lines.
+        let maximumRuns = logicalLines > 32 ? 16 : 64
+        let links = rendered.runs.compactMap(\.link)
+        // Link attributes are interaction, not decoration. A link-dense tile
+        // is already bounded to 1 KiB, so keep those runs clickable; collapse
+        // only non-interactive formatting whose loss cannot change behavior.
+        let attributed = rendered.runs.count > maximumRuns && links.isEmpty
+            ? AttributedString(String(rendered.characters))
+            : rendered
         return PreparedMarkdown(
             attributedText: attributed,
             sanitizedSource: sanitized,
@@ -750,6 +964,20 @@ enum PreparedMarkdownRenderer {
             var copy = self
             copy.intents.formUnion(intent)
             return copy
+        }
+
+        func nativeStyle(
+            syntaxColor: PreparedMarkdownNativeStyle.SyntaxColor? = nil
+        ) -> PreparedMarkdownNativeStyle {
+            PreparedMarkdownNativeStyle(
+                headingLevel: headingLevel,
+                isBold: intents.contains(.stronglyEmphasized),
+                isItalic: intents.contains(.emphasized),
+                isStrikethrough: intents.contains(.strikethrough),
+                isCode: isCode || intents.contains(.code),
+                isQuote: isQuote,
+                syntaxColor: syntaxColor
+            )
         }
     }
 
@@ -778,7 +1006,7 @@ enum PreparedMarkdownRenderer {
             return renderInlines(Array(heading.children), context: headingContext)
 
         case let codeBlock as Markdown.CodeBlock:
-            var codeContext = context
+            var codeContext = context.adding(.code)
             codeContext.isCode = true
             var result = AttributedString()
             if let language = codeBlock.language, !language.isEmpty {
@@ -1004,6 +1232,7 @@ enum PreparedMarkdownRenderer {
         if let link = context.link {
             result.link = link
         }
+        result.terminalRelayPreparedMarkdown.nativeStyle = context.nativeStyle()
         return result
     }
 
@@ -1024,18 +1253,26 @@ enum PreparedMarkdownRenderer {
             into: AttributedString()
         ) { result, token in
             var piece = styled(token.text, context: context)
+            let syntaxColor: PreparedMarkdownNativeStyle.SyntaxColor?
             switch token.kind {
             case .plain:
-                break
+                syntaxColor = nil
             case .keyword:
+                syntaxColor = .keyword
                 piece.foregroundColor = .purple
             case .string:
+                syntaxColor = .string
                 piece.foregroundColor = .green
             case .comment:
+                syntaxColor = .comment
                 piece.foregroundColor = .secondary
             case .number:
+                syntaxColor = .number
                 piece.foregroundColor = .blue
             }
+            piece.terminalRelayPreparedMarkdown.nativeStyle = context.nativeStyle(
+                syntaxColor: syntaxColor
+            )
             result.append(piece)
         }
     }
@@ -1077,6 +1314,7 @@ enum PreparedMarkdownRenderer {
 
 struct RichMarkdownView: View {
     let text: String
+    var exactFallbackText: String? = nil
     let isStreaming: Bool
 
     @Environment(\.openURL) private var openURL
@@ -1085,10 +1323,46 @@ struct RichMarkdownView: View {
     @State private var source = StreamingMarkdownSource()
     @State private var didFinishStreaming = false
 
+    @ViewBuilder
     var body: some View {
         let onOpenExternal: (URL) -> Void = { openURL($0) }
         let onOpenRepository: (ChatRepositoryLink) -> Void = { actions.openRepository($0) }
 
+        #if os(macOS)
+        if !isStreaming {
+            // A completed macOS row is already one prepared attributed Text.
+            // Do not wrap it in the MarkdownView renderer/style environment;
+            // those modifiers cannot affect it and add cold-host graph work.
+            PreparedMarkdownText(
+                source: text,
+                fallbackText: exactFallbackText ?? text,
+                cached: SanitizedMarkdownCache.shared.lookupPrepared(raw: text)
+            )
+                .environment(
+                    \.openURL,
+                    safeOpenURLAction(
+                        onOpenExternal: onOpenExternal,
+                        onOpenRepository: onOpenRepository
+                    )
+                )
+        } else {
+            configuredMarkdownContent(
+                onOpenExternal: onOpenExternal,
+                onOpenRepository: onOpenRepository
+            )
+        }
+        #else
+        configuredMarkdownContent(
+            onOpenExternal: onOpenExternal,
+            onOpenRepository: onOpenRepository
+        )
+        #endif
+    }
+
+    private func configuredMarkdownContent(
+        onOpenExternal: @escaping (URL) -> Void,
+        onOpenRepository: @escaping (ChatRepositoryLink) -> Void
+    ) -> some View {
         markdownContent
             .markdownCodeBlockStyle(TerminalRelayMarkdownCodeBlockStyle(isStreaming: isStreaming))
             .markdownTableStyle(TerminalRelayMarkdownTableStyle())
@@ -1131,19 +1405,29 @@ struct RichMarkdownView: View {
             )
             .environment(
                 \.openURL,
-                OpenURLAction { url in
-                    switch ChatURLPolicy.classify(url) {
-                    case .external(let externalURL):
-                        onOpenExternal(externalURL)
-                    case .repository(let link):
-                        onOpenRepository(link)
-                    case .blocked:
-                        break
-                    }
-                    return .handled
-                }
+                safeOpenURLAction(
+                    onOpenExternal: onOpenExternal,
+                    onOpenRepository: onOpenRepository
+                )
             )
             .textSelection(.enabled)
+    }
+
+    private func safeOpenURLAction(
+        onOpenExternal: @escaping (URL) -> Void,
+        onOpenRepository: @escaping (ChatRepositoryLink) -> Void
+    ) -> OpenURLAction {
+        OpenURLAction { url in
+            switch ChatURLPolicy.classify(url) {
+            case .external(let externalURL):
+                onOpenExternal(externalURL)
+            case .repository(let link):
+                onOpenRepository(link)
+            case .blocked:
+                break
+            }
+            return .handled
+        }
     }
 
     /// Completed macOS rows bind a prepared attributed artifact and never
@@ -1152,11 +1436,7 @@ struct RichMarkdownView: View {
     @ViewBuilder
     private var markdownContent: some View {
         #if os(macOS)
-        if !isStreaming {
-            PreparedMarkdownText(source: text)
-        } else {
-            streamingMarkdownContent
-        }
+        streamingMarkdownContent
         #else
         if !isStreaming,
            let sanitized = SanitizedMarkdownCache.shared.lookup(raw: text) {
@@ -1200,9 +1480,22 @@ struct RichMarkdownView: View {
 #if os(macOS)
 private struct PreparedMarkdownText: View {
     let source: String
+    let fallbackText: String
 
     @State private var prepared: PreparedMarkdown?
     @State private var preparedSource: String?
+    @Environment(\.macTranscriptScrollActivity) private var scrollActivity
+
+    init(
+        source: String,
+        fallbackText: String,
+        cached: PreparedMarkdown?
+    ) {
+        self.source = source
+        self.fallbackText = fallbackText
+        _prepared = State(initialValue: cached)
+        _preparedSource = State(initialValue: cached == nil ? nil : source)
+    }
 
     var body: some View {
         Group {
@@ -1212,16 +1505,21 @@ private struct PreparedMarkdownText: View {
                 // A cold live-completion miss remains fully visible while its
                 // final artifact is prepared. This is verbatim text only: it
                 // cannot parse Markdown or load an image on the main thread.
-                Text(verbatim: source)
+                Text(verbatim: fallbackText)
             }
         }
         .fixedSize(horizontal: false, vertical: true)
         .textSelection(.enabled)
         .task(id: source) {
+            guard preparedSource != source || prepared == nil else {
+                return
+            }
             let result = await SanitizedMarkdownCache.shared.preparedMarkdown(raw: source)
-            guard !Task.isCancelled else { return }
-            prepared = result
-            preparedSource = source
+            guard let result, !Task.isCancelled else { return }
+            await scrollActivity.adoptHeightChangingContentWhenIdle {
+                prepared = result
+                preparedSource = source
+            }
         }
     }
 
@@ -1229,7 +1527,7 @@ private struct PreparedMarkdownText: View {
         if preparedSource == source {
             return prepared
         }
-        return SanitizedMarkdownCache.shared.lookupPrepared(raw: source)
+        return nil
     }
 }
 #endif
@@ -1306,7 +1604,7 @@ struct CodeBlockView: View {
             HighlightedCodeText(
                 code: code,
                 language: language,
-                usesHighlighting: !isStreaming
+                usesHighlighting: !isStreaming && language?.isEmpty == false
             )
             .font(.system(.callout, design: .monospaced))
             .lineSpacing(3)
@@ -1355,6 +1653,9 @@ private struct HighlightedCodeText: View {
     let language: String?
     let usesHighlighting: Bool
     @State private var highlighted: AttributedString?
+    #if os(macOS)
+    @Environment(\.macTranscriptScrollActivity) private var scrollActivity
+    #endif
 
     var body: some View {
         Group {
@@ -1372,7 +1673,13 @@ private struct HighlightedCodeText: View {
                 language: language
             )
             guard !Task.isCancelled else { return }
+            #if os(macOS)
+            await scrollActivity.adoptHeightChangingContentWhenIdle {
+                highlighted = Self.attributedText(result.tokens)
+            }
+            #else
             highlighted = Self.attributedText(result.tokens)
+            #endif
         }
     }
 
@@ -1423,7 +1730,11 @@ struct ChatSyntaxHighlightingResult: Equatable, Sendable {
 }
 
 enum ChatSyntaxHighlighter {
-    static let maximumHighlightedRuns = 512
+    // Styling is optional but text is not. A bounded tile with hundreds of
+    // alternating attributes still makes TextKit shape hundreds of runs on
+    // the main thread, so preserve the exact code as one plain token above a
+    // small density budget.
+    static let maximumHighlightedRuns = 64
 
     private static let supportedLanguages: Set<String> = [
         "bash", "c", "cpp", "css", "go", "html", "javascript", "js", "json",

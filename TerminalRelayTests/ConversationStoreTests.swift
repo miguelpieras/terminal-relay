@@ -301,6 +301,334 @@ final class ConversationStoreTests: XCTestCase {
         )
     }
 
+    func testSameTextMessageCompletionSealsOnlyTheMutableTail() async throws {
+        let source = String(repeating: "sealed-prefix-line\n", count: 2_000)
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.started",
+                sequence: 1,
+                itemID: "message",
+                turnID: "turn",
+                payload: .object([
+                    "role": .string("assistant"),
+                    "text": .string(source),
+                ])
+            )
+        )
+        let streamingRows = store.transcriptProjections(
+            for: try XCTUnwrap(store.state.items.first)
+        )
+        let fullBuilds = store.projectionDiagnostics.fullItemBuilds
+        let incrementalBuilds = store.projectionDiagnostics.incrementalTailBuilds
+        XCTAssertGreaterThan(streamingRows.count, 1)
+
+        let completion = ChatTestFixtures.event(
+            "message.completed",
+            sequence: 2,
+            itemID: "message",
+            turnID: "turn",
+            payload: .object([
+                "role": .string("assistant"),
+                "text": .string(source),
+            ])
+        )
+        let prepared = await ConversationStore.prepareTranscriptProjections(
+            for: completion,
+            retaining: store.itemsForTranscriptProjectionPreparation
+        )
+        XCTAssertTrue(
+            prepared.isEmpty,
+            "A metadata-only completion must preserve the incremental tail path."
+        )
+        try store.apply(
+            completion,
+            preparedTranscriptProjections: prepared
+        )
+
+        let completedRows = store.transcriptProjections(
+            for: try XCTUnwrap(store.state.items.first)
+        )
+        XCTAssertEqual(completedRows.map(\.sourceText).joined(), source)
+        XCTAssertEqual(Array(streamingRows.dropLast()), Array(completedRows.dropLast()))
+        XCTAssertEqual(store.projectionDiagnostics.fullItemBuilds, fullBuilds)
+        XCTAssertEqual(
+            store.projectionDiagnostics.incrementalTailBuilds,
+            incrementalBuilds + 1
+        )
+        XCTAssertLessThanOrEqual(
+            store.projectionDiagnostics.lastIncrementalSourceBytes,
+            TranscriptRowProjection.maximumDisplayBytes
+        )
+    }
+
+    func testAuthoritativeMessageCompletionAdoptsPreparedRowsWithoutMainActorBuild() async throws {
+        let streamingSource = String(repeating: "streaming-line\n", count: 2_000)
+        let authoritativeSource = String(repeating: "authoritative-line\n", count: 3_000)
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.started",
+                sequence: 1,
+                itemID: "message",
+                turnID: "turn",
+                payload: .object([
+                    "role": .string("assistant"),
+                    "text": .string(streamingSource),
+                ])
+            )
+        )
+        _ = store.transcriptProjections(
+            for: try XCTUnwrap(store.state.items.first)
+        )
+        let fullBuilds = store.projectionDiagnostics.fullItemBuilds
+        let completion = ChatTestFixtures.event(
+            "message.completed",
+            sequence: 2,
+            itemID: "message",
+            turnID: "turn",
+            payload: .object([
+                "role": .string("assistant"),
+                "text": .string(authoritativeSource),
+            ])
+        )
+        let prepared = await ConversationStore.prepareTranscriptProjections(
+            for: completion,
+            retaining: store.itemsForTranscriptProjectionPreparation
+        )
+
+        try store.apply(
+            completion,
+            preparedTranscriptProjections: prepared
+        )
+
+        let completedRows = store.transcriptProjections(
+            for: try XCTUnwrap(store.state.items.first)
+        )
+        XCTAssertEqual(completedRows.map(\.sourceText).joined(), authoritativeSource)
+        XCTAssertEqual(
+            store.projectionDiagnostics.fullItemBuilds,
+            fullBuilds,
+            "The first published final rows must use the off-main prepared artifact."
+        )
+    }
+
+    func testSnapshotProjectionIsPreparedBeforePublishedRowsAreRequested() async throws {
+        let source = String(repeating: "snapshot-line-0123456789\n", count: 20_000)
+        let item = ConversationItem.message(
+            ChatMessage(id: "large-snapshot", role: .assistant, text: source)
+        )
+        let store = ConversationStore()
+
+        let envelope = try ChatTestFixtures.snapshotEvent(
+            baseSequence: 1,
+            items: [item]
+        )
+        let prepared = await ConversationStore.prepareTranscriptProjections(
+            for: envelope
+        )
+        try store.apply(
+            envelope,
+            preparedTranscriptProjections: prepared
+        )
+
+        let publishedItem = try XCTUnwrap(store.state.items.first)
+        let rows = store.transcriptProjections(for: publishedItem)
+        XCTAssertGreaterThan(rows.count, 100)
+        XCTAssertEqual(rows.map(\.sourceText).joined(), source)
+        XCTAssertEqual(
+            store.projectionDiagnostics.fullItemBuilds,
+            0,
+            "The first SwiftUI section evaluation must hit off-main prepared rows."
+        )
+    }
+
+    func testPreparingReplacementSnapshotLeavesPublishedProjectionCacheIntact() async throws {
+        let oldSource = String(repeating: "old\n", count: 80_000)
+        let newSource = String(repeating: "new\n", count: 100_000)
+        let oldItem = ConversationItem.message(
+            ChatMessage(id: "old-snapshot", role: .assistant, text: oldSource)
+        )
+        let newItem = ConversationItem.message(
+            ChatMessage(id: "new-snapshot", role: .assistant, text: newSource)
+        )
+        let store = ConversationStore()
+        store.replaceWithSnapshot(
+            ConversationSnapshot(
+                snapshotGeneration: ChatTestFixtures.generation,
+                baseSequence: 1,
+                items: [oldItem]
+            )
+        )
+        let publishedOldItem = try XCTUnwrap(store.state.items.first)
+        XCTAssertEqual(
+            store.transcriptProjections(for: publishedOldItem).map(\.sourceText).joined(),
+            oldSource
+        )
+        let buildsBeforePreparation = store.projectionDiagnostics.fullItemBuilds
+
+        let envelope = try ChatTestFixtures.snapshotEvent(
+            baseSequence: 2,
+            items: [newItem]
+        )
+        let preparation = Task {
+            await ConversationStore.prepareTranscriptProjections(for: envelope)
+        }
+        await Task.yield()
+        store.jumpToLatest()
+        XCTAssertEqual(
+            store.transcriptProjections(for: publishedOldItem).map(\.sourceText).joined(),
+            oldSource
+        )
+        XCTAssertEqual(
+            store.projectionDiagnostics.fullItemBuilds,
+            buildsBeforePreparation,
+            "Preparing B must not invalidate the still-published projection cache for A."
+        )
+
+        let prepared = await preparation.value
+        try store.apply(
+            envelope,
+            preparedTranscriptProjections: prepared
+        )
+        let publishedNewItem = try XCTUnwrap(store.state.items.first)
+        XCTAssertEqual(
+            store.transcriptProjections(for: publishedNewItem).map(\.sourceText).joined(),
+            newSource
+        )
+        XCTAssertEqual(
+            store.projectionDiagnostics.fullItemBuilds,
+            buildsBeforePreparation
+        )
+    }
+
+    func testPreparedHistoryCannotReplaceAnExistingIDWithConflictingContent() async throws {
+        let kept = ConversationItem.message(
+            ChatMessage(id: "kept", role: .assistant, text: "authoritative-current")
+        )
+        let conflicting = ConversationItem.message(
+            ChatMessage(id: "kept", role: .assistant, text: "stale-history-copy")
+        )
+        let older = ConversationItem.message(
+            ChatMessage(id: "older", role: .assistant, text: "older")
+        )
+        let store = ConversationStore()
+        store.replaceWithSnapshot(
+            ConversationSnapshot(
+                snapshotGeneration: ChatTestFixtures.generation,
+                baseSequence: 1,
+                items: [kept],
+                hasOlderHistory: true,
+                oldestItemID: "kept"
+            )
+        )
+        _ = store.transcriptProjections(for: kept)
+        let buildsBefore = store.projectionDiagnostics.fullItemBuilds
+        let envelope = ChatTestFixtures.event(
+            "history.page",
+            sequence: 2,
+            payload: .object([
+                "items": .array([
+                    try JSONValue.encoded(older),
+                    try JSONValue.encoded(conflicting),
+                ]),
+                "hasOlderHistory": .bool(false),
+                "oldestItemId": .string("older"),
+            ])
+        )
+        let prepared = await ConversationStore.prepareTranscriptProjections(
+            for: envelope,
+            retaining: store.state.items
+        )
+
+        try store.apply(
+            envelope,
+            preparedTranscriptProjections: prepared
+        )
+
+        XCTAssertEqual(store.state.items.map(\.id), ["older", "kept"])
+        let retained = try XCTUnwrap(store.state.items.last)
+        XCTAssertEqual(
+            store.transcriptProjections(for: retained).map(\.sourceText).joined(),
+            "authoritative-current"
+        )
+        XCTAssertEqual(store.projectionDiagnostics.fullItemBuilds, buildsBefore)
+    }
+
+    func testPreparedSnapshotUsesTheReducersFirstDuplicateItem() async throws {
+        let first = ConversationItem.message(
+            ChatMessage(id: "duplicate", role: .assistant, text: "first")
+        )
+        let last = ConversationItem.message(
+            ChatMessage(id: "duplicate", role: .assistant, text: "last")
+        )
+        let store = ConversationStore()
+        let envelope = try ChatTestFixtures.snapshotEvent(
+            baseSequence: 1,
+            items: [first, last]
+        )
+        let prepared = await ConversationStore.prepareTranscriptProjections(
+            for: envelope
+        )
+
+        try store.apply(
+            envelope,
+            preparedTranscriptProjections: prepared
+        )
+
+        let adopted = try XCTUnwrap(store.state.items.first)
+        XCTAssertEqual(store.state.items.count, 1)
+        XCTAssertEqual(
+            store.transcriptProjections(for: adopted).map(\.sourceText).joined(),
+            "first"
+        )
+        XCTAssertEqual(store.projectionDiagnostics.fullItemBuilds, 0)
+    }
+
+    func testConnectingPlaceholderPreservesPublishedRowsWithoutReprojection() async throws {
+        let source = String(repeating: "painted\n", count: 10_000)
+        let item = ConversationItem.message(
+            ChatMessage(id: "painted", role: .assistant, text: source)
+        )
+        let store = ConversationStore()
+        store.replaceWithSnapshot(
+            ConversationSnapshot(
+                snapshotGeneration: ChatTestFixtures.generation,
+                baseSequence: 1,
+                items: [item]
+            )
+        )
+        _ = store.transcriptProjections(for: item)
+        let buildsBefore = store.projectionDiagnostics.fullItemBuilds
+        let placeholder = ConversationSnapshot(
+            snapshotGeneration: ChatTestFixtures.generation,
+            baseSequence: 2,
+            items: [],
+            connectionState: .connecting
+        )
+        let envelope = ChatTestFixtures.event(
+            "conversation.snapshot",
+            sequence: 2,
+            payload: try JSONValue.encoded(placeholder)
+        )
+        let prepared = await ConversationStore.prepareTranscriptProjections(
+            for: envelope,
+            retaining: store.state.items
+        )
+
+        try store.apply(
+            envelope,
+            preparedTranscriptProjections: prepared
+        )
+
+        let retained = try XCTUnwrap(store.state.items.first)
+        XCTAssertEqual(
+            store.transcriptProjections(for: retained).map(\.sourceText).joined(),
+            source
+        )
+        XCTAssertEqual(store.projectionDiagnostics.fullItemBuilds, buildsBefore)
+    }
+
     func testLiveScrollingDefersStreamingPublicationAndCatchesUpOnce() throws {
         let store = ConversationStore(streamingPublishNanoseconds: 0)
         try store.apply(

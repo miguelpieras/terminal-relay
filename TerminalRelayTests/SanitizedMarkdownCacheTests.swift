@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 @testable import TerminalRelay
 
@@ -16,6 +17,10 @@ private actor PreparationConcurrencyProbe {
 
     func peakValue() -> Int {
         peak
+    }
+
+    func activeValue() -> Int {
+        active
     }
 }
 
@@ -41,7 +46,10 @@ final class SanitizedMarkdownCacheTests: XCTestCase {
         _ = await cache.preparedMarkdown(raw: "cached")
         let initialPreparations = cache.preparationCount
 
-        await cache.warm(texts: ["", "cached", "fresh **text**"], budget: .seconds(5))
+        await cache.warm(
+            texts: ["", "cached", "fresh **text**", "fresh **text**", "cached"],
+            budget: .seconds(5)
+        )
 
         XCTAssertEqual(cache.lookup(raw: "cached"), "cached")
         XCTAssertEqual(
@@ -49,7 +57,11 @@ final class SanitizedMarkdownCacheTests: XCTestCase {
             MarkdownSafety.sanitizedSource("fresh **text**")
         )
         XCTAssertNil(cache.lookup(raw: ""))
-        XCTAssertEqual(cache.preparationCount, initialPreparations + 1)
+        XCTAssertEqual(
+            cache.preparationCount,
+            initialPreparations + 1,
+            "Warming must deduplicate before starting detached preparation work."
+        )
     }
 
     func testPreparationGateDeterministicallyLimitsConcurrentWorkToTwo() async {
@@ -75,6 +87,40 @@ final class SanitizedMarkdownCacheTests: XCTestCase {
         XCTAssertEqual(peak, 2)
     }
 
+    func testCancelledQueuedPreparationNeverConsumesAPermit() async {
+        let gate = MarkdownPreparationGate(maxConcurrent: 1)
+        let probe = PreparationConcurrencyProbe()
+        let blocker = Task {
+            await gate.run(priority: .utility) {
+                await probe.begin()
+                try? await Task.sleep(for: .seconds(5))
+                await probe.end()
+                return true
+            }
+        }
+        while await probe.activeValue() == 0 {
+            await Task.yield()
+        }
+
+        let queuedRan = PreparationConcurrencyProbe()
+        let queued = Task {
+            await gate.run(priority: .userInitiated) {
+                await queuedRan.begin()
+                await queuedRan.end()
+                return true
+            }
+        }
+        await Task.yield()
+        queued.cancel()
+        let queuedResult = await queued.value
+        blocker.cancel()
+        _ = await blocker.value
+
+        XCTAssertNil(queuedResult)
+        let queuedPeak = await queuedRan.peakValue()
+        XCTAssertEqual(queuedPeak, 0)
+    }
+
     func testWarmUsesUtilityPriorityWhileVisibleMissUsesUserInitiated() async {
         let cache = SanitizedMarkdownCache()
 
@@ -85,7 +131,7 @@ final class SanitizedMarkdownCacheTests: XCTestCase {
             cache.lookupPrepared(raw: "background")?.requestedPriority,
             .utility
         )
-        XCTAssertEqual(visible.requestedPriority, .userInitiated)
+        XCTAssertEqual(visible?.requestedPriority, .userInitiated)
     }
 
     func testPreparedMarkdownPreservesCommonSemanticsAsOneCompleteTextArtifact() async {
@@ -115,7 +161,9 @@ final class SanitizedMarkdownCacheTests: XCTestCase {
         ![diagram](https://example.com/diagram.png)
         """
 
-        let prepared = await PreparedMarkdownRenderer.prepareOffMain(source)
+        guard let prepared = await PreparedMarkdownRenderer.prepareOffMain(source) else {
+            return XCTFail("Expected prepared Markdown")
+        }
 
         XCTAssertFalse(prepared.performedOnMainThread)
         for expected in [
@@ -149,7 +197,9 @@ final class SanitizedMarkdownCacheTests: XCTestCase {
         [traversal](../Secrets.swift)
         """
 
-        let prepared = await PreparedMarkdownRenderer.prepareOffMain(source)
+        guard let prepared = await PreparedMarkdownRenderer.prepareOffMain(source) else {
+            return XCTFail("Expected prepared Markdown")
+        }
 
         XCTAssertEqual(prepared.linkURLs.count, 2)
         XCTAssertTrue(prepared.linkURLs.contains(URL(string: "https://example.com/path")!))
@@ -177,8 +227,102 @@ final class SanitizedMarkdownCacheTests: XCTestCase {
 
         XCTAssertEqual(countAfterMiss, 1)
         XCTAssertEqual(cache.preparationCount, countAfterMiss)
-        XCTAssertEqual(second.plainText, first.plainText)
+        XCTAssertEqual(second?.plainText, first?.plainText)
         XCTAssertNotNil(cache.lookupPrepared(raw: source))
+    }
+
+    func testConcurrentVisibleAndPrefetchMissesShareOnePreparation() async {
+        let cache = SanitizedMarkdownCache()
+        let source = "# Shared miss\n\n" + String(repeating: "bounded text ", count: 40)
+
+        let values = await withTaskGroup(
+            of: PreparedMarkdown?.self,
+            returning: [PreparedMarkdown?].self
+        ) { group in
+            for priority in [TaskPriority.utility, .userInitiated, .utility] {
+                group.addTask {
+                    await cache.preparedMarkdown(raw: source, priority: priority)
+                }
+            }
+            var results: [PreparedMarkdown?] = []
+            for await result in group {
+                results.append(result)
+            }
+            return results
+        }
+
+        XCTAssertEqual(values.count, 3)
+        let expected = values.compactMap { $0?.plainText }.first
+        XCTAssertNotNil(expected)
+        XCTAssertTrue(values.allSatisfy { $0?.plainText == expected })
+        XCTAssertEqual(
+            cache.preparationCount,
+            1,
+            "A cell miss must join viewport prefetch instead of occupying a second parser permit."
+        )
+    }
+
+    func testPreparedMarkdownCachesOneNativeTextKitArtifactWithNativeAttributes() async {
+        let source = "# Heading\n\nText with **bold**, `code`, and [link](https://example.com)."
+        guard let prepared = await PreparedMarkdownRenderer.prepareOffMain(source) else {
+            return XCTFail("Expected prepared Markdown")
+        }
+
+        let first = prepared.appKitAttributedText()
+        let second = prepared.appKitAttributedText()
+
+        XCTAssertTrue(
+            first === second,
+            "Revisiting a native row must reuse the immutable TextKit artifact."
+        )
+        XCTAssertEqual(first.string, prepared.plainText)
+        XCTAssertNotNil(first.attribute(.font, at: 0, effectiveRange: nil) as? NSFont)
+        XCTAssertNil(
+            first.attribute(
+                NSAttributedString.Key("SwiftUI.Font"),
+                at: 0,
+                effectiveRange: nil
+            ),
+            "Native rows must not pass SwiftUI-only font attributes into TextKit."
+        )
+        let linkRange = (first.string as NSString).range(of: "link")
+        XCTAssertEqual(
+            first.attribute(.link, at: linkRange.location, effectiveRange: nil) as? URL,
+            URL(string: "https://example.com")
+        )
+    }
+
+    func testPreparedNativeArtifactCacheTracksDynamicTypeScale() async {
+        guard let prepared = await PreparedMarkdownRenderer.prepareOffMain(
+            "# Heading\n\nScaled body text"
+        ) else {
+            return XCTFail("Expected prepared Markdown")
+        }
+
+        let regular = prepared.appKitAttributedText(fontScale: 1)
+        let regularFont = regular.attribute(
+            .font,
+            at: 0,
+            effectiveRange: nil
+        ) as? NSFont
+        let accessibility = prepared.appKitAttributedText(fontScale: 2)
+        let repeatedAccessibility = prepared.appKitAttributedText(fontScale: 2)
+        let accessibilityFont = accessibility.attribute(
+            .font,
+            at: 0,
+            effectiveRange: nil
+        ) as? NSFont
+
+        XCTAssertFalse(regular === accessibility)
+        XCTAssertTrue(accessibility === repeatedAccessibility)
+        XCTAssertGreaterThan(
+            accessibilityFont?.pointSize ?? 0,
+            regularFont?.pointSize ?? .infinity
+        )
+        XCTAssertNil(
+            prepared.cachedAppKitAttributedText(fontScale: 1),
+            "A stale font-scale artifact must never survive a Dynamic Type reconfiguration."
+        )
     }
 
     func testPreparedMarkdownHandlesLargeBoundedChunkWithoutLosingText() async {
@@ -186,7 +330,9 @@ final class SanitizedMarkdownCacheTests: XCTestCase {
         let source = lines.joined(separator: "\n")
         XCTAssertLessThan(source.utf8.count, 4_096)
 
-        let prepared = await PreparedMarkdownRenderer.prepareOffMain(source)
+        guard let prepared = await PreparedMarkdownRenderer.prepareOffMain(source) else {
+            return XCTFail("Expected prepared Markdown")
+        }
 
         for line in lines {
             XCTAssertTrue(prepared.plainText.contains(line))
@@ -201,12 +347,14 @@ final class SanitizedMarkdownCacheTests: XCTestCase {
         XCTAssertEqual(
             tokens,
             [ChatCodeToken(text: code, kind: .plain)],
-            "More than 512 styled runs must collapse to one exact plain token."
+            "More than the bounded styled-run budget must collapse to one exact plain token."
         )
 
         let safeURL = URL(string: "https://example.com/dense")!
         let source = "```swift\n\(code)\n```\n\n[safe](\(safeURL.absoluteString))"
-        let prepared = await PreparedMarkdownRenderer.prepareOffMain(source)
+        guard let prepared = await PreparedMarkdownRenderer.prepareOffMain(source) else {
+            return XCTFail("Expected prepared Markdown")
+        }
 
         XCTAssertTrue(prepared.plainText.contains(code))
         XCTAssertEqual(prepared.linkURLs, [safeURL])
@@ -215,6 +363,43 @@ final class SanitizedMarkdownCacheTests: XCTestCase {
             8,
             "The prepared artifact must not recreate token-density as attributed runs."
         )
+    }
+
+    func testLineDenseRichMarkdownCollapsesRunsWithoutLosingRenderedText() async {
+        let source = (0..<120)
+            .map { $0.isMultiple(of: 2) ? "**bold-\($0)**" : "plain-\($0)" }
+            .joined(separator: "\n")
+        guard let prepared = await PreparedMarkdownRenderer.prepareOffMain(source) else {
+            return XCTFail("Expected prepared Markdown")
+        }
+
+        for index in 0..<120 {
+            XCTAssertTrue(prepared.plainText.contains("\(index)"))
+        }
+        XCTAssertLessThanOrEqual(
+            prepared.attributedText.runs.count,
+            16,
+            "Line-dense formatting must not recreate a cold-layout hitch."
+        )
+    }
+
+    func testLineDenseMarkdownKeepsEverySafeLinkInteractive() async {
+        let source = (0..<40)
+            .map { "[f\($0)](https://e.co/\($0))" }
+            .joined(separator: "\n")
+        XCTAssertLessThanOrEqual(
+            source.utf8.count,
+            TranscriptRowProjection.maximumDisplayBytes
+        )
+        guard let prepared = await PreparedMarkdownRenderer.prepareOffMain(source) else {
+            return XCTFail("Expected prepared Markdown")
+        }
+
+        XCTAssertEqual(prepared.linkURLs.count, 40)
+        XCTAssertEqual(prepared.attributedText.runs.compactMap(\.link).count, 40)
+        for index in 0..<40 {
+            XCTAssertTrue(prepared.plainText.contains("f\(index)"))
+        }
     }
 
     func testDefaultCacheEntryLimitCoversWorstCaseLineBoundedTranscript() {
@@ -239,15 +424,16 @@ final class SanitizedMarkdownCacheTests: XCTestCase {
         )
     }
 
-    func testDefaultCacheRetainsMoreThanEightMiBOfFourKiBTilesWithoutReparse() async {
+    func testDefaultCacheRetainsMoreThanEightMiBOfProductionTilesWithoutReparse() async {
         let cache = SanitizedMarkdownCache()
-        let tileCount = 2_100
-        let tileBytes = 4_096
+        let retainedTextBudget = 8 * 1_024 * 1_024
+        let tileBytes = TranscriptRowProjection.maximumDisplayBytes
+        let tileCount = (retainedTextBudget / tileBytes) + 64
         let tiles = (0..<tileCount).map { index -> String in
             let prefix = "tile-\(index)-"
             return prefix + String(repeating: "x", count: tileBytes - prefix.utf8.count)
         }
-        XCTAssertGreaterThan(tiles.reduce(0) { $0 + $1.utf8.count }, 8 * 1_024 * 1_024)
+        XCTAssertGreaterThan(tiles.reduce(0) { $0 + $1.utf8.count }, retainedTextBudget)
 
         await cache.warm(texts: tiles, budget: .seconds(60))
         let countAfterWarm = cache.preparationCount
@@ -313,5 +499,21 @@ final class SanitizedMarkdownCacheTests: XCTestCase {
             ["assistant markdown"],
             "Only completed non-user rich-markdown content should warm."
         )
+    }
+
+    func testWarmableTextSuffixMatchesFullProjectionWithoutRetainingEveryTile() {
+        let source = (0..<2_000).map { "line-\($0)" }.joined(separator: "\n")
+        let items: [ConversationItem] = [
+            .message(ChatMessage(id: "older", role: .assistant, text: "older")),
+            .message(ChatMessage(id: "recent", role: .assistant, text: source)),
+        ]
+        let all = SanitizedMarkdownCache.warmableTexts(items: items)
+        let suffix = SanitizedMarkdownCache.warmableTexts(
+            items: items,
+            suffixLimit: 5
+        )
+
+        XCTAssertEqual(suffix, Array(all.suffix(5)))
+        XCTAssertEqual(suffix.count, 5)
     }
 }

@@ -3,8 +3,8 @@ import XCTest
 
 final class TranscriptRowProjectionTests: XCTestCase {
     func testProductionTileBudgetsStayViewportSized() {
-        XCTAssertEqual(TranscriptRowProjection.maximumDisplayBytes, 4 * 1_024)
-        XCTAssertEqual(TranscriptRowProjection.maximumDisplayLines, 256)
+        XCTAssertEqual(TranscriptRowProjection.maximumDisplayBytes, 1 * 1_024)
+        XCTAssertEqual(TranscriptRowProjection.maximumDisplayLines, 128)
     }
 
     func testNewlineDenseTextUsesABoundedNumberOfRows() {
@@ -14,7 +14,10 @@ final class TranscriptRowProjectionTests: XCTestCase {
 
         XCTAssertEqual(
             segments.count,
-            Int(ceil(Double(lineCount) / Double(TranscriptRowProjection.maximumDisplayLines)))
+            Int(ceil(
+                Double(lineCount)
+                    / Double(TranscriptRowProjection.maximumDisplayLines - 1)
+            ))
         )
         XCTAssertEqual(segments.map(\.text).joined(), source)
     }
@@ -83,6 +86,217 @@ final class TranscriptRowProjectionTests: XCTestCase {
                 40
             )
         }
+    }
+
+    func testLongerMarkdownFenceIgnoresShortAndSuffixedFenceLikeContent() {
+        let source = """
+        Before
+        ````swift
+        first
+        ```
+        # still literal
+        ````not-a-close
+        * also literal
+        ````
+        closed
+        closed-again
+        After
+        """
+        let segments = TranscriptTextProjection.markdownSegments(
+            of: source,
+            maximumBytes: 160,
+            maximumLines: 6
+        )
+
+        XCTAssertEqual(segments.map(\.text).joined(), source)
+        XCTAssertGreaterThan(segments.count, 2)
+        guard let literalHeading = segments.first(where: {
+            $0.text.contains("# still literal")
+        }) else {
+            return XCTFail("Expected literal heading segment")
+        }
+        XCTAssertEqual(literalHeading.markdownContinuation?.openFence, "````")
+        XCTAssertTrue(literalHeading.renderedText.hasPrefix("````\n"))
+        guard let after = segments.first(where: { $0.text.contains("After") }) else {
+            return XCTFail("Expected post-fence segment")
+        }
+        XCTAssertNil(after.markdownContinuation?.openFence)
+    }
+
+    func testSubstantiallyLongFenceContinuesAcrossRowsWithinRenderedBudget() throws {
+        let fence = String(repeating: "`", count: 80)
+        let body = (0..<80).map { "value-\($0)\n" }.joined()
+        let source = "Before\n\(fence)\n\(body)\(fence)\nAfter"
+        let maximumBytes = 256
+        let segments = TranscriptTextProjection.markdownSegments(
+            of: source,
+            maximumBytes: maximumBytes,
+            maximumLines: 8
+        )
+
+        XCTAssertEqual(segments.map(\.text).joined(), source)
+        XCTAssertGreaterThan(segments.count, 4)
+        XCTAssertTrue(segments.allSatisfy {
+            $0.renderedText.utf8.count <= maximumBytes
+        })
+
+        let opening = try XCTUnwrap(segments.first(where: {
+            $0.text == fence + "\n"
+                && $0.markdownContinuation?.openFence == nil
+        }))
+        XCTAssertTrue(opening.renderedText.hasSuffix(fence))
+
+        let continuation = try XCTUnwrap(segments.first(where: {
+            $0.markdownContinuation?.openFence == fence
+                && $0.text.contains("value-")
+                && !$0.text.contains(fence)
+        }))
+        XCTAssertTrue(continuation.renderedText.hasPrefix(fence + "\n"))
+        XCTAssertTrue(continuation.renderedText.hasSuffix(fence))
+
+        let closing = try XCTUnwrap(segments.first(where: {
+            $0.markdownContinuation?.openFence == fence
+                && $0.text == fence + "\n"
+        }))
+        XCTAssertTrue(closing.renderedText.hasPrefix(fence + "\n"))
+        XCTAssertFalse(closing.renderedText.hasSuffix(fence))
+
+        let after = try XCTUnwrap(segments.first(where: { $0.text == "After" }))
+        XCTAssertNil(after.markdownContinuation?.openFence)
+        XCTAssertEqual(after.renderedText, "After")
+    }
+
+    func testSplitFenceLikeLineInsideCodeCannotCloseTheRealFence() async throws {
+        let fence = "````"
+        let splitCandidate = String(repeating: "`", count: 400)
+            + "not-a-close\n"
+        let source = fence + "\n"
+            + splitCandidate
+            + "still-code\n"
+            + fence + "\n"
+            + "After\nDone"
+        let segments = TranscriptTextProjection.markdownSegments(
+            of: source,
+            maximumBytes: 1_024,
+            maximumLines: 4
+        )
+
+        XCTAssertEqual(segments.map(\.text).joined(), source)
+        XCTAssertTrue(segments.allSatisfy { $0.renderedText.utf8.count <= 1_024 })
+
+        let candidateSegments = segments.filter {
+            $0.text.contains("not-a-close")
+                || (!$0.endsAtPhysicalLineEnd && $0.text.allSatisfy { $0 == "`" })
+        }
+        XCTAssertGreaterThan(candidateSegments.count, 1)
+        for segment in candidateSegments {
+            XCTAssertEqual(segment.markdownContinuation?.openFence, fence)
+            let preparedValue = await PreparedMarkdownRenderer.prepareOffMain(
+                segment.renderedText
+            )
+            let prepared = try XCTUnwrap(preparedValue)
+            let exactPayload = segment.text.trimmingCharacters(in: .newlines)
+            XCTAssertTrue(
+                prepared.plainText.contains(exactPayload),
+                "A partial delimiter line must render literally, not close the synthetic tile fence."
+            )
+        }
+
+        let body = try XCTUnwrap(segments.first { $0.text == "still-code\n" })
+        XCTAssertEqual(body.markdownContinuation?.openFence, fence)
+        let closing = try XCTUnwrap(segments.first {
+            $0.text == fence + "\n"
+                && $0.markdownContinuation?.openFence == fence
+        })
+        XCTAssertEqual(closing.markdownContinuation?.openFence, fence)
+        let after = try XCTUnwrap(segments.first { $0.text == "After\nDone" })
+        XCTAssertNil(after.markdownContinuation?.openFence)
+    }
+
+    func testOverBudgetPhysicalFenceLineRendersLiterallyWithoutOpeningFence() async throws {
+        let splitFence = String(repeating: "`", count: 400) + "\n"
+        let source = splitFence + "ordinary"
+        let segments = TranscriptTextProjection.markdownSegments(
+            of: source,
+            maximumBytes: 1_024,
+            maximumLines: 4
+        )
+
+        XCTAssertEqual(segments.map(\.text).joined(), source)
+        XCTAssertTrue(segments.allSatisfy { $0.renderedText.utf8.count <= 1_024 })
+
+        let delimiterSegments = segments.dropLast()
+        XCTAssertGreaterThan(delimiterSegments.count, 1)
+        for segment in delimiterSegments {
+            XCTAssertNil(segment.markdownContinuation?.openFence)
+            let preparedValue = await PreparedMarkdownRenderer.prepareOffMain(
+                segment.renderedText
+            )
+            let prepared = try XCTUnwrap(preparedValue)
+            XCTAssertTrue(
+                prepared.plainText.contains(
+                    segment.text.trimmingCharacters(in: .newlines)
+                ),
+                "An over-budget physical fence line uses the documented literal fallback."
+            )
+        }
+
+        let ordinary = try XCTUnwrap(segments.last)
+        XCTAssertEqual(ordinary.text, "ordinary")
+        XCTAssertNil(ordinary.markdownContinuation?.openFence)
+        XCTAssertEqual(ordinary.renderedText, "ordinary")
+    }
+
+    func testOverBudgetInfoStringOpensFenceForFollowingRows() async throws {
+        let openingLine = "```swift " + String(repeating: "x", count: 400) + "\n"
+        let source = openingLine + "# must be code\n```\nAfter\nDone"
+        let segments = TranscriptTextProjection.markdownSegments(
+            of: source,
+            maximumBytes: 1_024,
+            maximumLines: 4
+        )
+
+        XCTAssertEqual(segments.map(\.text).joined(), source)
+        let body = try XCTUnwrap(segments.first { $0.text == "# must be code\n" })
+        XCTAssertEqual(body.markdownContinuation?.openFence, "```")
+        let preparedBodyValue = await PreparedMarkdownRenderer.prepareOffMain(
+            body.renderedText
+        )
+        let preparedBody = try XCTUnwrap(preparedBodyValue)
+        XCTAssertTrue(preparedBody.plainText.contains("# must be code"))
+
+        let after = try XCTUnwrap(segments.first { $0.text == "After\nDone" })
+        XCTAssertNil(after.markdownContinuation?.openFence)
+        XCTAssertEqual(after.renderedText, "After\nDone")
+    }
+
+    func testOverBudgetWhitespaceCloserClosesFenceForFollowingRows() async throws {
+        let closer = "```" + String(repeating: " ", count: 400) + "\n"
+        let source = "```swift\ninside\n" + closer + "After"
+        let segments = TranscriptTextProjection.markdownSegments(
+            of: source,
+            maximumBytes: 1_024,
+            maximumLines: 4
+        )
+
+        XCTAssertEqual(segments.map(\.text).joined(), source)
+        let afterIndex = try XCTUnwrap(
+            segments.firstIndex { $0.text == "After" }
+        )
+        let closerSegments = segments[..<afterIndex].suffix(2)
+        XCTAssertEqual(closerSegments.map(\.text).joined(), closer)
+        XCTAssertTrue(closerSegments.allSatisfy {
+            $0.markdownContinuation?.openFence == "```"
+        })
+
+        let after = segments[afterIndex]
+        XCTAssertNil(after.markdownContinuation?.openFence)
+        XCTAssertEqual(after.renderedText, "After")
+        let preparedAfterValue = await PreparedMarkdownRenderer.prepareOffMain(
+            after.renderedText
+        )
+        let preparedAfter = try XCTUnwrap(preparedAfterValue)
+        XCTAssertEqual(preparedAfter.plainText, "After")
     }
 
     func testHalfMegabyteNewlineFreeMessageHasStrictlyBoundedTiles() throws {
@@ -287,6 +501,52 @@ final class TranscriptRowProjectionTests: XCTestCase {
         XCTAssertLessThan(
             result.resegmentedSourceBytes,
             original.utf8.count + delta.utf8.count
+        )
+    }
+
+    func testIncrementalAppendResumesFenceCandidateSplitAcrossPriorTile() throws {
+        let original = "```swift " + String(repeating: "x", count: 500)
+        let delta = String(repeating: "y", count: 100)
+            + "\n# body\n```\n"
+            + String(repeating: "post\n", count: 130)
+        let beforeItem = ConversationItem.message(
+            ChatMessage(
+                id: "assistant",
+                role: .assistant,
+                text: original,
+                isStreaming: true
+            )
+        )
+        let afterItem = ConversationItem.message(
+            ChatMessage(
+                id: "assistant",
+                role: .assistant,
+                text: original + delta,
+                isStreaming: true
+            )
+        )
+        let before = TranscriptRowProjection.makeRows(item: beforeItem)
+        XCTAssertGreaterThan(before.count, 1)
+
+        let result = try XCTUnwrap(
+            TranscriptRowProjection.appendingToTail(
+                .message(contentID: "assistant:content:0", text: delta),
+                item: afterItem,
+                previousRows: before
+            )
+        )
+        let rebuilt = TranscriptRowProjection.makeRows(item: afterItem)
+
+        XCTAssertEqual(result.rows, rebuilt)
+        XCTAssertEqual(try messageText(in: result.rows), original + delta)
+        let body = try XCTUnwrap(result.rows.first {
+            $0.sourceText.contains("# body")
+        })
+        XCTAssertEqual(body.markdownContinuation?.openFence, "```")
+        XCTAssertNil(result.rows.last?.markdownContinuation?.openFence)
+        XCTAssertEqual(
+            Array(before.dropLast()),
+            Array(result.rows.prefix(before.count - 1))
         )
     }
 

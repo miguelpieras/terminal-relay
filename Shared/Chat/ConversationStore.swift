@@ -128,6 +128,190 @@ private func inFlightTurnID(in items: [ConversationItem]) -> String? {
     return nil
 }
 
+private func snapshotToolStatus(_ turnState: TurnState) -> ToolActivityStatus {
+    switch turnState {
+    case .completed:
+        .completed
+    case .failed:
+        .failed
+    case .idle, .interrupted, .stopped, .unknown:
+        .cancelled
+    case .running, .awaitingApproval:
+        .running
+    }
+}
+
+private func finalizedInactiveSnapshotItem(
+    _ item: ConversationItem,
+    toolStatus: ToolActivityStatus
+) -> ConversationItem {
+    switch item {
+    case .message(var message) where message.isStreaming:
+        message.complete(text: nil)
+        return .message(message)
+    case .reasoning(var reasoning) where reasoning.isStreaming:
+        reasoning.isStreaming = false
+        return .reasoning(reasoning)
+    case .tool(var tool)
+        where tool.status == .pending || tool.status == .running:
+        tool.status = toolStatus
+        return .tool(tool)
+    default:
+        return item
+    }
+}
+
+/// Mirrors the reducer's authoritative completion mutations so the final
+/// bounded rows can be built off the main actor before the completed item is
+/// published. Keep this intentionally limited to completion records: deltas
+/// continue through the store's incremental tail projection path.
+private func completedTranscriptItem(
+    for envelope: ChatEnvelope,
+    currentItems: [ConversationItem]
+) -> ConversationItem? {
+    guard let itemID = envelope.itemID
+        ?? envelope.payload["itemId"]?.stringValue
+        ?? envelope.payload["id"]?.stringValue else {
+        return nil
+    }
+    let currentItem = currentItems.first { $0.id == itemID }
+
+    switch ChatEventKind(rawValue: envelope.type) {
+    case .messageCompleted:
+        let text = envelope.payload["text"]?.stringValue
+            ?? envelope.payload["content"]?.stringValue
+            ?? ""
+        let role = ChatMessageRole(
+            rawValue: envelope.payload["role"]?.stringValue ?? "assistant"
+        ) ?? .assistant
+        var message: ChatMessage
+        if case .message(let current)? = currentItem {
+            message = current
+            message.turnID = envelope.turnID ?? message.turnID
+            message.occurredAt = message.occurredAt ?? envelope.occurredAt
+            message.complete(
+                text: text.isEmpty
+                    && envelope.payload["text"] == nil
+                    && envelope.payload["content"] == nil
+                    ? nil
+                    : text,
+                isTruncated: envelope.payload["truncated"]?.boolValue ?? false,
+                originalByteCount: envelope.payload["originalByteCount"]?.intValue
+            )
+        } else {
+            message = ChatMessage(
+                id: itemID,
+                turnID: envelope.turnID,
+                role: role,
+                text: text,
+                occurredAt: envelope.occurredAt,
+                isStreaming: false
+            )
+            message.complete(
+                text: text,
+                isTruncated: envelope.payload["truncated"]?.boolValue ?? false,
+                originalByteCount: envelope.payload["originalByteCount"]?.intValue
+            )
+        }
+        return .message(message)
+
+    case .reasoningCompleted:
+        let text = envelope.payload["text"]?.stringValue ?? ""
+        if case .reasoning(var reasoning)? = currentItem {
+            if !text.isEmpty { reasoning.text = text }
+            reasoning.isStreaming = false
+            return .reasoning(reasoning)
+        }
+        return .reasoning(
+            ChatReasoning(
+                id: itemID,
+                turnID: envelope.turnID,
+                text: text,
+                isStreaming: false,
+                occurredAt: envelope.occurredAt
+            )
+        )
+
+    case .toolCompleted:
+        let status: ToolActivityStatus =
+            envelope.payload["status"]?.stringValue.flatMap(ToolActivityStatus.init(rawValue:))
+            ?? (envelope.payload["error"]?.isNonNull == true ? .failed : .completed)
+        let kind = ToolActivityKind(
+            rawValue: envelope.payload["kind"]?.stringValue ?? ""
+        ) ?? .generic
+        let title = envelope.payload["title"]?.stringValue
+            ?? envelope.payload["name"]?.stringValue
+            ?? "Agent activity"
+        if case .tool(var tool)? = currentItem {
+            tool.title = title
+            tool.status = status
+            tool.input = envelope.payload["input"]?.displayString ?? tool.input
+            if let output = envelope.payload["output"]?.displayString {
+                tool.output = output
+            } else if let outputDelta = envelope.payload["outputDelta"]?.displayString {
+                tool.output = (tool.output ?? "") + outputDelta
+            }
+            tool.errorMessage = envelope.payload["error"]?.displayString ?? tool.errorMessage
+            tool.durationMilliseconds = envelope.payload["durationMs"]?.int64Value
+                ?? tool.durationMilliseconds
+            tool.exitCode = envelope.payload["exitCode"]?.intValue ?? tool.exitCode
+            tool.isTruncated = envelope.payload["truncated"]?.boolValue ?? tool.isTruncated
+            tool.originalByteCount = envelope.payload["originalByteCount"]?.intValue
+                ?? tool.originalByteCount
+            return .tool(tool)
+        }
+        return .tool(
+            ToolActivity(
+                id: itemID,
+                turnID: envelope.turnID,
+                kind: kind,
+                title: title,
+                status: status,
+                input: envelope.payload["input"]?.displayString,
+                output: envelope.payload["output"]?.displayString
+                    ?? envelope.payload["outputDelta"]?.displayString,
+                errorMessage: envelope.payload["error"]?.displayString,
+                durationMilliseconds: envelope.payload["durationMs"]?.int64Value,
+                exitCode: envelope.payload["exitCode"]?.intValue,
+                occurredAt: envelope.occurredAt,
+                isTruncated: envelope.payload["truncated"]?.boolValue ?? false,
+                originalByteCount: envelope.payload["originalByteCount"]?.intValue
+            )
+        )
+
+    default:
+        return nil
+    }
+}
+
+/// Returns the single mutable content ID when a completion only seals an
+/// otherwise identical streaming message. That case must stay on the bounded
+/// tail-update path; preparing/replacing every row would trade the main-thread
+/// build hitch for an equally avoidable full-section diff.
+private func tailOnlyMessageCompletionContentID(
+    previous: ChatMessage,
+    updated: ChatMessage
+) -> String? {
+    guard previous.isStreaming,
+          previous.contents.count == 1,
+          updated.contents.count == 1,
+          let previousContent = previous.contents.first,
+          let updatedContent = updated.contents.first,
+          previousContent.id == updatedContent.id,
+          previousContent.kind == updatedContent.kind,
+          previousContent.text == updatedContent.text,
+          previousContent.language == updatedContent.language else {
+        return nil
+    }
+
+    var normalizedUpdated = updated
+    normalizedUpdated.contents = previous.contents
+    normalizedUpdated.isStreaming = previous.isStreaming
+    normalizedUpdated.isOptimistic = previous.isOptimistic
+    guard normalizedUpdated == previous else { return nil }
+    return previousContent.id
+}
+
 struct ConversationReducer {
     let maximumRetainedItems: Int
     let maximumRetainedContentBytes: Int
@@ -952,6 +1136,13 @@ struct ConversationReducer {
     }
 }
 
+struct PreparedTranscriptProjection: Sendable {
+    let item: ConversationItem
+    let rows: [TranscriptRowProjection]
+}
+
+typealias PreparedTranscriptProjectionBatch = [String: PreparedTranscriptProjection]
+
 @MainActor
 final class ConversationStore: ObservableObject {
     private struct ProjectionCacheEntry {
@@ -1050,8 +1241,22 @@ final class ConversationStore: ObservableObject {
 
     var lastAppliedSequence: Int64 { workingState.lastAppliedSequence }
     var snapshotGeneration: String? { workingState.snapshotGeneration }
+    var itemsForTranscriptProjectionPreparation: [ConversationItem] {
+        workingState.items
+    }
 
-    func apply(_ envelope: ChatEnvelope) throws {
+    /// Lightweight revision used by the macOS transcript's section cache.
+    /// It lets the view reuse every unchanged item's projected row array
+    /// instead of flattening the complete retained transcript on each update.
+    func transcriptItemContentRevision(for itemID: String) -> UInt64 {
+        publishedItemContentRevisions[itemID] ?? 0
+    }
+
+    @discardableResult
+    func apply(
+        _ envelope: ChatEnvelope,
+        preparedTranscriptProjections: PreparedTranscriptProjectionBatch = [:]
+    ) throws -> Bool {
         let previousItemCount = workingState.items.count
         let terminalTranscriptChanges = Self.terminalTranscriptChanges(
             for: envelope,
@@ -1074,7 +1279,7 @@ final class ConversationStore: ObservableObject {
                 itemIndex: &workingItemIndexByID
             )
         }
-        guard didApply else { return }
+        guard didApply else { return false }
         if (envelope.sequence ?? 0) > 0
             || ChatEventKind(rawValue: envelope.type) != .sessionHeartbeat {
             hasPendingStatePublication = true
@@ -1122,6 +1327,7 @@ final class ConversationStore: ObservableObject {
             itemID: changedItemID,
             previousItem: previousChangedItem
         )
+        installPreparedTranscriptProjections(preparedTranscriptProjections)
         if envelope.type == ChatEventKind.conversationSnapshot.rawValue {
             resetReconnectTransients()
         }
@@ -1144,6 +1350,138 @@ final class ConversationStore: ObservableObject {
                 unreadCount += workingState.items.count - previousItemCount
             }
         }
+        return true
+    }
+
+    nonisolated static func prepareTranscriptProjections(
+        for items: [ConversationItem]
+    ) async -> PreparedTranscriptProjectionBatch {
+        let task = Task.detached(priority: .userInitiated) {
+            var prepared: PreparedTranscriptProjectionBatch = [:]
+            prepared.reserveCapacity(items.count)
+            for item in items {
+                guard !Task.isCancelled else { break }
+                prepared[item.id] = PreparedTranscriptProjection(
+                    item: item,
+                    rows: TranscriptRowProjection.makeRows(item: item)
+                )
+            }
+            return prepared
+        }
+        return await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    /// Decodes and projects an authoritative snapshot/history page entirely
+    /// before the store mutates. Adoption is then one synchronous main-actor
+    /// transaction: the old published transcript and its cache remain intact
+    /// while this work runs, and the new state cannot publish before its rows
+    /// are installed.
+    nonisolated static func prepareTranscriptProjections(
+        for envelope: ChatEnvelope,
+        retaining currentItems: [ConversationItem] = []
+    ) async -> PreparedTranscriptProjectionBatch {
+        let task = Task.detached(priority: .userInitiated) {
+            () -> PreparedTranscriptProjectionBatch in
+            let items: [ConversationItem]
+            switch ChatEventKind(rawValue: envelope.type) {
+            case .conversationSnapshot:
+                guard let snapshot = try? envelope.decodePayload(ConversationSnapshot.self) else {
+                    return [:]
+                }
+                if snapshot.connectionState == .connecting,
+                   snapshot.items.isEmpty,
+                   snapshot.approvals.isEmpty,
+                   snapshot.questions.isEmpty,
+                   !currentItems.isEmpty {
+                    items = currentItems
+                } else {
+                    var seen: Set<String> = []
+                    var normalized = snapshot.items.filter {
+                        seen.insert($0.id).inserted
+                    }
+                    let reconciled = reconciledSnapshotTurn(
+                        turnState: snapshot.turnState,
+                        activeTurnID: snapshot.activeTurnID,
+                        items: normalized
+                    )
+                    if reconciled.activeTurnID == nil,
+                       !reconciled.state.isActive {
+                        let toolStatus = snapshotToolStatus(reconciled.state)
+                        normalized = normalized.map {
+                            finalizedInactiveSnapshotItem(
+                                $0,
+                                toolStatus: toolStatus
+                            )
+                        }
+                    }
+                    items = normalized
+                }
+            case .historyPage:
+                let retainedIDs = Set(currentItems.map(\.id))
+                items = (envelope.payload["items"]?.arrayValue ?? []).compactMap {
+                    try? $0.decoded()
+                }.filter { !retainedIDs.contains($0.id) }
+            case .messageCompleted, .reasoningCompleted, .toolCompleted:
+                let completed = completedTranscriptItem(
+                    for: envelope,
+                    currentItems: currentItems
+                )
+                if case .message(let previous)? = currentItems.first(where: {
+                    $0.id == completed?.id
+                }),
+                   case .message(let updated)? = completed,
+                   tailOnlyMessageCompletionContentID(
+                    previous: previous,
+                    updated: updated
+                   ) != nil {
+                    items = []
+                } else {
+                    items = completed.map { [$0] } ?? []
+                }
+            default:
+                items = []
+            }
+            guard !Task.isCancelled else { return [:] }
+            var prepared: PreparedTranscriptProjectionBatch = [:]
+            prepared.reserveCapacity(items.count)
+            for item in items {
+                guard !Task.isCancelled else { break }
+                guard prepared[item.id] == nil else { continue }
+                prepared[item.id] = PreparedTranscriptProjection(
+                    item: item,
+                    rows: TranscriptRowProjection.makeRows(item: item)
+                )
+            }
+            return prepared
+        }
+        return await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    private func installPreparedTranscriptProjections(
+        _ prepared: PreparedTranscriptProjectionBatch
+    ) {
+        for (itemID, value) in prepared {
+            guard let itemIndex = workingItemIndexByID[itemID],
+                  workingState.items.indices.contains(itemIndex),
+                  workingState.items[itemIndex] == value.item,
+                  let revision = itemContentRevisions[itemID] else {
+                continue
+            }
+            projectionCache[itemID] = ProjectionCacheEntry(
+                itemRevision: revision,
+                rows: value.rows
+            )
+            firstProjectionCache.removeValue(forKey: itemID)
+            pendingProjectionChanges.removeValue(forKey: itemID)
+        }
     }
 
     /// Adopts a cached state as the pre-connection baseline so the transcript
@@ -1151,7 +1489,10 @@ final class ConversationStore: ObservableObject {
     /// applied; the attach cursor then resumes from the cached sequence and
     /// the worker replays just the delta (or a fresh snapshot when its
     /// generation changed).
-    func hydrateFromCache(_ cached: ConversationState) {
+    func hydrateFromCache(
+        _ cached: ConversationState,
+        preparedProjections: PreparedTranscriptProjectionBatch = [:]
+    ) {
         guard workingState.lastAppliedSequence == 0,
               workingState.items.isEmpty else {
             return
@@ -1179,6 +1520,7 @@ final class ConversationStore: ObservableObject {
         clearStaleDestructiveApprovalConfirmation()
         transcriptContentRevision &+= 1
         resetItemContentRevisions(for: workingState.items)
+        installPreparedTranscriptProjections(preparedProjections)
         pendingTranscriptReset = true
         hasPendingStatePublication = true
         publishImmediately()
@@ -1657,13 +1999,29 @@ final class ConversationStore: ObservableObject {
     }
 
     private func resetItemContentRevisions(for items: [ConversationItem]) {
+        var previousItems: [String: ConversationItem] = [:]
+        previousItems.reserveCapacity(state.items.count)
+        for item in state.items where previousItems[item.id] == nil {
+            previousItems[item.id] = item
+        }
+        let previousRevisions = itemContentRevisions
         itemContentRevisions.removeAll(keepingCapacity: true)
-        projectionCache.removeAll(keepingCapacity: true)
-        firstProjectionCache.removeAll(keepingCapacity: true)
         pendingProjectionChanges.removeAll(keepingCapacity: true)
+        var preservedIDs = Set<String>()
+        preservedIDs.reserveCapacity(items.count)
         for item in items {
-            itemContentRevisions[item.id] = nextItemContentRevision
-            nextItemContentRevision &+= 1
+            if previousItems[item.id] == item,
+               let revision = previousRevisions[item.id] {
+                itemContentRevisions[item.id] = revision
+                preservedIDs.insert(item.id)
+            } else {
+                itemContentRevisions[item.id] = nextItemContentRevision
+                nextItemContentRevision &+= 1
+            }
+        }
+        projectionCache = projectionCache.filter { preservedIDs.contains($0.key) }
+        firstProjectionCache = firstProjectionCache.filter {
+            preservedIDs.contains($0.key)
         }
     }
 
@@ -1782,6 +2140,22 @@ final class ConversationStore: ObservableObject {
                 itemID: itemID,
                 target: .message(contentID: contentID),
                 text: text
+            )
+
+        case .messageCompleted:
+            guard case .message(let previous) = previousItem,
+                  case .message(let updated) = updatedItem,
+                  let contentID = tailOnlyMessageCompletionContentID(
+                    previous: previous,
+                    updated: updated
+                  ) else {
+                pendingProjectionChanges[itemID] = .rebuild
+                return
+            }
+            queueProjectionAppend(
+                itemID: itemID,
+                target: .message(contentID: contentID),
+                text: ""
             )
 
         case .reasoningDelta:

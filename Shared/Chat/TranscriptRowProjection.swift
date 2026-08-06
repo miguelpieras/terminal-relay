@@ -3,11 +3,43 @@ import Foundation
 struct TranscriptMarkdownContinuation: Equatable, Sendable {
     var openFence: String?
     var startsAtLineBoundary: Bool
+    var pendingFenceLine: TranscriptMarkdownFenceLineState
+
+    init(
+        openFence: String?,
+        startsAtLineBoundary: Bool,
+        pendingFenceLine: TranscriptMarkdownFenceLineState? = nil
+    ) {
+        self.openFence = openFence
+        self.startsAtLineBoundary = startsAtLineBoundary
+        self.pendingFenceLine = pendingFenceLine
+            ?? (startsAtLineBoundary ? .indent(0) : .ordinary)
+    }
 
     static let initial = TranscriptMarkdownContinuation(
         openFence: nil,
         startsAtLineBoundary: true
     )
+}
+
+/// Bounded summary of a physical Markdown line split across projection rows.
+/// It retains only fence-relevant state, never the line itself, so an
+/// arbitrarily long info string or whitespace-only closer cannot make
+/// projection memory depend on that line's length.
+enum TranscriptMarkdownFenceLineState: Equatable, Sendable {
+    case indent(Int)
+    case opening(
+        delimiter: UInt8,
+        runLength: Int,
+        inRun: Bool,
+        infoValid: Bool
+    )
+    case closing(
+        runLength: Int,
+        inRun: Bool,
+        trailingWhitespaceOnly: Bool
+    )
+    case ordinary
 }
 
 struct TranscriptTextSegment: Equatable, Sendable {
@@ -21,17 +53,23 @@ struct TranscriptTextSegment: Equatable, Sendable {
     /// lets a streaming append re-project only the former tail even when a
     /// fenced block opened many rows earlier.
     let markdownContinuation: TranscriptMarkdownContinuation?
+    /// True when this segment ends at a newline or the current source EOF.
+    /// Fence state may only transition after a complete physical source line;
+    /// a byte-budget cut must never turn a suffixed candidate into a close.
+    let endsAtPhysicalLineEnd: Bool
 
     init(
         index: Int,
         text: String,
         renderedText: String? = nil,
-        markdownContinuation: TranscriptMarkdownContinuation? = nil
+        markdownContinuation: TranscriptMarkdownContinuation? = nil,
+        endsAtPhysicalLineEnd: Bool = true
     ) {
         self.index = index
         self.text = text
         self.renderedText = renderedText ?? text
         self.markdownContinuation = markdownContinuation
+        self.endsAtPhysicalLineEnd = endsAtPhysicalLineEnd
     }
 }
 
@@ -49,19 +87,42 @@ enum TranscriptTextProjection {
         of source: String,
         maximumBytes: Int = TranscriptRowProjection.maximumDisplayBytes,
         maximumLines: Int = TranscriptRowProjection.maximumDisplayLines,
-        startingIndex: Int = 0
+        startingIndex: Int = 0,
+        initialStartsAtLineBoundary: Bool = true
     ) -> [TranscriptTextSegment] {
+        var result: [TranscriptTextSegment] = []
+        result.reserveCapacity(max(1, source.utf8.count / maximumBytes))
+        forEachSegment(
+            of: source,
+            maximumBytes: maximumBytes,
+            maximumLines: maximumLines,
+            startingIndex: startingIndex,
+            initialStartsAtLineBoundary: initialStartsAtLineBoundary
+        ) {
+            result.append($0)
+        }
+        return result
+    }
+
+    private static func forEachSegment(
+        of source: String,
+        maximumBytes: Int,
+        maximumLines: Int,
+        startingIndex: Int,
+        initialStartsAtLineBoundary: Bool,
+        _ body: (TranscriptTextSegment) -> Void
+    ) {
         guard !source.isEmpty else {
-            return [TranscriptTextSegment(index: startingIndex, text: "")]
+            body(TranscriptTextSegment(index: startingIndex, text: ""))
+            return
         }
         precondition(maximumBytes >= 4)
         precondition(maximumLines > 1)
 
         let utf8 = source.utf8
-        var result: [TranscriptTextSegment] = []
-        result.reserveCapacity(max(1, utf8.count / maximumBytes))
         var start = utf8.startIndex
-
+        var segmentIndex = startingIndex
+        var startsAtLineBoundary = initialStartsAtLineBoundary
         while start < utf8.endIndex {
             var end = start
             var bytes = 0
@@ -77,6 +138,13 @@ enum TranscriptTextProjection {
                 if byte == 0x0A {
                     lineCount += 1
                     lastLineBoundary = end
+                    if !startsAtLineBoundary {
+                        // Finish the physical line that began in an earlier
+                        // tile before admitting later lines. This lets the
+                        // bounded fence state commit before rendering the next
+                        // independently parsed row.
+                        break
+                    }
                 }
             }
 
@@ -97,22 +165,26 @@ enum TranscriptTextProjection {
             }
             precondition(end > start, "The transcript segment budget must fit one UTF-8 scalar")
 
-            result.append(
+            body(
                 TranscriptTextSegment(
-                    index: startingIndex + result.count,
-                    text: String(decoding: utf8[start..<end], as: UTF8.self)
+                    index: segmentIndex,
+                    text: String(decoding: utf8[start..<end], as: UTF8.self),
+                    endsAtPhysicalLineEnd: end == utf8.endIndex
+                        || utf8[utf8.index(before: end)] == 0x0A
                 )
             )
+            segmentIndex += 1
             start = end
+            startsAtLineBoundary = utf8[utf8.index(before: end)] == 0x0A
         }
-        return result
     }
 
     static func firstSegment(
         of source: String,
         maximumBytes: Int = TranscriptRowProjection.maximumDisplayBytes,
         maximumLines: Int = TranscriptRowProjection.maximumDisplayLines,
-        startingIndex: Int = 0
+        startingIndex: Int = 0,
+        initialStartsAtLineBoundary: Bool = true
     ) -> TranscriptFirstTextSegment {
         guard !source.isEmpty else {
             return TranscriptFirstTextSegment(
@@ -139,6 +211,9 @@ enum TranscriptTextProjection {
             if byte == 0x0A {
                 lineCount += 1
                 lastLineBoundary = end
+                if !initialStartsAtLineBoundary {
+                    break
+                }
             }
         }
         if end < utf8.endIndex, let lastLineBoundary {
@@ -153,7 +228,9 @@ enum TranscriptTextProjection {
         return TranscriptFirstTextSegment(
             segment: TranscriptTextSegment(
                 index: startingIndex,
-                text: String(decoding: utf8[start..<end], as: UTF8.self)
+                text: String(decoding: utf8[start..<end], as: UTF8.self),
+                endsAtPhysicalLineEnd: end == utf8.endIndex
+                    || utf8[utf8.index(before: end)] == 0x0A
             ),
             hasMore: end < utf8.endIndex
         )
@@ -169,20 +246,61 @@ enum TranscriptTextProjection {
         startingIndex: Int = 0,
         initialContinuation: TranscriptMarkdownContinuation = .initial
     ) -> [TranscriptTextSegment] {
-        precondition(maximumBytes >= 12)
+        let byteBudget = markdownByteBudget(maximumBytes: maximumBytes)
         precondition(maximumLines >= 3)
         let raw = segments(
             of: source,
-            // Reserve room for a synthetic three-byte fence and newline at
-            // each edge. Rendered input therefore stays inside the same cap.
-            maximumBytes: maximumBytes - 8,
+            maximumBytes: byteBudget.sourceBytes,
             maximumLines: maximumLines - 2,
-            startingIndex: startingIndex
+            startingIndex: startingIndex,
+            initialStartsAtLineBoundary: initialContinuation.startsAtLineBoundary
         )
         var continuation = initialContinuation
         return raw.map { segment in
-            renderedMarkdownSegment(segment, continuation: &continuation)
+            renderedMarkdownSegment(
+                segment,
+                continuation: &continuation,
+                maximumSyntheticFenceBytes: byteBudget.syntheticFenceBytes
+            )
         }
+    }
+
+    /// Returns only the newest rendered Markdown keys while scanning source
+    /// once and retaining at most `limit` small values. This is used by cache
+    /// warming so a maximum retained item never creates a temporary full row
+    /// array merely to select the visible suffix.
+    static func markdownSegmentSuffix(
+        of source: String,
+        limit: Int,
+        maximumBytes: Int = TranscriptRowProjection.maximumDisplayBytes,
+        maximumLines: Int = TranscriptRowProjection.maximumDisplayLines,
+        startingIndex: Int = 0,
+        initialContinuation: TranscriptMarkdownContinuation = .initial
+    ) -> [TranscriptTextSegment] {
+        guard limit > 0 else { return [] }
+        let byteBudget = markdownByteBudget(maximumBytes: maximumBytes)
+        precondition(maximumLines >= 3)
+        var continuation = initialContinuation
+        var suffix: [TranscriptTextSegment] = []
+        suffix.reserveCapacity(limit)
+        forEachSegment(
+            of: source,
+            maximumBytes: byteBudget.sourceBytes,
+            maximumLines: maximumLines - 2,
+            startingIndex: startingIndex,
+            initialStartsAtLineBoundary: initialContinuation.startsAtLineBoundary
+        ) { raw in
+            let rendered = renderedMarkdownSegment(
+                raw,
+                continuation: &continuation,
+                maximumSyntheticFenceBytes: byteBudget.syntheticFenceBytes
+            )
+            if suffix.count == limit {
+                suffix.removeFirst()
+            }
+            suffix.append(rendered)
+        }
+        return suffix
     }
 
     static func firstMarkdownSegment(
@@ -192,19 +310,21 @@ enum TranscriptTextProjection {
         startingIndex: Int = 0,
         initialContinuation: TranscriptMarkdownContinuation = .initial
     ) -> TranscriptFirstTextSegment {
-        precondition(maximumBytes >= 12)
+        let byteBudget = markdownByteBudget(maximumBytes: maximumBytes)
         precondition(maximumLines >= 3)
         let raw = firstSegment(
             of: source,
-            maximumBytes: maximumBytes - 8,
+            maximumBytes: byteBudget.sourceBytes,
             maximumLines: maximumLines - 2,
-            startingIndex: startingIndex
+            startingIndex: startingIndex,
+            initialStartsAtLineBoundary: initialContinuation.startsAtLineBoundary
         )
         var continuation = initialContinuation
         return TranscriptFirstTextSegment(
             segment: renderedMarkdownSegment(
                 raw.segment,
-                continuation: &continuation
+                continuation: &continuation,
+                maximumSyntheticFenceBytes: byteBudget.syntheticFenceBytes
             ),
             hasMore: raw.hasMore
         )
@@ -212,29 +332,64 @@ enum TranscriptTextProjection {
 
     private static func renderedMarkdownSegment(
         _ segment: TranscriptTextSegment,
-        continuation: inout TranscriptMarkdownContinuation
+        continuation: inout TranscriptMarkdownContinuation,
+        maximumSyntheticFenceBytes: Int
     ) -> TranscriptTextSegment {
         let continuationAtStart = continuation
-        let prefix = continuation.openFence.map { "\($0)\n" } ?? ""
-        for (lineIndex, line) in segment.text.split(
-            separator: "\n",
-            omittingEmptySubsequences: false
-        ).enumerated() where continuation.startsAtLineBoundary || lineIndex > 0 {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if let active = continuation.openFence {
-                if trimmed.hasPrefix(active) {
-                    continuation.openFence = nil
-                }
-            } else if trimmed.hasPrefix("```") {
-                continuation.openFence = "```"
-            } else if trimmed.hasPrefix("~~~") {
-                continuation.openFence = "~~~"
+        let isPhysicalLineFragment = !continuation.startsAtLineBoundary
+            || !segment.endsAtPhysicalLineEnd
+        if isPhysicalLineFragment {
+            // A split physical line is never allowed to open or close a fence:
+            // its unseen suffix can change whether the candidate is valid.
+            // Render the fragment literally. Inside a real fenced block an
+            // unmatchable guard fence prevents a partial delimiter run from
+            // closing the independently parsed tile; outside a block the
+            // first delimiter is an equivalent character reference so it
+            // remains visible without becoming an artificial fence.
+            let renderedText: String
+            if continuation.openFence != nil {
+                let guardFence = literalGuardFence(
+                    for: segment.text,
+                    maximumBytes: maximumSyntheticFenceBytes
+                )
+                renderedText = guardFence + "\n" + segment.text
+                    + (segment.text.hasSuffix("\n") ? "" : "\n")
+                    + guardFence
+            } else {
+                renderedText = neutralizingLeadingFence(in: segment.text)
             }
+            consumeFenceState(
+                in: segment.text,
+                endsAtPhysicalLineEnd: segment.endsAtPhysicalLineEnd,
+                continuation: &continuation,
+                maximumSyntheticFenceBytes: maximumSyntheticFenceBytes
+            )
+            return TranscriptTextSegment(
+                index: segment.index,
+                text: segment.text,
+                renderedText: renderedText,
+                markdownContinuation: continuationAtStart,
+                endsAtPhysicalLineEnd: segment.endsAtPhysicalLineEnd
+            )
         }
-        continuation.startsAtLineBoundary = segment.text.hasSuffix("\n")
+        let prefix = syntheticFence(
+            continuation.openFence,
+            suffix: "\n",
+            maximumBytes: maximumSyntheticFenceBytes
+        )
+        consumeFenceState(
+            in: segment.text,
+            endsAtPhysicalLineEnd: segment.endsAtPhysicalLineEnd,
+            continuation: &continuation,
+            maximumSyntheticFenceBytes: maximumSyntheticFenceBytes
+        )
         let suffix: String
         if let openFence = continuation.openFence {
-            suffix = (segment.text.hasSuffix("\n") ? "" : "\n") + openFence
+            suffix = syntheticFence(
+                openFence,
+                prefix: segment.text.hasSuffix("\n") ? "" : "\n",
+                maximumBytes: maximumSyntheticFenceBytes
+            )
         } else {
             suffix = ""
         }
@@ -242,9 +397,242 @@ enum TranscriptTextProjection {
             index: segment.index,
             text: segment.text,
             renderedText: prefix + segment.text + suffix,
-            markdownContinuation: continuationAtStart
+            markdownContinuation: continuationAtStart,
+            endsAtPhysicalLineEnd: segment.endsAtPhysicalLineEnd
         )
     }
+
+    private static func consumeFenceState(
+        in text: String,
+        endsAtPhysicalLineEnd: Bool,
+        continuation: inout TranscriptMarkdownContinuation,
+        maximumSyntheticFenceBytes: Int
+    ) {
+        for byte in text.utf8 {
+            if byte == 0x0A {
+                commitPendingFenceLine(
+                    continuation: &continuation,
+                    maximumSyntheticFenceBytes: maximumSyntheticFenceBytes
+                )
+                continuation.startsAtLineBoundary = true
+                continue
+            }
+            consumeFenceByte(
+                byte,
+                continuation: &continuation,
+                maximumSyntheticFenceBytes: maximumSyntheticFenceBytes
+            )
+            continuation.startsAtLineBoundary = false
+        }
+
+        // A final source line without a newline is still a complete Markdown
+        // line. A later streaming append re-projects the former tail from its
+        // saved start continuation, so committing here cannot lose append
+        // context.
+        if endsAtPhysicalLineEnd, !text.hasSuffix("\n") {
+            commitPendingFenceLine(
+                continuation: &continuation,
+                maximumSyntheticFenceBytes: maximumSyntheticFenceBytes
+            )
+            continuation.startsAtLineBoundary = false
+        }
+    }
+
+    private static func consumeFenceByte(
+        _ byte: UInt8,
+        continuation: inout TranscriptMarkdownContinuation,
+        maximumSyntheticFenceBytes: Int
+    ) {
+        switch continuation.pendingFenceLine {
+        case .indent(let count):
+            if byte == 0x20 {
+                continuation.pendingFenceLine = count < 3
+                    ? .indent(count + 1)
+                    : .ordinary
+                return
+            }
+            if let active = continuation.openFence,
+               byte == active.utf8.first {
+                continuation.pendingFenceLine = .closing(
+                    runLength: 1,
+                    inRun: true,
+                    trailingWhitespaceOnly: true
+                )
+            } else if continuation.openFence == nil,
+                      byte == 0x60 || byte == 0x7E {
+                continuation.pendingFenceLine = .opening(
+                    delimiter: byte,
+                    runLength: 1,
+                    inRun: true,
+                    infoValid: true
+                )
+            } else {
+                continuation.pendingFenceLine = .ordinary
+            }
+
+        case .opening(
+            let delimiter,
+            let runLength,
+            let inRun,
+            let infoValid
+        ):
+            if inRun, byte == delimiter {
+                continuation.pendingFenceLine = .opening(
+                    delimiter: delimiter,
+                    runLength: min(
+                        runLength + 1,
+                        maximumSyntheticFenceBytes + 1
+                    ),
+                    inRun: true,
+                    infoValid: infoValid
+                )
+            } else {
+                continuation.pendingFenceLine = .opening(
+                    delimiter: delimiter,
+                    runLength: runLength,
+                    inRun: false,
+                    infoValid: infoValid
+                        && (delimiter != 0x60 || byte != 0x60)
+                )
+            }
+
+        case .closing(
+            let runLength,
+            let inRun,
+            let trailingWhitespaceOnly
+        ):
+            let delimiter = continuation.openFence?.utf8.first
+            if inRun, byte == delimiter {
+                let requiredLength = continuation.openFence?.utf8.count ?? 0
+                continuation.pendingFenceLine = .closing(
+                    runLength: min(runLength + 1, max(requiredLength, 1)),
+                    inRun: true,
+                    trailingWhitespaceOnly: trailingWhitespaceOnly
+                )
+            } else {
+                continuation.pendingFenceLine = .closing(
+                    runLength: runLength,
+                    inRun: false,
+                    trailingWhitespaceOnly: trailingWhitespaceOnly
+                        && (byte == 0x20 || byte == 0x09 || byte == 0x0D)
+                )
+            }
+
+        case .ordinary:
+            break
+        }
+    }
+
+    private static func commitPendingFenceLine(
+        continuation: inout TranscriptMarkdownContinuation,
+        maximumSyntheticFenceBytes: Int
+    ) {
+        switch continuation.pendingFenceLine {
+        case .opening(
+            let delimiter,
+            let runLength,
+            _,
+            let infoValid
+        ) where continuation.openFence == nil
+            && runLength >= 3
+            && runLength <= maximumSyntheticFenceBytes
+            && infoValid:
+            continuation.openFence = String(
+                repeating: String(UnicodeScalar(delimiter)),
+                count: runLength
+            )
+
+        case .closing(
+            let runLength,
+            _,
+            let trailingWhitespaceOnly
+        ) where runLength >= (continuation.openFence?.utf8.count ?? .max)
+            && trailingWhitespaceOnly:
+            continuation.openFence = nil
+
+        default:
+            break
+        }
+        continuation.pendingFenceLine = .indent(0)
+    }
+
+    private static func markdownByteBudget(
+        maximumBytes: Int
+    ) -> (sourceBytes: Int, syntheticFenceBytes: Int) {
+        // Reserve enough room for both an opening and a closing synthetic
+        // delimiter, including their newlines. Making the source allowance no
+        // larger than the delimiter allowance guarantees that every fence a
+        // source row can contain can also be synthesized on adjacent rows.
+        precondition(maximumBytes >= 16)
+        let syntheticFenceBytes = maximumBytes / 3
+        let syntheticReserveBytes = (syntheticFenceBytes + 1) * 2
+        let sourceBytes = maximumBytes - syntheticReserveBytes
+        precondition(sourceBytes >= 4)
+        precondition(sourceBytes <= syntheticFenceBytes)
+        return (sourceBytes, syntheticFenceBytes)
+    }
+
+    private static func syntheticFence(
+        _ fence: String?,
+        prefix: String = "",
+        suffix: String = "",
+        maximumBytes: Int
+    ) -> String {
+        guard let fence,
+              fence.utf8.count <= maximumBytes else {
+            return ""
+        }
+        return prefix + fence + suffix
+    }
+
+    /// Picks a fence that no run in this bounded fragment can close. The
+    /// Markdown byte budget reserves one more delimiter byte than raw source,
+    /// so even a fragment made entirely of one delimiter has a safe guard.
+    private static func literalGuardFence(
+        for text: String,
+        maximumBytes: Int
+    ) -> String {
+        func maximumRun(of delimiter: UInt8) -> Int {
+            var maximum = 0
+            var current = 0
+            for byte in text.utf8 {
+                if byte == delimiter {
+                    current += 1
+                    maximum = max(maximum, current)
+                } else {
+                    current = 0
+                }
+            }
+            return maximum
+        }
+        let backticks = maximumRun(of: 0x60)
+        let tildes = maximumRun(of: 0x7E)
+        let delimiter: Character = backticks <= tildes ? "`" : "~"
+        let length = max(3, min(backticks, tildes) + 1)
+        precondition(length <= maximumBytes)
+        return String(repeating: String(delimiter), count: length)
+    }
+
+    private static func neutralizingLeadingFence(in text: String) -> String {
+        let characters = Array(text)
+        var index = 0
+        while index < characters.count, characters[index] == " ", index < 4 {
+            index += 1
+        }
+        guard index <= 3, index < characters.count else { return text }
+        let delimiter = characters[index]
+        guard delimiter == "`" || delimiter == "~" else { return text }
+        var end = index
+        while end < characters.count, characters[end] == delimiter {
+            end += 1
+        }
+        guard end - index >= 3 else { return text }
+        let entity = delimiter == "`" ? "&#96;" : "&#126;"
+        return String(characters[..<index])
+            + entity
+            + String(characters[(index + 1)...])
+    }
+
 }
 
 enum TranscriptProjectionTailAppend: Equatable, Sendable {
@@ -293,12 +681,14 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
         case generic
     }
 
-    // Keep each independently mounted table row small enough that TextKit and
-    // SwiftUI cannot turn a single viewport insertion into a long frame. The
-    // Markdown projection reserves part of these budgets for synthetic fence
-    // delimiters, so rendered text (not only retained source) stays bounded.
-    static let maximumDisplayBytes = 4 * 1_024
-    static let maximumDisplayLines = 256
+    // Keep each independently mounted table row below a single scroll-frame
+    // layout budget without exploding an 8 MiB newline-dense transcript into
+    // hundreds of thousands of table records. At 1 KiB / 128 lines a plain
+    // cold Text measures around 4 ms p95 on the supported macOS baseline;
+    // dense attributed artifacts are collapsed to bounded run counts before
+    // mounting. Markdown also reserves space for synthetic fence delimiters.
+    static let maximumDisplayBytes = 1 * 1_024
+    static let maximumDisplayLines = 128
 
     let id: String
     let sourceItemID: String

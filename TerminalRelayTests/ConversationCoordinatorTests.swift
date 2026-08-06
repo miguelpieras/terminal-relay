@@ -1008,13 +1008,142 @@ final class ConversationCoordinatorTests: XCTestCase {
         XCTAssertEqual(stops.first?.requestID, stops.last?.requestID)
     }
 
+    func testDetachDefersAConcurrentStartUntilTheOldTransportIsDisconnected() async {
+        let transport = LifecycleGateTransport(
+            initialEnvelope: Self.hello(sequence: 1),
+            heldDisconnectCalls: [1]
+        )
+        let store = ConversationStore()
+        let coordinator = makeCoordinator(store: store, transport: transport)
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+
+        let detachTask = Task { @MainActor in
+            await coordinator.detach()
+        }
+        await waitUntil { await transport.disconnectCallCount() == 1 }
+
+        coordinator.start()
+        await Task.yield()
+        let connectCallsWhileDetaching = await transport.connectCallCount()
+        XCTAssertEqual(
+            connectCallsWhileDetaching,
+            1,
+            "A new connection must not start while the prior disconnect is suspended."
+        )
+
+        await transport.releaseDisconnect(call: 1)
+        await detachTask.value
+        await waitUntil { await transport.connectCallCount() == 2 }
+        await coordinator.detach()
+    }
+
+    func testStopIgnoresAConcurrentStartUntilItsDisconnectCompletes() async {
+        let transport = LifecycleGateTransport(
+            initialEnvelope: Self.hello(sequence: 1),
+            heldDisconnectCalls: [1],
+            acknowledgesStop: true
+        )
+        let store = ConversationStore()
+        let coordinator = makeCoordinator(store: store, transport: transport)
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+
+        let stopTask = Task { @MainActor in
+            await coordinator.stop()
+        }
+        await waitUntil { await transport.disconnectCallCount() == 1 }
+
+        coordinator.start()
+        await Task.yield()
+        let connectCallsWhileStopping = await transport.connectCallCount()
+        XCTAssertEqual(
+            connectCallsWhileStopping,
+            1,
+            "A stopped session must not reconnect through a start racing its disconnect."
+        )
+
+        await transport.releaseDisconnect(call: 1)
+        await stopTask.value
+        XCTAssertEqual(store.state.connectionState, .stopped)
+        let connectCallsAfterStop = await transport.connectCallCount()
+        XCTAssertEqual(connectCallsAfterStop, 1)
+    }
+
+    func testStaleConnectFailureCannotPublishConnectingAfterDetachInvalidatesIt() async {
+        let transport = LifecycleGateTransport(
+            initialEnvelope: nil,
+            heldDisconnectCalls: [1, 2],
+            connectShouldFail: true
+        )
+        let store = ConversationStore()
+        let coordinator = makeCoordinator(store: store, transport: transport)
+        coordinator.start()
+        await waitUntil { await transport.disconnectCallCount() == 1 }
+
+        store.setInteractionResponding("detach-started", isResponding: true)
+        let detachTask = Task { @MainActor in
+            await coordinator.detach()
+        }
+        await waitUntil { !store.respondingInteractionIDs.contains("detach-started") }
+        store.setConnectionState(.failed, message: "Detached lifecycle marker")
+
+        await transport.releaseDisconnect(call: 1)
+        await waitUntil { await transport.disconnectCallCount() == 2 }
+        XCTAssertEqual(
+            store.state.connectionState,
+            .failed,
+            "The invalidated connection loop must not publish after its awaited disconnect."
+        )
+
+        await transport.releaseDisconnect(call: 2)
+        await detachTask.value
+        XCTAssertEqual(store.state.connectionState, .offlineAgentRunning)
+    }
+
+    func testSequenceGapDisconnectFinishesBeforeExplicitRetryReconnects() async {
+        let transport = LifecycleGateTransport(
+            initialEnvelope: Self.hello(sequence: 1),
+            heldDisconnectCalls: [1]
+        )
+        let store = ConversationStore()
+        let coordinator = makeCoordinator(store: store, transport: transport)
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+
+        await transport.yield(
+            .envelope(
+                ChatTestFixtures.event(
+                    "turn.started",
+                    sequence: 3,
+                    turnID: "gap-turn",
+                    payload: .object(["turnId": .string("gap-turn")])
+                )
+            )
+        )
+        await waitUntil { await transport.disconnectCallCount() == 1 }
+
+        coordinator.retry()
+        await Task.yield()
+        let connectCallsWhileResolvingGap = await transport.connectCallCount()
+        XCTAssertEqual(
+            connectCallsWhileResolvingGap,
+            1,
+            "Retry must wait for the sequence-gap lifecycle to finish disconnecting."
+        )
+
+        await transport.releaseDisconnect(call: 1)
+        await waitUntil { await transport.connectCallCount() == 2 }
+        await coordinator.detach()
+    }
+
     private func makeConnectedTransport() -> ChatFixtureTransport {
         ChatFixtureTransport(initialEvents: [Self.hello(sequence: 1)])
     }
 
     private func makeCoordinator(
         store: ConversationStore,
-        transport: ChatFixtureTransport
+        transport: any ChatTransport
     ) -> ConversationCoordinator {
         ConversationCoordinator(
             store: store,
@@ -1049,5 +1178,103 @@ final class ConversationCoordinatorTests: XCTestCase {
             }
             try? await Task.sleep(nanoseconds: 5_000_000)
         }
+    }
+}
+
+private actor LifecycleGateTransport: ChatTransport {
+    private let stream: AsyncStream<ChatTransportEvent>
+    private let continuation: AsyncStream<ChatTransportEvent>.Continuation
+    private let initialEnvelope: ChatEnvelope?
+    private let acknowledgesStop: Bool
+    private let connectShouldFail: Bool
+    private var heldDisconnectCalls: Set<Int>
+    private var disconnectContinuations: [Int: CheckedContinuation<Void, Never>] = [:]
+    private var connectCalls = 0
+    private var disconnectCalls = 0
+    private var isConnected = false
+
+    init(
+        initialEnvelope: ChatEnvelope?,
+        heldDisconnectCalls: Set<Int>,
+        acknowledgesStop: Bool = false,
+        connectShouldFail: Bool = false
+    ) {
+        let pair = AsyncStream.makeStream(of: ChatTransportEvent.self)
+        stream = pair.stream
+        continuation = pair.continuation
+        self.initialEnvelope = initialEnvelope
+        self.heldDisconnectCalls = heldDisconnectCalls
+        self.acknowledgesStop = acknowledgesStop
+        self.connectShouldFail = connectShouldFail
+    }
+
+    func connect() async throws {
+        connectCalls += 1
+        if connectShouldFail {
+            throw ChatTransportFailure(
+                category: "test_connect_failure",
+                message: "Controlled connection failure.",
+                isRecoverable: true
+            )
+        }
+        isConnected = true
+    }
+
+    func send(_ envelope: ChatEnvelope) async throws {
+        guard isConnected else {
+            throw ChatTransportFailure(
+                category: "not_connected",
+                message: "The controlled transport is disconnected.",
+                isRecoverable: true
+            )
+        }
+        if envelope.type == "session.attach", let initialEnvelope {
+            continuation.yield(.envelope(initialEnvelope))
+        }
+        if acknowledgesStop,
+           envelope.type == "session.stop",
+           let requestID = envelope.requestID {
+            continuation.yield(
+                .envelope(
+                    ChatTestFixtures.event(
+                        "ack",
+                        sequence: 2,
+                        payload: .object(["requestId": .string(requestID)])
+                    )
+                )
+            )
+        }
+    }
+
+    func disconnect() async {
+        disconnectCalls += 1
+        let call = disconnectCalls
+        if heldDisconnectCalls.contains(call) {
+            await withCheckedContinuation { continuation in
+                disconnectContinuations[call] = continuation
+            }
+        }
+        isConnected = false
+    }
+
+    func events() async -> AsyncStream<ChatTransportEvent> {
+        stream
+    }
+
+    func yield(_ event: ChatTransportEvent) {
+        continuation.yield(event)
+    }
+
+    func releaseDisconnect(call: Int) {
+        heldDisconnectCalls.remove(call)
+        disconnectContinuations.removeValue(forKey: call)?.resume()
+    }
+
+    func connectCallCount() -> Int {
+        connectCalls
+    }
+
+    func disconnectCallCount() -> Int {
+        disconnectCalls
     }
 }
