@@ -2054,6 +2054,9 @@ def exercise_validation(module) -> None:
     assert normalized["effort"] == "high"
     assert normalized["sandbox"] == "workspace-write"
     assert normalized["fastMode"] is True
+    assert module.public_launch_options(
+        normalized | {"_newSession": True}
+    ) == normalized
     for invalid in (
         ["--unknown"],
         ["--model"],

@@ -74,6 +74,9 @@ UUID_PATTERN = re.compile(
 )
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 SAFE_OPTION_PATTERN = re.compile(r"^[A-Za-z0-9._:/+=,-]{1,4096}$")
+PUBLIC_LAUNCH_OPTION_KEYS = frozenset(
+    {"model", "effort", "permissionMode", "sandbox", "fullAccess", "fastMode"}
+)
 ATTACHMENT_FILE_PATTERN = re.compile(
     r"^([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})(?:\.([a-z0-9]{1,10}))?$"
 )
@@ -99,6 +102,15 @@ class ChatError(Exception):
 
 def now_ms() -> int:
     return time.time_ns() // 1_000_000
+
+
+def public_launch_options(options: dict[str, Any]) -> dict[str, Any]:
+    """Return only the provider options exposed by the chat protocol."""
+    return {
+        key: value
+        for key, value in options.items()
+        if key in PUBLIC_LAUNCH_OPTION_KEYS
+    }
 
 
 def provider_timestamp_ms(value: Any) -> int | None:
@@ -3805,7 +3817,7 @@ class ChatBroker:
             "processStart": process_start_identity(os.getpid()),
             "socket": self.socket_path,
             "capabilities": chat_capabilities(self.provider_name),
-            "launchOptions": self.launch_options,
+            "launchOptions": public_launch_options(self.launch_options),
         }
         temporary = f"{self.state_path}.{os.getpid()}.{new_uuid()}.tmp"
         descriptor = os.open(
