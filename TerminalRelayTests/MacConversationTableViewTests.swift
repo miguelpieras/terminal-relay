@@ -207,6 +207,62 @@ final class MacConversationTableViewTests: XCTestCase {
         XCTAssertGreaterThan(textField?.frame.height ?? 0, 0)
     }
 
+    func testLegacyMouseWheelSynthesizesLiveScrollWindow() throws {
+        let initial = MixedRow(
+            id: "wheel-row",
+            contentRevision: 1,
+            text: "Interactive hosted content",
+            usesNativeText: false,
+            nativeAccessibilityIdentifier: "wheel-row",
+            usesLiveScrollText: true
+        )
+        let mounted = mountMixed(rows: [initial])
+        let scrollView = mounted.table.enclosingScrollView!
+
+        // A legacy mouse wheel posts no willStart/didEndLiveScroll pair; the
+        // phase-less event itself must open the same protection window.
+        let cgEvent = try XCTUnwrap(CGEvent(
+            scrollWheelEvent2Source: nil,
+            units: .pixel,
+            wheelCount: 1,
+            wheel1: -30,
+            wheel2: 0,
+            wheel3: 0
+        ))
+        let wheelEvent = try XCTUnwrap(NSEvent(cgEvent: cgEvent))
+        scrollView.scrollWheel(with: wheelEvent)
+
+        let changed = MixedRow(
+            id: "wheel-row",
+            contentRevision: 2,
+            text: "Exact wheel-mode text",
+            usesNativeText: false,
+            nativeAccessibilityIdentifier: "wheel-row",
+            usesLiveScrollText: true
+        )
+        mounted.hosting.rootView = mixedTable(rows: [changed])
+        settle(mounted.hosting)
+
+        let cell = mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: true
+        )!
+        XCTAssertTrue(cell.identifier?.rawValue.hasSuffix(".native-scroll") == true)
+
+        // After 250ms of wheel quiescence the window closes on its own and
+        // incremental restoration promotes the row back to its rich cell.
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        mounted.hosting.layoutSubtreeIfNeeded()
+        waitForLiveScrollRestoration(in: mounted.table, hosting: mounted.hosting)
+        let idleCell = mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: true
+        )!
+        XCTAssertTrue(idleCell.identifier?.rawValue.hasSuffix(".hosted") == true)
+    }
+
     func testFastRichTextPromotesOnlyAfterLiveScrollEnds() {
         let initial = MixedRow(
             id: "promoted-native",

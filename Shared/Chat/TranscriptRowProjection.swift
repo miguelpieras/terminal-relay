@@ -354,11 +354,7 @@ enum TranscriptTextProjection {
         startingIndex: Int = 0,
         initialContinuation: TranscriptMarkdownContinuation = .initial
     ) -> [TranscriptTextSegment] {
-        let byteBudget = markdownByteBudget(
-            maximumBytes: maximumBytes,
-            source: source,
-            initialContinuation: initialContinuation
-        )
+        let byteBudget = markdownByteBudget(maximumBytes: maximumBytes)
         precondition(maximumLines >= 3)
         let raw = segments(
             of: source,
@@ -390,11 +386,7 @@ enum TranscriptTextProjection {
         initialContinuation: TranscriptMarkdownContinuation = .initial
     ) -> [TranscriptTextSegment] {
         guard limit > 0 else { return [] }
-        let byteBudget = markdownByteBudget(
-            maximumBytes: maximumBytes,
-            source: source,
-            initialContinuation: initialContinuation
-        )
+        let byteBudget = markdownByteBudget(maximumBytes: maximumBytes)
         precondition(maximumLines >= 3)
         var continuation = initialContinuation
         var suffix: [TranscriptTextSegment] = []
@@ -426,11 +418,7 @@ enum TranscriptTextProjection {
         startingIndex: Int = 0,
         initialContinuation: TranscriptMarkdownContinuation = .initial
     ) -> TranscriptFirstTextSegment {
-        let byteBudget = markdownByteBudget(
-            maximumBytes: maximumBytes,
-            source: source,
-            initialContinuation: initialContinuation
-        )
+        let byteBudget = markdownByteBudget(maximumBytes: maximumBytes)
         precondition(maximumLines >= 3)
         let raw = firstSegment(
             of: source,
@@ -691,20 +679,18 @@ enum TranscriptTextProjection {
     }
 
     private static func markdownByteBudget(
-        maximumBytes: Int,
-        source: String,
-        initialContinuation: TranscriptMarkdownContinuation
+        maximumBytes: Int
     ) -> (sourceBytes: Int, syntheticFenceBytes: Int) {
-        let canRequireSyntheticFence = initialContinuation.openFence != nil
-            || source.utf8.contains(0x60)
-            || source.utf8.contains(0x7E)
-        guard canRequireSyntheticFence else {
-            return (maximumBytes, 0)
-        }
         // Reserve enough room for both an opening and a closing synthetic
         // delimiter, including their newlines. Making the source allowance no
         // larger than the delimiter allowance guarantees that every fence a
         // source row can contain can also be synthesized on adjacent rows.
+        //
+        // The reserve is unconditional. Deciding it from the presence of a
+        // backtick in the *examined* source made the budget depend on which
+        // window of the item a caller passed: streamed tail appends and full
+        // rebuilds then tiled the same content differently, so sealed rows
+        // changed identity at completion and warmed cache keys missed.
         precondition(maximumBytes >= 16)
         let syntheticFenceBytes = maximumBytes / 3
         let syntheticReserveBytes = (syntheticFenceBytes + 1) * 2

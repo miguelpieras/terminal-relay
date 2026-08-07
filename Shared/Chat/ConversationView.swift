@@ -401,6 +401,9 @@ enum MacTranscriptRow: MacConversationTableRow {
                 )
             }
             let source = content.text
+            // The prepared attributed representation flattens tables to text
+            // lines; rows carrying one stay hosted for real grid rendering.
+            if MarkdownSafety.containsTableCandidate(source) { return nil }
             // Assistant rows paint exact text first and adopt rich Markdown
             // only after scrolling. Avoid even a warm AppKit artifact lookup
             // while a gesture is realizing cells; user bubbles keep their

@@ -152,23 +152,33 @@ final class TranscriptRowProjectionTests: XCTestCase {
         }
     }
 
-    func testFenceFreeMarkdownUsesTheFullTileBudget() {
-        let source = String(repeating: "viewport bounded text ", count: 400)
+    func testMarkdownTileBudgetIsIdenticalWithAndWithoutFences() {
+        // The budget must not depend on the examined source: a per-call
+        // backtick check made streamed tail appends and full rebuilds tile
+        // the same content differently, so sealed rows changed identity when
+        // a later chunk introduced a fence.
+        let prose = String(repeating: "viewport bounded text ", count: 400)
         let maximumBytes = 1_024
-        let segments = TranscriptTextProjection.markdownSegments(
-            of: source,
+        let proseSegments = TranscriptTextProjection.markdownSegments(
+            of: prose,
+            maximumBytes: maximumBytes,
+            maximumLines: 128
+        )
+        let fenced = TranscriptTextProjection.markdownSegments(
+            of: prose + "`code`",
             maximumBytes: maximumBytes,
             maximumLines: 128
         )
 
-        XCTAssertEqual(segments.map(\.text).joined(), source)
-        XCTAssertTrue(segments.allSatisfy {
+        XCTAssertEqual(proseSegments.map(\.text).joined(), prose)
+        XCTAssertTrue(proseSegments.allSatisfy {
             $0.text == $0.renderedText
                 && $0.renderedText.utf8.count <= maximumBytes
         })
-        XCTAssertTrue(segments.dropLast().allSatisfy {
-            $0.text.utf8.count == maximumBytes
-        })
+        XCTAssertEqual(
+            proseSegments.dropLast().map(\.text),
+            Array(fenced.map(\.text).prefix(proseSegments.count - 1))
+        )
     }
 
     func testLongerMarkdownFenceIgnoresShortAndSuffixedFenceLikeContent() {

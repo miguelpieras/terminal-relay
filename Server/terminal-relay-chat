@@ -878,7 +878,7 @@ def codex_sandbox_policy(value: str) -> dict[str, Any]:
         raise ChatError("invalidOptions", "The sandbox mode is unsupported.") from error
 
 
-def content_text(value: Any) -> str:
+def content_text(value: Any, separator: str = "\n") -> str:
     if isinstance(value, str):
         return value
     if not isinstance(value, list):
@@ -895,7 +895,7 @@ def content_text(value: Any) -> str:
             )
             if isinstance(candidate, str):
                 parts.append(candidate)
-    return "\n".join(parts)
+    return separator.join(parts)
 
 
 def normalized_tool_status(value: Any, completed: bool) -> str:
@@ -1025,6 +1025,11 @@ class ProviderAdapter:
         self.launch_options = launch_options
         self.emit: Callable[..., Awaitable[dict[str, Any]]] | None = None
         self.connection_generation = new_uuid()
+        # Set by the broker: replaces every client's transcript with a fresh
+        # generation rebuilt from provider history. Adapters use it after a
+        # reconnect instead of re-emitting history as live events, which would
+        # duplicate items already shown under different live identities.
+        self.request_snapshot_rebuild: Callable[[], Awaitable[None]] | None = None
 
     async def start(self, emit: Callable[..., Awaitable[dict[str, Any]]]) -> str:
         self.emit = emit
@@ -1315,6 +1320,7 @@ class CodexAdapter(ProviderAdapter):
         self.last_reconciled_thread: dict[str, Any] | None = None
         self.interactions: dict[str, dict[str, Any]] = {}
         self.plan_buffers: dict[str, str] = {}
+        self.reasoning_streamed: set[str] = set()
 
     async def start(self, emit: Callable[..., Awaitable[dict[str, Any]]]) -> str:
         self.emit = emit
@@ -1566,8 +1572,16 @@ class CodexAdapter(ProviderAdapter):
                 self.websocket = websocket
                 self.connection_generation = new_uuid()
                 self.last_reconciled_thread = thread
-                await self._reconcile_thread(thread, prior_active_turn)
+                reconciled_items = await self._reconcile_thread(
+                    thread, prior_active_turn
+                )
                 for value in buffered:
+                    # thread/read already contains the text of deltas that
+                    # raced the handshake; replaying them would duplicate the
+                    # reconciled bytes. The eventual item/completed replaces
+                    # the full text authoritatively either way.
+                    if self._buffered_delta_item(value) in reconciled_items:
+                        continue
                     await self._dispatch_provider_value(value)
                 self.connection_ready.set()
                 if self.emit:
@@ -1585,6 +1599,20 @@ class CodexAdapter(ProviderAdapter):
             except Exception:
                 await asyncio.to_thread(websocket.close)
         return False
+
+    @staticmethod
+    def _buffered_delta_item(value: dict[str, Any]) -> str | None:
+        method = value.get("method")
+        if not isinstance(method, str) or "delta" not in method.lower():
+            return None
+        params = value.get("params")
+        if not isinstance(params, dict):
+            return None
+        item = params.get("item")
+        item_id = (
+            item.get("id") if isinstance(item, dict) else params.get("itemId")
+        )
+        return item_id if isinstance(item_id, str) else None
 
     @staticmethod
     def _turn_for_client_command(
@@ -1617,9 +1645,10 @@ class CodexAdapter(ProviderAdapter):
 
     async def _reconcile_thread(
         self, thread: dict[str, Any], prior_active_turn: str | None
-    ) -> None:
+    ) -> set[str]:
+        reconciled: set[str] = set()
         if not self.emit:
-            return
+            return reconciled
         turns = thread.get("turns")
         if not isinstance(turns, list):
             turns = []
@@ -1653,10 +1682,10 @@ class CodexAdapter(ProviderAdapter):
                     turn_id=prior_active_turn,
                 )
                 self.active_turn = None
-            return
+            return reconciled
         turn_id = target.get("id")
         if not isinstance(turn_id, str) or not UUID_PATTERN.fullmatch(turn_id):
-            return
+            return reconciled
         turn_status = target.get("status")
         items = target.get("items")
         if isinstance(items, list):
@@ -1668,8 +1697,11 @@ class CodexAdapter(ProviderAdapter):
                     continue
                 provider_type = str(item.get("type", "")).lower()
                 item_status = item.get("status")
+                # A still-streaming agent message must stay streaming: forcing
+                # it completed replayed the thread/read partial text as final,
+                # after which buffered deltas re-appended the same bytes.
                 completed = (
-                    "message" in provider_type
+                    "usermessage" in provider_type
                     or turn_status != "inProgress"
                     or item_status
                     in {
@@ -1688,6 +1720,7 @@ class CodexAdapter(ProviderAdapter):
                     turn_id=turn_id,
                     item_id=item_id,
                 )
+                reconciled.add(item_id)
         if turn_status == "inProgress":
             self.active_turn = turn_id
             await self.emit(
@@ -1695,7 +1728,7 @@ class CodexAdapter(ProviderAdapter):
                 {"status": "streaming", "reconciled": True},
                 turn_id=turn_id,
             )
-            return
+            return reconciled
         event_type = {
             "interrupted": "turn.interrupted",
             "failed": "turn.failed",
@@ -1706,6 +1739,7 @@ class CodexAdapter(ProviderAdapter):
             turn_id=turn_id,
         )
         self.active_turn = None
+        return reconciled
 
     async def _expire_interactions(self) -> None:
         if not self.emit:
@@ -1896,6 +1930,19 @@ class CodexAdapter(ProviderAdapter):
             )
             if isinstance(item_id, str):
                 self.plan_buffers.pop(item_id, None)
+                self.reasoning_streamed.discard(item_id)
+            return
+        if method == "item/reasoning/summaryPartAdded":
+            # A new summary part begins. Emit the same blank-line separator
+            # the completed item uses so streamed and rebuilt text match; the
+            # guard keeps a leading part from producing a blank first line.
+            if isinstance(item_id, str) and item_id in self.reasoning_streamed:
+                await self.emit(
+                    "reasoning.delta",
+                    {"text": "\n\n", "truncated": False, "originalByteCount": 2},
+                    turn_id=turn_id,
+                    item_id=item_id,
+                )
             return
         if method in {
             "item/agentMessage/delta",
@@ -1906,6 +1953,8 @@ class CodexAdapter(ProviderAdapter):
             event_type = (
                 "reasoning.delta" if "reasoning" in lower else "message.delta"
             )
+            if event_type == "reasoning.delta" and text and isinstance(item_id, str):
+                self.reasoning_streamed.add(item_id)
             await self.emit(
                 event_type,
                 {
@@ -2120,8 +2169,12 @@ class CodexAdapter(ProviderAdapter):
             )
             event_type = f"message.{event_suffix}"
         elif "reasoning" in lower:
+            # Summary parts join with a blank line, matching the separator the
+            # live stream emits on summaryPartAdded, so a completed reasoning
+            # item reproduces the streamed text byte-for-byte.
             reasoning_text = content_text(
-                item.get("summary") or item.get("content") or text
+                item.get("summary") or item.get("content") or text,
+                separator="\n\n",
             )
             payload.update(
                 {
@@ -2508,6 +2561,7 @@ class ClaudeAdapter(ProviderAdapter):
         self.active_turn: str | None = None
         self.pending_callbacks: dict[str, tuple[asyncio.Future[Any], dict[str, Any]]] = {}
         self.partial_blocks: dict[tuple[str, int], str] = {}
+        self.active_stream_message: str | None = None
         self.tool_items: dict[str, str] = {}
         self._sdk: Any = None
         self.client_factory: Callable[[Any], Any] | None = None
@@ -2783,30 +2837,15 @@ class ClaudeAdapter(ProviderAdapter):
                 self.connection_generation = new_uuid()
                 self.partial_blocks.clear()
                 self.tool_items.clear()
-                history, _ = await self.history(None, MAX_HISTORY_ITEMS)
-                if prior_active_turn:
-                    latest_user = next(
-                        (
-                            item
-                            for item in reversed(history)
-                            if item.get("type") == "message.completed"
-                            and item.get("payload", {}).get("role") == "user"
-                        ),
-                        None,
-                    )
-                    if latest_user:
-                        latest_user["turnId"] = prior_active_turn
-                        latest_user["payload"][
-                            "clientUserMessageId"
-                        ] = prior_active_turn
+                self.active_stream_message = None
+                # Replace every client's transcript with a fresh generation
+                # rebuilt from provider history. Re-emitting history as live
+                # events duplicated rows whose live identity (streamed
+                # messages, system notices) differs from the JSONL identity.
+                rebuild = self.request_snapshot_rebuild
+                if rebuild is not None:
+                    await rebuild()
                 if self.emit:
-                    for item in history:
-                        await self.emit(
-                            item["type"],
-                            item["payload"],
-                            turn_id=item.get("turnId"),
-                            item_id=item.get("itemId"),
-                        )
                     if prior_active_turn:
                         await self.emit(
                             "turn.failed",
@@ -2847,38 +2886,64 @@ class ClaudeAdapter(ProviderAdapter):
         if not self.emit:
             return
         value = sanitize_json(message)
+        if not isinstance(value, dict):
+            value = {}
         class_name = type(message).__name__
-        message_uuid = (
-            value.get("uuid") if isinstance(value, dict) else None
-        ) or (
-            value.get("session_id") if isinstance(value, dict) else None
-        ) or new_uuid()
-        if class_name == "StreamEvent" or (
-            isinstance(value, dict) and "event" in value
-        ):
+        if class_name == "StreamEvent" or "event" in value:
+            # Every stream_event envelope carries a fresh random uuid, and a
+            # session_id is shared by the whole conversation, so neither may
+            # key transcript items. Deltas accumulate under one broker-side
+            # identity per streamed message, allocated at message_start and
+            # adopted by the completed AssistantMessage so completion replaces
+            # the streamed rows instead of duplicating them.
+            if value.get("parent_tool_use_id"):
+                # Subagent partials render when their message completes.
+                return
             event = value.get("event", value)
             event_type = event.get("type") if isinstance(event, dict) else None
+            if event_type == "message_start":
+                self.active_stream_message = new_uuid()
+                return
             index = event.get("index", 0) if isinstance(event, dict) else 0
             delta = event.get("delta", {}) if isinstance(event, dict) else {}
             text = delta.get("text") if isinstance(delta, dict) else None
             if isinstance(text, str):
-                key = (str(message_uuid), int(index) if isinstance(index, int) else 0)
+                if self.active_stream_message is None:
+                    self.active_stream_message = new_uuid()
+                key = (
+                    self.active_stream_message,
+                    int(index) if isinstance(index, int) else 0,
+                )
                 self.partial_blocks[key] = self.partial_blocks.get(key, "") + text
                 await self.emit(
                     "message.delta",
                     {"role": "assistant", "text": text, "blockIndex": key[1]},
                     turn_id=self.active_turn,
-                    item_id=f"{message_uuid}:{key[1]}",
+                    item_id=f"{key[0]}:{key[1]}",
                 )
             return
         if class_name == "AssistantMessage":
-            await self._map_claude_content(value, "assistant", str(message_uuid))
+            identity = value.get("uuid") or value.get("message_id")
+            if not value.get("parent_tool_use_id"):
+                stream_identity = self.active_stream_message
+                self.active_stream_message = None
+                if stream_identity:
+                    identity = stream_identity
+                    for key in [
+                        key
+                        for key in self.partial_blocks
+                        if key[0] == stream_identity
+                    ]:
+                        self.partial_blocks.pop(key, None)
+            await self._map_claude_content(
+                value, "assistant", str(identity or new_uuid())
+            )
             return
         if class_name == "UserMessage":
             await self._map_claude_content(
                 value,
                 "user",
-                str(message_uuid),
+                str(value.get("uuid") or new_uuid()),
                 client_user_message_id=self.active_turn,
             )
             return
@@ -2907,17 +2972,11 @@ class ClaudeAdapter(ProviderAdapter):
             )
             self.active_turn = None
             return
-        await self.emit(
-            "tool.completed",
-            {
-                "kind": normalized_tool_kind(class_name),
-                "title": class_name,
-                "output": display_string(value),
-                "status": "completed",
-            },
-            turn_id=self.active_turn,
-            item_id=str(message_uuid),
-        )
+        # Everything else — SystemMessage and its subclasses (init, task and
+        # hook events), RateLimitEvent, future lifecycle envelopes — is
+        # session metadata, never transcript content. Rendering them produced
+        # random-identity "SystemMessage" rows that accumulated forever.
+        return
 
     async def _map_claude_content(
         self,
@@ -3038,6 +3097,12 @@ class ClaudeAdapter(ProviderAdapter):
             or value.get("role")
             or type(message).__name__.replace("Message", "").lower()
         )
+        # Session JSONL interleaves internal records (type "system" notices,
+        # isMeta caveats/command output) with the conversation. Rebuilding a
+        # transcript from them must reproduce only what the live stream
+        # showed, so anything that is not a user/assistant record is skipped.
+        if role not in {"user", "assistant"} or value.get("isMeta"):
+            return []
         content = message_value.get("content")
         if isinstance(content, str):
             content = [{"type": "text", "text": content}]
@@ -3062,9 +3127,7 @@ class ClaudeAdapter(ProviderAdapter):
                     "turnId": message_uuid if role == "user" else None,
                     "itemId": item_id,
                     "payload": {
-                        "role": (
-                            role if role in {"user", "assistant"} else "assistant"
-                        ),
+                        "role": role,
                         "text": text,
                         "status": "completed",
                         "blockIndex": index,
@@ -3362,6 +3425,7 @@ class ChatBroker:
         self.runtime_directory = runtime_directory
         self.relay_id = relay_id
         self.provider = provider
+        provider.request_snapshot_rebuild = self.rebuild_snapshot
         self.launch_options = launch_options
         self.provider_thread_id: str | None = provider.thread_id
         self.snapshot_generation = new_uuid()
@@ -3631,21 +3695,28 @@ class ChatBroker:
                     str(payload["output"])
                 )
             elif isinstance(output_delta, str):
+                initial_output = item_payload.get("output")
                 accumulator = self._snapshot_text_accumulator(
                     item_id,
                     "output",
-                    str(item_payload.get("output", "")),
+                    initial_output if isinstance(initial_output, str) else "",
                 )
                 accumulator.append(
                     output_delta,
                     payload.get("originalByteCount"),
                 )
+            # A delta's truncated/originalByteCount describe only that delta;
+            # the accumulator derives the item-level values at materialization.
+            excluded_keys = (
+                {"output", "outputDelta", "truncated", "originalByteCount"}
+                if isinstance(output_delta, str)
+                else {"output", "outputDelta"}
+            )
             item_payload.update(
                 {
                     key: value
                     for key, value in payload.items()
-                    if value is not None
-                    and key not in {"output", "outputDelta"}
+                    if value is not None and key not in excluded_keys
                 }
             )
         elif event_type == "approval.requested" and item_id:
@@ -4078,6 +4149,11 @@ class ChatBroker:
         )
         if self.provider_lock_descriptor is None:
             self._acquire_provider_lock()
+        # The provider is connected: stamp streaming before the rebuild so the
+        # authoritative rebuilt snapshot never looks like the pre-resume
+        # "connecting" placeholder, which clients keep painted rows for. An
+        # authoritative EMPTY snapshot must actually blank the transcript.
+        self.connection_state = "streaming"
         await self.rebuild_snapshot(load_provider_history=load_provider_history)
 
     def _remove_intent_file(self) -> None:

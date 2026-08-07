@@ -1425,6 +1425,14 @@ async def exercise_codex_reconnect(module, root: pathlib.Path) -> None:
     )
     adapter.websocket = first
     adapter.websocket_factory = lambda: second
+    # A delta that races the reconnect handshake: its bytes are already part
+    # of the thread/read text, so replaying it would duplicate them.
+    second.incoming.put(
+        {
+            "method": "item/agentMessage/delta",
+            "params": {"itemId": assistant_item_id, "delta": "partial"},
+        }
+    )
     events: list[dict] = []
 
     async def emit(event_type, payload, *, turn_id=None, item_id=None):
@@ -1474,6 +1482,17 @@ async def exercise_codex_reconnect(module, root: pathlib.Path) -> None:
         event for event in events if event["itemId"] == user_item_id
     )
     assert reconciled_user["payload"]["clientUserMessageId"] == command_id
+    assert reconciled_user["type"] == "message.completed"
+    reconciled_assistant = next(
+        event for event in events if event["itemId"] == assistant_item_id
+    )
+    assert reconciled_assistant["type"] == "message.started"
+    assert reconciled_assistant["payload"]["status"] == "streaming"
+    assert not any(
+        event["type"] == "message.delta"
+        and event["itemId"] == assistant_item_id
+        for event in events
+    )
     assert any(
         event["type"] == "turn.started"
         and event["turnId"] == turn_id
@@ -1708,6 +1727,12 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
     await adapter.interrupt(command_id)
     assert adapter.client.interrupted is True
 
+    SystemMessage = type("SystemMessage", (), {})
+    system = SystemMessage()
+    system.subtype = "init"
+    system.data = {"type": "system", "subtype": "init", "session_id": THREAD_ID}
+    events_before_system = len(events)
+    await received.put(system)
     UserMessage = type("UserMessage", (), {})
     user = UserMessage()
     user.uuid = "17171717-1717-4717-8717-171717171717"
@@ -1732,6 +1757,10 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
         and event["payload"]["text"] == "answer"
         for event in events
     )
+    assert not any(
+        "SystemMessage" in json.dumps(event)
+        for event in events[events_before_system:]
+    )
     live_user = next(
         event
         for event in events
@@ -1748,12 +1777,79 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
         and event["payload"]["text"] == "answer"
     )
     assert live_assistant["itemId"] == "16161616-1616-4616-8616-161616161616:0"
+    StreamEvent = type("StreamEvent", (), {})
+    stream_start = StreamEvent()
+    stream_start.uuid = "20202020-2020-4020-8020-202020202020"
+    stream_start.session_id = THREAD_ID
+    stream_start.event = {"type": "message_start", "message": {"id": "msg_1"}}
+    first_delta = StreamEvent()
+    first_delta.uuid = "21212121-2121-4121-8121-212121212121"
+    first_delta.session_id = THREAD_ID
+    first_delta.event = {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "text_delta", "text": "Hel"},
+    }
+    second_delta = StreamEvent()
+    second_delta.uuid = "22222222-2222-4222-8222-222222222222"
+    second_delta.session_id = THREAD_ID
+    second_delta.event = {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "text_delta", "text": "lo"},
+    }
+    streamed_assistant = AssistantMessage()
+    streamed_assistant.uuid = "23232323-2323-4323-8323-232323232323"
+    streamed_assistant.content = [{"type": "text", "text": "Hello"}]
+    for value in (stream_start, first_delta, second_delta, streamed_assistant):
+        await received.put(value)
+    for _ in range(100):
+        if any(
+            event["type"] == "message.completed"
+            and event["payload"]["text"] == "Hello"
+            for event in events
+        ):
+            break
+        await asyncio.sleep(0.01)
+    delta_ids = {
+        event["itemId"]
+        for event in events
+        if event["type"] == "message.delta"
+    }
+    # Stream envelopes carry random uuids; all deltas of one message must
+    # share a single stable item id that the completed message adopts.
+    assert len(delta_ids) == 1
+    streamed_completed = next(
+        event
+        for event in events
+        if event["type"] == "message.completed"
+        and event["payload"]["text"] == "Hello"
+    )
+    assert streamed_completed["itemId"] in delta_ids
+    assert adapter.partial_blocks == {}
     history_messages.extend(
         [
             SimpleNamespace(
                 uuid=user.uuid,
                 type="user",
                 message={"role": "user", "content": user.content},
+            ),
+            SimpleNamespace(
+                uuid="18181818-1818-4818-8818-181818181818",
+                type="system",
+                subtype="init",
+                message={
+                    "content": [{"type": "text", "text": "internal notice"}]
+                },
+            ),
+            SimpleNamespace(
+                uuid="19191919-1919-4919-8919-191919191919",
+                type="user",
+                isMeta=True,
+                message={
+                    "role": "user",
+                    "content": [{"type": "text", "text": "meta caveat"}],
+                },
             ),
             SimpleNamespace(
                 uuid=assistant.uuid,
@@ -1767,6 +1863,11 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
     assert live_user["itemId"] in reconciled_ids
     assert live_assistant["itemId"] in reconciled_ids
     assert len(reconciled_ids) == len(set(reconciled_ids))
+    reconciled_texts = [
+        item["payload"].get("text") for item in reconciled_history
+    ]
+    assert "internal notice" not in reconciled_texts
+    assert "meta caveat" not in reconciled_texts
 
     callback = asyncio.create_task(
         adapter._can_use_tool(
@@ -1958,6 +2059,12 @@ async def exercise_claude_reconnect(module, root: pathlib.Path) -> None:
     adapter = module.ClaudeAdapter(str(project), THREAD_ID, {})
     adapter._load_sdk = lambda: sdk
     events: list[dict] = []
+    rebuild_requests: list[bool] = []
+
+    async def request_rebuild():
+        rebuild_requests.append(True)
+
+    adapter.request_snapshot_rebuild = request_rebuild
 
     async def emit(event_type, payload, *, turn_id=None, item_id=None):
         event = {
@@ -1989,19 +2096,14 @@ async def exercise_claude_reconnect(module, root: pathlib.Path) -> None:
     assert clients[1].options.kwargs["resume"] == THREAD_ID
     assert adapter.connection_generation != first_generation
     assert adapter.active_turn is None
-    assert history_calls == [(module.CLAUDE_HISTORY_PAGE_MESSAGES, 0)]
-    assert any(
-        event["type"] == "message.completed"
-        and event["itemId"] == "40404040-4040-4040-8040-404040404040:0"
-        for event in events
+    # The reconnect must replace the transcript through one snapshot rebuild
+    # instead of re-emitting history records as live events, which duplicated
+    # rows whose live identity differs from the JSONL identity.
+    assert rebuild_requests == [True]
+    assert history_calls == []
+    assert not any(
+        event["type"] == "message.completed" for event in events
     )
-    reconciled_user = next(
-        event
-        for event in events
-        if event["itemId"] == "39393939-3939-4939-8939-393939393939:0"
-    )
-    assert reconciled_user["payload"]["clientUserMessageId"] == command_id
-    assert reconciled_user["turnId"] == command_id
     assert any(
         event["type"] == "turn.failed"
         and event["turnId"] == command_id

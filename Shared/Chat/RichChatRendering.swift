@@ -207,6 +207,28 @@ enum MarkdownSafety {
         return !collector.images.isEmpty
     }
 
+    /// Cheap GFM table screen: a pipe-bearing header line directly above a
+    /// delimiter line. Rows that pass stay on the SwiftUI Markdown path so
+    /// tables keep their grid rendering; a false positive only routes one
+    /// bounded row through the heavier-but-correct renderer.
+    static func containsTableCandidate(_ source: String) -> Bool {
+        var previousLineHasPipe = false
+        for substring in source.split(
+            separator: "\n",
+            omittingEmptySubsequences: false
+        ) {
+            let trimmed = substring.trimmingCharacters(in: .whitespaces)
+            if previousLineHasPipe,
+               trimmed.contains("-"),
+               !trimmed.isEmpty,
+               trimmed.allSatisfy({ "|-: ".contains($0) }) {
+                return true
+            }
+            previousLineHasPipe = trimmed.contains("|")
+        }
+        return false
+    }
+
     private static func neutralizingImages(in source: String) -> String {
         guard source.contains("![") else { return source }
         var collector = MarkdownImageCollector()
@@ -1040,8 +1062,10 @@ enum PreparedMarkdownRenderer {
             codeContext.isCode = true
             var result = AttributedString()
             if let language = codeBlock.language, !language.isEmpty {
-                var labelContext = codeContext
-                labelContext.intents.formUnion(.stronglyEmphasized)
+                // The label is chrome, not content: styling it with the code
+                // context painted the info string as the block's first line.
+                var labelContext = context.adding(.stronglyEmphasized)
+                labelContext.isCode = false
                 result.append(styled(language, context: labelContext))
                 result.append(AttributedString("\n"))
             }
@@ -1359,10 +1383,12 @@ struct RichMarkdownView: View {
         let onOpenRepository: (ChatRepositoryLink) -> Void = { actions.openRepository($0) }
 
         #if os(macOS)
-        if !isStreaming {
+        if !isStreaming, !MarkdownSafety.containsTableCandidate(text) {
             // A completed macOS row is already one prepared attributed Text.
             // Do not wrap it in the MarkdownView renderer/style environment;
             // those modifiers cannot affect it and add cold-host graph work.
+            // Rows carrying a table stay on the styled MarkdownView path so
+            // the table renders as a grid rather than flattened text.
             PreparedMarkdownText(
                 source: text,
                 fallbackText: exactFallbackText ?? text,

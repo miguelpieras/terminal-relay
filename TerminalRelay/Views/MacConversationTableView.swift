@@ -6,10 +6,16 @@ import SwiftUI
 @MainActor
 private final class MacConversationTranscriptScrollView: NSScrollView {
     var onLayout: (() -> Void)?
+    var onWheelEvent: ((NSEvent) -> Void)?
 
     override func layout() {
         super.layout()
         onLayout?()
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        onWheelEvent?(event)
+        super.scrollWheel(with: event)
     }
 }
 
@@ -772,12 +778,13 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         private var stabilizationScheduled = false
         private var stabilizationGeneration: UInt64 = 0
         private var isLiveScrolling = false
+        private var wheelScrollWindowActive = false
+        private var wheelQuiescenceTimer: Timer?
         private var pendingLiveScrollHeightInvalidations = IndexSet()
         private let liveScrollCells = NSHashTable<MacConversationReusableCell>
             .weakObjects()
         private var liveScrollRestorationQueue: [LiveScrollRestoration] = []
         private var liveScrollRestorationIndex = 0
-        private var liveScrollRestorationDisplayLink: CADisplayLink?
         private var liveScrollRestorationTimer: Timer?
         private var pendingLiveScrollRestorationAnchor: Anchor?
         private var pendingLiveScrollRestorationFollowsBottom = false
@@ -822,6 +829,9 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             (scrollView as? MacConversationTranscriptScrollView)?.onLayout = { [weak self] in
                 _ = self?.applyPendingScrollCorrectionIfReady()
             }
+            (scrollView as? MacConversationTranscriptScrollView)?.onWheelEvent = { [weak self] event in
+                self?.wheelEventDidArrive(event)
+            }
             lastViewportWidth = scrollView.contentView.bounds.width
             tableView.dataSource = self
             tableView.delegate = self
@@ -858,7 +868,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                     object: scrollView,
                     queue: .main
                 ) { [weak self] _ in
-                    MainActor.assumeIsolated { self?.liveScrollDidBegin() }
+                    MainActor.assumeIsolated { self?.trackpadLiveScrollWillStart() }
                 },
                 center.addObserver(
                     forName: NSScrollView.didEndLiveScrollNotification,
@@ -882,6 +892,10 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             scrollActivity.setLiveScrolling(false)
             scrollActivity.setIncrementalRestorationActive(false)
             (scrollView as? MacConversationTranscriptScrollView)?.onLayout = nil
+            (scrollView as? MacConversationTranscriptScrollView)?.onWheelEvent = nil
+            wheelQuiescenceTimer?.invalidate()
+            wheelQuiescenceTimer = nil
+            wheelScrollWindowActive = false
             for observer in observers {
                 NotificationCenter.default.removeObserver(observer)
             }
@@ -1135,11 +1149,13 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             configureChangedRows: Bool,
             tableView: NSTableView
         ) -> IndexSet {
-            let oldSectionIndex = Dictionary(uniqueKeysWithValues:
-                oldSnapshot.sections.enumerated().map { ($0.element.id, $0.offset) }
+            let oldSectionIndex = Dictionary(
+                oldSnapshot.sections.enumerated().map { ($0.element.id, $0.offset) },
+                uniquingKeysWith: { first, _ in first }
             )
-            let newSectionIndex = Dictionary(uniqueKeysWithValues:
-                newSnapshot.sections.enumerated().map { ($0.element.id, $0.offset) }
+            let newSectionIndex = Dictionary(
+                newSnapshot.sections.enumerated().map { ($0.element.id, $0.offset) },
+                uniquingKeysWith: { first, _ in first }
             )
             let oldCommonOrder = oldSnapshot.sections.compactMap {
                 newSectionIndex[$0.id] == nil ? nil : $0.id
@@ -1184,11 +1200,13 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                     continue
                 }
 
-                let oldRowIndex = Dictionary(uniqueKeysWithValues:
-                    oldSection.rows.enumerated().map { ($0.element.id, $0.offset) }
+                let oldRowIndex = Dictionary(
+                    oldSection.rows.enumerated().map { ($0.element.id, $0.offset) },
+                    uniquingKeysWith: { first, _ in first }
                 )
-                let newRowIndex = Dictionary(uniqueKeysWithValues:
-                    newSection.rows.enumerated().map { ($0.element.id, $0.offset) }
+                let newRowIndex = Dictionary(
+                    newSection.rows.enumerated().map { ($0.element.id, $0.offset) },
+                    uniquingKeysWith: { first, _ in first }
                 )
                 let oldRowOrder = oldSection.rows.compactMap {
                     newRowIndex[$0.id] == nil ? nil : $0.id
@@ -1304,14 +1322,18 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                       ) as? MacConversationReusableCell else {
                     continue
                 }
-                configure(
+                // Only rows whose cell actually changed re-measure; edge
+                // indexes are revisited on every batch and would otherwise
+                // re-fit the (possibly giant) first/last row each 33ms.
+                if configure(
                     cell,
                     with: snapshot[index],
                     isFirst: index == 0,
                     isLast: index == snapshot.count - 1,
                     isExplicit: true
-                )
-                configuredIndexes.insert(index)
+                ) {
+                    configuredIndexes.insert(index)
+                }
             }
             return configuredIndexes
         }
@@ -1379,6 +1401,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             return configuredIndexes
         }
 
+        @discardableResult
         private func configure(
             _ cell: MacConversationReusableCell,
             with row: Row,
@@ -1387,12 +1410,12 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             force: Bool = false,
             preparedContent: MacConversationReusableCell.Content? = nil,
             isExplicit: Bool
-        ) {
+        ) -> Bool {
             guard force || cell.representedRowID != row.id
                     || cell.contentRevision != row.contentRevision
                     || cell.isFirst != isFirst
                     || cell.isLast != isLast else {
-                return
+                return false
             }
             // This is the frame-critical realization path. Store/projection
             // and table-mutation signposts retain end-to-end observability;
@@ -1416,6 +1439,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 mutationSourceID: row.mutationSourceID,
                 isExplicit: isExplicit
             )
+            return true
         }
 
         private func cellContent(
@@ -1599,8 +1623,9 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         }
 
         private func rebuildSectionIndex() {
-            sectionIndexByID = Dictionary(uniqueKeysWithValues:
-                snapshot.sections.enumerated().map { ($0.element.id, $0.offset) }
+            sectionIndexByID = Dictionary(
+                snapshot.sections.enumerated().map { ($0.element.id, $0.offset) },
+                uniquingKeysWith: { first, _ in first }
             )
         }
 
@@ -1625,6 +1650,42 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 pendingMutationAnchor = anchor
                 pendingExpectedClipOriginY = scrollView?.contentView.bounds.origin.y
             }
+        }
+
+        /// Legacy mouse wheels never post the willStart/didEndLiveScroll
+        /// notification pair (per the NSScrollView header), so wheel scrolling
+        /// previously bypassed every gesture protection: idle promotions and
+        /// anchor corrections kept mutating rows under the moving viewport.
+        /// Phase-less wheel events synthesize the same live-scroll window a
+        /// trackpad gets, ended by a short quiescence timer.
+        private func wheelEventDidArrive(_ event: NSEvent) {
+            guard event.phase == [] && event.momentumPhase == [] else { return }
+            if !isLiveScrolling {
+                liveScrollDidBegin()
+                wheelScrollWindowActive = true
+            }
+            guard wheelScrollWindowActive else { return }
+            wheelQuiescenceTimer?.invalidate()
+            let timer = Timer(timeInterval: 0.25, repeats: false) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.wheelQuiescenceTimer = nil
+                    guard self.wheelScrollWindowActive else { return }
+                    self.wheelScrollWindowActive = false
+                    self.liveScrollDidEnd()
+                }
+            }
+            wheelQuiescenceTimer = timer
+            RunLoop.main.add(timer, forMode: .common)
+        }
+
+        /// A trackpad gesture takes ownership of any synthesized wheel
+        /// window; its own didEnd notification will close the mode.
+        private func trackpadLiveScrollWillStart() {
+            wheelScrollWindowActive = false
+            wheelQuiescenceTimer?.invalidate()
+            wheelQuiescenceTimer = nil
+            liveScrollDidBegin()
         }
 
         private func liveScrollDidBegin() {
@@ -1724,7 +1785,6 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                   liveScrollRestorationIndex < liveScrollRestorationQueue.count
                     || pendingLiveScrollRestorationAnchor != nil
                     || pendingLiveScrollRestorationFollowsBottom,
-                  liveScrollRestorationDisplayLink == nil,
                   liveScrollRestorationTimer == nil else {
                 if liveScrollRestorationIndex >= liveScrollRestorationQueue.count,
                    pendingLiveScrollRestorationAnchor == nil,
@@ -1733,24 +1793,21 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 }
                 return
             }
-            if let window = scrollView?.window {
-                let link = window.displayLink(
-                    target: self,
-                    selector: #selector(restoreNextLiveScrollRow(_:))
-                )
-                liveScrollRestorationDisplayLink = link
-                link.add(to: .main, forMode: .common)
-            } else {
-                let timer = Timer(
-                    timeInterval: 1.0 / 60.0,
-                    target: self,
-                    selector: #selector(restoreNextLiveScrollRow(_:)),
-                    userInfo: nil,
-                    repeats: true
-                )
-                liveScrollRestorationTimer = timer
-                RunLoop.main.add(timer, forMode: .common)
-            }
+            // A run-loop timer, not NSWindow.displayLink: the underlying
+            // CADisplayLink can fail to attach to the window's display (it
+            // logs "failed to create CADisplayLink" and never fires), which
+            // left the restoration queue stuck, live-scroll cells mounted
+            // forever, and idle adoptions latched off. The timer matches the
+            // 60 Hz pacing the idle-adoption queue already uses.
+            let timer = Timer(
+                timeInterval: 1.0 / 60.0,
+                target: self,
+                selector: #selector(restoreNextLiveScrollRow(_:)),
+                userInfo: nil,
+                repeats: true
+            )
+            liveScrollRestorationTimer = timer
+            RunLoop.main.add(timer, forMode: .common)
         }
 
         @objc
@@ -1764,49 +1821,68 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             let startedAt = CACurrentMediaTime()
             applyPendingLiveScrollRestorationCorrection()
 
-            var restoredRows = 0
-            while liveScrollRestorationIndex < liveScrollRestorationQueue.count {
-                let restoration = liveScrollRestorationQueue[
-                    liveScrollRestorationIndex
-                ]
-                liveScrollRestorationIndex += 1
-                guard let tableView,
-                      let index = currentIndex(for: restoration, in: tableView) else {
+            guard let tableView, let scrollView else {
+                finishLiveScrollRestoration()
+                return
+            }
+            // All still-visible transitioned rows restore in one batch so the
+            // viewport flips to its resting rendering atomically; a row-per-
+            // frame walk over the visible page read as a quarter-second of
+            // rippling reflows. Off-screen rows keep the incremental pace.
+            let visibleRange = tableView.rows(in: scrollView.contentView.bounds)
+            var batchIndexes = IndexSet()
+            var reloadIndexes = IndexSet()
+            var remaining: [LiveScrollRestoration] = []
+            var tookOffscreenFallback = false
+            for position in liveScrollRestorationIndex..<liveScrollRestorationQueue.count {
+                let restoration = liveScrollRestorationQueue[position]
+                guard let index = currentIndex(for: restoration, in: tableView) else {
                     continue
                 }
-
+                let isVisible = visibleRange.location != NSNotFound
+                    && NSLocationInRange(index, visibleRange)
+                if isVisible {
+                    batchIndexes.insert(index)
+                    if restoration.reloadsCell { reloadIndexes.insert(index) }
+                } else if batchIndexes.isEmpty && !tookOffscreenFallback {
+                    tookOffscreenFallback = true
+                    batchIndexes.insert(index)
+                    if restoration.reloadsCell { reloadIndexes.insert(index) }
+                } else {
+                    remaining.append(restoration)
+                }
+            }
+            if !batchIndexes.isEmpty {
                 let followsBottom = isAtBottom
                 pendingLiveScrollRestorationFollowsBottom = followsBottom
                 pendingLiveScrollRestorationAnchor = followsBottom
                     ? nil
                     : captureAnchor()
-                pendingLiveScrollRestorationExpectedOriginY = scrollView?
+                pendingLiveScrollRestorationExpectedOriginY = scrollView
                     .contentView.bounds.origin.y
-                if restoration.reloadsCell {
+                if !reloadIndexes.isEmpty {
                     tableView.reloadData(
-                        forRowIndexes: IndexSet(integer: index),
+                        forRowIndexes: reloadIndexes,
                         columnIndexes: IndexSet(integer: 0)
                     )
                     MacConversationTableDiagnostics.recordedTargetedRowReload(
-                        count: 1
+                        count: reloadIndexes.count
                     )
                 }
-                tableView.noteHeightOfRows(
-                    withIndexesChanged: IndexSet(integer: index)
-                )
+                tableView.noteHeightOfRows(withIndexesChanged: batchIndexes)
                 MacConversationTableDiagnostics.recordedHeightInvalidation()
-                scrollView?.layoutSubtreeIfNeeded()
+                scrollView.layoutSubtreeIfNeeded()
                 tableView.layoutSubtreeIfNeeded()
                 applyPendingLiveScrollRestorationCorrection(keepPending: true)
-                restoredRows = 1
-                break
             }
+            liveScrollRestorationQueue = remaining
+            liveScrollRestorationIndex = 0
 
             MacConversationTableDiagnostics.recordedLiveScrollRestoration(
-                restoredRows: restoredRows,
+                restoredRows: batchIndexes.count,
                 milliseconds: (CACurrentMediaTime() - startedAt) * 1_000
             )
-            if liveScrollRestorationIndex >= liveScrollRestorationQueue.count,
+            if remaining.isEmpty,
                pendingLiveScrollRestorationAnchor == nil,
                !pendingLiveScrollRestorationFollowsBottom {
                 finishLiveScrollRestoration()
@@ -1865,8 +1941,6 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         private func cancelLiveScrollRestoration(
             requeueMountedCells: Bool
         ) -> [MacConversationReusableCell] {
-            liveScrollRestorationDisplayLink?.invalidate()
-            liveScrollRestorationDisplayLink = nil
             liveScrollRestorationTimer?.invalidate()
             liveScrollRestorationTimer = nil
             let cells = requeueMountedCells
@@ -1883,8 +1957,6 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         }
 
         private func finishLiveScrollRestoration() {
-            liveScrollRestorationDisplayLink?.invalidate()
-            liveScrollRestorationDisplayLink = nil
             liveScrollRestorationTimer?.invalidate()
             liveScrollRestorationTimer = nil
             liveScrollRestorationQueue.removeAll(keepingCapacity: true)
