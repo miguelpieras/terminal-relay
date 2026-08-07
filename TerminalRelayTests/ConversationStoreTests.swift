@@ -1465,21 +1465,24 @@ final class ConversationStoreTests: XCTestCase {
         )
         _ = store.transcriptProjections(for: oldItem)
         let oldRevision = store.transcriptItemContentRevision(for: oldItem.id)
+        // The cursor jump keeps this snapshot on the authoritative-replace
+        // path instead of the continuous no-op path.
         let snapshot = ConversationSnapshot(
             snapshotGeneration: ChatTestFixtures.generation,
-            baseSequence: 2,
+            baseSequence: 3,
             items: [authoritativeItem]
         )
         let payload = PreparedConversationReducerPayload.conversationSnapshot(snapshot)
         let preserved = await ConversationStore.preparePreservedSnapshotItemIDs(
             for: payload,
-            retaining: store.state.items
+            retaining: store.state.items,
+            currentState: store.stateForTranscriptProjectionPreparation
         )
         XCTAssertFalse(preserved.contains(oldItem.id))
 
         let envelope = ChatTestFixtures.event(
             "conversation.snapshot",
-            sequence: 2,
+            sequence: 3,
             payload: .string("prepared payload must bypass this JSON")
         )
         let prepared = await ConversationStore.prepareTranscriptProjections(
@@ -1544,21 +1547,24 @@ final class ConversationStoreTests: XCTestCase {
             )
         )
         _ = store.transcriptProjections(for: oldItem)
+        // The cursor jump keeps this snapshot on the authoritative-replace
+        // path instead of the continuous no-op path.
         let snapshot = ConversationSnapshot(
             snapshotGeneration: ChatTestFixtures.generation,
-            baseSequence: 2,
+            baseSequence: 3,
             items: [authoritativeItem]
         )
         let payload = PreparedConversationReducerPayload.conversationSnapshot(snapshot)
         let preserved = await ConversationStore.preparePreservedSnapshotItemIDs(
             for: payload,
-            retaining: store.state.items
+            retaining: store.state.items,
+            currentState: store.stateForTranscriptProjectionPreparation
         )
         XCTAssertFalse(preserved.contains(oldItem.id))
 
         let envelope = ChatTestFixtures.event(
             "conversation.snapshot",
-            sequence: 2,
+            sequence: 3,
             payload: .string("prepared payload must bypass this JSON")
         )
         let prepared = await ConversationStore.prepareTranscriptProjections(
@@ -1584,6 +1590,206 @@ final class ConversationStoreTests: XCTestCase {
             .joined()
         XCTAssertEqual(Array(generic.detail?.utf8 ?? "".utf8), Array(authoritativeText.utf8))
         XCTAssertEqual(Array(projectedText.utf8), Array(authoritativeText.utf8))
+    }
+
+    func testContinuousCoveringSnapshotKeepsPaintedTranscriptWithoutReset() async throws {
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        for (sequence, text) in [(Int64(1), "First"), (2, "Second")] {
+            try store.apply(
+                ChatTestFixtures.event(
+                    "message.completed",
+                    sequence: sequence,
+                    itemID: "message-\(sequence)",
+                    turnID: "turn-1",
+                    payload: .object([
+                        "role": .string("assistant"),
+                        "text": .string(text),
+                    ])
+                )
+            )
+        }
+        let optimistic = ConversationStore.optimisticUserMessage(
+            requestID: "00000000-0000-4000-8000-0000000000aa",
+            text: "Pending send",
+            occurredAt: 3
+        )
+        store.addOptimisticUserMessage(
+            optimistic,
+            preparedTranscriptProjections: await ConversationStore
+                .prepareTranscriptProjections(for: [optimistic])
+        )
+        let paintedItems = store.state.items
+        let mutationBefore = store.transcriptMutation
+        let revisionBefore = store.transcriptContentRevision
+        let itemRevisionBefore = store.transcriptItemContentRevision(
+            for: "message-1"
+        )
+
+        // A peer attach without a valid replay cursor broadcasts this rebuilt
+        // snapshot into every attached client. It may restate older items this
+        // client no longer retains and cannot contain the optimistic message.
+        let olderItem = ConversationItem.message(
+            ChatMessage(id: "older-history", role: .assistant, text: "older")
+        )
+        let snapshot = ConversationSnapshot(
+            snapshotGeneration: ChatTestFixtures.generation,
+            baseSequence: 3,
+            items: [olderItem, paintedItems[0], paintedItems[1]]
+        )
+        let payload = PreparedConversationReducerPayload
+            .conversationSnapshot(snapshot)
+        let currentState = store.stateForTranscriptProjectionPreparation
+        let preserved = await ConversationStore.preparePreservedSnapshotItemIDs(
+            for: payload,
+            retaining: currentState.items,
+            currentState: currentState
+        )
+        XCTAssertEqual(preserved, Set(paintedItems.map(\.id)))
+        let envelope = ChatTestFixtures.event(
+            "conversation.snapshot",
+            sequence: 3,
+            payload: .string("prepared payload must bypass this JSON")
+        )
+        let prepared = await ConversationStore.prepareTranscriptProjections(
+            for: envelope,
+            retaining: currentState.items,
+            currentState: currentState,
+            preparedReducerPayload: payload,
+            preservingSnapshotItemIDs: preserved
+        )
+        XCTAssertTrue(prepared.isEmpty)
+
+        try store.apply(
+            envelope,
+            preparedTranscriptProjections: prepared,
+            preparedReducerPayload: payload,
+            preservedSnapshotItemIDs: preserved
+        )
+
+        XCTAssertEqual(store.state.lastAppliedSequence, 3)
+        XCTAssertEqual(store.state.items, paintedItems)
+        XCTAssertEqual(store.transcriptContentRevision, revisionBefore)
+        XCTAssertEqual(
+            store.transcriptItemContentRevision(for: "message-1"),
+            itemRevisionBefore
+        )
+        XCTAssertEqual(
+            store.transcriptMutation,
+            mutationBefore,
+            "A continuous covering snapshot must not rebuild the transcript."
+        )
+
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.completed",
+                sequence: 4,
+                itemID: "message-4",
+                turnID: "turn-1",
+                payload: .object([
+                    "role": .string("assistant"),
+                    "text": .string("Third"),
+                ])
+            )
+        )
+        XCTAssertEqual(store.state.lastAppliedSequence, 4)
+        XCTAssertTrue(store.state.items.contains { $0.id == "message-4" })
+    }
+
+    func testSnapshotThatShedsAPaintedItemStillResetsAuthoritatively() async throws {
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        for (sequence, text) in [(Int64(1), "First"), (2, "Second")] {
+            try store.apply(
+                ChatTestFixtures.event(
+                    "message.completed",
+                    sequence: sequence,
+                    itemID: "message-\(sequence)",
+                    turnID: "turn-1",
+                    payload: .object([
+                        "role": .string("assistant"),
+                        "text": .string(text),
+                    ])
+                )
+            )
+        }
+        let kept = store.state.items[1]
+        let mutationBefore = store.transcriptMutation
+
+        // Continuous cursor, but the broadcast shed "message-1" to fit the
+        // record limit: the rebuild must stay an authoritative reset.
+        let snapshot = ConversationSnapshot(
+            snapshotGeneration: ChatTestFixtures.generation,
+            baseSequence: 3,
+            items: [kept],
+            hasOlderHistory: true,
+            oldestItemID: kept.id
+        )
+        let payload = PreparedConversationReducerPayload
+            .conversationSnapshot(snapshot)
+        let currentState = store.stateForTranscriptProjectionPreparation
+        let preserved = await ConversationStore.preparePreservedSnapshotItemIDs(
+            for: payload,
+            retaining: currentState.items,
+            currentState: currentState
+        )
+        try store.apply(
+            ChatTestFixtures.event(
+                "conversation.snapshot",
+                sequence: 3,
+                payload: .string("prepared payload must bypass this JSON")
+            ),
+            preparedReducerPayload: payload,
+            preservedSnapshotItemIDs: preserved
+        )
+
+        XCTAssertEqual(store.state.items, [kept])
+        XCTAssertTrue(store.state.hasOlderHistory)
+        XCTAssertNotEqual(store.transcriptMutation, mutationBefore)
+        XCTAssertTrue(store.transcriptMutation.isAuthoritativeReset)
+    }
+
+    func testSnapshotWithCursorJumpOrForeignGenerationResetsAuthoritatively() async throws {
+        for (baseSequence, generation) in [
+            (Int64(4), ChatTestFixtures.generation),
+            (3, "00000000-0000-4000-8000-0000000000ff"),
+        ] {
+            let store = ConversationStore(streamingPublishNanoseconds: 0)
+            for (sequence, text) in [(Int64(1), "First"), (2, "Second")] {
+                try store.apply(
+                    ChatTestFixtures.event(
+                        "message.completed",
+                        sequence: sequence,
+                        itemID: "message-\(sequence)",
+                        turnID: "turn-1",
+                        payload: .object([
+                            "role": .string("assistant"),
+                            "text": .string(text),
+                        ])
+                    )
+                )
+            }
+            let snapshot = ConversationSnapshot(
+                snapshotGeneration: generation,
+                baseSequence: baseSequence,
+                items: store.state.items
+            )
+            let payload = PreparedConversationReducerPayload
+                .conversationSnapshot(snapshot)
+            try store.apply(
+                ChatTestFixtures.event(
+                    "conversation.snapshot",
+                    sequence: baseSequence,
+                    payload: .string("prepared payload must bypass this JSON"),
+                    snapshotGeneration: generation
+                ),
+                preparedReducerPayload: payload
+            )
+            XCTAssertTrue(
+                store.transcriptMutation.isAuthoritativeReset,
+                "A non-continuous snapshot must remain an authoritative reset."
+            )
+            XCTAssertEqual(store.state.lastAppliedSequence, baseSequence)
+            XCTAssertEqual(store.state.snapshotGeneration, generation)
+        }
     }
 
     func testMessageCompletionDoesNotMaterializeChunkedStreamingText() throws {

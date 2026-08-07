@@ -52,8 +52,10 @@ MAX_INLINE_TEXT_BYTES = 512 * 1024
 MAX_PREVIEW_BYTES = 256 * 1024
 MAX_HISTORY_ITEMS = 100
 MAX_HISTORY_BYTES = 4 * 1024 * 1024
-MAX_CLIENT_RECORDS = 512
-MAX_CLIENT_BYTES = 4 * 1024 * 1024
+# Sized so a client that stalls consuming for tens of seconds (a UI scroll
+# hitch during a delta storm) queues instead of getting dropped mid-turn.
+MAX_CLIENT_RECORDS = 2048
+MAX_CLIENT_BYTES = 16 * 1024 * 1024
 MAX_REPLAY_RECORDS = 2048
 MAX_REPLAY_BYTES = 8 * 1024 * 1024
 MAX_COMMAND_RESULTS = 1024

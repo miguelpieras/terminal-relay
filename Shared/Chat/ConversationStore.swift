@@ -624,6 +624,19 @@ struct ConversationReducer {
             state.lastErrorMessage = nil
             return
         }
+        // Prepared-payload gating keeps this decision aligned with the
+        // store's transcript bookkeeping, which also keys off the prepared
+        // payload; every production snapshot apply is prepared.
+        if case .conversationSnapshot = preparedPayload,
+           snapshotIsContinuousAndCovering(snapshot, for: state) {
+            state.snapshotGeneration = snapshot.snapshotGeneration
+            state.lastAppliedSequence = snapshot.baseSequence
+            state.connectionState = snapshot.connectionState
+            state.capabilities = snapshot.capabilities
+            state.usage = snapshot.usage ?? state.usage
+            state.lastErrorMessage = nil
+            return
+        }
         state.snapshotGeneration = snapshot.snapshotGeneration
         state.lastAppliedSequence = snapshot.baseSequence
         state.items = stableDeduplicated(snapshot.items)
@@ -1342,6 +1355,47 @@ enum PreparedConversationReducerPayload: Sendable {
             && snapshot.approvals.isEmpty
             && snapshot.questions.isEmpty
     }
+
+    func preservesPaintedTranscript(previousState: ConversationState) -> Bool {
+        guard case .conversationSnapshot(let snapshot) = self else {
+            return false
+        }
+        if preservesPaintedTranscript(
+            previousItemCount: previousState.items.count
+        ) {
+            return true
+        }
+        return snapshotIsContinuousAndCovering(snapshot, for: previousState)
+    }
+}
+
+/// The broker broadcasts a rebuilt full snapshot into every attached client
+/// whenever a peer attaches without a valid replay cursor. When that snapshot
+/// stays on the client's generation, consumes exactly the next sequence, and
+/// still contains every item the client shows, it restates what the applied
+/// stream already delivered — so it may adopt the cursor while keeping the
+/// painted transcript instead of forcing an authoritative reset mid-scroll.
+private func snapshotIsContinuousAndCovering(
+    _ snapshot: ConversationSnapshot,
+    for state: ConversationState
+) -> Bool {
+    guard !state.items.isEmpty,
+          state.snapshotGeneration == snapshot.snapshotGeneration,
+          snapshot.baseSequence == state.lastAppliedSequence + 1 else {
+        return false
+    }
+    let snapshotItemIDs = Set(snapshot.items.map(\.id))
+    return state.items.allSatisfy { item in
+        if snapshotItemIDs.contains(item.id) {
+            return true
+        }
+        // A still-unacknowledged optimistic user message cannot be in the
+        // broker's view yet; keeping it painted matches live behavior.
+        if case .message(let message) = item {
+            return message.isOptimistic
+        }
+        return false
+    }
 }
 
 struct PreparedConversationApplication: Sendable {
@@ -1498,9 +1552,7 @@ final class ConversationStore: ObservableObject {
     ) throws -> Bool {
         let previousItemCount = workingState.items.count
         let preservesPaintedTranscript = preparedReducerPayload?
-            .preservesPaintedTranscript(
-                previousItemCount: previousItemCount
-            ) == true
+            .preservesPaintedTranscript(previousState: workingState) == true
         let terminalTranscriptChanges = Self.terminalTranscriptChanges(
             for: envelope,
             in: workingState
@@ -1731,7 +1783,8 @@ final class ConversationStore: ObservableObject {
     /// main actor receives only the IDs proven unchanged.
     nonisolated static func preparePreservedSnapshotItemIDs(
         for payload: PreparedConversationReducerPayload?,
-        retaining currentItems: [ConversationItem]
+        retaining currentItems: [ConversationItem],
+        currentState: ConversationState? = nil
     ) async -> Set<String> {
         guard case .conversationSnapshot(let snapshot) = payload,
               !currentItems.isEmpty else {
@@ -1743,6 +1796,10 @@ final class ConversationStore: ObservableObject {
             if payload?.preservesPaintedTranscript(
                 previousItemCount: currentItems.count
             ) == true {
+                return Set(currentItems.map(\.id))
+            }
+            if let currentState,
+               snapshotIsContinuousAndCovering(snapshot, for: currentState) {
                 return Set(currentItems.map(\.id))
             }
             var previousByID: [String: ConversationItem] = [:]
@@ -2003,6 +2060,12 @@ final class ConversationStore: ObservableObject {
                    snapshot.approvals.isEmpty,
                    snapshot.questions.isEmpty,
                    !retainedItems.isEmpty {
+                    return [:]
+                } else if let currentState,
+                          snapshotIsContinuousAndCovering(
+                            snapshot,
+                            for: currentState
+                          ) {
                     return [:]
                 } else {
                     items = normalizedSnapshotItems(snapshot).filter {

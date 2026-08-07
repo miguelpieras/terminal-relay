@@ -792,7 +792,10 @@ async def exercise_protocol(module, root: pathlib.Path) -> None:
     assert reused["payload"]["code"] == "requestIdReused"
     assert await first.reader.read() == b""
 
-    # Slow readers are bounded independently.
+    # Slow readers are bounded independently, with enough headroom that a
+    # client stalled by a UI scroll hitch queues instead of being dropped.
+    assert module.MAX_CLIENT_RECORDS >= 2048
+    assert module.MAX_CLIENT_BYTES >= 16 * 1024 * 1024
     dummy = module.ClientConnection(None, None)  # type: ignore[arg-type]
     dummy.queued_bytes = module.MAX_CLIENT_BYTES
     assert dummy.enqueue(b"x\n") is False
@@ -2287,6 +2290,39 @@ async def exercise_early_attach(module, root: pathlib.Path) -> None:
     delta = await client.read_type("message.delta")
     assert delta["seq"] == event["seq"]
     assert delta["snapshotGeneration"] == rebuilt["snapshotGeneration"]
+
+    # A peer attaching without a replay cursor broadcasts a rebuilt snapshot
+    # into every attached client. Clients suppress the visible transcript
+    # reset only while that broadcast stays on the same generation, consumes
+    # exactly the next sequence, and still covers every materialized item.
+    peer_reader, peer_writer = await asyncio.open_unix_connection(
+        broker.socket_path
+    )
+    peer = ProtocolClient(module, peer_reader, peer_writer, broker.relay_id)
+    await peer.attach()
+    broadcast = await client.read_type("conversation.snapshot")
+    assert broadcast["snapshotGeneration"] == rebuilt["snapshotGeneration"]
+    assert broadcast["payload"]["snapshotGeneration"] == rebuilt["snapshotGeneration"]
+    assert broadcast["payload"]["baseSeq"] == delta["seq"] + 1
+    assert broadcast["payload"]["baseSeq"] == broadcast["seq"]
+    broadcast_items = {
+        item["itemId"] for item in broadcast["payload"]["items"]
+    }
+    assert "33333333-3333-4333-8333-333333333333" in broadcast_items
+    assert "44444444-4444-4444-8444-444444444444" in broadcast_items
+    # The stream stays continuous for the already-attached client: the
+    # broadcast ack consumes one sequence, then live events continue.
+    follow_up = await broker.emit(
+        "message.delta",
+        {"role": "assistant", "text": " more"},
+        turn_id=THREAD_ID,
+        item_id="44444444-4444-4444-8444-444444444444",
+    )
+    tail = await client.read_type("message.delta")
+    assert tail["seq"] == follow_up["seq"]
+    assert tail["seq"] == broadcast["seq"] + 2
+    assert tail["snapshotGeneration"] == rebuilt["snapshotGeneration"]
+    await peer.close()
     await client.close()
     broker.stop_event.set()
     await asyncio.wait_for(broker_task, 5)

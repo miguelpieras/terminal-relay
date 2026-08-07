@@ -801,7 +801,8 @@ final class ConversationCoordinator {
                 let preservedSnapshotItemIDs = await ConversationStore
                     .preparePreservedSnapshotItemIDs(
                         for: reducerPayload,
-                        retaining: currentState?.items ?? []
+                        retaining: currentState?.items ?? [],
+                        currentState: currentState
                     )
                 async let projections = ConversationStore.prepareTranscriptProjections(
                     for: envelope,
