@@ -204,6 +204,10 @@ grep -Fq 'verify-published-worker-runtime.sh' "$helper_installer" \
     || fail "helper-only installation does not require the matching signed stable runtime"
 grep -Fq 'file-attachments-v1' "$application_installer" \
     || fail "application installer does not require file-attachment support"
+grep -Fq 'discard_successful_state_backups' "$application_installer" \
+    || fail "application installer does not clean successful state rollback backups"
+grep -Fq 'runtime-manifest\.json|runtime-update-public\.pem' "$application_installer" \
+    || fail "application installer does not narrowly recognize its stale state backups"
 grep -Fq 'file-attachments-v1' "$helper_installer" \
     || fail "helper-only installer does not require file-attachment support"
 grep -Fq 'file-attachments-v1' "$lifecycle" \

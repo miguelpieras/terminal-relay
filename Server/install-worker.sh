@@ -107,6 +107,7 @@ declare -a rollback_destinations=()
 declare -a rollback_backups=()
 declare -a rollback_had_previous=()
 declare -a rollback_active=()
+declare -a stale_state_backups=()
 
 log() {
     printf '[terminal-relay] %s\n' "$*"
@@ -186,6 +187,40 @@ announce_rollback_backup() {
         && "${rollback_had_previous[$index]}" == true ]]; then
         log "Backed up ${rollback_destinations[$index]} to ${rollback_backups[$index]}"
     fi
+}
+
+discard_successful_state_backups() {
+    local backup
+    local destination
+    local index
+    local removed=false
+
+    for backup in "${stale_state_backups[@]}"; do
+        [[ -f "$backup" && ! -L "$backup" \
+            && "$(/usr/bin/stat -c '%U:%G:%a' "$backup")" == "root:root:644" ]] \
+            || fail "A stale managed-state backup became unsafe during installation."
+        /bin/rm -- "$backup"
+        removed=true
+    done
+
+    for ((index=0; index<${#rollback_destinations[@]}; index++)); do
+        destination="${rollback_destinations[$index]}"
+        case "$destination" in
+            "$runtime_manifest_destination"|"$runtime_update_public_key_destination") ;;
+            *) continue ;;
+        esac
+        [[ "${rollback_active[$index]}" == true \
+            && "${rollback_had_previous[$index]}" == true ]] || continue
+        backup="${rollback_backups[$index]}"
+        [[ -f "$backup" && ! -L "$backup" \
+            && "$(/usr/bin/stat -c '%U:%G:%a' "$backup")" == "root:root:644" ]] \
+            || fail "A managed-state rollback backup became unsafe during installation."
+        /bin/rm -- "$backup"
+        rollback_active[index]=false
+        removed=true
+    done
+
+    [[ "$removed" != true ]] || log "Removed stale managed-state installer backups."
 }
 
 install_managed_file() {
@@ -483,7 +518,15 @@ validate_managed_state() {
             entry_name="$(basename "$entry")"
             case "$entry_name" in
                 installer-version|worker-id|display-name|authorized-keys-installed|runtime-manifest.json|runtime-update-public.pem) ;;
-                *) fail "Unexpected state entry: $entry" ;;
+                *)
+                    if [[ "$entry_name" =~ ^(runtime-manifest\.json|runtime-update-public\.pem)\.backup\.[0-9]{8}T[0-9]{6}Z(\.[1-9][0-9]*)?$ \
+                        && -f "$entry" && ! -L "$entry" \
+                        && "$(/usr/bin/stat -c '%U:%G:%a' "$entry")" == "root:root:644" ]]; then
+                        stale_state_backups+=("$entry")
+                    else
+                        fail "Unexpected state entry: $entry"
+                    fi
+                    ;;
             esac
         done < <(/usr/bin/find "$state_directory" -mindepth 1 -maxdepth 1 -print0)
 
@@ -1282,6 +1325,7 @@ main() {
     enforce_mobile_command_gateway
 
     installation_succeeded=true
+    discard_successful_state_backups
     printf '%s\n' 'TERMINAL_RELAY_RESULT_V1'
     printf 'id=%s\n' "$worker_id"
     printf 'name=%s\n' "$worker_name"
