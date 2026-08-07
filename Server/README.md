@@ -221,8 +221,8 @@ terminal-relay-session chat-capabilities-v1 <codex|claude> <repository>
 terminal-relay-session chat-start-v1 <codex|claude> <repository> [provider-thread-id] [agent arguments...]
 terminal-relay-session chat-attach-v1 <codex|claude> <repository> <relay-id>
 terminal-relay-session chat-stop-v1 <codex|claude> <repository> <relay-id>
-terminal-relay-session chat-attachment-upload-v1 codex <repository> <relay-id> <request-id> <attachment-id> <extension> <byte-count>
-terminal-relay-session chat-attachment-delete-v1 codex <repository> <relay-id> <request-id>
+terminal-relay-session chat-attachment-upload-v1 <codex|claude> <repository> <relay-id> <request-id> <attachment-id> <extension> <byte-count>
+terminal-relay-session chat-attachment-delete-v1 <codex|claude> <repository> <relay-id> <request-id>
 ```
 
 `chat-start-v1` launches one `terminal-relay-chat` broker under the existing
@@ -237,7 +237,7 @@ Workers advertising `file-attachments-v1` accept attachment bytes only on the
 typed upload helper's SSH standard input. Uploads are atomically placed in an
 owner-only, relay- and request-scoped runtime directory; original filenames
 are metadata, not paths. The broker validates identity, regular-file type,
-ownership, mode, and byte counts before starting the Codex turn. It removes the
+ownership, mode, and byte counts before starting the provider turn. It removes the
 request directory on every terminal turn result, rejected submission, explicit
 client cleanup, broker startup or shutdown, and through a bounded orphan
 sweep. Attachment contents and paths are not logged or persisted in the

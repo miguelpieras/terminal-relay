@@ -143,8 +143,8 @@ usage:
   terminal-relay-session chat-start-v1 <codex|claude> <repository> [provider-thread-id] [agent arguments...]
   terminal-relay-session chat-attach-v1 <codex|claude> <repository> <relay-id>
   terminal-relay-session chat-stop-v1 <codex|claude> <repository> <relay-id>
-  terminal-relay-session chat-attachment-upload-v1 <codex> <repository> <relay-id> <request-id> <attachment-id> <extension> <byte-count>
-  terminal-relay-session chat-attachment-delete-v1 <codex> <repository> <relay-id> <request-id>
+  terminal-relay-session chat-attachment-upload-v1 <codex|claude> <repository> <relay-id> <request-id> <attachment-id> <extension> <byte-count>
+  terminal-relay-session chat-attachment-delete-v1 <codex|claude> <repository> <relay-id> <request-id>
   terminal-relay-session restore
   terminal-relay-session threads <repository> <active|archived> [cursor]
   terminal-relay-session threads-v2 <codex|claude> <repository> <open|archived> [cursor]
@@ -1993,8 +1993,7 @@ chat_attachment_upload_v1() {
     local extension="$6"
     local byte_count="$7"
 
-    [[ "$provider" == "codex" ]] \
-        || fail_usage "File attachment uploads require Codex."
+    validate_tool "$provider"
     is_valid_repository_name "$repository" \
         || fail_usage "Invalid chat repository: $repository"
     is_valid_instance "$relay_id" || fail_usage "Invalid chat relay identifier."
@@ -2022,8 +2021,7 @@ chat_attachment_delete_v1() {
     local relay_id="$3"
     local request_id="$4"
 
-    [[ "$provider" == "codex" ]] \
-        || fail_usage "File attachment cleanup requires Codex."
+    validate_tool "$provider"
     is_valid_repository_name "$repository" \
         || fail_usage "Invalid chat repository: $repository"
     is_valid_instance "$relay_id" || fail_usage "Invalid chat relay identifier."

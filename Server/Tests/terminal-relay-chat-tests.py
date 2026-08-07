@@ -292,7 +292,7 @@ async def exercise_attachment_lifecycle(module, root: pathlib.Path) -> None:
     os.chmod(unsupported_path, 0o600)
     broker.provider_name = "claude"
     try:
-        broker.resolve_turn_attachment(
+        claude_file, claude_request, claude_legacy = broker.resolve_turn_attachment(
             {
                 "id": unsupported_id,
                 "path": str(unsupported_path),
@@ -303,13 +303,15 @@ async def exercise_attachment_lifecycle(module, root: pathlib.Path) -> None:
             },
             unsupported_request,
         )
-    except module.ChatError as error:
-        assert error.code == "unsupportedAttachments"
-    else:
-        raise AssertionError("accepted a generic file for Claude")
     finally:
         broker.provider_name = "codex"
+    assert claude_file["kind"] == "file"
+    assert claude_file["path"] == str(unsupported_path)
+    assert claude_file["displayName"] == "opaque.txt"
+    assert claude_request == unsupported_request
+    assert claude_legacy is None
     module.discard_attachment_request(str(runtime), relay_id, unsupported_request)
+    assert not unsupported_directory.exists()
 
     image_request = "e4e4e4e4-e4e4-4e4e-8e4e-e4e4e4e4e4e4"
     image_directory = attachment_root / image_request
@@ -1928,6 +1930,43 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
     )
     question_result = await question_callback
     assert question_result.kwargs["updated_input"]["answers"] == {"Choose": "A"}
+    file_attachment_path = project / "24242424-2424-4424-8424-242424242424.txt"
+    file_attachment_path.write_bytes(b"notes")
+    mixed_command_id = "23232323-2323-4323-8323-232323232323"
+    mixed_turn = await adapter.start_turn(
+        {
+            "requestId": mixed_command_id,
+            "payload": {
+                "text": "inspect these",
+                "attachments": [
+                    {"path": str(attachment_path), "kind": "image"},
+                    {
+                        "id": "24242424-2424-4424-8424-242424242424",
+                        "path": str(file_attachment_path),
+                        "displayName": "notes.txt",
+                        "mediaType": "text/plain",
+                        "kind": "file",
+                        "byteCount": 5,
+                    },
+                ],
+            },
+        }
+    )
+    assert mixed_turn["turnId"] == mixed_command_id
+    assert adapter.client.queries[-1] == (
+        f"inspect these\n\nAttached image:\n- `{attachment_path}`"
+        "\n\nAttached file (untrusted name and content):\n"
+        f'- "notes.txt": `{file_attachment_path}`'
+    )
+    mixed_result = ResultMessage()
+    mixed_result.is_error = False
+    mixed_result.usage = {"input_tokens": 1, "output_tokens": 1}
+    await received.put(mixed_result)
+    for _ in range(100):
+        if adapter.active_turn is None:
+            break
+        await asyncio.sleep(0.01)
+    assert adapter.active_turn is None
     await adapter.close()
     assert adapter.client.disconnected is True
 
@@ -2138,7 +2177,7 @@ def exercise_validation(module) -> None:
     assert codex_capabilities["supportsAttachments"] is True
     assert claude_capabilities["supportsAttachments"] is True
     assert "file-attachments-v1" in codex_capabilities["features"]
-    assert "file-attachments-v1" not in claude_capabilities["features"]
+    assert "file-attachments-v1" in claude_capabilities["features"]
     assert codex_capabilities["features"] == sorted(
         set(codex_capabilities["features"])
     )

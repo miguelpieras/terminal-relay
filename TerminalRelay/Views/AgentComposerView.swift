@@ -901,8 +901,8 @@ struct AgentComposerView: View {
     }
 
     private func chooseFiles() {
-        guard session.usesNativeChat, session.kind == .codex else {
-            pasteNotice = "Files can be attached to Codex chats."
+        guard session.usesNativeChat else {
+            pasteNotice = "Files can be attached to chat sessions."
             return
         }
         let panel = NSOpenPanel()
@@ -917,8 +917,8 @@ struct AgentComposerView: View {
     }
 
     private func pasteFiles(_ urls: [URL]) -> Bool {
-        guard session.usesNativeChat, session.kind == .codex else {
-            pasteNotice = "Files can be attached to Codex chats."
+        guard session.usesNativeChat else {
+            pasteNotice = "Files can be attached to chat sessions."
             return true
         }
         guard session.status == .running,

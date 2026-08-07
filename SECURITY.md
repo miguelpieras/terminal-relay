@@ -35,7 +35,7 @@ Terminal Relay is a client for infrastructure controlled by its user:
   listener, a bounded per-client queue and replay ring, canonical repository
   validation, provider-thread locking, command idempotency, and exact-instance
   stop protection.
-- Codex attachments use one typed SSH upload operation with bytes on standard
+- Chat attachments use one typed SSH upload operation with bytes on standard
   input. The worker binds every file to the exact relay, turn request, and
   attachment UUID; writes it atomically with owner-only permissions; enforces
   per-file and per-turn bounds; and rejects links, special files, unsafe paths,

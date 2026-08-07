@@ -148,18 +148,17 @@ protocol error.
 
 ## Ephemeral attachments
 
-The supported Codex worker runtime requires `file-attachments-v1` and accepts
-regular files and images. Native Codex clients can rely on that runtime
-contract instead of hiding attachment controls while a conversation's
-capability snapshot catches up. Claude conversations do not accept regular
-file attachments.
+The supported worker runtime requires `file-attachments-v1` and accepts
+regular files and images for both providers. Native clients can rely on that
+runtime contract instead of hiding attachment controls while a conversation's
+capability snapshot catches up.
 
 The client generates the `turn.start` request UUID before upload and invokes
 one of two fixed, typed SSH helper operations:
 
 ```text
-terminal-relay-session chat-attachment-upload-v1 codex <repository> <relay-id> <request-id> <attachment-id> <extension> <byte-count>
-terminal-relay-session chat-attachment-delete-v1 codex <repository> <relay-id> <request-id>
+terminal-relay-session chat-attachment-upload-v1 <codex|claude> <repository> <relay-id> <request-id> <attachment-id> <extension> <byte-count>
+terminal-relay-session chat-attachment-delete-v1 <codex|claude> <repository> <relay-id> <request-id>
 ```
 
 The upload bytes are carried on SSH standard input. The helper creates
@@ -178,9 +177,12 @@ tree; and enforces the limits above before invoking the provider.
 
 Codex images are sent as `localImage` inputs. Regular files are exposed only
 through one untrusted `additionalContext.terminal_relay_attachments` value
-containing bounded JSON metadata and worker-local paths. Terminal Relay does
-not copy attachment bytes into the repository, provider history, replay
-window, or its own transcript storage.
+containing bounded JSON metadata and worker-local paths. Claude turns list
+attachments in the prompt as bounded untrusted metadata — sanitized display
+names for regular files plus worker-local paths — and Claude Code reads the
+contents on demand through its own tools under the normal approval flow.
+Terminal Relay does not copy attachment bytes into the repository, provider
+history, replay window, or its own transcript storage.
 
 The broker deletes the exact request directory after the associated turn
 completes, fails, or is interrupted. It also deletes uploads when validation or

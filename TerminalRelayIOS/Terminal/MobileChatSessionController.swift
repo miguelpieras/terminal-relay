@@ -245,7 +245,6 @@ final class MobileChatSessionController: ObservableObject {
     private func makeAttachmentActions(
         identity: ChatConversationIdentity
     ) -> ChatAttachmentActions? {
-        guard kind == .codex else { return nil }
         return ChatAttachmentActions(
             upload: { [dependencies, kind, repositoryName] attachment, requestID in
                 let command = try WorkerRemoteCommand.uploadChatAttachment(

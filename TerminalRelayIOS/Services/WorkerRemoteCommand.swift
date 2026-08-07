@@ -269,8 +269,7 @@ enum WorkerRemoteCommand {
             repositoryName: repositoryName,
             instanceToken: relayID
         )
-        guard kind == .codex,
-              ChatWireValidation.isCanonicalUUID(requestID),
+        guard ChatWireValidation.isCanonicalUUID(requestID),
               ChatWireValidation.isCanonicalUUID(attachmentID),
               fileExtension.range(
                   of: #"^[a-z0-9]{0,10}$"#,
@@ -302,7 +301,7 @@ enum WorkerRemoteCommand {
             repositoryName: repositoryName,
             instanceToken: relayID
         )
-        guard kind == .codex, ChatWireValidation.isCanonicalUUID(requestID) else {
+        guard ChatWireValidation.isCanonicalUUID(requestID) else {
             throw WorkerRemoteCommandError.invalidInstanceToken
         }
         return [

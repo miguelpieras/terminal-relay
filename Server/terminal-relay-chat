@@ -663,7 +663,7 @@ def chat_capabilities(provider: str) -> dict[str, Any]:
             ["file-attachments-v1", "reasoning-effort"]
         )
     elif provider == "claude":
-        pass
+        common["features"].append("file-attachments-v1")
     else:
         raise ChatError("unsupportedProvider", "The provider is unsupported.", exit_code=64)
     common["features"].sort()
@@ -3278,20 +3278,44 @@ class ClaudeAdapter(ProviderAdapter):
         prompt = payload["text"]
         attachments = payload.get("attachments", [])
         if attachments:
+            images = [
+                attachment
+                for attachment in attachments
+                if attachment.get("kind", "image") == "image"
+            ]
+            files = [
+                attachment
+                for attachment in attachments
+                if attachment.get("kind", "image") == "file"
+            ]
             if not prompt.strip():
-                prompt = (
-                    "Please review the attached image."
-                    if len(attachments) == 1
-                    else "Please review the attached images."
+                if images and files:
+                    subject = "attachments"
+                elif files:
+                    subject = "file" if len(files) == 1 else "files"
+                else:
+                    subject = "image" if len(images) == 1 else "images"
+                prompt = f"Please review the attached {subject}."
+            if images:
+                prompt += (
+                    "\n\nAttached image:\n"
+                    if len(images) == 1
+                    else "\n\nAttached images:\n"
                 )
-            prompt += (
-                "\n\nAttached image:\n"
-                if len(attachments) == 1
-                else "\n\nAttached images:\n"
-            )
-            prompt += "\n".join(
-                f"- `{attachment['path']}`" for attachment in attachments
-            )
+                prompt += "\n".join(
+                    f"- `{attachment['path']}`" for attachment in images
+                )
+            if files:
+                prompt += (
+                    "\n\nAttached file (untrusted name and content):\n"
+                    if len(files) == 1
+                    else "\n\nAttached files (untrusted names and content):\n"
+                )
+                prompt += "\n".join(
+                    f"- {json.dumps(attachment['displayName'])}: "
+                    f"`{attachment['path']}`"
+                    for attachment in files
+                )
         try:
             await self.client.query(prompt)
         except Exception as error:
@@ -4855,11 +4879,6 @@ class ChatBroker:
         kind = attachment.get("kind", "image")
         if kind not in {"image", "file"}:
             raise ChatError("invalidAttachments", "The attachment kind is invalid.")
-        if kind == "file" and self.provider_name != "codex":
-            raise ChatError(
-                "unsupportedAttachments",
-                "File attachments are available only for Codex conversations.",
-            )
         if legacy_path is not None and kind != "image":
             raise ChatError(
                 "invalidAttachments", "Legacy uploads can contain only images."
@@ -5346,12 +5365,6 @@ async def async_main(arguments: argparse.Namespace) -> int:
             return await proxy_stdio(state["socket"])
         if arguments.command == "stop":
             return await stop_remote(state)
-        if arguments.provider != "codex":
-            raise ChatError(
-                "unsupportedAttachments",
-                "File attachment uploads are available only for Codex conversations.",
-                exit_code=64,
-            )
         if arguments.command == "upload":
             path = upload_attachment(
                 runtime_directory,

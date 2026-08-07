@@ -241,7 +241,7 @@ final class WorkerRemoteCommandTests: XCTestCase {
         ) { error in
             XCTAssertEqual(error as? WorkerRemoteCommandError, .invalidInstanceToken)
         }
-        XCTAssertThrowsError(
+        XCTAssertEqual(
             try WorkerRemoteCommand.uploadChatAttachment(
                 kind: .claude,
                 repositoryName: "terminal-relay",
@@ -250,10 +250,18 @@ final class WorkerRemoteCommandTests: XCTestCase {
                 attachmentID: attachmentID,
                 fileExtension: "pdf",
                 byteCount: 4_096
-            )
-        ) { error in
-            XCTAssertEqual(error as? WorkerRemoteCommandError, .invalidInstanceToken)
-        }
+            ),
+            "'/usr/local/bin/terminal-relay-session' 'chat-attachment-upload-v1' 'claude' 'terminal-relay' '\(instanceToken)' '\(requestID)' '\(attachmentID)' 'pdf' '4096'"
+        )
+        XCTAssertEqual(
+            try WorkerRemoteCommand.deleteChatAttachmentUpload(
+                kind: .claude,
+                repositoryName: "terminal-relay",
+                relayID: instanceToken,
+                requestID: requestID
+            ),
+            "'/usr/local/bin/terminal-relay-session' 'chat-attachment-delete-v1' 'claude' 'terminal-relay' '\(instanceToken)' '\(requestID)'"
+        )
         XCTAssertThrowsError(
             try WorkerRemoteCommand.startChat(
                 kind: .codex,

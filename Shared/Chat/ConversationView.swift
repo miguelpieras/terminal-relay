@@ -3360,8 +3360,7 @@ private struct ConversationComposer: View {
     }
 
     private var canAttachFiles: Bool {
-        coordinator.identity.provider == .codex
-            && attachmentActions != nil
+        attachmentActions != nil
     }
 
     var body: some View {

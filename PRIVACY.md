@@ -20,7 +20,7 @@ usage, and bounded file previews are held only in app memory while their
 conversation is open. The apps do not write that structured content to
 `UserDefaults`, files, analytics, or a Terminal Relay service.
 
-Files selected for a native Codex message are read into app memory and sent
+Files selected for a native chat message are read into app memory and sent
 directly over the authenticated SSH connection only when you send that
 message. The worker stores each upload temporarily in an owner-only directory
 named with random relay, request, and attachment identifiers. The original
@@ -81,7 +81,9 @@ maintainer-operated service.
 
 Terminal Relay does not copy attached files into a repository, its transcript
 state, or its replay window. The worker passes their temporary local paths to
-Codex for the requested turn, then removes the exact request directory when
+Codex or Claude for the requested turn — for Claude, the sanitized display
+names and paths become part of the prompt kept in that provider's own local
+session history — then removes the exact request directory when
 the turn completes, fails, or is interrupted. It also removes rejected or
 cancelled uploads, clears the relay's attachment tree when its broker starts
 or stops, and periodically removes unclaimed uploads older than ten minutes.

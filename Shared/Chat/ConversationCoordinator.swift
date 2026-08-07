@@ -40,7 +40,6 @@ enum ConversationCoordinatorError: LocalizedError, Equatable {
     case tooManyAttachments
     case attachmentsTooLarge
     case attachmentPathTooLarge
-    case unsupportedAttachments
     case turnAlreadyActive
     case noActiveTurn
     case interactionUnavailable
@@ -59,8 +58,6 @@ enum ConversationCoordinatorError: LocalizedError, Equatable {
             "The selected attachments exceed the 100 MiB per-message limit."
         case .attachmentPathTooLarge:
             "An attachment path is too long to send safely."
-        case .unsupportedAttachments:
-            "This worker does not support file attachments for this conversation."
         case .turnAlreadyActive:
             "Wait for the current turn to finish before sending another message."
         case .noActiveTurn:
@@ -1092,12 +1089,6 @@ final class ConversationCoordinator {
         }
         guard attachments.allSatisfy({ $0.path.utf8.count <= 4_096 }) else {
             throw ConversationCoordinatorError.attachmentPathTooLarge
-        }
-        guard attachments.allSatisfy({
-            $0.kind == .image
-                || identity.provider == .codex
-        }) else {
-            throw ConversationCoordinatorError.unsupportedAttachments
         }
     }
 

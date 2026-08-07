@@ -171,11 +171,12 @@ conversation. Already-running legacy terminal sessions remain separate; never
 start a terminal against the same provider thread to bypass a native-chat
 failure or provider lock.
 
-## A Codex attachment fails or remains on the worker
+## A chat attachment fails or remains on the worker
 
-First confirm `chat-capabilities-v1 codex` reports
-`file-attachments-v1`. That feature is required by the supported worker
-runtime, so reconcile a worker that does not report it before retrying. The app
+First confirm `chat-capabilities-v1` for the conversation's provider (`codex`
+or `claude`) reports `file-attachments-v1`. That feature is required by the
+supported worker runtime, so reconcile a worker that does not report it before
+retrying. The app
 retains selected bytes in memory after a failed upload, so use the attachment's
 Retry action instead of selecting the file again.
 

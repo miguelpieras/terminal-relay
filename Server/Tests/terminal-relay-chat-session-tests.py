@@ -172,6 +172,23 @@ except BlockingIOError:
                 in capability_value["capabilities"]["features"]
             )
 
+            claude_capability = helper(
+                "chat-capabilities-v1", "claude", "example-repository"
+            )
+            claude_lines = claude_capability.stdout.splitlines()
+            assert claude_lines[0] == MARKER
+            claude_capability_value = json.loads(claude_lines[1])
+            assert claude_capability_value["provider"] == "claude"
+            assert claude_capability_value["available"] is True
+            assert (
+                claude_capability_value["capabilities"]["supportsAttachments"]
+                is True
+            )
+            assert (
+                "file-attachments-v1"
+                in claude_capability_value["capabilities"]["features"]
+            )
+
             start = helper(
                 "chat-start-v1",
                 "codex",
