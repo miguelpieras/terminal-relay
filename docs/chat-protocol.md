@@ -148,10 +148,11 @@ protocol error.
 
 ## Ephemeral attachments
 
-Codex workers that advertise `file-attachments-v1` accept regular files and
-images. Older workers retain the existing PNG-image behavior; clients do not
-send regular files to them. Claude conversations do not accept regular file
-attachments.
+The supported Codex worker runtime requires `file-attachments-v1` and accepts
+regular files and images. Native Codex clients can rely on that runtime
+contract instead of hiding attachment controls while a conversation's
+capability snapshot catches up. Claude conversations do not accept regular
+file attachments.
 
 The client generates the `turn.start` request UUID before upload and invokes
 one of two fixed, typed SSH helper operations:

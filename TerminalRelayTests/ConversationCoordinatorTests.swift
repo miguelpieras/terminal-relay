@@ -150,7 +150,7 @@ final class ConversationCoordinatorTests: XCTestCase {
         XCTAssertEqual(encodedAttachment?["byteCount"]?.int64Value, 4_096)
     }
 
-    func testFileAttachmentsRequireCapabilityAndRespectByteLimits() async {
+    func testCodexFileAttachmentsDoNotDependOnTransientCapabilitiesAndRespectByteLimits() async {
         let transport = makeConnectedTransport()
         let store = ConversationStore()
         let coordinator = makeCoordinator(store: store, transport: transport)
@@ -165,15 +165,11 @@ final class ConversationCoordinatorTests: XCTestCase {
             byteCount: 10
         )
 
-        let unsupportedWasSent = await coordinator.send(
+        let fileWasSent = await coordinator.send(
             text: "Inspect",
             attachments: [file]
         )
-        XCTAssertFalse(unsupportedWasSent)
-        XCTAssertEqual(
-            store.state.lastErrorMessage,
-            ConversationCoordinatorError.unsupportedAttachments.localizedDescription
-        )
+        XCTAssertTrue(fileWasSent)
 
         let oversizedImage = ChatAttachmentReference(
             id: "fedcbafe-dcba-4fed-8cba-fedcbafedcba",
@@ -193,7 +189,7 @@ final class ConversationCoordinatorTests: XCTestCase {
             ConversationCoordinatorError.attachmentsTooLarge.localizedDescription
         )
         let starts = await transport.sentEnvelopes().filter { $0.type == "turn.start" }
-        XCTAssertTrue(starts.isEmpty)
+        XCTAssertEqual(starts.count, 1)
     }
 
     func testInferredResumedTurnRejectsNewSendLocallyAndPreservesDraft() async throws {

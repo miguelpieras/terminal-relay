@@ -174,8 +174,8 @@ failure or provider lock.
 ## A Codex attachment fails or remains on the worker
 
 First confirm `chat-capabilities-v1 codex` reports
-`file-attachments-v1`. A worker without that feature accepts only the existing
-PNG-image flow; update its runtime before retrying a regular file. The app
+`file-attachments-v1`. That feature is required by the supported worker
+runtime, so reconcile a worker that does not report it before retrying. The app
 retains selected bytes in memory after a failed upload, so use the attachment's
 Retry action instead of selecting the file again.
 

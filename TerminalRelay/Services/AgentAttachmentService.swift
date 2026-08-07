@@ -28,8 +28,7 @@ enum AgentAttachmentService {
         guard attachment.byteCount <= ChatAttachmentPolicy.maximumFileBytes else {
             throw AgentAttachmentUploadError.tooLarge
         }
-        if session.kind == .codex,
-           session.chatCoordinator?.store.state.capabilities.supportsFileAttachments == true {
+        if session.usesNativeChat, session.kind == .codex {
             let configuration = SSHCommandBuilder.workerChatAttachmentUploadConfiguration(
                 for: worker,
                 kind: session.kind,
@@ -68,8 +67,7 @@ enum AgentAttachmentService {
         session: TerminalSession,
         worker: ServerProfile
     ) async {
-        guard session.kind == .codex,
-              session.chatCoordinator?.store.state.capabilities.supportsFileAttachments == true else {
+        guard session.usesNativeChat, session.kind == .codex else {
             return
         }
         let configuration = SSHCommandBuilder.workerChatAttachmentDeleteConfiguration(

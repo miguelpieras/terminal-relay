@@ -3356,9 +3356,8 @@ private struct ConversationComposer: View {
                 || store.state.connectionState == .interrupted)
     }
 
-    private var supportsFileAttachments: Bool {
+    private var canAttachFiles: Bool {
         coordinator.identity.provider == .codex
-            && store.state.capabilities.supportsFileAttachments
             && attachmentActions != nil
     }
 
@@ -3449,7 +3448,7 @@ private struct ConversationComposer: View {
         VStack(alignment: .leading, spacing: 0) {
             promptEditor
             HStack(spacing: 4) {
-                if supportsFileAttachments {
+                if canAttachFiles {
                     Button {
                         isImportingAttachments = true
                     } label: {

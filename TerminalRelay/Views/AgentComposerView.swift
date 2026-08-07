@@ -608,13 +608,6 @@ struct AgentComposerView: View {
         session.kind == .codex ? codexFastModeEnabled : claudeFastModeEnabled
     }
 
-    private var supportsFileAttachments: Bool {
-        session.usesNativeChat
-            && session.kind == .codex
-            && session.chatCoordinator?.store.state.capabilities
-                .supportsFileAttachments == true
-    }
-
     private func send() {
         guard canSend else { return }
 
@@ -908,8 +901,8 @@ struct AgentComposerView: View {
     }
 
     private func chooseFiles() {
-        guard supportsFileAttachments else {
-            pasteNotice = "File attachments are unavailable in this conversation."
+        guard session.usesNativeChat, session.kind == .codex else {
+            pasteNotice = "Files can be attached to Codex chats."
             return
         }
         let panel = NSOpenPanel()
@@ -924,7 +917,10 @@ struct AgentComposerView: View {
     }
 
     private func pasteFiles(_ urls: [URL]) -> Bool {
-        guard supportsFileAttachments else { return false }
+        guard session.usesNativeChat, session.kind == .codex else {
+            pasteNotice = "Files can be attached to Codex chats."
+            return true
+        }
         guard session.status == .running,
               nativeSubmissionInFlightID == nil else {
             pasteNotice = "Files can be attached when the session is connected."

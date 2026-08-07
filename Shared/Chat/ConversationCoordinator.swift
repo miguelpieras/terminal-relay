@@ -1094,8 +1094,7 @@ final class ConversationCoordinator {
         }
         guard attachments.allSatisfy({
             $0.kind == .image
-                || (identity.provider == .codex
-                    && store.state.capabilities.supportsFileAttachments)
+                || identity.provider == .codex
         }) else {
             throw ConversationCoordinatorError.unsupportedAttachments
         }

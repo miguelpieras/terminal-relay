@@ -149,9 +149,6 @@ struct ChatCapabilities: Codable, Equatable, Sendable {
         self.supportsAttachments = supportsAttachments
     }
 
-    var supportsFileAttachments: Bool {
-        features.contains("file-attachments-v1")
-    }
 }
 
 enum ChatMessageRole: String, Codable, Equatable, Sendable {
