@@ -206,8 +206,9 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         self.status = initialStatus
         self.launchState = launchState
         self.terminalTitle = nil
-        self.threadID = threadID
+        let resolvedThreadID = threadID
             ?? (kind == .claude && launchState == .ready ? instanceToken : nil)
+        self.threadID = resolvedThreadID
         self.remoteAttachedClientCount = remoteAttachedClientCount
         switch presentation {
         case .terminal:
@@ -243,7 +244,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
                 identity: ChatConversationIdentity(
                     relayID: instanceToken,
                     provider: ChatProvider(rawValue: kind.rawValue),
-                    providerThreadID: threadID
+                    providerThreadID: resolvedThreadID
                 ),
                 launchOptions: launchDefaults.chatOptions(for: kind),
                 cache: ConversationStateCache.shared

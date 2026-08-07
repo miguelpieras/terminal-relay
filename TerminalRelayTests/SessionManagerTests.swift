@@ -595,6 +595,23 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(session?.displayTitle, "Codex 1")
     }
 
+    func testClaudeChatSessionWithoutSnapshotThreadIDKeepsCacheIdentityInSync() {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let instanceToken = "01234567-89ab-" + "4def-8abc-0123456789ab"
+        let session = TerminalSession(
+            project: project,
+            server: server,
+            kind: .claude,
+            sequenceNumber: 1,
+            instanceToken: instanceToken,
+            presentation: .chat
+        )
+
+        XCTAssertEqual(session.threadID, instanceToken)
+        XCTAssertEqual(session.chatCoordinator?.identity.providerThreadID, session.threadID)
+    }
+
     func testRemoteRefreshPreservesLiveCodexWorkingStateAndUsesReportedState() async {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let project = makeProject(name: "Terminal Relay", server: server)
