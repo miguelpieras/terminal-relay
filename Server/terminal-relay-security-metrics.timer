@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh Terminal Relay fleet security metrics
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+RandomizedDelaySec=30s
+Unit=terminal-relay-security-metrics.service
+
+[Install]
+WantedBy=timers.target

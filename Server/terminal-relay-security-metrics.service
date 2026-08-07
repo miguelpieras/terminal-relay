@@ -1,0 +1,22 @@
+[Unit]
+Description=Collect Terminal Relay fleet security metrics
+Wants=tailscaled.service
+After=tailscaled.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/sbin/terminal-relay-security-metrics
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/prometheus/node-exporter
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true

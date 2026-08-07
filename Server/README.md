@@ -30,6 +30,11 @@ workers are discovered automatically by Prometheus. Worker-specific addresses,
 host keys, Tailscale identities, UUIDs, provider credentials, project checkouts,
 and repository deploy keys remain local and unique.
 
+The host baseline also refreshes four public-safe node-exporter textfile gauges
+for the installed Tailscale version, the fleet security minimum, Tailscale
+auto-update state, and the standard Ubuntu reboot-required marker. It does not
+scan worker projects, terminal sessions, or host indicators of compromise.
+
 `manage-worker.sh verify` also compares the deployed session helper, MCP, and
 Claude session adapter digests with the current checkout, checks their root
 ownership and mode, verifies the pinned SDK version, runs Codex's required

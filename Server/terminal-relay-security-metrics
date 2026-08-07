@@ -1,0 +1,106 @@
+#!/bin/bash
+set -euo pipefail
+
+readonly minimum_tailscale_version="1.102.1"
+readonly metrics_directory="${TERMINAL_RELAY_SECURITY_METRICS_DIRECTORY:-/var/lib/prometheus/node-exporter}"
+readonly metrics_file="$metrics_directory/fleet-security.prom"
+readonly reboot_required_file="${TERMINAL_RELAY_SECURITY_METRICS_REBOOT_REQUIRED_FILE:-/var/run/reboot-required}"
+readonly tailscale_command="${TERMINAL_RELAY_SECURITY_METRICS_TAILSCALE_COMMAND:-/usr/bin/tailscale}"
+
+version_is_older() {
+    local version="${1%%-*}"
+    local minimum="$2"
+    local index
+    local version_number
+    local minimum_number
+    local -a version_components
+    local -a minimum_components
+
+    version="${version%%+*}"
+    version="${version%%~*}"
+    IFS=. read -r -a version_components <<< "$version"
+    IFS=. read -r -a minimum_components <<< "$minimum"
+    [[ "${#version_components[@]}" -eq 3 ]] || return 0
+
+    for index in 0 1 2; do
+        [[ "${version_components[$index]}" =~ ^[0-9]+$ ]] || return 0
+        version_number=$((10#${version_components[$index]}))
+        minimum_number=$((10#${minimum_components[$index]}))
+        if (( version_number < minimum_number )); then
+            return 0
+        fi
+        if (( version_number > minimum_number )); then
+            return 1
+        fi
+    done
+    return 1
+}
+
+[[ "$metrics_directory" == /* ]] || {
+    printf 'terminal-relay-security-metrics: metrics directory must be absolute\n' >&2
+    exit 1
+}
+[[ ! -L "$metrics_directory" ]] || {
+    printf 'terminal-relay-security-metrics: refusing symlinked metrics directory\n' >&2
+    exit 1
+}
+if [[ -e "$metrics_directory" ]]; then
+    [[ -d "$metrics_directory" ]] || {
+        printf 'terminal-relay-security-metrics: metrics path is not a directory\n' >&2
+        exit 1
+    }
+else
+    /usr/bin/install -d -m 0755 "$metrics_directory"
+fi
+
+tailscale_version="unknown"
+if [[ -x "$tailscale_command" ]]; then
+    version_output="$("$tailscale_command" version 2>/dev/null || true)"
+    version_candidate="$(printf '%s\n' "$version_output" | /usr/bin/awk 'NR == 1 { print $1 }')"
+    if [[ "$version_candidate" =~ ^[0-9]+\.[0-9]+\.[0-9]+[-+~.0-9A-Za-z]*$ ]]; then
+        tailscale_version="$version_candidate"
+    fi
+fi
+
+security_update_required=1
+if [[ "$tailscale_version" != unknown ]] \
+    && ! version_is_older "$tailscale_version" "$minimum_tailscale_version"; then
+    security_update_required=0
+fi
+
+auto_update_enabled=0
+if [[ -x "$tailscale_command" ]] \
+    && preferences="$("$tailscale_command" debug prefs 2>/dev/null)" \
+    && preference_value="$(printf '%s\n' "$preferences" | /usr/bin/python3 -c '
+import json
+import sys
+
+preferences = json.load(sys.stdin)
+print(1 if preferences.get("AutoUpdate", {}).get("Apply") is True else 0)
+' 2>/dev/null)" \
+    && [[ "$preference_value" == 1 ]]; then
+    auto_update_enabled=1
+fi
+
+reboot_required=0
+[[ ! -e "$reboot_required_file" ]] || reboot_required=1
+
+temporary_file="$(/usr/bin/mktemp "$metrics_directory/.fleet-security.prom.XXXXXX")"
+trap '/bin/rm -f -- "$temporary_file"' EXIT
+{
+    printf '# HELP fleet_tailscale_version_info Tailscale version installed on the host.\n'
+    printf '# TYPE fleet_tailscale_version_info gauge\n'
+    printf 'fleet_tailscale_version_info{version="%s"} 1\n' "$tailscale_version"
+    printf '# HELP fleet_tailscale_security_update_required Whether Tailscale is older than the fleet security minimum.\n'
+    printf '# TYPE fleet_tailscale_security_update_required gauge\n'
+    printf 'fleet_tailscale_security_update_required %s\n' "$security_update_required"
+    printf '# HELP fleet_tailscale_auto_update_enabled Whether automatic Tailscale updates are enabled.\n'
+    printf '# TYPE fleet_tailscale_auto_update_enabled gauge\n'
+    printf 'fleet_tailscale_auto_update_enabled %s\n' "$auto_update_enabled"
+    printf '# HELP fleet_reboot_required Whether the host requires a reboot.\n'
+    printf '# TYPE fleet_reboot_required gauge\n'
+    printf 'fleet_reboot_required %s\n' "$reboot_required"
+} > "$temporary_file"
+/bin/chmod 0644 "$temporary_file"
+/bin/mv -f -- "$temporary_file" "$metrics_file"
+trap - EXIT

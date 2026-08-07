@@ -4,6 +4,9 @@ set -euo pipefail
 script_directory="$(cd "$(dirname "$0")" && pwd -P)"
 baseline_file="$script_directory/worker-baseline.env"
 node_exporter_template="$script_directory/node-exporter.service.template"
+security_metrics_collector="$script_directory/terminal-relay-security-metrics"
+security_metrics_service="$script_directory/terminal-relay-security-metrics.service"
+security_metrics_timer="$script_directory/terminal-relay-security-metrics.timer"
 
 fail() {
     printf '[terminal-relay-host] ERROR: %s\n' "$*" >&2
@@ -27,6 +30,15 @@ EOF
     || fail "Missing or unsafe baseline file: $baseline_file"
 [[ -f "$node_exporter_template" && ! -L "$node_exporter_template" ]] \
     || fail "Missing or unsafe node-exporter template: $node_exporter_template"
+for required_file in \
+    "$security_metrics_collector" \
+    "$security_metrics_service" \
+    "$security_metrics_timer"; do
+    [[ -f "$required_file" && ! -L "$required_file" ]] \
+        || fail "Missing or unsafe security-metrics file: $required_file"
+done
+[[ -x "$security_metrics_collector" ]] \
+    || fail "Security-metrics collector is not executable: $security_metrics_collector"
 # shellcheck disable=SC1090
 . "$baseline_file"
 
@@ -38,6 +50,10 @@ readonly tailscale_source="/etc/apt/sources.list.d/tailscale.list"
 readonly tailscale_key_url="https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg"
 readonly tailscale_repository="deb [signed-by=$tailscale_keyring] https://pkgs.tailscale.com/stable/ubuntu noble main"
 readonly node_exporter_unit="/etc/systemd/system/node-exporter.service"
+readonly security_metrics_collector_path="/usr/local/sbin/terminal-relay-security-metrics"
+readonly security_metrics_service_unit="/etc/systemd/system/terminal-relay-security-metrics.service"
+readonly security_metrics_timer_unit="/etc/systemd/system/terminal-relay-security-metrics.timer"
+readonly security_metrics_file="/var/lib/prometheus/node-exporter/fleet-security.prom"
 readonly runtime_user="terminal-relay"
 readonly runtime_keys="/home/$runtime_user/.ssh/authorized_keys"
 readonly root_keys="/root/.ssh/authorized_keys"
@@ -302,6 +318,27 @@ configure_node_exporter() {
     /usr/bin/systemctl enable --now node-exporter.service
 }
 
+configure_security_metrics() {
+    install_binary_file \
+        "$security_metrics_collector" \
+        "$security_metrics_collector_path" \
+        root root 0755
+    install_binary_file \
+        "$security_metrics_service" \
+        "$security_metrics_service_unit" \
+        root root 0644
+    install_binary_file \
+        "$security_metrics_timer" \
+        "$security_metrics_timer_unit" \
+        root root 0644
+    /usr/bin/systemctl daemon-reload
+    /usr/bin/systemd-analyze verify \
+        "$security_metrics_service_unit" \
+        "$security_metrics_timer_unit"
+    /usr/bin/systemctl start terminal-relay-security-metrics.service
+    /usr/bin/systemctl enable --now terminal-relay-security-metrics.timer
+}
+
 configure_firewall() {
     /usr/sbin/ufw --force reset >/dev/null
     /usr/sbin/ufw default deny incoming >/dev/null
@@ -409,6 +446,48 @@ verify_node_exporter() {
         || fail "The broad apt node exporter service is not masked."
 }
 
+verify_security_metrics() {
+    local destination
+    local metric
+    local mode
+    local source
+
+    for metric in \
+        "$security_metrics_collector:$security_metrics_collector_path:755" \
+        "$security_metrics_service:$security_metrics_service_unit:644" \
+        "$security_metrics_timer:$security_metrics_timer_unit:644"; do
+        IFS=: read -r source destination mode <<< "$metric"
+        [[ -f "$destination" && ! -L "$destination" ]] \
+            || fail "Security-metrics managed file is missing or unsafe: $destination"
+        /usr/bin/cmp -s "$source" "$destination" \
+            || fail "Security-metrics managed file differs from the baseline: $destination"
+        [[ "$(/usr/bin/stat -c '%U:%G:%a' "$destination")" == "root:root:$mode" ]] \
+            || fail "Security-metrics managed file ownership or mode is incorrect: $destination"
+    done
+
+    /usr/bin/systemctl is-enabled --quiet terminal-relay-security-metrics.timer \
+        || fail "terminal-relay-security-metrics.timer is not enabled."
+    /usr/bin/systemctl is-active --quiet terminal-relay-security-metrics.timer \
+        || fail "terminal-relay-security-metrics.timer is not active."
+    [[ "$(/usr/bin/systemctl show -p Result --value terminal-relay-security-metrics.service)" == success ]] \
+        || fail "terminal-relay-security-metrics.service did not complete successfully."
+
+    [[ -f "$security_metrics_file" && ! -L "$security_metrics_file" ]] \
+        || fail "Fleet security metrics are missing or unsafe."
+    [[ "$(/usr/bin/stat -c '%U:%G:%a' "$security_metrics_file")" == root:root:644 ]] \
+        || fail "Fleet security metrics ownership or mode is incorrect."
+    /bin/grep -Fqx \
+        "fleet_tailscale_version_info{version=\"$TERMINAL_RELAY_TAILSCALE_VERSION\"} 1" \
+        "$security_metrics_file" \
+        || fail "Fleet Tailscale version metric differs from the baseline."
+    /bin/grep -Fqx 'fleet_tailscale_security_update_required 0' "$security_metrics_file" \
+        || fail "Fleet Tailscale security-update metric is not healthy."
+    /bin/grep -Eq '^fleet_tailscale_auto_update_enabled [01]$' "$security_metrics_file" \
+        || fail "Fleet Tailscale auto-update metric is invalid."
+    /bin/grep -Eq '^fleet_reboot_required [01]$' "$security_metrics_file" \
+        || fail "Fleet reboot-required metric is invalid."
+}
+
 verify_host() {
     local held
     local os_hostname
@@ -435,6 +514,7 @@ verify_host() {
     verify_operator_keys
     verify_firewall
     verify_node_exporter
+    verify_security_metrics
 
     held="$(/usr/bin/apt-mark showhold)"
     for package in tailscale docker.io containerd runc prometheus-node-exporter ufw; do
@@ -477,6 +557,7 @@ reconcile_host() {
     ensure_private_reconcile_route
     install_host_packages
     normalize_operator_keys
+    configure_security_metrics
     configure_node_exporter
     configure_firewall
     /usr/bin/timedatectl set-timezone UTC

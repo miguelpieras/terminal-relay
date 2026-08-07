@@ -17,6 +17,9 @@ readonly RUNTIME_UPDATER_SOURCE="$SERVER_DIRECTORY/terminal-relay-runtime-update
 readonly RUNTIME_PUBLIC_KEY_SOURCE="$SERVER_DIRECTORY/terminal-relay-runtime-update.pub"
 readonly STABLE_RUNTIME_PREFLIGHT="$SCRIPT_DIRECTORY/verify-published-worker-runtime.sh"
 readonly NODE_EXPORTER_TEMPLATE="$SERVER_DIRECTORY/node-exporter.service.template"
+readonly SECURITY_METRICS_COLLECTOR="$SERVER_DIRECTORY/terminal-relay-security-metrics"
+readonly SECURITY_METRICS_SERVICE="$SERVER_DIRECTORY/terminal-relay-security-metrics.service"
+readonly SECURITY_METRICS_TIMER="$SERVER_DIRECTORY/terminal-relay-security-metrics.timer"
 readonly BOOTSTRAP_SCRIPT="$SCRIPT_DIRECTORY/bootstrap-worker.sh"
 readonly SSH_CONFIG="$HOME/.ssh/config"
 readonly TAILSCALE_KEYCHAIN_SERVICE="com.mpieras.TerminalRelay.worker-lifecycle.tailscale-oauth"
@@ -151,6 +154,15 @@ validate_local_prerequisites() {
         || die "Claude SDK requirements source is missing or unsafe"
     [[ -f "$NODE_EXPORTER_TEMPLATE" && ! -L "$NODE_EXPORTER_TEMPLATE" ]] \
         || die "missing or unsafe node-exporter template"
+    for command in \
+        "$SECURITY_METRICS_COLLECTOR" \
+        "$SECURITY_METRICS_SERVICE" \
+        "$SECURITY_METRICS_TIMER"; do
+        [[ -f "$command" && ! -L "$command" ]] \
+            || die "missing or unsafe security-metrics lifecycle file"
+    done
+    [[ -x "$SECURITY_METRICS_COLLECTOR" ]] \
+        || die "security-metrics collector must be executable"
     [[ -f "$OPERATOR_PRIVATE_KEY" && -r "$OPERATOR_PRIVATE_KEY" ]] \
         || die "operator private key is unavailable: $OPERATOR_PRIVATE_KEY"
     [[ -f "$OPERATOR_PUBLIC_KEY" && -r "$OPERATOR_PUBLIC_KEY" ]] \
@@ -581,7 +593,13 @@ host_bundle() {
     /bin/rm -rf -- "$payload_directory"
     /bin/mkdir -m 0700 "$payload_directory"
     /bin/cp "$BASELINE_FILE" "$payload_directory/worker-baseline.env"
-    /bin/cp "$HOST_INSTALLER" "$NODE_EXPORTER_TEMPLATE" "$payload_directory/"
+    /bin/cp \
+        "$HOST_INSTALLER" \
+        "$NODE_EXPORTER_TEMPLATE" \
+        "$SECURITY_METRICS_COLLECTOR" \
+        "$SECURITY_METRICS_SERVICE" \
+        "$SECURITY_METRICS_TIMER" \
+        "$payload_directory/"
     /bin/chmod 0700 "$payload_directory/install-worker-host.sh"
     if [[ -n "$auth_key_file" ]]; then
         /bin/cp "$auth_key_file" "$payload_directory/tailscale-auth-key"
