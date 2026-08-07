@@ -70,6 +70,7 @@ struct AgentComposerView: View {
                 PromptEditor(
                     text: $draft,
                     onSubmit: send,
+                    onPasteFiles: pasteFiles,
                     onPasteImages: addImages,
                     onEscape: handleEscape,
                     onFocusChange: { isEditorFocused = $0 }
@@ -921,6 +922,17 @@ struct AgentComposerView: View {
         }
     }
 
+    private func pasteFiles(_ urls: [URL]) -> Bool {
+        guard supportsFileAttachments else { return false }
+        guard session.status == .running,
+              nativeSubmissionInFlightID == nil else {
+            pasteNotice = "Files can be attached when the session is connected."
+            return true
+        }
+        addFiles(urls)
+        return true
+    }
+
     private func addFiles(_ urls: [URL]) {
         pasteNotice = nil
         for url in urls {
@@ -1223,6 +1235,15 @@ private struct NativeComposerStoreObserver: View {
     }
 }
 
+enum ClipboardFileURLs {
+    static func read(from pasteboard: NSPasteboard = .general) -> [URL] {
+        pasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        ) as? [URL] ?? []
+    }
+}
+
 private struct ClipboardImage {
     let pngData: Data
     let preview: NSImage
@@ -1341,6 +1362,7 @@ private struct PromptEditor: NSViewRepresentable {
     @Binding var text: String
 
     let onSubmit: () -> Void
+    let onPasteFiles: ([URL]) -> Bool
     let onPasteImages: ([ClipboardImage]) -> Void
     let onEscape: (Bool) -> Void
     let onFocusChange: (Bool) -> Void
@@ -1377,6 +1399,7 @@ private struct PromptEditor: NSViewRepresentable {
         textView.setAccessibilityLabel("Message")
         textView.setAccessibilityHelp("Return sends. Shift Return inserts a new line.")
         textView.onSubmit = onSubmit
+        textView.onPasteFiles = onPasteFiles
         textView.onPasteImages = onPasteImages
         textView.onEscape = onEscape
         textView.onFocusChange = onFocusChange
@@ -1401,6 +1424,7 @@ private struct PromptEditor: NSViewRepresentable {
         }
         textView.insertionPointColor = .secondaryLabelColor
         textView.onSubmit = onSubmit
+        textView.onPasteFiles = onPasteFiles
         textView.onPasteImages = onPasteImages
         textView.onEscape = onEscape
         textView.onFocusChange = onFocusChange
@@ -1422,6 +1446,7 @@ private struct PromptEditor: NSViewRepresentable {
 
 private final class ComposerTextView: NSTextView {
     var onSubmit: (() -> Void)?
+    var onPasteFiles: (([URL]) -> Bool)?
     var onPasteImages: (([ClipboardImage]) -> Void)?
     var onEscape: ((Bool) -> Void)?
     var onFocusChange: ((Bool) -> Void)?
@@ -1457,6 +1482,10 @@ private final class ComposerTextView: NSTextView {
     }
 
     override func paste(_ sender: Any?) {
+        let fileURLs = ClipboardFileURLs.read()
+        if !fileURLs.isEmpty, onPasteFiles?(fileURLs) == true {
+            return
+        }
         let images = ClipboardImage.read()
         if images.isEmpty {
             super.paste(sender)

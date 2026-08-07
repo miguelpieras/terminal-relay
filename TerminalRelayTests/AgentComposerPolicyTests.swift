@@ -3,6 +3,24 @@ import XCTest
 @testable import TerminalRelay
 
 final class AgentComposerPolicyTests: XCTestCase {
+    func testClipboardFileURLsReadsFinderStyleFileCopies() throws {
+        let pasteboard = NSPasteboard(
+            name: NSPasteboard.Name("AgentComposerPolicyTests.files")
+        )
+        pasteboard.clearContents()
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("pdf")
+        try Data("clipboard file".utf8).write(to: fileURL)
+        defer {
+            try? FileManager.default.removeItem(at: fileURL)
+            pasteboard.clearContents()
+        }
+
+        XCTAssertTrue(pasteboard.writeObjects([fileURL as NSURL]))
+        XCTAssertEqual(ClipboardFileURLs.read(from: pasteboard), [fileURL])
+    }
+
     func testProjectWorkspaceStartsWithTheEnvironmentSidebarVisible() {
         XCTAssertTrue(
             ProjectWorkspaceLayoutPolicy.showsEnvironmentSidebarByDefault
