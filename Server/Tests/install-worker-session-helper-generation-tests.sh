@@ -76,6 +76,8 @@ runtime_control_script="$(render_runtime_control_script)"
     && "$runtime_control_script" == *'"$temporary_directory/runtime-manifest.json"'* \
     && "$runtime_control_script" == *'systemctl enable --now'* ]] \
     || { echo "Runtime-control renderer expanded or lost literal remote variables." >&2; exit 1; }
+[[ "$(< "$installer")" == *"runtime|\$runtime_version|1|2|agent-sessions,chat-v1,file-attachments-v1,runtime-updates-v1,threads-v1,threads-v2"* ]] \
+    || { echo "Helper installer does not verify the file-attachment runtime capability." >&2; exit 1; }
 /bin/bash -n <<< "$runtime_control_script"
 [[ "$(< "$restore_unit")" == *'ExecStart=/usr/local/bin/terminal-relay-session restore'* \
     && "$(< "$restore_unit")" == *'WantedBy=multi-user.target'* \

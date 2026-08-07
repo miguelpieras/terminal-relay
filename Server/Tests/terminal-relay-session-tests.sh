@@ -958,11 +958,11 @@ assert_equal "70" "$malformed_update_status" "malformed agent update status"
 assert_contains "$malformed_update_output" "malformed" "malformed agent update diagnostic"
 /bin/rm -f -- "$agent_update_status_file"
 printf '%s\n' \
-    '{"runtimeVersion":2000000000,"protocol":{"minimum":1,"maximum":2},"capabilities":["agent-sessions","chat-v1","runtime-updates-v1","threads-v1","threads-v2"]}' \
+    '{"runtimeVersion":2000000000,"protocol":{"minimum":1,"maximum":2},"capabilities":["agent-sessions","chat-v1","file-attachments-v1","runtime-updates-v1","threads-v1","threads-v2"]}' \
     > "$runtime_manifest_file"
 /bin/chmod 644 "$runtime_manifest_file"
 assert_equal \
-    $'__TERMINAL_RELAY_RUNTIME_INFO_V1__\nruntime|2000000000|1|2|agent-sessions,chat-v1,runtime-updates-v1,threads-v1,threads-v2' \
+    $'__TERMINAL_RELAY_RUNTIME_INFO_V1__\nruntime|2000000000|1|2|agent-sessions,chat-v1,file-attachments-v1,runtime-updates-v1,threads-v1,threads-v2' \
     "$(/bin/bash "$helper" runtime-info)" \
     "worker runtime information"
 assert_equal \

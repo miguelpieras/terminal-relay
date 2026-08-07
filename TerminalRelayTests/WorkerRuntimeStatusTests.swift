@@ -7,12 +7,13 @@ final class WorkerRuntimeStatusTests: XCTestCase {
         let data = Data(
             """
             \(WorkerRuntimeInfoProtocol.marker)
-            runtime|2000000000|1|2|agent-sessions,chat-v1,runtime-updates-v1,threads-v1,threads-v2
+            runtime|2000000000|1|2|agent-sessions,chat-v1,file-attachments-v1,runtime-updates-v1,threads-v1,threads-v2
             """.utf8
         )
         let info = try WorkerRuntimeInfoProtocol.parse(data)
         XCTAssertEqual(info.version, 2_000_000_000)
         XCTAssertTrue(info.isClientProtocolCompatible)
+        XCTAssertTrue(info.supports("file-attachments-v1"))
         XCTAssertTrue(info.supports("threads-v2"))
         XCTAssertFalse(info.supports("unknown"))
     }

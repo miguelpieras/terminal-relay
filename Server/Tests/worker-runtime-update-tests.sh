@@ -61,6 +61,7 @@ assert manifest["protocol"] == {"minimum": 1, "maximum": 2}
 assert manifest["capabilities"] == [
     "agent-sessions",
     "chat-v1",
+    "file-attachments-v1",
     "runtime-updates-v1",
     "threads-v1",
     "threads-v2",

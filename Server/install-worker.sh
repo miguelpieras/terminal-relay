@@ -1234,7 +1234,9 @@ verify_readiness() {
     run_as_worker /usr/bin/awk \
         '/^MemTotal:/ { found = 1 } END { exit !found }' /proc/meminfo
     run_as_worker /bin/df -Pk "$workspace_directory" >/dev/null
-    run_as_worker "$launcher_destination" runtime-info >/dev/null
+    run_as_worker "$launcher_destination" runtime-info \
+        | /bin/grep -Eq '^runtime\|[1-9][0-9]*\|1\|2\|agent-sessions,chat-v1,file-attachments-v1,runtime-updates-v1,threads-v1,threads-v2$' \
+        || fail "The installed worker runtime does not support file attachments."
     run_as_worker "$launcher_destination" runtime-update-status >/dev/null
 
     workspace_probe="$(run_as_worker /usr/bin/mktemp \

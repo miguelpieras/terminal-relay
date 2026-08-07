@@ -133,6 +133,7 @@ if (
     != [
         "agent-sessions",
         "chat-v1",
+        "file-attachments-v1",
         "runtime-updates-v1",
         "threads-v1",
         "threads-v2",

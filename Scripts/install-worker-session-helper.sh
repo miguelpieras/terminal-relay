@@ -1091,6 +1091,19 @@ set -e
     exit "$runtime_control_status"
 }
 
+runtime_info_output="$(/usr/bin/ssh "$application_target" \
+    '/usr/local/bin/terminal-relay-session runtime-info')" || {
+    echo "The installed worker runtime could not be verified." >&2
+    exit 70
+}
+printf '%s\n' "$runtime_info_output" \
+    | /usr/bin/grep -Fqx '__TERMINAL_RELAY_RUNTIME_INFO_V1__' \
+    || { echo "The installed worker runtime marker is invalid." >&2; exit 70; }
+printf '%s\n' "$runtime_info_output" \
+    | /usr/bin/grep -Fqx \
+        "runtime|$runtime_version|1|2|agent-sessions,chat-v1,file-attachments-v1,runtime-updates-v1,threads-v1,threads-v2" \
+    || { echo "The installed worker runtime does not support file attachments." >&2; exit 70; }
+
 echo "Installed helper, restore unit, and automatic runtime update controls."
 [[ "$helper_result" != replaced ]] || echo "Helper backup retained at $helper_backup"
 [[ "$unit_result" != replaced ]] || echo "Unit backup retained at $unit_backup"

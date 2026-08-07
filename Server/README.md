@@ -197,7 +197,8 @@ terminal-relay-session runtime-update-request
 ```
 
 `runtime-info` reports the installed version, supported client-protocol range,
-and sorted capabilities. `runtime-update-status` reports only a timestamp,
+and sorted capabilities, including the required `file-attachments-v1` feature.
+`runtime-update-status` reports only a timestamp,
 checking/success/failure, installed version, target version, and a safe failure
 code. Clients request one immediate check when a reported protocol or required
 capability is incompatible, poll with bounded backoff, refresh worker catalogs
@@ -283,7 +284,8 @@ helper and unit files are retained as timestamped backups and the installer
 prints a guarded rollback command. The MCP and Claude adapter are always staged,
 atomically renamed, and verified in place. Replacing the helper or MCP also
 schedules the shared Codex app-server to restart after active Codex terminals
-drain.
+drain. Both the full worker installer and this helper-only installer require the
+installed runtime to advertise `file-attachments-v1` before succeeding.
 
 Run the isolated local helper coverage before installation:
 

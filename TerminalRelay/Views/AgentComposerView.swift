@@ -115,18 +115,16 @@ struct AgentComposerView: View {
             HStack(spacing: 10) {
                 modelControls
 
-                if supportsFileAttachments {
-                    Button(action: chooseFiles) {
-                        Image(systemName: "paperclip")
-                            .font(.system(size: 13, weight: .medium))
-                            .frame(width: 30, height: 30)
-                            .contentShape(Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(session.status != .running || nativeSubmissionInFlightID != nil)
-                    .accessibilityLabel("Attach files")
-                    .help("Attach files")
+                Button(action: chooseFiles) {
+                    Image(systemName: "paperclip")
+                        .font(.system(size: 13, weight: .medium))
+                        .frame(width: 30, height: 30)
+                        .contentShape(Circle())
                 }
+                .buttonStyle(.plain)
+                .disabled(session.status != .running || nativeSubmissionInFlightID != nil)
+                .accessibilityLabel("Attach files")
+                .help("Attach files")
 
                 Spacer(minLength: 8)
 
@@ -910,7 +908,10 @@ struct AgentComposerView: View {
     }
 
     private func chooseFiles() {
-        guard supportsFileAttachments else { return }
+        guard supportsFileAttachments else {
+            pasteNotice = "File attachments are unavailable in this conversation."
+            return
+        }
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false

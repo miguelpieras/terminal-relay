@@ -946,7 +946,7 @@ systemctl is-active --quiet terminal-relay-runtime-update.path
     >/dev/null
 "$claude_sdk/bin/python3" "$chat_broker" ready --provider claude >/dev/null
 "$session_helper" runtime-info \
-    | grep -Eq "^runtime\\|$expected_runtime_version\\|1\\|2\\|agent-sessions,chat-v1,runtime-updates-v1,threads-v1,threads-v2$"
+    | grep -Eq "^runtime\\|$expected_runtime_version\\|1\\|2\\|agent-sessions,chat-v1,file-attachments-v1,runtime-updates-v1,threads-v1,threads-v2$"
 "$session_helper" runtime-update-status >/dev/null
 printf 'application=ready\n'
 REMOTE

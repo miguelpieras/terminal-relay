@@ -202,6 +202,12 @@ grep -Fq 'verify-published-worker-runtime.sh' "$review_lifecycle" \
     || fail "App Review provisioning does not require the matching signed stable runtime"
 grep -Fq 'verify-published-worker-runtime.sh' "$helper_installer" \
     || fail "helper-only installation does not require the matching signed stable runtime"
+grep -Fq 'file-attachments-v1' "$application_installer" \
+    || fail "application installer does not require file-attachment support"
+grep -Fq 'file-attachments-v1' "$helper_installer" \
+    || fail "helper-only installer does not require file-attachment support"
+grep -Fq 'file-attachments-v1' "$lifecycle" \
+    || fail "fleet verification does not require file-attachment support"
 grep -Fq 'CODEX_NON_INTERACTIVE=1' "$agent_updater" \
     || fail "Codex automatic updates are not unattended"
 grep -Fq 'apt/latest latest main' "$application_installer" \
