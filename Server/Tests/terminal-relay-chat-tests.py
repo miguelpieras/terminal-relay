@@ -2649,6 +2649,74 @@ def exercise_snapshot_trim(module, root: pathlib.Path) -> None:
         raise AssertionError("accepted an unshrinkable snapshot")
 
 
+def exercise_chat_bindings(module, root: pathlib.Path) -> None:
+    import contextlib
+    import io
+    import time
+
+    runtime = root / "bindings"
+    runtime.mkdir(mode=0o700)
+
+    def write_relay(relay_id: str, status: str, pid: int, age_seconds: int) -> pathlib.Path:
+        directory = runtime / f"chat-{relay_id}"
+        directory.mkdir(mode=0o700)
+        state = {
+            "v": 1,
+            "status": status,
+            "provider": "codex",
+            "repository": "example-repository",
+            "relayId": relay_id,
+            "providerThreadId": THREAD_ID,
+            "pid": pid,
+            "processStart": "proc_1",
+            "socket": str(directory / "broker.sock"),
+        }
+        state_file = directory / "broker.json"
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        state_file.chmod(0o600)
+        stamp = time.time() - age_seconds
+        os.utime(directory, (stamp, stamp))
+        return directory
+
+    live_relay = "11111111-2222-4333-8444-555555555555"
+    stale_stopped = write_relay(
+        "aaaaaaaa-1111-4111-8111-111111111111", "stopped", 1,
+        module.STOPPED_RELAY_SWEEP_SECONDS + 60,
+    )
+    fresh_stopped = write_relay(
+        "bbbbbbbb-2222-4222-8222-222222222222", "stopped", 1, 60
+    )
+    dead_ready = write_relay(
+        "cccccccc-3333-4333-8333-333333333333", "ready", 2 ** 22 - 1,
+        module.STOPPED_RELAY_SWEEP_SECONDS + 60,
+    )
+    live_directory = write_relay(live_relay, "ready", os.getpid(), 60)
+
+    original_validate = module.validate_live_state_process
+    module.validate_live_state_process = lambda state: None if state[
+        "pid"
+    ] == os.getpid() else original_validate(state)
+    try:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            module.emit_chat_bindings(str(runtime), "codex", "example-repository")
+        lines = [line for line in output.getvalue().splitlines() if line]
+        assert lines == [f"{THREAD_ID}|{live_relay}|chat"]
+        # Repository mismatch yields no bindings but must not touch live state.
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            module.emit_chat_bindings(str(runtime), "codex", "other-repository")
+        assert output.getvalue() == ""
+    finally:
+        module.validate_live_state_process = original_validate
+
+    # Long-stopped and long-dead relays are swept; fresh and live ones stay.
+    assert not stale_stopped.exists()
+    assert not dead_ready.exists()
+    assert fresh_stopped.exists()
+    assert live_directory.exists()
+
+
 def run() -> None:
     module = load_broker()
     exercise_validation(module)
@@ -2662,6 +2730,7 @@ def run() -> None:
         asyncio.run(exercise_protocol(module, root_path))
         asyncio.run(exercise_early_attach(module, root_path))
         exercise_snapshot_trim(module, root_path)
+        exercise_chat_bindings(module, root_path)
         asyncio.run(exercise_codex_adapter(module, root_path))
         asyncio.run(exercise_codex_reconnect(module, root_path))
         asyncio.run(exercise_codex_close_timeout(module, root_path))

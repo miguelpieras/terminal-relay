@@ -2999,9 +2999,6 @@ provider_active_bindings() {
     local metadata_file
     local instance
     local tool
-    local chat_directory
-    local chat_state
-    local chat_fields
 
     shopt -s nullglob
     for metadata_file in "$runtime_directory"/*.session; do
@@ -3020,43 +3017,15 @@ provider_active_bindings() {
         fi
         unlock_tool_metadata
     done
-    for chat_directory in "$runtime_directory"/chat-*; do
-        [[ -d "$chat_directory" && ! -L "$chat_directory" ]] || continue
-        instance="${chat_directory##*/chat-}"
-        is_valid_instance "$instance" || continue
-        chat_state="$("$default_python_path" "$chat_path" inspect \
-            --runtime-directory "$runtime_directory" \
-            --relay-id "$instance" 2>/dev/null)" || continue
-        chat_fields="$("$default_python_path" - "$chat_state" \
-            "$requested_provider" "$requested_repository" <<'PYTHON_CHAT_BINDING'
-import json
-import re
-import sys
-
-try:
-    value = json.loads(sys.argv[1])
-except ValueError:
-    raise SystemExit(70)
-pattern = re.compile(
-    r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
-)
-if (
-    value.get("status") != "ready"
-    or value.get("provider") != sys.argv[2]
-    or value.get("repository") != sys.argv[3]
-    or not pattern.fullmatch(str(value.get("providerThreadId", "")))
-    or not pattern.fullmatch(str(value.get("relayId", "")))
-):
-    raise SystemExit(75)
-print("{}|{}|chat".format(value["providerThreadId"], value["relayId"]))
-PYTHON_CHAT_BINDING
-)" || continue
-        IFS='|' read -r chat_thread_id chat_relay_id chat_presentation <<< "$chat_fields"
-        tmux_command has-session \
-            -t "$(chat_session_name_for "$requested_provider" "$chat_relay_id")" \
-            2>/dev/null || continue
-        printf '%s\n' "$chat_fields"
-    done
+    # One python invocation scans every chat relay (and sweeps long-stopped
+    # ones); a per-relay spawn made this loop cost seconds once stopped
+    # relay directories accumulated. Liveness comes from the broker's
+    # pid/processStart/cmdline validation, which is what the relay actually
+    # runs under — tmux merely wraps it.
+    "$default_python_path" "$chat_path" inspect-bindings \
+        --runtime-directory "$runtime_directory" \
+        --provider "$requested_provider" \
+        --repository "$requested_repository" 2>/dev/null || true
     shopt -u nullglob
 }
 

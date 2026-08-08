@@ -5096,6 +5096,53 @@ def load_state(runtime_directory: str, relay_id: str) -> dict[str, Any]:
     return state_value
 
 
+STOPPED_RELAY_SWEEP_SECONDS = 24 * 60 * 60
+
+
+def emit_chat_bindings(runtime_directory: str, provider: str, repository: str) -> None:
+    """Scan every chat relay in ONE process: print 'threadId|relayId|chat'
+    for live brokers matching provider+repository, and sweep relay
+    directories that have been stopped (or dead) for a day. Replaces a
+    per-relay python spawn that made thread catalogs cost seconds once
+    stopped relays accumulated."""
+    try:
+        entries = sorted(os.listdir(runtime_directory))
+    except OSError:
+        return
+    now = time.time()
+    for entry in entries:
+        if not entry.startswith("chat-"):
+            continue
+        relay_id = entry[len("chat-"):]
+        if not UUID_PATTERN.fullmatch(relay_id):
+            continue
+        session_directory = os.path.join(runtime_directory, entry)
+        try:
+            state = load_state(runtime_directory, relay_id)
+            if state["status"] == "ready":
+                validate_live_state_process(state)
+                if (
+                    state["provider"] == provider
+                    and state["repository"] == repository
+                ):
+                    print(
+                        "{}|{}|chat".format(
+                            state["providerThreadId"], state["relayId"]
+                        )
+                    )
+                continue
+        except ChatError:
+            pass
+        # Stopped, crashed, or unreadable relays contribute no bindings; the
+        # age guard keeps a mid-start directory (state not yet written) and
+        # any concurrent attach race out of the sweep.
+        try:
+            if now - os.lstat(session_directory).st_mtime > STOPPED_RELAY_SWEEP_SECONDS:
+                shutil.rmtree(session_directory, ignore_errors=True)
+        except OSError:
+            continue
+
+
 def validate_live_state_process(state: dict[str, Any]) -> None:
     pid = state["pid"]
     try:
@@ -5288,6 +5335,11 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_parser.add_argument("--runtime-directory", required=True)
     inspect_parser.add_argument("--relay-id", required=True)
 
+    bindings = subparsers.add_parser("inspect-bindings", add_help=False)
+    bindings.add_argument("--runtime-directory", required=True)
+    bindings.add_argument("--provider", choices=("codex", "claude"), required=True)
+    bindings.add_argument("--repository", required=True)
+
     attach = subparsers.add_parser("attach", add_help=False)
     attach.add_argument("--runtime-directory", required=True)
     attach.add_argument("--relay-id", required=True)
@@ -5452,6 +5504,16 @@ def main() -> int:
         if state["status"] == "ready":
             validate_live_state_process(state)
         print(json.dumps(state, separators=(",", ":")))
+        return 0
+    if arguments.command == "inspect-bindings":
+        runtime_directory = canonical_directory(
+            arguments.runtime_directory, "runtime directory"
+        )
+        emit_chat_bindings(
+            runtime_directory,
+            arguments.provider,
+            canonical_repository(arguments.repository),
+        )
         return 0
     return asyncio.run(async_main(arguments))
 

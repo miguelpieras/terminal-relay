@@ -17,6 +17,7 @@ enum SSHCommandBuilder {
             "-o", "ServerAliveInterval=30",
             "-o", "ServerAliveCountMax=3"
         ]
+        arguments += multiplexingOptions
 
         if server.port != 22 {
             arguments += ["-p", String(server.port)]
@@ -355,6 +356,21 @@ enum SSHCommandBuilder {
         )
     }
 
+    /// Shares one SSH connection across commands to the same worker: a fresh
+    /// TCP+auth handshake costs ~0.5s per command while a multiplexed channel
+    /// costs ~0.1s, and every sidebar refresh and conversation open pays it.
+    /// ControlMaster=auto degrades to a direct connection whenever the master
+    /// socket is unavailable, so multiplexing is never a correctness risk.
+    /// The path stays short (~/.ssh + hash) because the kernel caps unix
+    /// socket paths at 104 bytes.
+    private static var multiplexingOptions: [String] {
+        [
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPath=~/.ssh/tr-mux-%C",
+            "-o", "ControlPersist=60"
+        ]
+    }
+
     private static func batchConfiguration(
         for server: ServerProfile,
         remoteCommand: String,
@@ -367,6 +383,7 @@ enum SSHCommandBuilder {
             "-o", "ServerAliveCountMax=3",
             "-o", "StrictHostKeyChecking=accept-new"
         ]
+        arguments += multiplexingOptions
         if disablesPTY {
             arguments.append("-T")
         }
