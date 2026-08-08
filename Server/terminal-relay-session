@@ -140,7 +140,7 @@ usage:
   terminal-relay-session runtime-update-status
   terminal-relay-session runtime-update-request
   terminal-relay-session chat-capabilities-v1 <codex|claude> <repository>
-  terminal-relay-session chat-start-v1 <codex|claude> <repository> [provider-thread-id] [agent arguments...]
+  terminal-relay-session chat-start-v1 <codex|claude> <repository> [provider-thread-id] <agent arguments...>
   terminal-relay-session chat-attach-v1 <codex|claude> <repository> <relay-id>
   terminal-relay-session chat-stop-v1 <codex|claude> <repository> <relay-id>
   terminal-relay-session chat-attachment-upload-v1 <codex|claude> <repository> <relay-id> <request-id> <attachment-id> <extension> <byte-count>
@@ -1498,6 +1498,7 @@ write_chat_intent() {
     is_valid_instance "$relay_id" || return 64
     is_valid_instance "$provider_thread_id" || return 64
     is_valid_boot_id "$boot_id" || return 64
+    [[ $# -gt 0 ]] || return 64
     validate_launch_arguments "$provider" "$@" || return $?
     path="$(chat_intent_file_for "$relay_id")"
     [[ ! -L "$path" ]] || return 70
@@ -1730,6 +1731,13 @@ chat_start_v1() {
     if [[ $# -gt 0 ]] && is_valid_instance "$1"; then
         provider_thread_id="$1"
         shift
+    fi
+    # Every client sends the user's launch defaults; an optionless start would
+    # persist a restart intent that restores the conversation with default
+    # permissions forever.
+    if [[ $# -eq 0 ]]; then
+        echo "Structured chat requires explicit agent launch arguments." >&2
+        return 64
     fi
     validate_launch_arguments "$provider" "$@" || return $?
     boot_id="$(current_boot_id)" || {
@@ -4180,6 +4188,18 @@ restore_chat_sessions() {
             # A concurrent stop withdrew the intent, or the resume failed and
             # the broker dropped it; either way there is nothing to restore.
             printf 'Skipped structured chat %s: its restart intent was withdrawn.\n' \
+                "$chat_intent_relay_id"
+            unset requested_chat_relay_id
+            continue
+        fi
+        if [[ $start_status -eq 64 ]]; then
+            # The stored launch arguments can never relaunch (for example an
+            # optionless intent left by a manual chat-start). Relaunching
+            # anyway would run the conversation with default permissions, so
+            # drop the intent and leave the conversation inactive; the next
+            # open from a client re-resumes it with real launch defaults.
+            /bin/rm -f -- "$intent_path"
+            printf 'Removed structured chat %s: its restart intent lacks valid launch options.\n' \
                 "$chat_intent_relay_id"
             unset requested_chat_relay_id
             continue

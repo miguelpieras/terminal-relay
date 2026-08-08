@@ -189,6 +189,24 @@ except BlockingIOError:
                 in claude_capability_value["capabilities"]["features"]
             )
 
+            # A start without launch arguments would persist a restart intent
+            # that restores the conversation with default permissions, so the
+            # helper refuses it outright — with and without a thread id.
+            bare_start = helper(
+                "chat-start-v1", "codex", "example-repository", check=False
+            )
+            assert bare_start.returncode == 64, bare_start.stderr
+            assert "launch arguments" in bare_start.stderr
+            bare_resume = helper(
+                "chat-start-v1",
+                "codex",
+                "example-repository",
+                str(uuid.uuid4()),
+                check=False,
+            )
+            assert bare_resume.returncode == 64, bare_resume.stderr
+            assert "launch arguments" in bare_resume.stderr
+
             start = helper(
                 "chat-start-v1",
                 "codex",
@@ -271,6 +289,35 @@ except BlockingIOError:
                 if f"|{relay_id}|" in line
             )
             assert restored_record.split("|")[8:] == [thread_id, "chat"]
+
+            # A restart intent without launch options (e.g. left by a manual
+            # chat-start before the argument requirement) is dropped at
+            # restore instead of relaunching with default permissions.
+            poisoned_relay = str(uuid.uuid4())
+            poisoned_intent = runtime / f"{poisoned_relay}.chat-intent"
+            poisoned_intent.write_text(
+                "version|1\n"
+                "provider|codex\n"
+                "repository|example-repository\n"
+                f"relay|{poisoned_relay}\n"
+                f"thread|{uuid.uuid4()}\n"
+                "boot|aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n"
+                "argc|0\n",
+                encoding="utf-8",
+            )
+            poisoned_intent.chmod(0o600)
+            cleaned = helper("restore", check=False)
+            assert cleaned.returncode == 0, (
+                f"stdout={cleaned.stdout!r} stderr={cleaned.stderr!r}"
+            )
+            assert (
+                f"Removed structured chat {poisoned_relay}" in cleaned.stdout
+            )
+            assert not poisoned_intent.exists()
+            assert all(
+                f"|{poisoned_relay}|" not in line
+                for line in helper("status").stdout.splitlines()
+            )
 
             attachment_request_id = str(uuid.uuid4())
             attachment_id = str(uuid.uuid4())
