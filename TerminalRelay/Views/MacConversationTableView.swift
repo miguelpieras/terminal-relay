@@ -273,6 +273,10 @@ struct MacConversationNativeTextPresentation {
     let minimumTextContainerHeight: CGFloat
     let maximumContentWidth: CGFloat?
     let maximumTextWidth: CGFloat?
+    /// Sizes the tile to the text it lays out rather than to
+    /// `maximumTextWidth`. Only whole-item tiles may hug: a message split
+    /// across several tiles has to keep one shared bubble width.
+    let hugsTextWidth: Bool
     let backgroundColor: NSColor?
     let backgroundCornerRadius: CGFloat
     let roundedCorners: RoundedCorners
@@ -308,6 +312,7 @@ struct MacConversationNativeTextPresentation {
         minimumTextContainerHeight: CGFloat = 0,
         maximumContentWidth: CGFloat? = nil,
         maximumTextWidth: CGFloat? = nil,
+        hugsTextWidth: Bool = false,
         backgroundColor: NSColor? = nil,
         backgroundCornerRadius: CGFloat = 0,
         roundedCorners: RoundedCorners = [],
@@ -345,6 +350,7 @@ struct MacConversationNativeTextPresentation {
         self.maximumTextWidth = maximumTextWidth.flatMap {
             $0.isFinite && $0 > 0 ? $0 : nil
         }
+        self.hugsTextWidth = hugsTextWidth
         self.backgroundColor = backgroundColor
         self.backgroundCornerRadius = backgroundCornerRadius.isFinite
             ? max(0, backgroundCornerRadius)
@@ -386,6 +392,7 @@ struct MacConversationNativeTextPresentation {
             ),
             maximumContentWidth: maximumContentWidth,
             maximumTextWidth: maximumTextWidth,
+            hugsTextWidth: hugsTextWidth,
             backgroundColor: backgroundColor,
             backgroundCornerRadius: backgroundCornerRadius,
             roundedCorners: roundedCorners,
@@ -2727,9 +2734,27 @@ private final class MacConversationScrollTextCell: MacConversationReusableCell {
                 ?? presentation.maximumContentWidth
                 ?? contentWidth
         )
+        let horizontalTextInset = presentation.textContainerInset.width
+        let verticalTextInset = presentation.textContainerInset.height
+        let textEdges = presentation.textEdgeInsets.left
+            + presentation.textEdgeInsets.right
+            + (horizontalTextInset * 2)
+        let wrappingWidth = max(
+            1,
+            (presentation.horizontalAlignment == .fill
+                ? contentWidth
+                : maximumTextContainerWidth) - textEdges
+        )
+        let measuredText = scrollTextView.textSize(for: wrappingWidth)
+        // A hugging tile sizes to its text instead of filling the wrapping
+        // limit, matching the settled Auto Layout tile so the bubble keeps its
+        // width across the live-scroll swap.
+        let textWidth = presentation.hugsTextWidth
+            ? min(wrappingWidth, max(1, ceil(measuredText.width)))
+            : wrappingWidth
         let textContainerWidth = presentation.horizontalAlignment == .fill
             ? contentWidth
-            : maximumTextContainerWidth
+            : min(maximumTextContainerWidth, textWidth + textEdges)
         let textContainerX: CGFloat
         switch presentation.horizontalAlignment {
         case .fill, .leading:
@@ -2740,15 +2765,7 @@ private final class MacConversationScrollTextCell: MacConversationReusableCell {
             textContainerX = contentX
                 + ((contentWidth - textContainerWidth) / 2)
         }
-        let horizontalTextInset = presentation.textContainerInset.width
-        let verticalTextInset = presentation.textContainerInset.height
-        let textWidth = max(
-            1,
-            textContainerWidth - presentation.textEdgeInsets.left
-                - presentation.textEdgeInsets.right
-                - (horizontalTextInset * 2)
-        )
-        let textHeight = scrollTextView.textHeight(for: textWidth)
+        let textHeight = measuredText.height
         let measuredContainerHeight = presentation.textEdgeInsets.top
             + verticalTextInset
             + textHeight
@@ -3092,6 +3109,7 @@ private final class MacConversationNativeTextCell:
                         - presentation.textEdgeInsets.right
                 )
             }
+            nativeTextView.hugsTextWidth = presentation.hugsTextWidth
             linkHandler = presentation.linkHandler ?? nativeLinkHandler
             nativeTextView.setAccessibilityLabel(presentation.accessibilityLabel)
             nativeTextView.setAccessibilityIdentifier(
@@ -3187,6 +3205,7 @@ private final class MacConversationNativeTextCell:
                     - presentation.textEdgeInsets.right
             )
         }
+        nativeTextView.hugsTextWidth = presentation.hugsTextWidth
         linkHandler = presentation.linkHandler ?? nativeLinkHandler
         nativeTextView.setAccessibilityLabel(presentation.accessibilityLabel)
         nativeTextView.setAccessibilityIdentifier(
@@ -3230,6 +3249,7 @@ private final class MacConversationNativeTextCell:
         // invalidates TextKit twice for every cold tile and never presents an
         // observable empty state.
         nativeTextView.maximumIntrinsicWidth = nil
+        nativeTextView.hugsTextWidth = false
         fastTextField.provisionalIntrinsicWidth = nil
         textContainerView.layer?.backgroundColor = NSColor.clear.cgColor
         textContainerView.layer?.cornerRadius = 0
@@ -3405,7 +3425,7 @@ private final class MacConversationWrappingTextField: NSTextField {
 final class MacConversationScrollTextView: NSView {
     private var framesetter: CTFramesetter?
     private var measuredWidth: CGFloat = -1
-    private var measuredHeight: CGFloat = 0
+    private var measuredSize: CGSize = CGSize(width: 0, height: 0)
     var provisionalIntrinsicWidth: CGFloat? {
         didSet {
             guard oldValue != provisionalIntrinsicWidth else { return }
@@ -3487,9 +3507,15 @@ final class MacConversationScrollTextView: NSView {
     }
 
     func textHeight(for width: CGFloat) -> CGFloat {
-        guard let framesetter else { return 1 }
+        textSize(for: width).height
+    }
+
+    /// The size the text occupies when wrapped at `width`. The reported width
+    /// hugs the laid-out lines, so a width-limited tile can size to its text.
+    func textSize(for width: CGFloat) -> CGSize {
+        guard let framesetter else { return CGSize(width: 0, height: 1) }
         if abs(width - measuredWidth) <= 0.5 {
-            return measuredHeight
+            return measuredSize
         }
         let suggested = CTFramesetterSuggestFrameSizeWithConstraints(
             framesetter,
@@ -3502,13 +3528,16 @@ final class MacConversationScrollTextView: NSView {
             nil
         )
         measuredWidth = width
-        measuredHeight = max(1, ceil(suggested.height))
-        return measuredHeight
+        measuredSize = CGSize(
+            width: min(width, max(0, ceil(suggested.width))),
+            height: max(1, ceil(suggested.height))
+        )
+        return measuredSize
     }
 
     private func resetMeasurement() {
         measuredWidth = -1
-        measuredHeight = 0
+        measuredSize = CGSize(width: 0, height: 0)
         invalidateIntrinsicContentSize()
     }
 }
@@ -3522,6 +3551,13 @@ private final class MacConversationIntrinsicTextView: NSTextView {
     var maximumIntrinsicWidth: CGFloat? {
         didSet {
             if oldValue != maximumIntrinsicWidth {
+                invalidateIntrinsicContentSize()
+            }
+        }
+    }
+    var hugsTextWidth = false {
+        didSet {
+            if oldValue != hugsTextWidth {
                 invalidateIntrinsicContentSize()
             }
         }
@@ -3567,11 +3603,19 @@ private final class MacConversationIntrinsicTextView: NSTextView {
             }
             layoutManager.ensureLayout(for: textContainer)
             let used = layoutManager.usedRect(for: textContainer)
-            return NSSize(
-                width: min(
+            let width = hugsTextWidth
+                ? min(
                     maximumIntrinsicWidth,
-                    ceil(used.width + (textContainerInset.width * 2))
-                ),
+                    ceil(
+                        Self.laidOutTextWidth(
+                            layoutManager: layoutManager,
+                            textContainer: textContainer
+                        ) + (textContainerInset.width * 2)
+                    )
+                )
+                : maximumIntrinsicWidth
+            return NSSize(
+                width: width,
                 height: ceil(used.height + (textContainerInset.height * 2))
             )
         }
@@ -3610,6 +3654,23 @@ private final class MacConversationIntrinsicTextView: NSTextView {
         guard widthChanged else { return }
         lastMeasuredWidth = newSize.width
         invalidateIntrinsicContentSize()
+    }
+
+    /// The width the glyphs actually occupy. `usedRect(for:)` reports the
+    /// container width once any line wraps, which would stretch a width-limited
+    /// tile — the user bubble — to its wrapping limit instead of hugging its
+    /// text. Line fragment used rects are tight to the laid-out glyphs.
+    private static func laidOutTextWidth(
+        layoutManager: NSLayoutManager,
+        textContainer: NSTextContainer
+    ) -> CGFloat {
+        var width: CGFloat = 0
+        layoutManager.enumerateLineFragments(
+            forGlyphRange: layoutManager.glyphRange(for: textContainer)
+        ) { _, usedRect, _, _, _ in
+            width = max(width, usedRect.maxX)
+        }
+        return width
     }
 
     private func configure() {

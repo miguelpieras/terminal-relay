@@ -30,6 +30,7 @@ final class MacConversationTableViewTests: XCTestCase {
         var lastRowBottomInsetAdjustment: CGFloat = 0
         var maximumContentWidth: CGFloat? = 320
         var maximumTextWidth: CGFloat? = nil
+        var hugsTextWidth = false
         var horizontalAlignment:
             MacConversationNativeTextPresentation.HorizontalAlignment = .fill
         var backgroundCornerRadius: CGFloat = 0
@@ -59,6 +60,7 @@ final class MacConversationTableViewTests: XCTestCase {
                 textContainerInset: NSSize(width: 2, height: 2),
                 maximumContentWidth: maximumContentWidth,
                 maximumTextWidth: maximumTextWidth,
+                hugsTextWidth: hugsTextWidth,
                 backgroundColor: NSColor.controlBackgroundColor,
                 backgroundCornerRadius: backgroundCornerRadius,
                 horizontalAlignment: horizontalAlignment,
@@ -1228,6 +1230,10 @@ final class MacConversationTableViewTests: XCTestCase {
             XCTAssertEqual(presentation.horizontalAlignment, .trailing)
             XCTAssertNotNil(presentation.backgroundColor)
             XCTAssertEqual(presentation.backgroundCornerRadius, 16)
+            XCTAssertFalse(
+                presentation.hugsTextWidth,
+                "A segment of a divided message shares the bubble width."
+            )
             if index == 0 {
                 XCTAssertTrue(presentation.roundedCorners.contains(.topLeading))
                 XCTAssertTrue(presentation.roundedCorners.contains(.topTrailing))
@@ -1256,6 +1262,27 @@ final class MacConversationTableViewTests: XCTestCase {
         XCTAssertEqual(nativeFooter?.itemID, "user")
         XCTAssertEqual(nativeFooter?.isTrailing, true)
         XCTAssertEqual(userProjections.map(\.sourceText).joined(), userSource)
+
+        let short = ConversationItem.message(
+            ChatMessage(id: "short-user", role: .user, text: "hello", occurredAt: 2)
+        )
+        let shortProjections = TranscriptRowProjection.makeRows(item: short)
+        XCTAssertEqual(shortProjections.count, 1)
+        let shortRows = makeMacTranscriptRows(
+            item: short,
+            projections: shortProjections,
+            isExpanded: false,
+            copiedItemID: nil,
+            sectionRevision: 3
+        )
+        XCTAssertEqual(
+            shortRows.first?.nativeTextPresentation(
+                dynamicTypeSize: .large,
+                colorScheme: .light
+            )?.hugsTextWidth,
+            true,
+            "An undivided user message must size its bubble to the text."
+        )
     }
 
     func testNativeFooterUsesReusableAppKitControlsAndRoutesCopy() throws {
@@ -1509,6 +1536,7 @@ final class MacConversationTableViewTests: XCTestCase {
                     usesNativeText: true,
                     maximumContentWidth: 760,
                     maximumTextWidth: 640,
+                    hugsTextWidth: true,
                     horizontalAlignment: .trailing,
                     backgroundCornerRadius: 16
                 )
@@ -1525,6 +1553,11 @@ final class MacConversationTableViewTests: XCTestCase {
         )
 
         XCTAssertLessThanOrEqual(textView.frame.width, 640.5)
+        XCTAssertLessThan(
+            textView.frame.width,
+            240,
+            "A short user message must hug its text, not stretch the bubble to the 640-point limit."
+        )
         XCTAssertEqual(
             textView.convert(textView.bounds, to: cell).maxX,
             cell.bounds.midX + 380,
@@ -1532,6 +1565,104 @@ final class MacConversationTableViewTests: XCTestCase {
             "The user bubble must trail the centered 760-point transcript, not the window edge."
         )
         XCTAssertEqual(textView.superview?.layer?.cornerRadius, 16)
+    }
+
+    func testSegmentedBubbleTilesKeepOneSharedWidth() throws {
+        let mounted = mountMixed(
+            rows: (0..<2).map { index in
+                MixedRow(
+                    id: "segment-\(index)",
+                    contentRevision: 1,
+                    text: index == 0
+                        ? "A first bubble segment that is clearly the wider one"
+                        : "short tail",
+                    usesNativeText: true,
+                    maximumContentWidth: 760,
+                    maximumTextWidth: 640,
+                    horizontalAlignment: .trailing,
+                    backgroundCornerRadius: 16
+                )
+            },
+            windowWidth: 1_200
+        )
+        let widths = try (0..<2).map { row -> CGFloat in
+            let cell = mounted.table.view(
+                atColumn: 0,
+                row: row,
+                makeIfNecessary: true
+            )!
+            return try XCTUnwrap(
+                descendant(of: cell, type: NSTextView.self)
+            ).frame.width
+        }
+
+        XCTAssertEqual(
+            widths[0],
+            640,
+            accuracy: 0.5,
+            "A tile that is only part of a message must fill the shared bubble width."
+        )
+        XCTAssertEqual(
+            widths[0],
+            widths[1],
+            accuracy: 0.5,
+            "Segments of one message must not come out ragged."
+        )
+    }
+
+    func testTrailingLiveScrollBubbleKeepsTheHuggedWidth() throws {
+        let row = MixedRow(
+            id: "trailing-bubble",
+            contentRevision: 1,
+            text: "Short user message",
+            usesNativeText: true,
+            maximumContentWidth: 760,
+            maximumTextWidth: 640,
+            hugsTextWidth: true,
+            horizontalAlignment: .trailing,
+            backgroundCornerRadius: 16
+        )
+        let mounted = mountMixed(rows: [row], windowWidth: 1_200)
+        NotificationCenter.default.post(
+            name: NSScrollView.willStartLiveScrollNotification,
+            object: mounted.table.enclosingScrollView!
+        )
+        mounted.hosting.rootView = mixedTable(rows: [
+            MixedRow(
+                id: "trailing-bubble",
+                contentRevision: 2,
+                text: "Short user message",
+                usesNativeText: true,
+                maximumContentWidth: 760,
+                maximumTextWidth: 640,
+                hugsTextWidth: true,
+                horizontalAlignment: .trailing,
+                backgroundCornerRadius: 16
+            )
+        ])
+        mounted.hosting.needsLayout = true
+        mounted.hosting.layoutSubtreeIfNeeded()
+        let cell = mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: true
+        )!
+        let scrollTextView = try XCTUnwrap(
+            descendant(of: cell, type: MacConversationScrollTextView.self)
+        )
+        let bubble = try XCTUnwrap(scrollTextView.superview)
+
+        XCTAssertLessThan(
+            bubble.frame.width,
+            240,
+            "The live-scroll bubble must hug its text, not widen to 640 mid-gesture."
+        )
+        XCTAssertEqual(
+            bubble.convert(bubble.bounds, to: cell).maxX,
+            cell.bounds.midX + 380,
+            accuracy: 1,
+            "The live-scroll bubble must trail the centered 760-point transcript."
+        )
     }
 
     func testNativeGlobalEdgeAdjustmentsApplyOnlyAtTranscriptEdges() {

@@ -668,6 +668,10 @@ enum MacTranscriptRow: MacConversationTableRow {
             ),
             maximumContentWidth: 760,
             maximumTextWidth: 640,
+            // Only an undivided message may hug its text. A message long
+            // enough to span several tiles keeps the shared bubble width so
+            // the stacked segments cannot come out ragged.
+            hugsTextWidth: projection.isFirstInItem && projection.isLastInItem,
             backgroundColor: NSColor.secondaryLabelColor.withAlphaComponent(0.12),
             backgroundCornerRadius: 16,
             roundedCorners: corners,
