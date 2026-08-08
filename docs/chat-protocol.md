@@ -131,7 +131,7 @@ terminal.
 | --- | --- |
 | `session.attach` | `afterSeq`, optional `snapshotGeneration`; read-only and always first |
 | `history.load` | `beforeItemId`, `limit`; returns one bounded older page |
-| `turn.start` | `text`, `attachments`, launch options; idempotent by `requestId` |
+| `turn.start` | `text`, `attachments`, launch options; idempotent by `requestId`. Explicit launch options are adopted into the conversation's persisted restart intent, so a worker reboot restores the latest choice |
 | `turn.interrupt` | exact `turnId`; stale turns are rejected |
 | `approval.respond` | provider connection generation, provider request ID, decision, optional permission changes |
 | `question.respond` | provider connection generation, provider request ID, structured answers |

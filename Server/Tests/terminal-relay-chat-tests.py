@@ -1569,9 +1569,17 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
             self.queries: list[str] = []
             self.interrupted = False
             self.disconnected = False
+            self.model_calls: list[str] = []
+            self.permission_calls: list[str] = []
 
         async def connect(self):
             return None
+
+        async def set_model(self, model):
+            self.model_calls.append(model)
+
+        async def set_permission_mode(self, mode):
+            self.permission_calls.append(mode)
 
         async def receive_messages(self):
             while True:
@@ -1962,6 +1970,38 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
     mixed_result.is_error = False
     mixed_result.usage = {"input_tokens": 1, "output_tokens": 1}
     await received.put(mixed_result)
+    for _ in range(100):
+        if adapter.active_turn is None:
+            break
+        await asyncio.sleep(0.01)
+    assert adapter.active_turn is None
+
+    # A turn carrying explicit options steers the live SDK session and the
+    # reconnect surface instead of being ignored.
+    options_command_id = "25252525-2525-4525-8525-252525252525"
+    options_turn = await adapter.start_turn(
+        {
+            "requestId": options_command_id,
+            "payload": {
+                "text": "switch options",
+                "options": {
+                    "model": "opus",
+                    "effort": "low",
+                    "permissionMode": "acceptEdits",
+                },
+            },
+        }
+    )
+    assert options_turn["turnId"] == options_command_id
+    assert adapter.client.model_calls == ["opus"]
+    assert adapter.client.permission_calls == ["acceptEdits"]
+    assert adapter.options_kwargs["model"] == "opus"
+    assert adapter.options_kwargs["effort"] == "low"
+    assert adapter.options_kwargs["permission_mode"] == "acceptEdits"
+    options_result = ResultMessage()
+    options_result.is_error = False
+    options_result.usage = {"input_tokens": 1, "output_tokens": 1}
+    await received.put(options_result)
     for _ in range(100):
         if adapter.active_turn is None:
             break
@@ -2519,6 +2559,244 @@ async def exercise_early_attach(module, root: pathlib.Path) -> None:
     await stuck_client.close()
 
 
+def write_intent_file(
+    path: pathlib.Path,
+    provider: str,
+    repository: str,
+    relay_id: str,
+    thread_id: str,
+    boot_id: str,
+    arguments: list[str],
+) -> None:
+    """Write a restart intent exactly as the session helper does."""
+    lines = [
+        "version|1",
+        f"provider|{provider}",
+        f"repository|{repository}",
+        f"relay|{relay_id}",
+        f"thread|{thread_id}",
+        f"boot|{boot_id}",
+        f"argc|{len(arguments)}",
+    ]
+    lines += [f"arg|{argument.encode('utf-8').hex()}" for argument in arguments]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+
+
+def read_intent_file(path: pathlib.Path) -> tuple[dict[str, str], list[str]]:
+    fields: dict[str, str] = {}
+    arguments: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        key, _, value = line.partition("|")
+        if key == "arg":
+            arguments.append(bytes.fromhex(value).decode("utf-8"))
+        else:
+            assert key not in fields, f"duplicate intent field {key}"
+            fields[key] = value
+    return fields, arguments
+
+
+async def exercise_option_adoption(module, root: pathlib.Path) -> None:
+    runtime = root / "adopt-runtime"
+    project = root / "adopt-project"
+    runtime.mkdir(mode=0o700)
+    os.chmod(runtime, 0o700)
+    project.mkdir()
+    boot_id = "b0b0b0b0-b0b0-4b0b-8b0b-b0b0b0b0b0b0"
+    stale_boot_id = "c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1"
+    boot_path = root / "adopt-boot-id"
+    boot_path.write_text(f"{boot_id}\n", encoding="utf-8")
+
+    initial_arguments = ["--model", "gpt-5", "--effort", "medium"]
+    launch_options = module.validate_launch_arguments(initial_arguments)
+    provider = module.FakeProvider(str(project), THREAD_ID, launch_options)
+    broker = module.ChatBroker(
+        "codex",
+        "example-repository",
+        str(project),
+        str(runtime),
+        RELAY_ID,
+        provider,
+        launch_options,
+    )
+    intent_path = runtime / f"{RELAY_ID}.chat-intent"
+    write_intent_file(
+        intent_path,
+        "codex",
+        "example-repository",
+        RELAY_ID,
+        THREAD_ID,
+        stale_boot_id,
+        initial_arguments,
+    )
+    original_boot_path = module.BOOT_ID_PATH
+    module.BOOT_ID_PATH = str(boot_path)
+    try:
+        broker_task = asyncio.create_task(broker.run())
+        await wait_ready(broker)
+        client = await connect(module, broker)
+
+        turn_request, turn = client.command(
+            "turn.start",
+            {
+                "text": "switch",
+                "attachments": [],
+                "model": "gpt-5-codex",
+                "reasoningEffort": "high",
+                "fastMode": True,
+            },
+        )
+        await client.send(turn)
+        await client.read_type("ack", turn_request)
+
+        # The provider shares the adopted dict, so later turns and reconnects
+        # merge against the user's latest explicit options.
+        assert provider.launch_options is broker.launch_options
+        assert broker.launch_options["model"] == "gpt-5-codex"
+        assert broker.launch_options["effort"] == "high"
+        assert broker.launch_options["fastMode"] is True
+
+        fields, arguments = read_intent_file(intent_path)
+        assert arguments, "the rewritten intent lost its launch arguments"
+        assert fields == {
+            "version": "1",
+            "provider": "codex",
+            "repository": "example-repository",
+            "relay": RELAY_ID,
+            "thread": THREAD_ID,
+            "boot": boot_id,
+            "argc": str(len(arguments)),
+        }
+        assert stat.S_IMODE(os.lstat(intent_path).st_mode) == 0o600
+        # Relaunching from the rewritten intent restores exactly the adopted
+        # options.
+        assert module.public_launch_options(
+            module.validate_launch_arguments(arguments)
+        ) == module.public_launch_options(broker.launch_options)
+        assert "gpt-5-codex" in arguments
+        assert "--fast" in arguments
+        assert not any(
+            entry.name.endswith(".tmp") for entry in runtime.iterdir()
+        )
+        state = json.loads(
+            pathlib.Path(broker.state_path).read_text(encoding="utf-8")
+        )
+        assert state["status"] == "ready"
+        assert state["launchOptions"]["model"] == "gpt-5-codex"
+        assert state["launchOptions"]["effort"] == "high"
+        assert state["launchOptions"]["fastMode"] is True
+
+        # Unchanged options leave the persisted intent untouched.
+        provider.active_turn = None
+        before = os.lstat(intent_path)
+        repeat_request, repeat = client.command(
+            "turn.start",
+            {
+                "text": "again",
+                "attachments": [],
+                "model": "gpt-5-codex",
+                "reasoningEffort": "high",
+                "fastMode": True,
+            },
+        )
+        await client.send(repeat)
+        await client.read_type("ack", repeat_request)
+        after = os.lstat(intent_path)
+        assert (before.st_ino, before.st_mtime_ns) == (
+            after.st_ino,
+            after.st_mtime_ns,
+        )
+
+        # An explicit permission mode survives the full-access round trip
+        # instead of escalating back to bypassPermissions.
+        downgraded = module.validate_launch_arguments(
+            module.launch_arguments_for(
+                {"permissionMode": "acceptEdits", "fullAccess": True}
+            )
+        )
+        assert downgraded["permissionMode"] == "acceptEdits"
+        assert downgraded["fullAccess"] is True
+
+        # A permission mode outside the launch enum is rejected before it can
+        # reach an adapter or the persisted options.
+        provider.active_turn = None
+        invalid_request, invalid = client.command(
+            "turn.start",
+            {
+                "text": "poison",
+                "attachments": [],
+                "options": {"permissionMode": "yolo"},
+            },
+        )
+        await client.send(invalid)
+        invalid_error = await client.read_type("error", invalid_request)
+        assert invalid_error["payload"]["code"] == "invalidOptions"
+
+        # A rewrite that could not land keeps retrying on later turns until
+        # the on-disk intent converges with the adopted options.
+        intent_path.chmod(0o644)
+        blocked_request, blocked = client.command(
+            "turn.start",
+            {
+                "text": "blocked",
+                "attachments": [],
+                "model": "gpt-5-codex",
+                "reasoningEffort": "xhigh",
+                "fastMode": True,
+            },
+        )
+        await client.send(blocked)
+        await client.read_type("ack", blocked_request)
+        assert broker.launch_options["effort"] == "xhigh"
+        _, blocked_arguments = read_intent_file(intent_path)
+        assert "xhigh" not in blocked_arguments
+        intent_path.chmod(0o600)
+        provider.active_turn = None
+        retry_request, retry = client.command(
+            "turn.start",
+            {
+                "text": "retry",
+                "attachments": [],
+                "model": "gpt-5-codex",
+                "reasoningEffort": "xhigh",
+                "fastMode": True,
+            },
+        )
+        await client.send(retry)
+        await client.read_type("ack", retry_request)
+        _, converged_arguments = read_intent_file(intent_path)
+        assert "xhigh" in converged_arguments
+        assert not any(
+            entry.name.endswith(".tmp") for entry in runtime.iterdir()
+        )
+
+        # A withdrawn intent is never resurrected by an option change: a
+        # stopped conversation must stay stopped across boots.
+        provider.active_turn = None
+        intent_path.unlink()
+        withdrawn_request, withdrawn = client.command(
+            "turn.start",
+            {
+                "text": "later",
+                "attachments": [],
+                "model": "gpt-5",
+                "reasoningEffort": "low",
+            },
+        )
+        await client.send(withdrawn)
+        await client.read_type("ack", withdrawn_request)
+        assert broker.launch_options["effort"] == "low"
+        assert not intent_path.exists()
+
+        stop_request, stop = client.command("session.stop", {})
+        await client.send(stop)
+        await client.read_type("ack", stop_request)
+        await asyncio.wait_for(broker_task, 5)
+        await client.close()
+    finally:
+        module.BOOT_ID_PATH = original_boot_path
+
+
 def exercise_snapshot_trim(module, root: pathlib.Path) -> None:
     runtime = root / "tr"
     runtime.mkdir(mode=0o700)
@@ -2729,6 +3007,7 @@ def run() -> None:
         asyncio.run(exercise_attachment_lifecycle(module, root_path))
         asyncio.run(exercise_protocol(module, root_path))
         asyncio.run(exercise_early_attach(module, root_path))
+        asyncio.run(exercise_option_adoption(module, root_path))
         exercise_snapshot_trim(module, root_path)
         exercise_chat_bindings(module, root_path)
         asyncio.run(exercise_codex_adapter(module, root_path))

@@ -37,6 +37,7 @@ from typing import Any, Awaitable, Callable
 
 PROTOCOL_VERSION = 1
 INSTALLED_PATH = "/usr/local/bin/terminal-relay-chat"
+BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
 SAFE_PATH = "/usr/local/bin:/usr/bin:/bin"
 MAX_RECORD_BYTES = 1024 * 1024
 MAX_JSON_DEPTH = 32
@@ -117,6 +118,43 @@ def public_launch_options(options: dict[str, Any]) -> dict[str, Any]:
         for key, value in options.items()
         if key in PUBLIC_LAUNCH_OPTION_KEYS
     }
+
+
+def current_boot_id() -> str | None:
+    """Read the worker boot identity used to stamp restart intents."""
+    try:
+        if os.path.islink(BOOT_ID_PATH):
+            return None
+        with open(BOOT_ID_PATH, "r", encoding="utf-8") as stream:
+            boot_id = stream.readline().strip()
+    except OSError:
+        return None
+    return boot_id if UUID_PATTERN.fullmatch(boot_id) else None
+
+
+def launch_arguments_for(options: dict[str, Any]) -> list[str]:
+    """Render canonical launch arguments for the persisted restart surface.
+
+    Always emits at least the permission mode so a rewritten restart intent
+    can never become the argument-less form that boot restore refuses.
+    --full-access precedes --permission-mode because validation applies
+    arguments in order: the explicit mode must win the round trip instead of
+    being escalated back to bypassPermissions.
+    """
+    arguments: list[str] = []
+    if options.get("fullAccess"):
+        arguments.append("--full-access")
+    arguments += ["--permission-mode", options.get("permissionMode") or "default"]
+    for key, flag in (
+        ("model", "--model"),
+        ("effort", "--effort"),
+        ("sandbox", "--sandbox"),
+    ):
+        if options.get(key):
+            arguments += [flag, options[key]]
+    if options.get("fastMode"):
+        arguments.append("--fast")
+    return arguments
 
 
 def provider_timestamp_ms(value: Any) -> int | None:
@@ -2674,6 +2712,31 @@ class ClaudeAdapter(ProviderAdapter):
         await client.connect()
         return client
 
+    async def _apply_turn_options(self, options: dict[str, Any]) -> None:
+        """Steer the live SDK session toward the latest explicit options.
+
+        Options the SDK cannot change mid-session (effort, or a setter the
+        installed SDK lacks) still land in options_kwargs so the next
+        reconnect or restore launches with them.
+        """
+        for option, kwarg, setter_name in (
+            ("model", "model", "set_model"),
+            ("permissionMode", "permission_mode", "set_permission_mode"),
+        ):
+            value = options.get(option)
+            if not value or self.options_kwargs.get(kwarg) == value:
+                continue
+            setter = getattr(self.client, setter_name, None)
+            if callable(setter):
+                with contextlib.suppress(Exception):
+                    result = setter(value)
+                    if inspect.isawaitable(result):
+                        await result
+            self.options_kwargs[kwarg] = value
+        effort = options.get("effort")
+        if effort and self.options_kwargs.get("effort") != effort:
+            self.options_kwargs["effort"] = effort
+
     async def _can_use_tool(
         self,
         tool_name: str,
@@ -3279,6 +3342,9 @@ class ClaudeAdapter(ProviderAdapter):
                 ) from error
         self.active_turn = command["requestId"]
         payload = command["payload"]
+        await self._apply_turn_options(
+            {**self.launch_options, **payload.get("options", {})}
+        )
         prompt = payload["text"]
         attachments = payload.get("attachments", [])
         if attachments:
@@ -3457,6 +3523,9 @@ class ChatBroker:
         self.provider = provider
         provider.request_snapshot_rebuild = self.rebuild_snapshot
         self.launch_options = launch_options
+        # The restart intent written at chat start carries the same launch
+        # arguments this broker was served with.
+        self.persisted_launch_options = public_launch_options(launch_options)
         self.provider_thread_id: str | None = provider.thread_id
         self.snapshot_generation = new_uuid()
         self.sequence = 0
@@ -4225,6 +4294,97 @@ class ChatBroker:
             ):
                 os.unlink(intent_path)
 
+    def _adopt_turn_options(self, options: dict[str, Any]) -> None:
+        """Adopt explicit turn options so a worker reboot keeps them.
+
+        The provider adapter shares the launch-options dict, so the adopted
+        values also become the merge base for later turns and reconnects.
+        """
+        explicit = {
+            key: options[key]
+            for key in PUBLIC_LAUNCH_OPTION_KEYS
+            if key in options
+        }
+        if not explicit:
+            return
+        try:
+            arguments = launch_arguments_for({**self.launch_options, **explicit})
+            adopted = validate_launch_arguments(arguments)
+        except ChatError:
+            return
+        public = public_launch_options(adopted)
+        if (
+            public == public_launch_options(self.launch_options)
+            and public == self.persisted_launch_options
+        ):
+            return
+        if public != public_launch_options(self.launch_options):
+            for key in PUBLIC_LAUNCH_OPTION_KEYS:
+                self.launch_options.pop(key, None)
+            self.launch_options.update(adopted)
+            with contextlib.suppress(OSError):
+                self._write_state("ready")
+        # Keep retrying on later turns until the on-disk intent converges: a
+        # transiently failed rewrite must not leave a reboot restoring stale
+        # options forever.
+        with contextlib.suppress(OSError):
+            if self._rewrite_intent_file(arguments):
+                self.persisted_launch_options = public
+
+    def _rewrite_intent_file(self, arguments: list[str]) -> bool:
+        """Atomically refresh the boot-restore intent with adopted options.
+
+        Only an existing intent is rewritten: a conversation whose intent was
+        withdrawn (an explicit stop, a failed resume) must stay stopped, and
+        an intent without launch arguments is never written. Returns whether
+        the rewritten intent reached disk.
+        """
+        if not arguments or self.provider_thread_id is None:
+            return False
+        intent_path = os.path.join(
+            self.runtime_directory, f"{self.relay_id}.chat-intent"
+        )
+        try:
+            info = os.lstat(intent_path)
+        except OSError:
+            return False
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            return False
+        boot_id = current_boot_id()
+        if boot_id is None:
+            return False
+        lines = [
+            "version|1",
+            f"provider|{self.provider_name}",
+            f"repository|{self.repository}",
+            f"relay|{self.relay_id}",
+            f"thread|{self.provider_thread_id}",
+            f"boot|{boot_id}",
+            f"argc|{len(arguments)}",
+        ]
+        lines += [f"arg|{argument.encode('utf-8').hex()}" for argument in arguments]
+        temporary = f"{intent_path}.{os.getpid()}.{new_uuid()}.tmp"
+        descriptor = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+        )
+        try:
+            try:
+                os.write(descriptor, ("\n".join(lines) + "\n").encode("utf-8"))
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.replace(temporary, intent_path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary)
+            raise
+        return True
+
     async def _open_attach_surface(self) -> None:
         self.server = await asyncio.start_unix_server(
             self.handle_client,
@@ -4669,6 +4829,21 @@ class ChatBroker:
                 "danger-full-access",
             }:
                 raise ChatError("invalidOptions", "The sandbox mode is unsupported.")
+            # Match the launch-argument enum: an unvalidated mode would poison
+            # the Claude adapter's reconnect options before adoption could
+            # reject it.
+            if payload_options.get("permissionMode") not in {
+                None,
+                "default",
+                "acceptEdits",
+                "plan",
+                "bypassPermissions",
+                "dontAsk",
+                "auto",
+            }:
+                raise ChatError(
+                    "invalidOptions", "The permission mode is unsupported."
+                )
             payload["options"] = payload_options
             try:
                 result = await self.provider.start_turn(command)
@@ -4715,6 +4890,7 @@ class ChatBroker:
                     self.turn_attachment_requests[turn_id] = managed_request_ids
                 if legacy_paths:
                     self.turn_legacy_attachment_paths[turn_id] = legacy_paths
+            self._adopt_turn_options(payload_options)
             return sanitize_json(result)
         if command_type == "turn.interrupt":
             turn_id = canonical_uuid(
