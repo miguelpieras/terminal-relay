@@ -4,6 +4,11 @@ struct ChatRetryPolicy: Equatable, Sendable {
     let maximumAutomaticRetries: Int
     let initialDelayNanoseconds: UInt64
     let maximumDelayNanoseconds: UInt64
+    // How long an attached conversation may sit in "connecting" before the
+    // attach is declared failed. The broker heartbeats "connecting" while a
+    // provider resume is in flight, so a hung resume keeps the transport
+    // alive indefinitely — this deadline is the only escape.
+    var connectingGraceNanoseconds: UInt64 = 45_000_000_000
 
     static let standard = ChatRetryPolicy(
         maximumAutomaticRetries: 5,
@@ -107,6 +112,8 @@ final class ConversationCoordinator {
     private var retryTask: Task<Void, Never>?
     private var retrySleepTask: Task<Void, Never>?
     private var retrySleepToken: UUID?
+    private var connectingWatchdogTask: Task<Void, Never>?
+    private var attachGeneration: UInt64 = 0
     private var shouldStayConnected = false
     private var isAttached = false
     private var needsFreshSnapshot = false
@@ -143,6 +150,7 @@ final class ConversationCoordinator {
         lifecycleTask?.cancel()
         retryTask?.cancel()
         retrySleepTask?.cancel()
+        connectingWatchdogTask?.cancel()
         previewHydrationTask?.cancel()
         cacheSaveTask?.cancel()
     }
@@ -692,6 +700,7 @@ final class ConversationCoordinator {
                 isAttached = true
                 needsFreshSnapshot = false
                 retryCount = 0
+                startConnectingWatchdog(lifecycleEpoch: epoch)
 
                 eventLoop: for await event in stream {
                     guard canContinueLifecycle(epoch) else { break eventLoop }
@@ -712,7 +721,11 @@ final class ConversationCoordinator {
                         break eventLoop
                     }
                 }
+                connectingWatchdogTask?.cancel()
+                connectingWatchdogTask = nil
             } catch {
+                connectingWatchdogTask?.cancel()
+                connectingWatchdogTask = nil
                 guard canContinueLifecycle(epoch) else { return }
                 isAttached = false
                 resetReconnectScopedState()
@@ -726,7 +739,7 @@ final class ConversationCoordinator {
             guard retryCount <= retryPolicy.maximumAutomaticRetries else {
                 store.setConnectionState(
                     .offlineAgentRunning,
-                    message: "The agent is still running. Tap Retry to reconnect."
+                    message: "Lost the connection to this conversation. Tap Retry to reconnect."
                 )
                 shouldStayConnected = false
                 return
@@ -753,6 +766,43 @@ final class ConversationCoordinator {
                 store.setConnectionState(.connecting)
             }
         }
+    }
+
+    private func startConnectingWatchdog(lifecycleEpoch epoch: UInt64) {
+        connectingWatchdogTask?.cancel()
+        connectingWatchdogTask = nil
+        let grace = retryPolicy.connectingGraceNanoseconds
+        guard grace > 0 else { return }
+        attachGeneration &+= 1
+        let generation = attachGeneration
+        connectingWatchdogTask = Task { [weak self] in
+            guard (try? await Task.sleep(nanoseconds: grace)) != nil else { return }
+            await self?.handleConnectingWatchdogExpiry(
+                lifecycleEpoch: epoch,
+                attachGeneration: generation
+            )
+        }
+    }
+
+    private func handleConnectingWatchdogExpiry(
+        lifecycleEpoch epoch: UInt64,
+        attachGeneration generation: UInt64
+    ) async {
+        guard canContinueLifecycle(epoch),
+              attachGeneration == generation,
+              isAttached,
+              store.workingConnectionState == .connecting else {
+            return
+        }
+        shouldStayConnected = false
+        isAttached = false
+        connectingWatchdogTask = nil
+        store.setConnectionState(
+            .failed,
+            message: "The worker didn't finish loading this conversation. "
+                + "Tap Retry, or open the thread again from the sidebar."
+        )
+        await transport.disconnect()
     }
 
     private func apply(

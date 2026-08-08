@@ -1021,6 +1021,52 @@ final class ConversationCoordinatorTests: XCTestCase {
         await coordinator.detach()
     }
 
+    func testConnectingWatchdogFailsAnAttachThatNeverProgresses() async {
+        // The broker heartbeats "connecting" while a provider resume is in
+        // flight, so a hung resume keeps the transport alive with no
+        // disconnect for the retry loop to react to.
+        let transport = ChatFixtureTransport(
+            initialEvents: [Self.hello(sequence: 1, connectionState: "connecting")]
+        )
+        let store = ConversationStore()
+        let coordinator = ConversationCoordinator(
+            store: store,
+            transport: transport,
+            identity: ChatTestFixtures.identity,
+            retryPolicy: ChatRetryPolicy(
+                maximumAutomaticRetries: 0,
+                initialDelayNanoseconds: 0,
+                maximumDelayNanoseconds: 0,
+                connectingGraceNanoseconds: 50_000_000
+            )
+        )
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .failed }
+        XCTAssertNotNil(store.state.lastErrorMessage)
+        await coordinator.detach()
+    }
+
+    func testConnectingWatchdogStaysQuietOnceTheConversationProgresses() async {
+        let transport = makeConnectedTransport()
+        let store = ConversationStore()
+        let coordinator = ConversationCoordinator(
+            store: store,
+            transport: transport,
+            identity: ChatTestFixtures.identity,
+            retryPolicy: ChatRetryPolicy(
+                maximumAutomaticRetries: 0,
+                initialDelayNanoseconds: 0,
+                maximumDelayNanoseconds: 0,
+                connectingGraceNanoseconds: 50_000_000
+            )
+        )
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(store.state.connectionState, .streaming)
+        await coordinator.detach()
+    }
+
     func testHistoryPreviewAndRetryActionsSendTheirExactCommands() async {
         let transport = makeConnectedTransport()
         let store = ConversationStore()
@@ -1779,12 +1825,20 @@ final class ConversationCoordinatorTests: XCTestCase {
         )
     }
 
-    private static func hello(sequence: Int64) -> ChatEnvelope {
-        ChatTestFixtures.event(
+    private static func hello(
+        sequence: Int64,
+        connectionState: String? = nil
+    ) -> ChatEnvelope {
+        var payload = (try? JSONValue.encoded(ChatCapabilities(features: ["streaming"])))
+            ?? .object([:])
+        if let connectionState, case .object(var members) = payload {
+            members["connectionState"] = .string(connectionState)
+            payload = .object(members)
+        }
+        return ChatTestFixtures.event(
             "session.hello",
             sequence: sequence,
-            payload: (try? JSONValue.encoded(ChatCapabilities(features: ["streaming"])))
-                ?? .object([:])
+            payload: payload
         )
     }
 

@@ -999,12 +999,25 @@ struct ContentView: View {
                     }
                 }
             case .thread(let project, let thread):
-                DormantThreadRow(
+                ProjectThreadRow(
                     thread: thread,
-                    projectName: project.displayName
-                ) {
-                    resumeThread(thread, for: project)
-                }
+                    projectName: project.displayName,
+                    onResume: {
+                        resumeThread(thread, for: project)
+                    },
+                    onArchive: {
+                        guard let worker = serverStore.server(id: project.serverID) else { return }
+                        Task {
+                            _ = await workerSessionService.setThreadArchived(
+                                kind: thread.kind,
+                                repositoryName: project.displayName,
+                                threadID: thread.threadID,
+                                archived: true,
+                                on: worker
+                            )
+                        }
+                    }
+                )
             }
         }
 
@@ -2302,7 +2315,7 @@ private struct ProjectSidebarSection: View {
                         .padding(.trailing, 12)
                         .frame(height: 35, alignment: .leading)
                     } else {
-                        Text("No sessions")
+                        Text("No conversations")
                             .font(.system(size: 14))
                             .foregroundStyle(SidebarPalette.tertiary)
                             .padding(.leading, 40)
@@ -2413,16 +2426,33 @@ private struct ProjectSidebarSection: View {
                         }
                     }
 
-                    ForEach(matchingDormantThreads) { thread in
-                        DormantThreadRow(thread: thread) {
-                            Task { await onResumeThread(thread) }
+                    if searchQuery.isEmpty && matchingSessions.count > 5 {
+                        Button(isExpanded ? "Show less" : "Show more") {
+                            isExpanded.toggle()
                         }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 14))
+                        .foregroundStyle(SidebarPalette.secondary)
+                        .padding(.leading, 40)
+                        .frame(height: 35)
+                    }
+
+                    ForEach(matchingDormantThreads) { thread in
+                        ProjectThreadRow(
+                            thread: thread,
+                            onResume: {
+                                Task { await onResumeThread(thread) }
+                            },
+                            onArchive: {
+                                Task { await onSetThreadArchived(thread, true) }
+                            }
+                        )
                         .contextMenu {
-                            Button("Resume Thread") {
+                            Button("Open Conversation") {
                                 Task { await onResumeThread(thread) }
                             }
                             .disabled(!thread.capabilities.resume)
-                            Button("Rename Thread") {
+                            Button("Rename Conversation") {
                                 threadName = thread.title ?? ""
                                 threadPendingRename = thread
                             }
@@ -2431,7 +2461,7 @@ private struct ProjectSidebarSection: View {
                                 copyToPasteboard(thread.threadID)
                             }
                             Divider()
-                            Button("Archive Thread", role: .destructive) {
+                            Button("Archive Conversation", role: .destructive) {
                                 Task { await onSetThreadArchived(thread, true) }
                             }
                             .disabled(!thread.capabilities.archive)
@@ -2457,7 +2487,7 @@ private struct ProjectSidebarSection: View {
 
                         if showsArchivedThreads || !searchQuery.isEmpty {
                             ForEach(sortedArchivedThreads) { thread in
-                                DormantThreadRow(thread: thread, isArchived: true) {}
+                                ProjectThreadRow(thread: thread, isArchived: true, onResume: {})
                                     .contextMenu {
                                         Button("Unarchive Thread") {
                                             Task { await onSetThreadArchived(thread, false) }
@@ -2469,17 +2499,6 @@ private struct ProjectSidebarSection: View {
                                     }
                             }
                         }
-                    }
-
-                    if searchQuery.isEmpty && matchingSessions.count > 5 {
-                        Button(isExpanded ? "Show less" : "Show more") {
-                            isExpanded.toggle()
-                        }
-                        .buttonStyle(.plain)
-                        .font(.system(size: 14))
-                        .foregroundStyle(SidebarPalette.secondary)
-                        .padding(.leading, 40)
-                        .frame(height: 35)
                     }
                 }
             }
@@ -2589,67 +2608,106 @@ private struct ProjectSidebarSection: View {
     }
 }
 
-private struct DormantThreadRow: View {
+private struct ProjectThreadRow: View {
     let thread: WorkerThreadSnapshot
     var isArchived = false
     var projectName: String? = nil
     let onResume: () -> Void
+    var onArchive: (() -> Void)? = nil
 
-    private var statusIcon: String {
-        if isArchived { return "archivebox.fill" }
-        switch thread.activityState {
-        case .inactive: return "pause.circle"
-        case .relayActive: return "terminal"
-        case .externalActive: return "arrow.up.right.circle"
-        case .unknown: return "questionmark.circle"
-        }
-    }
+    @State private var isHovering = false
 
     private var helpText: String {
-        if isArchived { return "Archived provider conversation" }
+        if isArchived { return "Archived conversation" }
         switch thread.activityState {
-        case .inactive: return "Resume provider conversation"
+        case .inactive: return "Open conversation"
         case .relayActive: return "Open in Terminal Relay"
         case .externalActive: return "Active outside Terminal Relay"
         case .unknown: return "Provider activity could not be verified"
         }
     }
 
-    var body: some View {
-        Button(action: onResume) {
-            HStack(spacing: 7) {
-                AgentBrandIcon(kind: thread.kind, size: 17)
-                    .frame(width: 18, height: 18)
-                    .opacity(0.55)
-                Text(thread.title ?? "Untitled thread")
-                    .font(.system(size: 14))
-                    .foregroundStyle(SidebarPalette.secondary)
-                    .lineLimit(1)
-                Spacer(minLength: 5)
-                if let projectName {
-                    Text(projectName)
-                        .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(SidebarPalette.tertiary)
-                        .lineLimit(1)
-                        .frame(maxWidth: 72, alignment: .trailing)
-                }
-                if thread.activityState == .externalActive {
-                    Text("External")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(SidebarPalette.tertiary)
-                }
-                Image(systemName: statusIcon)
-                    .font(.system(size: 11))
-                    .foregroundStyle(SidebarPalette.tertiary)
-            }
-            .padding(.horizontal, 8)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .contentShape(Rectangle())
+    // External/unknown threads cannot be opened from here; they keep a
+    // visible caption and secondary text so a no-op click is never a mystery.
+    private var isInteractive: Bool {
+        !isArchived && thread.capabilities.resume
+    }
+
+    private var statusCaption: String? {
+        guard !isArchived else { return nil }
+        switch thread.activityState {
+        case .inactive, .relayActive: return nil
+        case .externalActive: return "External"
+        case .unknown: return "Unavailable"
         }
-        .buttonStyle(.plain)
-        .disabled(isArchived || !thread.capabilities.resume)
+    }
+
+    var body: some View {
+        ZStack(alignment: .trailing) {
+            Button(action: onResume) {
+                HStack(spacing: 7) {
+                    AgentBrandIcon(kind: thread.kind, size: 17)
+                        .frame(width: 18, height: 18)
+                        .opacity(isArchived ? 0.55 : 1)
+                    Text(thread.title ?? "Untitled thread")
+                        .font(.system(size: 14))
+                        .foregroundStyle(
+                            isInteractive ? SidebarPalette.primary : SidebarPalette.secondary
+                        )
+                        .lineLimit(1)
+                    Spacer(minLength: 5)
+                    if let projectName {
+                        Text(projectName)
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundStyle(SidebarPalette.tertiary)
+                            .lineLimit(1)
+                            .frame(maxWidth: 72, alignment: .trailing)
+                    }
+                    if let statusCaption {
+                        Text(statusCaption)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(SidebarPalette.tertiary)
+                    }
+                    if isArchived {
+                        Image(systemName: "archivebox.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(SidebarPalette.tertiary)
+                    }
+                }
+                .padding(.trailing, onArchive == nil ? 8 : 25)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .contentShape(Rectangle())
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .buttonStyle(.plain)
+            .disabled(isArchived || !thread.capabilities.resume)
+
+            if let onArchive {
+                Button(action: onArchive) {
+                    Image(systemName: "archivebox")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(SidebarPalette.secondary)
+                        .frame(width: 19, height: 25)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(!isHovering || !thread.capabilities.archive)
+                .help("Archive conversation")
+                .padding(.trailing, 8)
+                .opacity(isHovering ? 1 : 0)
+                .allowsHitTesting(isHovering)
+                .accessibilityHidden(!isHovering)
+            }
+        }
         .padding(.leading, 18)
         .frame(height: 35)
+        .background(
+            !isArchived && isHovering ? SidebarPalette.hover : Color.clear,
+            in: RoundedRectangle(cornerRadius: 6)
+        )
+        .padding(.horizontal, 10)
+        .contentShape(Rectangle())
+        .onHover { isHovering = $0 }
         .help(helpText)
     }
 }
@@ -2845,7 +2903,7 @@ private struct FlatEmptyProjectRow: View {
                         .font(.system(size: 14))
                         .lineLimit(1)
                     Spacer(minLength: 5)
-                    Text("No sessions")
+                    Text("No conversations")
                         .font(.system(size: 10.5))
                         .foregroundStyle(SidebarPalette.tertiary)
                 }

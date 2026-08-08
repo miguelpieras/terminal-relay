@@ -418,17 +418,13 @@ struct ProjectDetailView: View {
                     .listRowBackground(Color.clear)
                 }
             }
-            if !sessions.isEmpty {
-                Section("Active Conversations") {
+            if !sessions.isEmpty || !dormantThreads.isEmpty {
+                Section("Conversations") {
                     ForEach(sessions) { session in
                         conversationRow(session)
                     }
-                }
-            }
-            if !dormantThreads.isEmpty {
-                Section("Paused Threads") {
                     ForEach(dormantThreads) { thread in
-                        dormantThreadRow(thread)
+                        threadRow(thread)
                     }
                 }
             }
@@ -596,26 +592,26 @@ struct ProjectDetailView: View {
         }
     }
 
-    private func dormantThreadRow(_ thread: WorkerThreadSnapshot) -> some View {
+    private func threadRow(_ thread: WorkerThreadSnapshot) -> some View {
         Button {
             Task { await model.resumeThread(workerID: workerID, thread: thread) }
         } label: {
             HStack(spacing: 12) {
                 AgentTaskIcon(kind: thread.kind)
-                    .opacity(0.62)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(thread.title ?? "Untitled thread")
                         .font(.body.weight(.medium))
                         .foregroundStyle(.primary)
                         .lineLimit(2)
-                    Text(activityLabel(for: thread))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    if let status = activityLabel(for: thread) {
+                        Text(status)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 Spacer()
-                Image(systemName: "play.fill")
-                    .foregroundStyle(.secondary)
             }
+            .padding(.vertical, 3)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -630,17 +626,17 @@ struct ProjectDetailView: View {
                     )
                 }
             } label: {
-                Label("Archive Thread", systemImage: "archivebox")
+                Label("Archive", systemImage: "archivebox")
             }
             .disabled(!thread.capabilities.archive)
         }
         .contextMenu {
-            Button("Rename Thread") {
+            Button("Rename Conversation") {
                 threadName = thread.title ?? ""
                 threadPendingRename = thread
             }
             .disabled(!thread.capabilities.rename)
-            Button("Archive Thread", role: .destructive) {
+            Button("Archive Conversation", role: .destructive) {
                 Task {
                     await model.setThreadArchived(
                         workerID: workerID,
@@ -653,10 +649,9 @@ struct ProjectDetailView: View {
         }
     }
 
-    private func activityLabel(for thread: WorkerThreadSnapshot) -> String {
+    private func activityLabel(for thread: WorkerThreadSnapshot) -> String? {
         switch thread.activityState {
-        case .inactive: "Paused · tap to resume"
-        case .relayActive: "Active in Terminal Relay"
+        case .inactive, .relayActive: nil
         case .externalActive: "Active outside Terminal Relay"
         case .unknown: "Activity unavailable"
         }

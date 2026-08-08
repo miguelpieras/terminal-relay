@@ -66,6 +66,10 @@ ATTACH_TIMEOUT_SECONDS = 10
 INTERACTION_TIMEOUT_SECONDS = 10 * 60
 PROVIDER_RECONNECT_DELAYS = (0.0, 0.1, 0.25, 0.5, 1.0)
 PROVIDER_RECONNECT_WAIT_SECONDS = 10
+# Hard ceiling on an early-ready provider resume. A wedged resume (app-server
+# accepting but not reading, a blocked sendall) otherwise heartbeats
+# "connecting" to attached clients forever.
+PROVIDER_CONNECT_DEADLINE_SECONDS = 120
 CLAUDE_HISTORY_PAGE_MESSAGES = 100
 SOCKET_NAME = "broker.sock"
 STATE_NAME = "broker.json"
@@ -4079,6 +4083,7 @@ class ChatBroker:
                 try:
                     await asyncio.wait(
                         {connect, stop_wait},
+                        timeout=PROVIDER_CONNECT_DEADLINE_SECONDS,
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                 finally:
@@ -4087,12 +4092,27 @@ class ChatBroker:
                         await stop_wait
                 if connect.done():
                     connect.result()
-                else:
+                elif self.stop_event.is_set():
                     connect.cancel()
                     with contextlib.suppress(Exception, asyncio.CancelledError):
                         await connect
                     stopped_while_connecting = True
                     self.rebuilding_snapshot = False
+                else:
+                    # Deadline expired. The resume may be stuck in an
+                    # uncancellable to_thread call, so give the cancel a
+                    # bounded grace and abandon the task if it stays wedged;
+                    # the failed-start path below still notifies clients,
+                    # writes "stopped", and drops the restart intent.
+                    connect.cancel()
+                    finished, _ = await asyncio.wait({connect}, timeout=5)
+                    for task in finished:
+                        with contextlib.suppress(Exception, asyncio.CancelledError):
+                            task.result()
+                    raise ChatError(
+                        "resumeTimeout",
+                        "The provider conversation did not resume in time.",
+                    )
             else:
                 await self._connect_provider(load_provider_history)
         except Exception as error:
@@ -4131,6 +4151,15 @@ class ChatBroker:
                 # the restart intent so boot restore stops relaunching it.
                 self._remove_intent_file()
             self._clear_all_attachments()
+            # Release the provider flock explicitly: a resume wedged in an
+            # uncancellable to_thread call can keep the interpreter from ever
+            # exiting, and the kernel only drops the flock with the process.
+            # Without this, every retry of the thread fails "threadActive"
+            # against a zombie broker whose state already says "stopped".
+            if self.provider_lock_descriptor is not None:
+                with contextlib.suppress(OSError):
+                    os.close(self.provider_lock_descriptor)
+                self.provider_lock_descriptor = None
             raise
         if not stopped_while_connecting:
             self.connection_state = "streaming"

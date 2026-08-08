@@ -136,7 +136,7 @@ struct IPadWorkspaceSidebar: View {
                         }
 
                         ForEach(project.threads) { thread in
-                            dormantThreadRow(thread, project: project)
+                            threadRow(thread, project: project)
                         }
                     }
                 }
@@ -272,12 +272,23 @@ struct IPadWorkspaceSidebar: View {
 
     private func isSelected(_ session: WorkerSessionSnapshot) -> Bool {
         guard let route = model.terminalRoute else { return false }
-        return route.kind == session.kind
-            && route.repositoryName == session.repositoryName
-            && route.instanceToken == session.instanceToken
+        guard route.kind == session.kind,
+              route.repositoryName == session.repositoryName else {
+            return false
+        }
+        if let token = route.instanceToken {
+            return token == session.instanceToken
+        }
+        // A resume route carries no instance token yet; once the live
+        // session appears, match it by the provider thread instead so the
+        // open conversation still highlights.
+        if let threadID = route.providerThreadID {
+            return threadID == session.threadID
+        }
+        return true
     }
 
-    private func dormantThreadRow(
+    private func threadRow(
         _ thread: WorkerThreadSnapshot,
         project: IPadSidebarProject
     ) -> some View {
@@ -290,20 +301,18 @@ struct IPadWorkspaceSidebar: View {
             HStack(spacing: 9) {
                 Image(systemName: thread.kind.systemImage)
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.blue.opacity(0.65))
+                    .foregroundStyle(thread.kind == .codex ? .blue : .orange)
                     .frame(width: 18)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(thread.title ?? "Untitled thread")
                         .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.primary)
                         .lineLimit(2)
-                    Text(activityLabel(for: thread))
+                    Text(activityLabel(for: thread) ?? thread.kind.displayName)
                         .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 4)
-                Image(systemName: "play.circle")
-                    .foregroundStyle(.secondary)
             }
             .padding(.leading, 20)
             .contentShape(Rectangle())
@@ -311,7 +320,7 @@ struct IPadWorkspaceSidebar: View {
         .buttonStyle(.plain)
         .disabled(!thread.capabilities.resume)
         .contextMenu {
-            Button("Archive Thread", role: .destructive) {
+            Button("Archive Conversation", role: .destructive) {
                 Task {
                     await model.setThreadArchived(
                         workerID: project.workerID,
@@ -324,10 +333,9 @@ struct IPadWorkspaceSidebar: View {
         }
     }
 
-    private func activityLabel(for thread: WorkerThreadSnapshot) -> String {
+    private func activityLabel(for thread: WorkerThreadSnapshot) -> String? {
         switch thread.activityState {
-        case .inactive: "Paused"
-        case .relayActive: "Active in Terminal Relay"
+        case .inactive, .relayActive: nil
         case .externalActive: "Active elsewhere"
         case .unknown: "Activity unavailable"
         }

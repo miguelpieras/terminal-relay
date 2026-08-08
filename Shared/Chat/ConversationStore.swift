@@ -1517,6 +1517,12 @@ final class ConversationStore: ObservableObject {
     var hasActiveWorkingTurn: Bool {
         workingState.turnState.isActive
     }
+    /// The authoritative connection state. The @Published projection freezes
+    /// during live transcript scrolling, so liveness decisions (the attach
+    /// watchdog) must never read `state.connectionState`.
+    var workingConnectionState: ChatConnectionState {
+        workingState.connectionState
+    }
 
     func transcriptProjectionPreparationItem(
         for envelope: ChatEnvelope

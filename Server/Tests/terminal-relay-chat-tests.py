@@ -2466,6 +2466,58 @@ async def exercise_early_attach(module, root: pathlib.Path) -> None:
     await watcher.close()
     await stopper.close()
 
+    # A resume that hangs past the connect deadline ends the session instead
+    # of heartbeating "connecting" to attached clients forever.
+    deadline_runtime = root / "ed"
+    deadline_runtime.mkdir(mode=0o700)
+    deadline_intent = deadline_runtime / f"{RELAY_ID}.chat-intent"
+    deadline_intent.write_text("intent\n", encoding="utf-8")
+    deadline_intent.chmod(0o600)
+    hung_provider = GatedProvider(str(project), THREAD_ID, {}, scripted_history=history)
+    deadline_broker = module.ChatBroker(
+        "codex",
+        "example-repository",
+        str(project),
+        str(deadline_runtime),
+        RELAY_ID,
+        hung_provider,
+        {},
+    )
+    original_deadline = module.PROVIDER_CONNECT_DEADLINE_SECONDS
+    # Roomy enough that the attach handshake always registers the client
+    # before the deadline fires; the gate is never released, so only the
+    # deadline can end the run.
+    module.PROVIDER_CONNECT_DEADLINE_SECONDS = 1.0
+    try:
+        deadline_task = asyncio.create_task(deadline_broker.run())
+        await wait_attach_surface(deadline_broker)
+        reader, writer = await asyncio.open_unix_connection(
+            deadline_broker.socket_path
+        )
+        stuck_client = ProtocolClient(module, reader, writer, deadline_broker.relay_id)
+        await stuck_client.attach()
+        # The provider gate is never released: only the deadline can end this.
+        ended = await stuck_client.read_type("session.ended")
+        assert ended["payload"]["reason"] == "resumeTimeout"
+        try:
+            await asyncio.wait_for(deadline_task, 10)
+        except module.ChatError as error:
+            assert error.code == "resumeTimeout"
+        else:
+            raise AssertionError("a hung resume must propagate the deadline failure")
+    finally:
+        module.PROVIDER_CONNECT_DEADLINE_SECONDS = original_deadline
+    state = json.loads(
+        pathlib.Path(deadline_broker.state_path).read_text(encoding="utf-8")
+    )
+    assert state["status"] == "stopped"
+    assert not pathlib.Path(deadline_broker.socket_path).exists()
+    assert not deadline_intent.exists()
+    # The provider flock must release on the deadline path even if a wedged
+    # resume thread would keep the process alive.
+    assert deadline_broker.provider_lock_descriptor is None
+    await stuck_client.close()
+
 
 def exercise_snapshot_trim(module, root: pathlib.Path) -> None:
     runtime = root / "tr"
