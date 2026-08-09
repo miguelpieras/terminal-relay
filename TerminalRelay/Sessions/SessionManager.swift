@@ -68,6 +68,7 @@ final class SessionManager: ObservableObject {
     private var sessionObservers: [UUID: AnyCancellable] = [:]
     private var taskCompletionObservers: [UUID: AnyCancellable] = [:]
     private var backgroundAttachmentAttemptedSessionIDs = Set<UUID>()
+    private var stopsInFlight = Set<UUID>()
 
     init(
         defaults: UserDefaults = .standard,
@@ -114,6 +115,7 @@ final class SessionManager: ObservableObject {
 
     func sidebarSessions(forProjectID projectID: UUID) -> [TerminalSession] {
         let defaultOrder = Array(sessions(forProjectID: projectID).reversed())
+            .filter { $0.status != .stopping }
         guard let savedTokens = sidebarSessionInstanceTokensByProject[projectID.uuidString] else {
             return defaultOrder
         }
@@ -686,6 +688,25 @@ final class SessionManager: ObservableObject {
         }
     }
 
+    /// Marks a session as stopping before its remote stop lands so the UI can
+    /// drop it immediately; `stopAgent` completes or cancels the state later.
+    func beginArchiveStop(sessionID: UUID) {
+        guard let session = sessions.first(where: { $0.id == sessionID }),
+              session.status.occupiesSlot else {
+            return
+        }
+        session.beginRemoteStop()
+        if selectedSessionID == sessionID {
+            selectedSessionID = sessions.last(where: {
+                $0.projectID == session.projectID && $0.status != .stopping
+            })?.id
+        }
+    }
+
+    func cancelArchiveStop(sessionID: UUID) {
+        sessions.first(where: { $0.id == sessionID })?.cancelRemoteStop()
+    }
+
     @discardableResult
     func stopAgent(
         sessionID: UUID,
@@ -696,9 +717,10 @@ final class SessionManager: ObservableObject {
               session.serverKey == worker.concurrencyKey,
               WorkerSessionProtocol.isValidRepositoryName(session.projectName),
               session.status.occupiesSlot,
-              session.status != .stopping else {
+              stopsInFlight.insert(sessionID).inserted else {
             return false
         }
+        defer { stopsInFlight.remove(sessionID) }
 
         let remoteKey = RemoteSessionKey(
             serverKey: worker.concurrencyKey,

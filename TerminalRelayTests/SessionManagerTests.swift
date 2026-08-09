@@ -1738,6 +1738,117 @@ final class SessionManagerTests: XCTestCase {
         )
     }
 
+    func testBeginArchiveStopHidesTheSessionImmediatelyAndStopStillCompletes() async {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let manager = SessionManager()
+        let instanceToken = "01234567-89ab-" + "4def-8abc-0123456789ab"
+        let response = WorkerSessionResponse(
+            projects: [project.displayName],
+            sessions: [
+                WorkerSessionSnapshot(
+                    kind: .claude,
+                    repositoryName: project.displayName,
+                    attachedClientCount: 0,
+                    instanceToken: instanceToken
+                )
+            ]
+        )
+        manager.reconcile(
+            worker: server,
+            projects: [project],
+            response: response,
+            launchDefaults: .standard
+        )
+        let session = manager.session(projectID: project.id, kind: .claude)!
+        manager.selectSession(session.id)
+
+        manager.beginArchiveStop(sessionID: session.id)
+
+        XCTAssertEqual(session.status, .stopping)
+        XCTAssertNil(manager.selectedSessionID)
+        XCTAssertTrue(manager.sidebarSessions(forProjectID: project.id).isEmpty)
+
+        // A status refresh racing the stop must not resurrect or duplicate the row.
+        manager.reconcile(
+            worker: server,
+            projects: [project],
+            response: response,
+            launchDefaults: .standard
+        )
+        XCTAssertEqual(session.status, .stopping)
+        XCTAssertTrue(manager.sidebarSessions(forProjectID: project.id).isEmpty)
+        XCTAssertEqual(manager.sessions.count, 1)
+
+        let recorder = WorkerSessionCommandRecorder(
+            results: [
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data(),
+                    standardError: Data()
+                )
+            ]
+        )
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+
+        let stopped = await manager.stopAgent(
+            sessionID: session.id,
+            on: server,
+            using: service
+        )
+
+        XCTAssertTrue(stopped)
+        XCTAssertEqual(session.status, .exited(nil))
+        XCTAssertEqual(
+            recorder.configurations,
+            [
+                SSHCommandBuilder.workerSessionStopConfiguration(
+                    for: server,
+                    kind: .claude,
+                    repositoryName: project.displayName,
+                    instanceToken: instanceToken
+                )
+            ]
+        )
+    }
+
+    func testCancelArchiveStopRestoresTheHiddenSession() {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let manager = SessionManager()
+        let instanceToken = "01234567-89ab-" + "4def-8abc-0123456789ab"
+        manager.reconcile(
+            worker: server,
+            projects: [project],
+            response: WorkerSessionResponse(
+                projects: [project.displayName],
+                sessions: [
+                    WorkerSessionSnapshot(
+                        kind: .claude,
+                        repositoryName: project.displayName,
+                        attachedClientCount: 0,
+                        instanceToken: instanceToken
+                    )
+                ]
+            ),
+            launchDefaults: .standard
+        )
+        let session = manager.session(projectID: project.id, kind: .claude)!
+
+        manager.beginArchiveStop(sessionID: session.id)
+        XCTAssertTrue(manager.sidebarSessions(forProjectID: project.id).isEmpty)
+
+        manager.cancelArchiveStop(sessionID: session.id)
+
+        XCTAssertEqual(session.status, .remoteRunning)
+        XCTAssertEqual(
+            manager.sidebarSessions(forProjectID: project.id).map(\.id),
+            [session.id]
+        )
+    }
+
     func testStopRejectsStaleSameRepositoryInstanceAfterRefresh() async {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let project = makeProject(name: "Terminal Relay", server: server)

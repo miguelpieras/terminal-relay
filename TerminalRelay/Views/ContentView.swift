@@ -515,7 +515,7 @@ struct ContentView: View {
         let projectsWithItems = Set(flatSidebarItems.map(\.project.id))
         return visibleProjects.filter { project in
             !projectsWithItems.contains(project.id)
-                && sessionManager.sessions(forProjectID: project.id).isEmpty
+                && sessionManager.sidebarSessions(forProjectID: project.id).isEmpty
                 && dormantThreads(for: project).isEmpty
         }
     }
@@ -1758,6 +1758,11 @@ struct ContentView: View {
     }
 
     private func archiveSessions(_ sessionIDs: Set<UUID>) {
+        // Hide the rows immediately; failed stops revert below.
+        for sessionID in sessionIDs {
+            sessionManager.beginArchiveStop(sessionID: sessionID)
+        }
+
         Task {
             var archivedSessionIDs = Set<UUID>()
 
@@ -1766,6 +1771,7 @@ struct ContentView: View {
                       let worker = serverStore.servers.first(where: {
                           $0.concurrencyKey == session.serverKey
                       }) else {
+                    sessionManager.cancelArchiveStop(sessionID: sessionID)
                     continue
                 }
 
@@ -1780,6 +1786,8 @@ struct ContentView: View {
                     )
                     if didArchive {
                         sessionManager.close(sessionID: sessionID)
+                    } else {
+                        sessionManager.cancelArchiveStop(sessionID: sessionID)
                     }
                 } else {
                     sessionManager.close(sessionID: sessionID)
@@ -1796,19 +1804,22 @@ struct ContentView: View {
     }
 
     private func archiveLiveThread(_ request: LiveThreadArchiveRequest) {
-        Task {
-            guard let session = sessionManager.sessions.first(where: {
-                $0.id == request.sessionID
-            }),
-            session.threadID == request.threadID,
-            session.status.occupiesSlot,
-            let project = projectStore.project(id: session.projectID),
-            let worker = serverStore.servers.first(where: {
-                $0.concurrencyKey == session.serverKey
-            }) else {
-                return
-            }
+        guard let session = sessionManager.sessions.first(where: {
+            $0.id == request.sessionID
+        }),
+        session.threadID == request.threadID,
+        session.status.occupiesSlot,
+        let project = projectStore.project(id: session.projectID),
+        let worker = serverStore.servers.first(where: {
+            $0.concurrencyKey == session.serverKey
+        }) else {
+            return
+        }
 
+        // Hide the conversation immediately; the stop reverts it on failure.
+        sessionManager.beginArchiveStop(sessionID: session.id)
+
+        Task {
             let didStop = await sessionManager.stopAgentAfterRefresh(
                 sessionID: session.id,
                 on: worker,
@@ -1816,18 +1827,21 @@ struct ContentView: View {
                 launchDefaults: launchDefaults,
                 using: workerSessionService
             )
-            guard didStop else { return }
+            guard didStop else {
+                sessionManager.cancelArchiveStop(sessionID: session.id)
+                return
+            }
 
-            let didArchive = await workerSessionService.setThreadArchived(
+            // Remove the row before the archive round-trip so it never
+            // reappears; an archive failure resurfaces the dormant thread.
+            sessionManager.close(sessionID: session.id)
+            _ = await workerSessionService.setThreadArchived(
                 kind: session.kind,
                 repositoryName: project.displayName,
                 threadID: request.threadID,
                 archived: true,
                 on: worker
             )
-            if didArchive {
-                sessionManager.close(sessionID: session.id)
-            }
         }
     }
 
