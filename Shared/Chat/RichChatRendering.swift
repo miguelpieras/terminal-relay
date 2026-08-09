@@ -467,6 +467,7 @@ struct TerminalRelayMarkdownTableStyle: MarkdownTableStyle {
 private struct TerminalRelayMarkdownTable: View {
     let configuration: MarkdownTableStyleConfiguration
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @State private var gridWidth: CGFloat?
 
     var body: some View {
         Group {
@@ -482,8 +483,15 @@ private struct TerminalRelayMarkdownTable: View {
                 ScrollView(.horizontal) {
                     tableGrid
                         .fixedSize(horizontal: true, vertical: false)
+                        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: {
+                            gridWidth = $0 > 0 ? $0 : nil
+                        }
                 }
                 .scrollIndicators(.visible)
+                // A horizontal scroll view claims its whole axis. A table
+                // narrower than the row would otherwise stretch its border —
+                // and the user bubble hosting it — to the full width.
+                .frame(maxWidth: gridWidth)
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel("Scrollable table")
                 .accessibilityHint("Swipe horizontally to read every table column.")

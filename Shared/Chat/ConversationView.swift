@@ -1930,7 +1930,7 @@ private struct ConversationTranscriptScroller<Content: View>: View {
 }
 #endif
 
-private struct ChatMessageView: View {
+struct ChatMessageView: View {
     let message: ChatMessage
     var segment: TranscriptRowProjection?
     var showsFooter: Bool
