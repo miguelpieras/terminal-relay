@@ -113,15 +113,30 @@ final class ConversationScrollingUITests: XCTestCase {
             .firstMatch
     }
 
+    /// Polls the condition, re-reading element attributes every pass.
+    ///
+    /// `XCTNSPredicateExpectation` bound to an element evaluates a cached
+    /// query snapshot, so it can keep reporting the state the interface left
+    /// several seconds earlier — the transcript's jump control was observed
+    /// "still there" for a full timeout after a fresh read said it was gone.
+    /// Every attribute read below takes a new snapshot instead.
+    private func waitUntil(
+        timeout: TimeInterval,
+        _ condition: () -> Bool
+    ) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        repeat {
+            if condition() { return true }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        } while Date() < deadline
+        return condition()
+    }
+
     private func waitUntilHittable(
         _ element: XCUIElement,
         timeout: TimeInterval = 5
     ) -> Bool {
-        let expectation = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "exists == true AND hittable == true"),
-            object: element
-        )
-        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+        waitUntil(timeout: timeout) { element.exists && element.isHittable }
     }
 
     private func waitUntilFullyVisible(
@@ -129,12 +144,7 @@ final class ConversationScrollingUITests: XCTestCase {
         in container: XCUIElement,
         timeout: TimeInterval = 3
     ) -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        repeat {
-            if isFullyVisible(element, in: container) { return true }
-            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
-        } while Date() < deadline
-        return isFullyVisible(element, in: container)
+        waitUntil(timeout: timeout) { isFullyVisible(element, in: container) }
     }
 
     private func isFullyVisible(
@@ -154,11 +164,9 @@ final class ConversationScrollingUITests: XCTestCase {
         on element: XCUIElement,
         timeout: TimeInterval = 3
     ) -> Bool {
-        let expectation = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "label CONTAINS %@", fragment),
-            object: element
-        )
-        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+        waitUntil(timeout: timeout) {
+            element.exists && element.label.contains(fragment)
+        }
     }
 
     private func waitUntilValue(
@@ -166,22 +174,16 @@ final class ConversationScrollingUITests: XCTestCase {
         on element: XCUIElement,
         timeout: TimeInterval = 3
     ) -> Bool {
-        let expectation = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "value == %@", expectedValue),
-            object: element
-        )
-        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+        waitUntil(timeout: timeout) {
+            element.exists && element.value as? String == expectedValue
+        }
     }
 
     private func waitUntilGone(
         _ element: XCUIElement,
         timeout: TimeInterval = 3
     ) -> Bool {
-        let expectation = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "exists == false"),
-            object: element
-        )
-        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+        waitUntil(timeout: timeout) { !element.exists }
     }
 
     private func assertViewportRemainsStable(
