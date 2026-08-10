@@ -2623,6 +2623,134 @@ final class MacConversationTableViewTests: XCTestCase {
         #endif
     }
 
+    /// A message that completes during a live turn swaps its row from the
+    /// hosted streaming cell to a native tile. Reloading that one row leaves
+    /// the row view still owning the old cell, so the replacement kept its own
+    /// fitting width and painted its bubble against the transcript's leading
+    /// edge while every other row stayed centered.
+    func testCompletedLiveMessageKeepsTheSharedTranscriptColumn() async throws {
+        let history: [ConversationItem] = [
+            .message(
+                ChatMessage(
+                    id: "history-user",
+                    turnID: "turn-0",
+                    role: .user,
+                    text: "hello",
+                    occurredAt: 1_786_343_000_000
+                )
+            ),
+            .message(
+                ChatMessage(
+                    id: "history-assistant",
+                    turnID: "turn-0",
+                    role: .assistant,
+                    text: "Hello! What would you like to work on?",
+                    occurredAt: 1_786_343_001_000
+                )
+            ),
+        ]
+        let transport = ChatFixtureTransport(initialEvents: [
+            ChatTestFixtures.event(
+                "session.hello",
+                sequence: 1,
+                payload: (try? JSONValue.encoded(
+                    ChatCapabilities(features: ["streaming"])
+                )) ?? .object([:])
+            ),
+            try ChatTestFixtures.snapshotEvent(baseSequence: 2, items: history),
+        ])
+        let store = ConversationStore()
+        let coordinator = ConversationCoordinator(
+            store: store,
+            transport: transport,
+            identity: ChatTestFixtures.identity,
+            retryPolicy: .immediate
+        )
+        coordinator.start()
+        await waitForItems(2, in: store)
+
+        let hosting = NSHostingView(
+            rootView: ConversationView(
+                coordinator: coordinator,
+                showsComposer: false,
+                startsCoordinator: false
+            )
+        )
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 2_040, height: 900),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hosting
+        window.orderFront(nil)
+        Self.retainedWindows.append(window)
+        settle(hosting)
+
+        await transport.yield(.envelope(ChatTestFixtures.event(
+            "message.delta",
+            sequence: 3,
+            itemID: "live-assistant",
+            turnID: "turn-1",
+            payload: .object([
+                "role": .string("assistant"),
+                "text": .string("I am well too"),
+            ])
+        )))
+        await waitForItems(3, in: store)
+        settle(hosting)
+
+        await transport.yield(.envelope(ChatTestFixtures.event(
+            "message.completed",
+            sequence: 4,
+            itemID: "live-assistant",
+            turnID: "turn-1",
+            payload: .object([
+                "role": .string("assistant"),
+                "text": .string("I am well too — what is on your mind today?"),
+            ])
+        )))
+        for _ in 0..<80 {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.005))
+        }
+        settle(hosting)
+
+        let table = try XCTUnwrap(descendant(of: hosting, type: NSTableView.self))
+        XCTAssertEqual(
+            table.numberOfRows,
+            6,
+            "The completed live message must add its own text and footer rows."
+        )
+        for index in 0..<table.numberOfRows {
+            let cell = try XCTUnwrap(
+                table.view(atColumn: 0, row: index, makeIfNecessary: true)
+            )
+            XCTAssertEqual(
+                cell.frame.width,
+                table.bounds.width - 32,
+                accuracy: 0.5,
+                "Row \(index) must span the table; a cell left at its own fitting width shifts its column."
+            )
+            let container = try XCTUnwrap(cell.subviews.first)
+            let box = container.convert(container.bounds, to: table)
+            XCTAssertEqual(
+                box.midX,
+                table.bounds.midX,
+                accuracy: 0.5,
+                "Row \(index) must center on the same transcript column as every other row."
+            )
+        }
+        await coordinator.detach()
+    }
+
+    private func waitForItems(_ count: Int, in store: ConversationStore) async {
+        for _ in 0..<200 where store.state.items.count < count {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertGreaterThanOrEqual(store.state.items.count, count)
+    }
+
     private func makeRows(count: Int) -> [Row] {
         (0..<count).map {
             Row(id: "row-\($0)", contentRevision: 1)

@@ -1308,13 +1308,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             }
 
             if !cellClassChanges.isEmpty {
-                tableView.reloadData(
-                    forRowIndexes: cellClassChanges,
-                    columnIndexes: IndexSet(integer: 0)
-                )
-                MacConversationTableDiagnostics.recordedTargetedRowReload(
-                    count: cellClassChanges.count
-                )
+                replaceRows(at: cellClassChanges, in: tableView)
                 changedIndexes.subtract(cellClassChanges)
             }
 
@@ -1343,6 +1337,25 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 }
             }
             return configuredIndexes
+        }
+
+        /// Rebuilds the rows whose cell class changed. `reloadData(forRowIndexes:)`
+        /// swaps the cell view but leaves the row view still owning the old one,
+        /// so the replacement never receives the table's cell geometry: it keeps
+        /// its own fitting width and the transcript column stops lining up with
+        /// every other row. Removing and reinserting the row builds a fresh row
+        /// view that adopts the new cell.
+        private func replaceRows(
+            at indexes: IndexSet,
+            in tableView: NSTableView
+        ) {
+            tableView.beginUpdates()
+            tableView.removeRows(at: indexes, withAnimation: [])
+            tableView.insertRows(at: indexes, withAnimation: [])
+            tableView.endUpdates()
+            MacConversationTableDiagnostics.recordedTargetedRowReload(
+                count: indexes.count
+            )
         }
 
         private func survivingFlatIndex(
@@ -1387,11 +1400,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                     continue
                 }
                 guard cell.kind == cellKind(for: snapshot[index]) else {
-                    tableView.reloadData(
-                        forRowIndexes: IndexSet(integer: index),
-                        columnIndexes: IndexSet(integer: 0)
-                    )
-                    MacConversationTableDiagnostics.recordedTargetedRowReload(count: 1)
+                    replaceRows(at: IndexSet(integer: index), in: tableView)
                     configuredIndexes.insert(index)
                     continue
                 }
