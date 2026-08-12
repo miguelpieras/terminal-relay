@@ -250,11 +250,12 @@ private func completedTranscriptItem(
         let kind = ToolActivityKind(
             rawValue: envelope.payload["kind"]?.stringValue ?? ""
         ) ?? .generic
-        let title = envelope.payload["title"]?.stringValue
+        let payloadTitle = envelope.payload["title"]?.stringValue
             ?? envelope.payload["name"]?.stringValue
-            ?? "Agent activity"
+        let title = payloadTitle ?? "Agent activity"
         if case .tool(var tool)? = currentItem {
-            tool.title = title
+            // A result merge without its own title must not rename the tool.
+            tool.title = payloadTitle ?? tool.title
             tool.status = status
             tool.input = envelope.payload["input"]?.displayString ?? tool.input
             if let output = envelope.payload["output"]?.displayString {
@@ -868,9 +869,9 @@ struct ConversationReducer {
         }()
 
         let toolKind = ToolActivityKind(rawValue: envelope.payload["kind"]?.stringValue ?? "") ?? .generic
-        let title = envelope.payload["title"]?.stringValue
+        let payloadTitle = envelope.payload["title"]?.stringValue
             ?? envelope.payload["name"]?.stringValue
-            ?? "Agent activity"
+        let title = payloadTitle ?? "Agent activity"
 
         let hasAuthoritativeOutput = envelope.payload["output"]?.isNonNull == true
         if (kind == .toolCompleted || (kind == .toolUpdated && hasAuthoritativeOutput)),
@@ -887,7 +888,8 @@ struct ConversationReducer {
 
         if let index = itemIndex[itemID],
            case .tool(var tool) = state.items[index] {
-            tool.title = title
+            // A result merge without its own title must not rename the tool.
+            tool.title = payloadTitle ?? tool.title
             tool.status = status
             tool.input = envelope.payload["input"]?.displayString ?? tool.input
             if let output = envelope.payload["output"]?.displayString {
@@ -1663,7 +1665,7 @@ final class ConversationStore: ObservableObject {
 
         if isStreamingDelta {
             if !isNearBottom, workingState.items.count > previousItemCount {
-                unreadCount += workingState.items.count - previousItemCount
+                unreadCount += unreadArrivals(previousItemCount: previousItemCount)
             }
             if isNearBottom, !isTranscriptLiveScrolling {
                 scheduleStreamingPublish()
@@ -1671,10 +1673,19 @@ final class ConversationStore: ObservableObject {
         } else {
             publishImmediately()
             if !isNearBottom, workingState.items.count > previousItemCount {
-                unreadCount += workingState.items.count - previousItemCount
+                unreadCount += unreadArrivals(previousItemCount: previousItemCount)
             }
         }
         return true
+    }
+
+    /// New-item arrivals that the transcript will actually render; hidden
+    /// noise records must not raise a "new messages" badge.
+    private func unreadArrivals(previousItemCount: Int) -> Int {
+        workingState.items
+            .suffix(workingState.items.count - previousItemCount)
+            .filter { !$0.isTranscriptNoise }
+            .count
     }
 
     nonisolated static func prepareTranscriptProjections(

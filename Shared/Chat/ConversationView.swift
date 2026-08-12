@@ -1079,6 +1079,7 @@ struct ConversationView: View {
         var retainedItemIDs = Set<String>()
         retainedItemIDs.reserveCapacity(store.state.items.count)
         for item in store.state.items {
+            if item.isTranscriptNoise { continue }
             retainedItemIDs.insert(item.id)
             let isExpanded = store.expandedItemIDs.contains(item.id)
             let isDisclosure: Bool
@@ -1304,15 +1305,19 @@ struct ConversationView: View {
 
     #if os(iOS)
     private var iosTranscript: some View {
-        let visibleItems = self.visibleItems
+        // The scroller's anchor identities must come from the same filtered
+        // list the ForEach renders; a hidden noise row would otherwise become
+        // an anchor no view carries and prepends would lose the reading
+        // position.
+        let renderedItems = self.visibleItems.filter { !$0.isTranscriptNoise }
         return ConversationTranscriptScroller(
             isConversationEmpty: store.state.items.isEmpty,
-            firstItemID: visibleItems.first?.id,
+            firstItemID: renderedItems.first?.id,
             contentRevision: transcriptContentRevision,
             isNearBottom: store.isNearBottom,
             unreadCount: store.unreadCount,
             itemExists: { id in
-                visibleItems.contains(where: { $0.id == id })
+                renderedItems.contains(where: { $0.id == id })
             },
             onNearBottomChange: { store.setNearBottom($0) },
             onAnchoredChange: { _ in },
@@ -1321,7 +1326,7 @@ struct ConversationView: View {
             VStack(alignment: .leading, spacing: 14) {
                 earlierContent
 
-                ForEach(visibleItems) { item in
+                ForEach(renderedItems) { item in
                     timelineView(for: item)
                         .id(item.id)
                         .accessibilityIdentifier("conversation.item.\(item.id)")

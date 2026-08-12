@@ -1031,6 +1031,25 @@ enum ConversationItem: Codable, Equatable, Identifiable, Sendable {
     case plan(ChatPlan)
     case generic(ChatGenericItem)
 
+    /// Typeless provider content blocks used to map to placeholder "generic"
+    /// tool records. Workers no longer emit them, but stored history and
+    /// older workers still do. Only the shapes that duplicate other rows are
+    /// noise — thinking-signature blobs and echoes of the visible message
+    /// text; a tool echo's output is the sole record of what ran, so it
+    /// keeps rendering.
+    var isTranscriptNoise: Bool {
+        guard case .tool(let tool) = self,
+              tool.kind == .generic,
+              tool.title == "generic",
+              (tool.input ?? "").isEmpty,
+              (tool.errorMessage ?? "").isEmpty else {
+            return false
+        }
+        guard let output = tool.output, !output.isEmpty else { return true }
+        return output.hasPrefix("{\"signature\"")
+            || output.hasPrefix("{\"text\"")
+    }
+
     var id: String {
         switch self {
         case .message(let item): item.id

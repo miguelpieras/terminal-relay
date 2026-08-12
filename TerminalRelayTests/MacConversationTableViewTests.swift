@@ -1332,9 +1332,15 @@ final class MacConversationTableViewTests: XCTestCase {
         )
         XCTAssertNil(descendant(of: cell, type: NSHostingView<AnyView>.self))
         XCTAssertEqual(hostedBuilds, 0)
+        let controls = try XCTUnwrap(descendant(of: cell, type: NSStackView.self))
+        XCTAssertEqual(
+            controls.alphaValue,
+            0,
+            "Footer controls stay hidden until the pointer reveals them."
+        )
         let button = try XCTUnwrap(descendant(of: cell, type: NSButton.self))
-        XCTAssertGreaterThanOrEqual(button.frame.width, 44)
-        XCTAssertGreaterThanOrEqual(button.frame.height, 44)
+        XCTAssertGreaterThanOrEqual(button.frame.width, 22)
+        XCTAssertGreaterThanOrEqual(button.frame.height, 22)
         button.performClick(nil)
         XCTAssertEqual(copiedItemID, "message")
         XCTAssertEqual(button.accessibilityLabel(), "Message copied")

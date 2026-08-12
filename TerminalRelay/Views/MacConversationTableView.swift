@@ -797,6 +797,9 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         private var pendingLiveScrollRestorationFollowsBottom = false
         private var pendingLiveScrollRestorationExpectedOriginY: CGFloat?
         private var lastViewportWidth: CGFloat?
+        private var hoverTrackingArea: NSTrackingArea?
+        private var revealedFooterItemID: String?
+        private var footerHoverHideTimer: Timer?
         private var prefetchedRange: Range<Int>?
         private var lastPrefetchVisibleLowerBound: Int?
         private var lastPrefetchDirection: PrefetchDirection?
@@ -842,6 +845,20 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             lastViewportWidth = scrollView.contentView.bounds.width
             tableView.dataSource = self
             tableView.delegate = self
+
+            let hoverArea = NSTrackingArea(
+                rect: .zero,
+                options: [
+                    .mouseMoved,
+                    .mouseEnteredAndExited,
+                    .activeInKeyWindow,
+                    .inVisibleRect,
+                ],
+                owner: self,
+                userInfo: nil
+            )
+            tableView.addTrackingArea(hoverArea)
+            hoverTrackingArea = hoverArea
 
             let clip = scrollView.contentView
             clip.postsBoundsChangedNotifications = true
@@ -907,6 +924,13 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 NotificationCenter.default.removeObserver(observer)
             }
             observers.removeAll()
+            if let hoverTrackingArea {
+                tableView?.removeTrackingArea(hoverTrackingArea)
+            }
+            hoverTrackingArea = nil
+            footerHoverHideTimer?.invalidate()
+            footerHoverHideTimer = nil
+            revealedFooterItemID = nil
             tableView?.dataSource = nil
             tableView?.delegate = nil
             scrollView = nil
@@ -926,6 +950,75 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             prefetchedRange = nil
             lastPrefetchVisibleLowerBound = nil
             lastPrefetchDirection = nil
+        }
+
+        // MARK: Footer hover reveal
+
+        @objc(mouseMoved:)
+        func hoverMouseMoved(with event: NSEvent) {
+            guard let tableView else { return }
+            let point = tableView.convert(event.locationInWindow, from: nil)
+            let rowIndex = tableView.row(at: point)
+            var hoveredItemID: String?
+            if rowIndex >= 0,
+               let location = snapshot.location(ofFlatIndex: rowIndex),
+               let cell = tableView.view(
+                   atColumn: 0,
+                   row: rowIndex,
+                   makeIfNecessary: false
+               ) as? MacConversationReusableCell {
+                let cellPoint = cell.convert(event.locationInWindow, from: nil)
+                if cell.hoverRevealTarget(contains: cellPoint) {
+                    hoveredItemID = snapshot
+                        .sections[location.section]
+                        .rows[location.row]
+                        .mutationSourceID
+                }
+            }
+            setHoveredFooterSource(itemID: hoveredItemID)
+        }
+
+        @objc(mouseExited:)
+        func hoverMouseExited(with event: NSEvent) {
+            setHoveredFooterSource(itemID: nil)
+        }
+
+        /// One message's footer controls stay revealed while the pointer is on
+        /// that message (or the controls themselves). Losing the target only
+        /// schedules the fade so the pointer can cross the small gap between
+        /// a bubble and its controls without flicker.
+        private func setHoveredFooterSource(itemID: String?) {
+            if let itemID {
+                footerHoverHideTimer?.invalidate()
+                footerHoverHideTimer = nil
+                guard itemID != revealedFooterItemID else { return }
+                applyRevealedFooter(itemID: itemID)
+            } else if revealedFooterItemID != nil, footerHoverHideTimer == nil {
+                let timer = Timer(timeInterval: 0.25, repeats: false) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        guard let self else { return }
+                        self.footerHoverHideTimer = nil
+                        self.applyRevealedFooter(itemID: nil)
+                    }
+                }
+                footerHoverHideTimer = timer
+                // Common modes keep the fade honest while a scroller drag or
+                // menu runs its event-tracking loop.
+                RunLoop.main.add(timer, forMode: .common)
+            }
+        }
+
+        private func applyRevealedFooter(itemID: String?) {
+            revealedFooterItemID = itemID
+            tableView?.enumerateAvailableRowViews { rowView, _ in
+                for case let cell as MacConversationNativeFooterCell
+                    in rowView.subviews {
+                    cell.setControlsRevealed(
+                        itemID != nil && cell.footerItemID == itemID,
+                        animated: true
+                    )
+                }
+            }
         }
 
         func update(
@@ -1451,6 +1544,13 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 nativeLinkHandler: onNativeLink,
                 nativeCopyMessageHandler: onNativeCopyMessage
             )
+            if let footerCell = cell as? MacConversationNativeFooterCell {
+                footerCell.setControlsRevealed(
+                    revealedFooterItemID != nil
+                        && footerCell.footerItemID == revealedFooterItemID,
+                    animated: false
+                )
+            }
             MacConversationTableDiagnostics.recordedConfiguration(
                 mutationSourceID: row.mutationSourceID,
                 isExplicit: isExplicit
@@ -1518,24 +1618,30 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         private func liveScrollPresentation(
             for footer: MacConversationNativeFooterPresentation
         ) -> MacConversationNativeTextPresentation {
+            // Hover-revealed controls render nothing during a live gesture.
+            // The stand-in lays out the timestamp in clear color so its
+            // measured height tracks the label at every font scale (with the
+            // copy control's 22pt floor) and swapping cell classes never
+            // moves the viewport.
             MacConversationNativeTextPresentation(
                 fallbackString: footer.timestampLabel ?? "",
                 contentInsets: NSEdgeInsets(
-                    top: 7,
+                    top: 2,
                     left: 28,
-                    bottom: 7,
+                    bottom: 8,
                     right: 28
                 ),
-                firstRowTopInsetAdjustment: 15,
-                lastRowBottomInsetAdjustment: 9,
-                minimumTextContainerHeight: 44,
+                firstRowTopInsetAdjustment: 20,
+                lastRowBottomInsetAdjustment: 8,
+                minimumTextContainerHeight: 22,
                 maximumContentWidth: 760,
                 maximumTextWidth: 220,
                 horizontalAlignment: footer.isTrailing ? .trailing : .leading,
                 fallbackFont: NSFont.systemFont(
-                    ofSize: 11 * footer.fontScale
+                    ofSize: NSFont.smallSystemFontSize
+                        * max(0.5, footer.fontScale)
                 ),
-                fallbackColor: .secondaryLabelColor,
+                fallbackColor: .clear,
                 accessibilityLabel: footer.timestampAccessibilityLabel,
                 accessibilityIdentifier: footer.accessibilityIdentifier,
                 usesFastPlainTextRenderer: true
@@ -2193,6 +2299,15 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         }
 
         private func viewportDidScroll() {
+            // Rows move under a stationary pointer without any mouseMoved
+            // event, so a revealed footer would otherwise follow its message
+            // around the screen. Hide immediately; the next physical pointer
+            // move re-evaluates.
+            if revealedFooterItemID != nil || footerHoverHideTimer != nil {
+                footerHoverHideTimer?.invalidate()
+                footerHoverHideTimer = nil
+                applyRevealedFooter(itemID: nil)
+            }
             sampleNearBottom()
             scheduleViewportPrefetch()
         }
@@ -2373,6 +2488,13 @@ private class MacConversationReusableCell: NSTableCellView {
         preconditionFailure("Reusable transcript cell must implement content adoption")
     }
 
+    /// Whether a pointer at `point` (cell coordinates) rests on the content
+    /// that should reveal the owning message's footer controls — the bubble
+    /// or text block, never the full row band.
+    func hoverRevealTarget(contains point: NSPoint) -> Bool {
+        false
+    }
+
     override func prepareForReuse() {
         super.prepareForReuse()
         representedRowID = nil
@@ -2427,6 +2549,15 @@ private final class MacConversationHostedCell: MacConversationReusableCell {
         // performs a second SwiftUI graph transition for every cold row that
         // enters the viewport and cancels useful preparation already in flight.
     }
+
+    override func hoverRevealTarget(contains point: NSPoint) -> Bool {
+        // SwiftUI owns the exact bubble frame; the centered content column is
+        // the closest AppKit-visible bound for these rare hosted tiles.
+        let columnWidth = min(760, bounds.width - 56)
+        guard columnWidth > 0 else { return false }
+        let leadingEdge = (bounds.width - columnWidth) / 2
+        return point.x >= leadingEdge && point.x <= leadingEdge + columnWidth
+    }
 }
 
 @MainActor
@@ -2442,6 +2573,9 @@ private final class MacConversationNativeFooterCell: MacConversationReusableCell
     private var copiedResetTask: Task<Void, Never>?
     private var copyMessageHandler: (@MainActor (String) -> Void)?
     private var itemID: String?
+    private var controlsRevealed = false
+
+    var footerItemID: String? { itemID }
 
     init() {
         super.init(kind: .nativeFooter)
@@ -2450,7 +2584,8 @@ private final class MacConversationNativeFooterCell: MacConversationReusableCell
         controls.translatesAutoresizingMaskIntoConstraints = false
         controls.orientation = .horizontal
         controls.alignment = .centerY
-        controls.spacing = 9
+        controls.spacing = 6
+        controls.alphaValue = 0
 
         copyButton.translatesAutoresizingMaskIntoConstraints = false
         copyButton.title = ""
@@ -2498,8 +2633,8 @@ private final class MacConversationNativeFooterCell: MacConversationReusableCell
             bottomConstraint,
             controls.topAnchor.constraint(equalTo: layoutContainer.topAnchor),
             controls.bottomAnchor.constraint(equalTo: layoutContainer.bottomAnchor),
-            copyButton.widthAnchor.constraint(equalToConstant: 44),
-            copyButton.heightAnchor.constraint(equalToConstant: 44),
+            copyButton.widthAnchor.constraint(equalToConstant: 22),
+            copyButton.heightAnchor.constraint(equalToConstant: 22),
         ])
         setCopyState(copied: false)
     }
@@ -2507,6 +2642,37 @@ private final class MacConversationNativeFooterCell: MacConversationReusableCell
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    /// Controls fade in only while the pointer is over the owning message or
+    /// this row's controls; the row keeps its constant height either way.
+    func setControlsRevealed(_ revealed: Bool, animated: Bool) {
+        guard controlsRevealed != revealed else { return }
+        controlsRevealed = revealed
+        if animated {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.15
+                controls.animator().alphaValue = revealed ? 1 : 0
+            }
+        } else {
+            controls.alphaValue = revealed ? 1 : 0
+        }
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let view = super.hitTest(point)
+        // The invisible copy button must not swallow clicks in the gap
+        // between messages.
+        if !controlsRevealed, view?.isDescendant(of: controls) == true {
+            return nil
+        }
+        return view
+    }
+
+    override func hoverRevealTarget(contains point: NSPoint) -> Bool {
+        controls.convert(controls.bounds, to: self)
+            .insetBy(dx: -10, dy: -6)
+            .contains(point)
     }
 
     override func setContent(
@@ -2528,8 +2694,8 @@ private final class MacConversationNativeFooterCell: MacConversationReusableCell
         }
         copyMessageHandler = nativeCopyMessageHandler
 
-        topConstraint.constant = isFirst ? 22 : 7
-        bottomConstraint.constant = -(isLast ? 16 : 7)
+        topConstraint.constant = isFirst ? 22 : 2
+        bottomConstraint.constant = -(isLast ? 16 : 8)
         if presentation.isTrailing {
             if controlsLeadingConstraint.isActive {
                 controlsLeadingConstraint.isActive = false
@@ -2543,6 +2709,19 @@ private final class MacConversationNativeFooterCell: MacConversationReusableCell
             }
             if !controlsLeadingConstraint.isActive {
                 controlsLeadingConstraint.isActive = true
+            }
+        }
+        // Under a trailing bubble the timestamp leads the copy control so the
+        // glyph hugs the bubble edge; leading messages keep the mirrored order.
+        let orderedControls = presentation.isTrailing
+            ? [timestampLabel, copyButton]
+            : [copyButton, timestampLabel]
+        if controls.arrangedSubviews != orderedControls {
+            for view in controls.arrangedSubviews {
+                controls.removeArrangedSubview(view)
+            }
+            for view in orderedControls {
+                controls.addArrangedSubview(view)
             }
         }
 
@@ -2570,6 +2749,7 @@ private final class MacConversationNativeFooterCell: MacConversationReusableCell
         setAccessibilityIdentifier(nil)
         copyButton.setAccessibilityIdentifier(nil)
         setCopyState(copied: false)
+        setControlsRevealed(false, animated: false)
         super.prepareForReuse()
     }
 
@@ -2848,6 +3028,11 @@ private final class MacConversationNativeTextCell:
     MacConversationReusableCell,
     NSTextViewDelegate
 {
+    override func hoverRevealTarget(contains point: NSPoint) -> Bool {
+        textContainerView.convert(textContainerView.bounds, to: self)
+            .contains(point)
+    }
+
     private let layoutContainer = NSView(frame: .zero)
     private let textContainerView = NSView(frame: .zero)
     private let nativeTextView = MacConversationIntrinsicTextView(frame: .zero)

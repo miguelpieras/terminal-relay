@@ -805,7 +805,11 @@ final class ConversationStoreTests: XCTestCase {
         let updatedTool = try XCTUnwrap(store.state.tools.first)
         let rows = store.transcriptProjections(for: store.state.items[0])
         XCTAssertEqual(updatedTool.kind, .search)
-        XCTAssertEqual(updatedTool.title, "Agent activity")
+        XCTAssertEqual(
+            updatedTool.title,
+            "Original search",
+            "An update without its own title must not rename the tool."
+        )
         XCTAssertEqual(updatedTool.status, .running)
         XCTAssertEqual(updatedTool.input, "search input")
         XCTAssertEqual(
@@ -824,6 +828,89 @@ final class ConversationStoreTests: XCTestCase {
         XCTAssertFalse(
             capturedTool.isOutputStorageMaterialized,
             "Cumulative compatibility adoption must not flatten streamed output."
+        )
+    }
+
+    func testTypelessProviderArtifactsAreTranscriptNoise() {
+        func tool(
+            kind: ToolActivityKind,
+            title: String,
+            input: String? = nil,
+            output: String? = nil,
+            errorMessage: String? = nil
+        ) -> ConversationItem {
+            .tool(
+                ToolActivity(
+                    id: "artifact",
+                    turnID: nil,
+                    kind: kind,
+                    title: title,
+                    status: .completed,
+                    input: input,
+                    output: output,
+                    errorMessage: errorMessage,
+                    durationMilliseconds: nil,
+                    exitCode: nil,
+                    occurredAt: nil,
+                    isTruncated: false,
+                    originalByteCount: nil
+                )
+            )
+        }
+
+        // Stored typeless provider blocks: a thinking-signature blob and a
+        // text echo of the visible message.
+        XCTAssertTrue(
+            tool(
+                kind: .generic,
+                title: "generic",
+                output: "{\"signature\":\"CAIS\"}"
+            ).isTranscriptNoise
+        )
+        XCTAssertTrue(
+            tool(
+                kind: .generic,
+                title: "generic",
+                output: "{\"text\":\"visible reply\"}"
+            ).isTranscriptNoise
+        )
+
+        // Old-worker tool echoes: the "generic" record's output is the only
+        // remaining trace of what ran, so it must keep rendering.
+        XCTAssertFalse(
+            tool(
+                kind: .generic,
+                title: "generic",
+                output: "{\"id\":\"t1\",\"input\":{\"command\":\"ls\"},\"name\":\"Bash\"}"
+            ).isTranscriptNoise
+        )
+        XCTAssertFalse(
+            tool(
+                kind: .generic,
+                title: "generic",
+                output: "{\"content\":\"listing\",\"is_error\":false,\"tool_use_id\":\"t1\"}"
+            ).isTranscriptNoise
+        )
+        XCTAssertFalse(
+            tool(kind: .shell, title: "Run command", output: "ok")
+                .isTranscriptNoise
+        )
+        XCTAssertFalse(
+            tool(kind: .generic, title: "Tool result", output: "value")
+                .isTranscriptNoise
+        )
+        XCTAssertFalse(
+            tool(kind: .generic, title: "generic", input: "real input")
+                .isTranscriptNoise
+        )
+        XCTAssertFalse(
+            tool(kind: .generic, title: "generic", errorMessage: "failed")
+                .isTranscriptNoise
+        )
+        XCTAssertFalse(
+            ConversationItem.message(
+                ChatMessage(id: "m", role: .assistant, text: "generic")
+            ).isTranscriptNoise
         )
     }
 

@@ -954,6 +954,34 @@ def normalized_tool_status(value: Any, completed: bool) -> str:
     return "running"
 
 
+def claude_block_type(block: dict[str, Any]) -> str | None:
+    """Classify one Claude content block for transcript mapping.
+
+    Live SDK content blocks are dataclasses whose asdict form carries no
+    "type" key, so blocks without one are classified by field shape; typed
+    variants such as server_tool_use/advisor_tool_result normalize to the
+    plain tool branches so the live stream and the history rebuild render
+    the same rows. Returns None for metadata-only artifacts that must never
+    render.
+    """
+    block_type = block.get("type")
+    if isinstance(block_type, str):
+        if block_type.endswith("_tool_use"):
+            return "tool_use"
+        if block_type.endswith("_tool_result"):
+            return "tool_result"
+        return block_type
+    if "text" in block:
+        return "text"
+    if "thinking" in block or "signature" in block:
+        return "thinking"
+    if "name" in block and "input" in block:
+        return "tool_use"
+    if "tool_use_id" in block:
+        return "tool_result"
+    return None
+
+
 def normalized_tool_kind(provider_type: str, name: Any = None) -> str:
     value = f"{provider_type} {name or ''}".lower()
     if any(token in value for token in ("command", "bash", "shell", "terminal")):
@@ -2603,6 +2631,7 @@ class ClaudeAdapter(ProviderAdapter):
         self.client: Any = None
         self.receive_task: asyncio.Task[None] | None = None
         self.active_turn: str | None = None
+        self.turn_user_echo: str | None = None
         self.pending_callbacks: dict[str, tuple[asyncio.Future[Any], dict[str, Any]]] = {}
         self.partial_blocks: dict[tuple[str, int], str] = {}
         self.active_stream_message: str | None = None
@@ -2930,6 +2959,7 @@ class ClaudeAdapter(ProviderAdapter):
                             turn_id=prior_active_turn,
                         )
                 self.active_turn = None
+                self.turn_user_echo = None
                 self.connection_ready.set()
                 if self.emit:
                     await self.emit(
@@ -3009,11 +3039,15 @@ class ClaudeAdapter(ProviderAdapter):
             )
             return
         if class_name == "UserMessage":
+            if value.get("parent_tool_use_id"):
+                # Subagent sidechain records are filtered out of history
+                # rebuilds; the live stream must not render them either.
+                return
             await self._map_claude_content(
                 value,
                 "user",
                 str(value.get("uuid") or new_uuid()),
-                client_user_message_id=self.active_turn,
+                client_user_message_id=self.turn_user_echo,
             )
             return
         if class_name == "ResultMessage":
@@ -3040,6 +3074,7 @@ class ClaudeAdapter(ProviderAdapter):
                 turn_id=self.active_turn,
             )
             self.active_turn = None
+            self.turn_user_echo = None
             return
         # Everything else — SystemMessage and its subclasses (init, task and
         # hook events), RateLimitEvent, future lifecycle envelopes — is
@@ -3064,12 +3099,20 @@ class ClaudeAdapter(ProviderAdapter):
             if not isinstance(block, dict):
                 continue
             item_id = f"{message_uuid}:{index}"
-            block_type = block.get("type", "generic")
+            block_type = claude_block_type(block)
+            if block_type is None:
+                # Metadata-only stream artifacts (e.g. signature fragments)
+                # are never transcript content, matching the history rebuild.
+                continue
             if block_type in {"text", "thinking"}:
                 event_prefix = "reasoning" if block_type == "thinking" else "message"
                 text, truncated, original = bounded_text(
                     block.get("text") or block.get("thinking")
                 )
+                if not text:
+                    # Signature-only thinking blocks and empty echoes render
+                    # nothing; the streamed message is sealed by turn end.
+                    continue
                 payload: dict[str, Any] = {
                     "role": role,
                     "text": text,
@@ -3080,6 +3123,7 @@ class ClaudeAdapter(ProviderAdapter):
                 }
                 if role == "user" and client_user_message_id:
                     payload["clientUserMessageId"] = client_user_message_id
+                    self.turn_user_echo = None
                 await self.emit(
                     f"{event_prefix}.completed",
                     payload,
@@ -3112,15 +3156,19 @@ class ClaudeAdapter(ProviderAdapter):
                     if isinstance(tool_use_id, str)
                     else item_id
                 )
+                payload = {
+                    "kind": "generic",
+                    "output": sanitize_json(block.get("content")),
+                    "toolUseId": tool_use_id,
+                    "status": "failed" if block.get("is_error") else "completed",
+                }
+                if result_item_id == item_id:
+                    # Only a result with no known tool_use needs its own
+                    # title; a merge must keep the original tool name.
+                    payload["title"] = "Tool result"
                 await self.emit(
                     "tool.completed",
-                    {
-                        "kind": "generic",
-                        "title": "Tool result",
-                        "output": sanitize_json(block.get("content")),
-                        "toolUseId": tool_use_id,
-                        "status": "failed" if block.get("is_error") else "completed",
-                    },
+                    payload,
                     turn_id=self.active_turn,
                     item_id=result_item_id,
                 )
@@ -3181,7 +3229,7 @@ class ClaudeAdapter(ProviderAdapter):
         for index, block in enumerate(content):
             if not isinstance(block, dict):
                 continue
-            block_type = block.get("type")
+            block_type = claude_block_type(block)
             item_id = f"{message_uuid}:{index}"
             if block_type in {"text", "thinking"}:
                 text, truncated, original = bounded_text(
@@ -3341,6 +3389,10 @@ class ClaudeAdapter(ProviderAdapter):
                     "providerDisconnected", "Claude is reconnecting."
                 ) from error
         self.active_turn = command["requestId"]
+        # Only the first user text of the turn is the echo of what the user
+        # typed; later user-role records (interruption notices, sidechain
+        # residue) must not adopt the optimistic message's identity.
+        self.turn_user_echo = command["requestId"]
         payload = command["payload"]
         await self._apply_turn_options(
             {**self.launch_options, **payload.get("options", {})}
@@ -3390,6 +3442,7 @@ class ClaudeAdapter(ProviderAdapter):
             await self.client.query(prompt)
         except Exception as error:
             self.active_turn = None
+            self.turn_user_echo = None
             raise ChatError(
                 "providerUnavailable", "Claude could not start the turn."
             ) from error
@@ -3758,12 +3811,34 @@ class ChatBroker:
             "reasoning.completed",
             "tool.completed",
         } and item_id:
-            prior_occurred_at = self.items.get(item_id, {}).get("occurredAt")
+            prior = self.items.get(item_id, {})
+            prior_occurred_at = prior.get("occurredAt")
+            if event_type == "tool.completed":
+                # A completion that merges into a started tool omits the
+                # title; a later attach must still see the original
+                # title/kind/input, so completion overlays rather than
+                # replaces the stored payload.
+                merged = dict(prior.get("payload") or {})
+                for key in (
+                    "output",
+                    "outputDelta",
+                    "truncated",
+                    "originalByteCount",
+                ):
+                    merged.pop(key, None)
+                merged.update(
+                    {
+                        key: value
+                        for key, value in payload.items()
+                        if value is not None
+                    }
+                )
+                payload = merged
             self._discard_snapshot_text(item_id)
             self.items[item_id] = {
                 "type": event_type,
                 "itemId": item_id,
-                "turnId": turn_id,
+                "turnId": turn_id or prior.get("turnId"),
                 "occurredAt": (
                     prior_occurred_at
                     if prior_occurred_at is not None

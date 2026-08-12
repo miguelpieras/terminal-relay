@@ -1840,6 +1840,90 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
     )
     assert streamed_completed["itemId"] in delta_ids
     assert adapter.partial_blocks == {}
+
+    # Live SDK content blocks are dataclasses whose asdict form has no "type"
+    # key. Shape classification must map them like typed blocks instead of
+    # rendering placeholder "generic" tool rows.
+    shaped_assistant = AssistantMessage()
+    shaped_assistant.uuid = "24242424-2424-4424-8424-242424242424"
+    shaped_assistant.content = [
+        {"thinking": "", "signature": "sig-1"},
+        {"text": "shaped answer"},
+        {"id": "tool-9", "name": "Bash", "input": {"command": "ls"}},
+    ]
+    shaped_result = UserMessage()
+    shaped_result.uuid = "25252525-2525-4525-8525-252525252525"
+    shaped_result.content = [
+        {"tool_use_id": "tool-9", "content": "listing", "is_error": False}
+    ]
+    await received.put(shaped_assistant)
+    await received.put(shaped_result)
+    for _ in range(100):
+        if any(
+            event["type"] == "tool.completed"
+            and event["itemId"] == f"{shaped_assistant.uuid}:2"
+            for event in events
+        ):
+            break
+        await asyncio.sleep(0.01)
+    assert not any(
+        event["payload"].get("title") == "generic" for event in events
+    )
+    shaped_message = next(
+        event
+        for event in events
+        if event["type"] == "message.completed"
+        and event["payload"]["text"] == "shaped answer"
+    )
+    assert shaped_message["itemId"] == f"{shaped_assistant.uuid}:1"
+    # A signature-only thinking block renders nothing.
+    assert not any(
+        event["itemId"] == f"{shaped_assistant.uuid}:0" for event in events
+    )
+    shaped_tool = next(
+        event for event in events if event["type"] == "tool.started"
+    )
+    assert shaped_tool["itemId"] == f"{shaped_assistant.uuid}:2"
+    assert shaped_tool["payload"]["title"] == "Bash"
+    shaped_tool_result = next(
+        event
+        for event in events
+        if event["type"] == "tool.completed"
+        and event["itemId"] == f"{shaped_assistant.uuid}:2"
+    )
+    assert shaped_tool_result["payload"]["output"] == "listing"
+    # A merge into the started tool must not rename it.
+    assert "title" not in shaped_tool_result["payload"]
+
+    # Only the first user text of a turn is the optimistic echo; later
+    # user-role records must not adopt its identity, and sidechain records
+    # must not render at all.
+    late_user = UserMessage()
+    late_user.uuid = "26262626-2626-4626-8626-262626262626"
+    late_user.content = [{"text": "[Request interrupted by user]"}]
+    sidechain_user = UserMessage()
+    sidechain_user.uuid = "27272727-2727-4727-8727-272727272727"
+    sidechain_user.parent_tool_use_id = "tool-9"
+    sidechain_user.content = [{"text": "subagent prompt"}]
+    # The sidechain record goes first: the receive loop is sequential, so
+    # once the later user event exists the sidechain was fully processed.
+    await received.put(sidechain_user)
+    await received.put(late_user)
+    for _ in range(100):
+        if any(
+            event["itemId"] == f"{late_user.uuid}:0" for event in events
+        ):
+            break
+        await asyncio.sleep(0.01)
+    late_user_event = next(
+        event for event in events if event["itemId"] == f"{late_user.uuid}:0"
+    )
+    assert late_user_event["type"] == "message.completed"
+    assert "clientUserMessageId" not in late_user_event["payload"]
+    assert not any(
+        sidechain_user.uuid in str(event.get("itemId")) for event in events
+    )
+
     history_messages.extend(
         [
             SimpleNamespace(
@@ -1871,6 +1955,31 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
             ),
         ]
     )
+    # Server-side tools keep the same row across the live stream and the
+    # history rebuild: the stored JSONL types normalize to tool_use and
+    # tool_result.
+    history_messages.append(
+        SimpleNamespace(
+            uuid="28282828-2828-4828-8828-282828282828",
+            type="assistant",
+            message={
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "server_tool_use",
+                        "id": "srv-1",
+                        "name": "web_search",
+                        "input": {"query": "docs"},
+                    },
+                    {
+                        "type": "web_search_tool_result",
+                        "tool_use_id": "srv-1",
+                        "content": [{"title": "Doc"}],
+                    },
+                ],
+            },
+        )
+    )
     reconciled_history, _ = await adapter.history(None, 100)
     reconciled_ids = [item["itemId"] for item in reconciled_history]
     assert live_user["itemId"] in reconciled_ids
@@ -1881,6 +1990,14 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
     ]
     assert "internal notice" not in reconciled_texts
     assert "meta caveat" not in reconciled_texts
+    server_tool = next(
+        item
+        for item in reconciled_history
+        if item["itemId"] == "28282828-2828-4828-8828-282828282828:0"
+    )
+    assert server_tool["type"] == "tool.completed"
+    assert server_tool["payload"]["title"] == "web_search"
+    assert "Doc" in str(server_tool["payload"].get("output"))
 
     callback = asyncio.create_task(
         adapter._can_use_tool(
