@@ -3023,19 +3023,32 @@ class ClaudeAdapter(ProviderAdapter):
             return
         if class_name == "AssistantMessage":
             identity = value.get("uuid") or value.get("message_id")
+            streamed_text_indexes: list[int] = []
             if not value.get("parent_tool_use_id"):
                 stream_identity = self.active_stream_message
                 self.active_stream_message = None
                 if stream_identity:
                     identity = stream_identity
-                    for key in [
+                    streamed_keys = [
                         key
                         for key in self.partial_blocks
                         if key[0] == stream_identity
-                    ]:
+                    ]
+                    # Stream deltas key items by the API block index, but the
+                    # completed content list may omit blocks (signature-only
+                    # thinking), shifting list positions. Text completions
+                    # must reuse the streamed indexes or the completed text
+                    # lands beside the streamed row instead of replacing it.
+                    streamed_text_indexes = sorted(
+                        key[1] for key in streamed_keys
+                    )
+                    for key in streamed_keys:
                         self.partial_blocks.pop(key, None)
             await self._map_claude_content(
-                value, "assistant", str(identity or new_uuid())
+                value,
+                "assistant",
+                str(identity or new_uuid()),
+                streamed_text_indexes=streamed_text_indexes,
             )
             return
         if class_name == "UserMessage":
@@ -3088,6 +3101,7 @@ class ClaudeAdapter(ProviderAdapter):
         role: str,
         message_uuid: str,
         client_user_message_id: str | None = None,
+        streamed_text_indexes: list[int] | None = None,
     ) -> None:
         assert self.emit is not None
         content = value.get("content", [])
@@ -3095,6 +3109,7 @@ class ClaudeAdapter(ProviderAdapter):
             content = [{"type": "text", "text": content}]
         if not isinstance(content, list):
             content = []
+        remaining_stream_indexes = list(streamed_text_indexes or [])
         for index, block in enumerate(content):
             if not isinstance(block, dict):
                 continue
@@ -3113,10 +3128,14 @@ class ClaudeAdapter(ProviderAdapter):
                     # Signature-only thinking blocks and empty echoes render
                     # nothing; the streamed message is sealed by turn end.
                     continue
+                block_index = index
+                if block_type == "text" and remaining_stream_indexes:
+                    block_index = remaining_stream_indexes.pop(0)
+                    item_id = f"{message_uuid}:{block_index}"
                 payload: dict[str, Any] = {
                     "role": role,
                     "text": text,
-                    "blockIndex": index,
+                    "blockIndex": block_index,
                     "truncated": truncated,
                     "originalByteCount": original,
                     "status": "completed",
@@ -3235,6 +3254,10 @@ class ClaudeAdapter(ProviderAdapter):
                 text, truncated, original = bounded_text(
                     block.get("text") or block.get("thinking")
                 )
+                if not text:
+                    # Live mapping skips signature-only thinking and empty
+                    # echoes; the rebuild must produce the same rows.
+                    continue
                 record = {
                     "type": (
                         "reasoning.completed"

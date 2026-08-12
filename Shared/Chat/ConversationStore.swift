@@ -1,5 +1,17 @@
 import Combine
 import Foundation
+import OSLog
+
+/// Sanitized transcript-envelope forensics: event types, item/turn IDs, and
+/// item counts only — never message text. One line per item-creating or
+/// lifecycle envelope, so a duplicated or missing row can be traced to the
+/// exact event that produced it:
+/// `log show --info --predicate 'subsystem == "com.mpieras.TerminalRelay"'`
+/// under the `chat-transcript` category (see docs/debugging.md).
+private let conversationTranscriptLogger = Logger(
+    subsystem: "com.mpieras.TerminalRelay",
+    category: "chat-transcript"
+)
 
 struct ConversationState: Codable, Equatable, Sendable {
     var snapshotGeneration: String?
@@ -1584,6 +1596,7 @@ final class ConversationStore: ObservableObject {
             )
         }
         guard didApply else { return false }
+        logTranscriptEnvelope(envelope, previousItemCount: previousItemCount)
         let adoptedPreparedTranscriptItem: Bool
         switch (ChatEventKind(rawValue: envelope.type), preparedReducerPayload) {
         case (.messageCompleted, .completedItem(.message(let item))):
@@ -1677,6 +1690,40 @@ final class ConversationStore: ObservableObject {
             }
         }
         return true
+    }
+
+    /// One sanitized unified-log line per envelope that creates a transcript
+    /// item or changes lifecycle state. Streaming deltas that only extend an
+    /// existing item, heartbeats, and acknowledgements stay unlogged so the
+    /// category records identity decisions without per-token volume.
+    private func logTranscriptEnvelope(
+        _ envelope: ChatEnvelope,
+        previousItemCount: Int
+    ) {
+        let createdItem = workingState.items.count > previousItemCount
+        if !createdItem {
+            switch ChatEventKind(rawValue: envelope.type) {
+            case .messageDelta, .reasoningDelta, .toolUpdated,
+                 .sessionHeartbeat, .acknowledgement:
+                return
+            default:
+                break
+            }
+        }
+        let itemID = envelope.itemID
+            ?? envelope.payload["itemId"]?.stringValue
+            ?? envelope.payload["id"]?.stringValue
+            ?? "-"
+        conversationTranscriptLogger.info(
+            """
+            apply \(envelope.type, privacy: .public) \
+            seq=\(envelope.sequence ?? 0, privacy: .public) \
+            item=\(itemID, privacy: .public) \
+            turn=\(envelope.turnID ?? "-", privacy: .public) \
+            created=\(createdItem, privacy: .public) \
+            items=\(self.workingState.items.count, privacy: .public)
+            """
+        )
     }
 
     /// New-item arrivals that the transcript will actually render; hidden

@@ -1841,6 +1841,62 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
     assert streamed_completed["itemId"] in delta_ids
     assert adapter.partial_blocks == {}
 
+    # A thinking block occupies API stream index 0, so the text deltas stream
+    # at index 1 — but the completed content list may contain only the
+    # TextBlock (signature-only thinking is dropped), putting the text at
+    # list position 0. The completion must reuse the streamed index or the
+    # reply duplicates: one row from the stream, one from the completion.
+    misaligned_start = StreamEvent()
+    misaligned_start.uuid = "30303030-3030-4030-8030-303030303030"
+    misaligned_start.session_id = THREAD_ID
+    misaligned_start.event = {"type": "message_start", "message": {"id": "msg_2"}}
+    misaligned_delta = StreamEvent()
+    misaligned_delta.uuid = "31313131-3131-4131-8131-313131313131"
+    misaligned_delta.session_id = THREAD_ID
+    misaligned_delta.event = {
+        "type": "content_block_delta",
+        "index": 1,
+        "delta": {"type": "text_delta", "text": "Hey! What can I help you with today?"},
+    }
+    misaligned_assistant = AssistantMessage()
+    misaligned_assistant.uuid = "32323232-3232-4232-8232-323232323232"
+    misaligned_assistant.content = [
+        {"text": "Hey! What can I help you with today?"}
+    ]
+    events_before_misaligned = len(events)
+    for value in (misaligned_start, misaligned_delta, misaligned_assistant):
+        await received.put(value)
+    for _ in range(100):
+        if any(
+            event["type"] == "message.completed"
+            and event["payload"]["text"]
+            == "Hey! What can I help you with today?"
+            for event in events[events_before_misaligned:]
+        ):
+            break
+        await asyncio.sleep(0.01)
+    misaligned_events = events[events_before_misaligned:]
+    misaligned_delta_ids = {
+        event["itemId"]
+        for event in misaligned_events
+        if event["type"] == "message.delta"
+    }
+    assert len(misaligned_delta_ids) == 1
+    misaligned_completed = next(
+        event
+        for event in misaligned_events
+        if event["type"] == "message.completed"
+    )
+    assert misaligned_completed["itemId"] in misaligned_delta_ids
+    assert misaligned_completed["payload"]["blockIndex"] == 1
+    assert len(
+        [
+            event
+            for event in misaligned_events
+            if event["type"] == "message.completed"
+        ]
+    ) == 1
+
     # Live SDK content blocks are dataclasses whose asdict form has no "type"
     # key. Shape classification must map them like typed blocks instead of
     # rendering placeholder "generic" tool rows.

@@ -6,7 +6,15 @@ launch failures. Replace `N` with the worker number.
 ## macOS app logs
 
 Terminal Relay writes structured events to the macOS unified log under the
-`com.mpieras.TerminalRelay` subsystem. Recent events:
+`com.mpieras.TerminalRelay` subsystem. The unified log is system-managed and
+size-bounded; the app keeps no log files of its own, so nothing can overgrow.
+Right after hitting a problem, capture the window that contains it:
+
+```bash
+./Scripts/collect-diagnostics.sh 1h
+```
+
+which writes a timestamped file to the Desktop, or query directly:
 
 ```bash
 /usr/bin/log show --last 1h --style compact --info \
@@ -28,6 +36,12 @@ The categories are:
   results.
 - `terminal-session`: native-chat and terminal attachment start, reconnect,
   sanitized failure, and exit.
+- `chat-transcript`: one line per transcript envelope that creates an item or
+  changes lifecycle state — event type, sequence, item and turn IDs, and item
+  counts, never message text. Duplicated, missing, or misordered rows trace
+  back to the exact event here (e.g. a `message.completed` whose `item=` does
+  not match the id its deltas streamed under).
+- `conversation-scroll`: scroll-state transitions and pin commands.
 
 The app deliberately does not log authorization URL or code contents,
 credentials, native-chat records, file previews, secret answers, or terminal
