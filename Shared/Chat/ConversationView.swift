@@ -957,6 +957,22 @@ struct ConversationView: View {
                 coordinator.start()
             }
         }
+        .onChange(of: isPendingTurnGap, initial: true) { _, isPending in
+            pendingTurnRevealTask?.cancel()
+            pendingTurnRevealTask = nil
+            if isPending {
+                // Envelope boundaries (reasoning sealed, tool about to
+                // start) pass through a pending gap for one publish; only a
+                // gap that persists is the model actually thinking.
+                pendingTurnRevealTask = Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 250_000_000)
+                    guard !Task.isCancelled else { return }
+                    showsPendingTurnIndicator = true
+                }
+            } else {
+                showsPendingTurnIndicator = false
+            }
+        }
         .onDisappear {
             if startsCoordinator {
                 Task {
@@ -1003,6 +1019,15 @@ struct ConversationView: View {
     private static let transcriptWindowStep = 150
 
     @State private var firstVisibleItemID: String?
+    @State private var showsPendingTurnIndicator = false
+    @State private var pendingTurnRevealTask: Task<Void, Never>?
+
+    private var isPendingTurnGap: Bool {
+        PendingTurnIndicator.showsPendingTurn(
+            turnState: store.state.turnState,
+            lastItem: store.state.items.last
+        )
+    }
 
     #if os(macOS)
     /// False until the AppKit transcript has applied content and completed
@@ -1043,12 +1068,7 @@ struct ConversationView: View {
         hasher.combine(store.isLoadingOlderHistory)
         hasher.combine(store.state.hasOlderHistory)
         hasher.combine(store.state.didTruncateHistory)
-        hasher.combine(
-            PendingTurnIndicator.showsPendingTurn(
-                turnState: store.state.turnState,
-                lastItem: store.state.items.last
-            )
-        )
+        hasher.combine(showsPendingTurnIndicator)
         hasher.combine(colorScheme)
         hasher.combine(dynamicTypeSize)
         return hasher.finalize()
@@ -1130,10 +1150,7 @@ struct ConversationView: View {
             )
         }
         macTranscriptSectionCache.retain(itemIDs: retainedItemIDs)
-        if PendingTurnIndicator.showsPendingTurn(
-            turnState: store.state.turnState,
-            lastItem: store.state.items.last
-        ) {
+        if showsPendingTurnIndicator {
             sections.append(
                 MacConversationTableSection(
                     id: "pending-turn",
@@ -1358,10 +1375,7 @@ struct ConversationView: View {
                         .accessibilityIdentifier("conversation.item.\(item.id)")
                 }
 
-                if PendingTurnIndicator.showsPendingTurn(
-                    turnState: store.state.turnState,
-                    lastItem: store.state.items.last
-                ) {
+                if showsPendingTurnIndicator {
                     PendingTurnIndicator()
                         .id("pending-turn")
                         .accessibilityIdentifier("conversation.pending-turn")

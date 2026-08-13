@@ -1897,6 +1897,108 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
         ]
     ) == 1
 
+    # Thought text streams live into one reasoning row: thinking deltas share
+    # a stable item id, the completed thinking block adopts it byte-for-byte,
+    # and the completed text still lands on its own streamed index.
+    thinking_start = StreamEvent()
+    thinking_start.uuid = "33333333-3333-4333-8333-333333333333"
+    thinking_start.session_id = THREAD_ID
+    thinking_start.event = {"type": "message_start", "message": {"id": "msg_3"}}
+    first_thinking = StreamEvent()
+    first_thinking.uuid = "34343434-3434-4434-8434-343434343434"
+    first_thinking.session_id = THREAD_ID
+    first_thinking.event = {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "thinking_delta", "thinking": "Let me "},
+    }
+    second_thinking = StreamEvent()
+    second_thinking.uuid = "35353535-3535-4535-8535-353535353535"
+    second_thinking.session_id = THREAD_ID
+    second_thinking.event = {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "thinking_delta", "thinking": "think."},
+    }
+    signature_fragment = StreamEvent()
+    signature_fragment.uuid = "36363636-3636-4636-8636-363636363636"
+    signature_fragment.session_id = THREAD_ID
+    signature_fragment.event = {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "signature_delta", "signature": "sig-2"},
+    }
+    thinking_text_delta = StreamEvent()
+    thinking_text_delta.uuid = "37373737-3737-4737-8737-373737373737"
+    thinking_text_delta.session_id = THREAD_ID
+    thinking_text_delta.event = {
+        "type": "content_block_delta",
+        "index": 1,
+        "delta": {"type": "text_delta", "text": "Answer."},
+    }
+    thinking_assistant = AssistantMessage()
+    thinking_assistant.uuid = "38383838-3838-4838-8838-383838383838"
+    thinking_assistant.content = [
+        {"thinking": "Let me think.", "signature": "sig-2"},
+        {"text": "Answer."},
+    ]
+    events_before_thinking = len(events)
+    for value in (
+        thinking_start,
+        first_thinking,
+        second_thinking,
+        signature_fragment,
+        thinking_text_delta,
+        thinking_assistant,
+    ):
+        await received.put(value)
+    for _ in range(100):
+        if any(
+            event["type"] == "message.completed"
+            and event["payload"]["text"] == "Answer."
+            for event in events[events_before_thinking:]
+        ):
+            break
+        await asyncio.sleep(0.01)
+    thinking_events = events[events_before_thinking:]
+    reasoning_delta_ids = {
+        event["itemId"]
+        for event in thinking_events
+        if event["type"] == "reasoning.delta"
+    }
+    assert len(reasoning_delta_ids) == 1
+    assert "".join(
+        event["payload"]["text"]
+        for event in thinking_events
+        if event["type"] == "reasoning.delta"
+    ) == "Let me think."
+    reasoning_completed = next(
+        event
+        for event in thinking_events
+        if event["type"] == "reasoning.completed"
+    )
+    assert reasoning_completed["itemId"] in reasoning_delta_ids
+    assert reasoning_completed["payload"]["text"] == "Let me think."
+    thinking_completed_message = next(
+        event
+        for event in thinking_events
+        if event["type"] == "message.completed"
+    )
+    thinking_message_delta_ids = {
+        event["itemId"]
+        for event in thinking_events
+        if event["type"] == "message.delta"
+    }
+    assert thinking_completed_message["itemId"] in thinking_message_delta_ids
+    # Reasoning and text rows share the streamed message uuid at their own
+    # block indexes.
+    assert reasoning_completed["itemId"].endswith(":0")
+    assert thinking_completed_message["itemId"].endswith(":1")
+    assert reasoning_completed["itemId"].split(":")[0] == (
+        thinking_completed_message["itemId"].split(":")[0]
+    )
+    assert adapter.partial_thinking == {}
+
     # Live SDK content blocks are dataclasses whose asdict form has no "type"
     # key. Shape classification must map them like typed blocks instead of
     # rendering placeholder "generic" tool rows.

@@ -2634,6 +2634,7 @@ class ClaudeAdapter(ProviderAdapter):
         self.turn_user_echo: str | None = None
         self.pending_callbacks: dict[str, tuple[asyncio.Future[Any], dict[str, Any]]] = {}
         self.partial_blocks: dict[tuple[str, int], str] = {}
+        self.partial_thinking: dict[tuple[str, int], str] = {}
         self.active_stream_message: str | None = None
         self.tool_items: dict[str, str] = {}
         self._sdk: Any = None
@@ -2934,6 +2935,7 @@ class ClaudeAdapter(ProviderAdapter):
                 self.client = candidate
                 self.connection_generation = new_uuid()
                 self.partial_blocks.clear()
+                self.partial_thinking.clear()
                 self.tool_items.clear()
                 self.active_stream_message = None
                 # Replace every client's transcript with a fresh generation
@@ -3006,6 +3008,7 @@ class ClaudeAdapter(ProviderAdapter):
             index = event.get("index", 0) if isinstance(event, dict) else 0
             delta = event.get("delta", {}) if isinstance(event, dict) else {}
             text = delta.get("text") if isinstance(delta, dict) else None
+            thinking = delta.get("thinking") if isinstance(delta, dict) else None
             if isinstance(text, str):
                 if self.active_stream_message is None:
                     self.active_stream_message = new_uuid()
@@ -3020,10 +3023,29 @@ class ClaudeAdapter(ProviderAdapter):
                     turn_id=self.active_turn,
                     item_id=f"{key[0]}:{key[1]}",
                 )
+            elif isinstance(thinking, str) and thinking:
+                # Thought text streams into a live reasoning row exactly like
+                # message text; signature deltas stay metadata-only.
+                if self.active_stream_message is None:
+                    self.active_stream_message = new_uuid()
+                key = (
+                    self.active_stream_message,
+                    int(index) if isinstance(index, int) else 0,
+                )
+                self.partial_thinking[key] = (
+                    self.partial_thinking.get(key, "") + thinking
+                )
+                await self.emit(
+                    "reasoning.delta",
+                    {"text": thinking, "blockIndex": key[1]},
+                    turn_id=self.active_turn,
+                    item_id=f"{key[0]}:{key[1]}",
+                )
             return
         if class_name == "AssistantMessage":
             identity = value.get("uuid") or value.get("message_id")
             streamed_text_indexes: list[int] = []
+            streamed_thinking_indexes: list[int] = []
             if not value.get("parent_tool_use_id"):
                 stream_identity = self.active_stream_message
                 self.active_stream_message = None
@@ -3036,19 +3058,31 @@ class ClaudeAdapter(ProviderAdapter):
                     ]
                     # Stream deltas key items by the API block index, but the
                     # completed content list may omit blocks (signature-only
-                    # thinking), shifting list positions. Text completions
-                    # must reuse the streamed indexes or the completed text
-                    # lands beside the streamed row instead of replacing it.
+                    # thinking), shifting list positions. Text and thinking
+                    # completions must reuse the streamed indexes or the
+                    # completed block lands beside the streamed row instead
+                    # of replacing it.
                     streamed_text_indexes = sorted(
                         key[1] for key in streamed_keys
                     )
                     for key in streamed_keys:
                         self.partial_blocks.pop(key, None)
+                    streamed_thinking_keys = [
+                        key
+                        for key in self.partial_thinking
+                        if key[0] == stream_identity
+                    ]
+                    streamed_thinking_indexes = sorted(
+                        key[1] for key in streamed_thinking_keys
+                    )
+                    for key in streamed_thinking_keys:
+                        self.partial_thinking.pop(key, None)
             await self._map_claude_content(
                 value,
                 "assistant",
                 str(identity or new_uuid()),
                 streamed_text_indexes=streamed_text_indexes,
+                streamed_thinking_indexes=streamed_thinking_indexes,
             )
             return
         if class_name == "UserMessage":
@@ -3102,6 +3136,7 @@ class ClaudeAdapter(ProviderAdapter):
         message_uuid: str,
         client_user_message_id: str | None = None,
         streamed_text_indexes: list[int] | None = None,
+        streamed_thinking_indexes: list[int] | None = None,
     ) -> None:
         assert self.emit is not None
         content = value.get("content", [])
@@ -3110,6 +3145,7 @@ class ClaudeAdapter(ProviderAdapter):
         if not isinstance(content, list):
             content = []
         remaining_stream_indexes = list(streamed_text_indexes or [])
+        remaining_thinking_indexes = list(streamed_thinking_indexes or [])
         for index, block in enumerate(content):
             if not isinstance(block, dict):
                 continue
@@ -3131,6 +3167,9 @@ class ClaudeAdapter(ProviderAdapter):
                 block_index = index
                 if block_type == "text" and remaining_stream_indexes:
                     block_index = remaining_stream_indexes.pop(0)
+                    item_id = f"{message_uuid}:{block_index}"
+                elif block_type == "thinking" and remaining_thinking_indexes:
+                    block_index = remaining_thinking_indexes.pop(0)
                     item_id = f"{message_uuid}:{block_index}"
                 payload: dict[str, Any] = {
                     "role": role,
