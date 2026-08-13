@@ -2560,11 +2560,61 @@ private final class MacConversationHostedCell: MacConversationReusableCell {
     }
 }
 
+/// Borderless icon button that paints a rounded grey wash while the pointer
+/// is over it, matching the composer controls' hover affordance.
+@MainActor
+private final class MacConversationHoverIconButton: NSButton {
+    private var isPointerInside = false
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas where area.owner === self {
+            removeTrackingArea(area)
+        }
+        addTrackingArea(
+            NSTrackingArea(
+                rect: .zero,
+                options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                owner: self,
+                userInfo: nil
+            )
+        )
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        isPointerInside = true
+        refreshHoverBackground()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        isPointerInside = false
+        refreshHoverBackground()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refreshHoverBackground()
+    }
+
+    private func refreshHoverBackground() {
+        wantsLayer = true
+        layer?.cornerRadius = 5
+        let color = isPointerInside
+            ? NSColor.labelColor.withAlphaComponent(0.08)
+            : .clear
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = color.cgColor
+        }
+    }
+}
+
 @MainActor
 private final class MacConversationNativeFooterCell: MacConversationReusableCell {
     private let layoutContainer = NSView(frame: .zero)
     private let controls = NSStackView(frame: .zero)
-    private let copyButton = NSButton(frame: .zero)
+    private let copyButton = MacConversationHoverIconButton(frame: .zero)
     private let timestampLabel = NSTextField(labelWithString: "")
     private var topConstraint: NSLayoutConstraint!
     private var bottomConstraint: NSLayoutConstraint!

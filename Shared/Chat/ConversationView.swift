@@ -51,6 +51,7 @@ enum MacTranscriptRow: MacConversationTableRow {
     case history(id: String, revision: UInt64)
     case item(TranscriptRowProjection, isExpanded: Bool, copiedItemID: String?)
     case messageFooter(MacMessageFooter, revision: UInt64)
+    case pendingTurn
     case approval(ApprovalRequest, revision: UInt64)
     case question(QuestionRequest, revision: UInt64)
 
@@ -59,6 +60,7 @@ enum MacTranscriptRow: MacConversationTableRow {
         case .history(let id, _): id
         case .item(let projection, _, _): projection.id
         case .messageFooter(let footer, _): footer.id
+        case .pendingTurn: "pending-turn"
         case .approval(let approval, _): "approval:\(approval.id)"
         case .question(let question, _): "question:\(question.id)"
         }
@@ -69,6 +71,8 @@ enum MacTranscriptRow: MacConversationTableRow {
         case .history(_, let revision), .messageFooter(_, let revision),
              .approval(_, let revision), .question(_, let revision):
             return revision
+        case .pendingTurn:
+            return 0
         case .item(let projection, let isExpanded, let copiedItemID):
             var revision = projection.contentRevision &* 1099511628211
             revision ^= isExpanded ? 1 : 0
@@ -85,6 +89,7 @@ enum MacTranscriptRow: MacConversationTableRow {
         case .history: "transcript.history"
         case .item(let projection, _, _): "transcript.\(projection.kind.rawValue)"
         case .messageFooter: "transcript.message-footer"
+        case .pendingTurn: "transcript.pending-turn"
         case .approval: "transcript.approval"
         case .question: "transcript.question"
         }
@@ -1038,6 +1043,12 @@ struct ConversationView: View {
         hasher.combine(store.isLoadingOlderHistory)
         hasher.combine(store.state.hasOlderHistory)
         hasher.combine(store.state.didTruncateHistory)
+        hasher.combine(
+            PendingTurnIndicator.showsPendingTurn(
+                turnState: store.state.turnState,
+                lastItem: store.state.items.last
+            )
+        )
         hasher.combine(colorScheme)
         hasher.combine(dynamicTypeSize)
         return hasher.finalize()
@@ -1119,6 +1130,18 @@ struct ConversationView: View {
             )
         }
         macTranscriptSectionCache.retain(itemIDs: retainedItemIDs)
+        if PendingTurnIndicator.showsPendingTurn(
+            turnState: store.state.turnState,
+            lastItem: store.state.items.last
+        ) {
+            sections.append(
+                MacConversationTableSection(
+                    id: "pending-turn",
+                    revision: 0,
+                    rows: [.pendingTurn]
+                )
+            )
+        }
         sections.append(contentsOf: store.state.approvals.map { approval in
             var hasher = Hasher()
             hasher.combine(approval.id)
@@ -1278,6 +1301,9 @@ struct ConversationView: View {
                     .accessibilityIdentifier(
                         "conversation.item.\(footer.itemID).footer"
                     )
+            case .pendingTurn:
+                PendingTurnIndicator()
+                    .accessibilityIdentifier("conversation.pending-turn")
             case .approval(let approval, _):
                 ApprovalCard(
                     approval: approval,
@@ -1330,6 +1356,15 @@ struct ConversationView: View {
                     timelineView(for: item)
                         .id(item.id)
                         .accessibilityIdentifier("conversation.item.\(item.id)")
+                }
+
+                if PendingTurnIndicator.showsPendingTurn(
+                    turnState: store.state.turnState,
+                    lastItem: store.state.items.last
+                ) {
+                    PendingTurnIndicator()
+                        .id("pending-turn")
+                        .accessibilityIdentifier("conversation.pending-turn")
                 }
 
                 ForEach(store.state.approvals) { approval in
@@ -2201,6 +2236,46 @@ private struct StreamingIndicator: View {
         .font(.caption)
         .foregroundStyle(.secondary)
         .accessibilityLabel("Assistant is responding")
+    }
+}
+
+/// Shown at the transcript tail while a turn is running but nothing is
+/// visibly streaming yet — the model is thinking (Claude emits no events
+/// during extended thinking) or between tool results and its next text.
+struct PendingTurnIndicator: View {
+    var body: some View {
+        HStack(spacing: 7) {
+            ProgressView()
+                .controlSize(.mini)
+            Text("Thinking…")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, ChatInteractionTargetLayout.compactControlVerticalPadding)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Assistant is thinking")
+    }
+
+    /// The indicator fills only the gaps where no transcript row shows
+    /// activity: an active turn whose tail item is neither streaming text or
+    /// reasoning nor a running tool. A completed assistant message at the
+    /// tail means the reply just landed and the turn is sealing — showing
+    /// "Thinking…" there would flash on every turn end.
+    static func showsPendingTurn(
+        turnState: TurnState,
+        lastItem: ConversationItem?
+    ) -> Bool {
+        guard turnState == .running else { return false }
+        switch lastItem {
+        case .message(let message):
+            return message.role == .user && !message.isStreaming
+        case .reasoning(let reasoning):
+            return !reasoning.isStreaming
+        case .tool(let tool):
+            return tool.status != .running && tool.status != .pending
+        case .diff, .plan, .generic, nil:
+            return true
+        }
     }
 }
 

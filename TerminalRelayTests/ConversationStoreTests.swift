@@ -914,6 +914,52 @@ final class ConversationStoreTests: XCTestCase {
         )
     }
 
+    func testPendingTurnIndicatorFillsOnlyInactiveGaps() {
+        func shows(_ turnState: TurnState, _ item: ConversationItem?) -> Bool {
+            PendingTurnIndicator.showsPendingTurn(
+                turnState: turnState,
+                lastItem: item
+            )
+        }
+        let userMessage = ConversationItem.message(
+            ChatMessage(id: "u", role: .user, text: "hello")
+        )
+        var streamingReply = ChatMessage(id: "a", role: .assistant, text: "…")
+        streamingReply.isStreaming = true
+        var completedReply = streamingReply
+        completedReply.complete(text: "done")
+        let runningTool = ConversationItem.tool(
+            ToolActivity(
+                id: "t", turnID: nil, kind: .shell, title: "Run",
+                status: .running, input: nil, output: nil, errorMessage: nil,
+                durationMilliseconds: nil, exitCode: nil, occurredAt: nil,
+                isTruncated: false, originalByteCount: nil
+            )
+        )
+        var completedTool = runningTool
+        if case .tool(var tool) = completedTool {
+            tool.status = .completed
+            completedTool = .tool(tool)
+        }
+
+        // The model is thinking: turn active with nothing streaming yet, or
+        // after a tool finished and before the next block.
+        XCTAssertTrue(shows(.running, nil))
+        XCTAssertTrue(shows(.running, userMessage))
+        XCTAssertTrue(shows(.running, completedTool))
+
+        // Something already shows activity, or the turn is over.
+        XCTAssertFalse(shows(.running, .message(streamingReply)))
+        XCTAssertFalse(
+            shows(.running, .message(completedReply)),
+            "A sealed reply means the turn is ending, not thinking."
+        )
+        XCTAssertFalse(shows(.running, runningTool))
+        XCTAssertFalse(shows(.completed, userMessage))
+        XCTAssertFalse(shows(.awaitingApproval, userMessage))
+        XCTAssertFalse(shows(.idle, nil))
+    }
+
     func testInvalidPreparedTranscriptAuthorityDoesNotAdvanceSequence() throws {
         let events: [ChatEnvelope] = [
             ChatTestFixtures.event(

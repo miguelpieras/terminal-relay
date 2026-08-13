@@ -26,6 +26,8 @@ struct AgentComposerView: View {
     @State private var pasteNotice: String?
     @State private var isEditorFocused = false
     @State private var isShowingModelPanel = false
+    @State private var isModelControlHovered = false
+    @State private var isAttachControlHovered = false
     @State private var selectedModelSection: ModelPanelSection?
     @State private var pendingNativeSubmissions: [PendingNativeSubmission] = []
     @State private var nativeSubmissionInFlightID: UUID?
@@ -42,6 +44,10 @@ struct AgentComposerView: View {
             supportsUltra: false
         )
     ]
+
+    private var canAttach: Bool {
+        session.status == .running && nativeSubmissionInFlightID == nil
+    }
 
     private var canSend: Bool {
         AgentComposerSendPolicy.canSend(
@@ -119,10 +125,17 @@ struct AgentComposerView: View {
                     Image(systemName: "paperclip")
                         .font(.system(size: 13, weight: .medium))
                         .frame(width: 30, height: 30)
+                        .background(
+                            Color.primary.opacity(
+                                isAttachControlHovered && canAttach ? 0.08 : 0
+                            ),
+                            in: Circle()
+                        )
                         .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
-                .disabled(session.status != .running || nativeSubmissionInFlightID != nil)
+                .onHover { isAttachControlHovered = $0 }
+                .disabled(!canAttach)
                 .accessibilityLabel("Attach files")
                 .help("Attach files")
 
@@ -294,7 +307,13 @@ struct AgentComposerView: View {
             .padding(.horizontal, 10)
             .frame(height: 30)
             .background(
-                Color.white.opacity(isShowingModelPanel ? 0.1 : 0),
+                Color.primary.opacity(
+                    isShowingModelPanel
+                        ? 0.1
+                        : (isModelControlHovered && session.status == .running
+                            ? 0.08
+                            : 0)
+                ),
                 in: Capsule()
             )
             .contentShape(Capsule())
@@ -302,6 +321,7 @@ struct AgentComposerView: View {
         .buttonStyle(.plain)
         .textSelection(.disabled)
         .onHover { isHovering in
+            isModelControlHovered = isHovering
             modelPanelClickMonitor.isPointerInsideControl = isHovering
             (isHovering ? NSCursor.pointingHand : NSCursor.arrow).set()
         }
