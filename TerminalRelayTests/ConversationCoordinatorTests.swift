@@ -1024,7 +1024,9 @@ final class ConversationCoordinatorTests: XCTestCase {
     func testConnectingWatchdogFailsAnAttachThatNeverProgresses() async {
         // The broker heartbeats "connecting" while a provider resume is in
         // flight, so a hung resume keeps the transport alive with no
-        // disconnect for the retry loop to react to.
+        // disconnect for the retry loop to react to. Because events ARE
+        // arriving, this is the wedged-broker case: the watchdog must wait
+        // out the full connecting grace, then fail honestly.
         let transport = ChatFixtureTransport(
             initialEvents: [Self.hello(sequence: 1, connectionState: "connecting")]
         )
@@ -1037,11 +1039,76 @@ final class ConversationCoordinatorTests: XCTestCase {
                 maximumAutomaticRetries: 0,
                 initialDelayNanoseconds: 0,
                 maximumDelayNanoseconds: 0,
-                connectingGraceNanoseconds: 50_000_000
+                attachResponseGraceNanoseconds: 10_000_000,
+                connectingGraceNanoseconds: 200_000_000
             )
         )
         coordinator.start()
+        // Probe strictly between the two graces: with envelopes arriving,
+        // the banner must wait for the FULL connecting grace — firing at the
+        // short response grace would reintroduce the terminal-failure-on-
+        // slow-resume bug this watchdog split exists to prevent.
+        try? await Task.sleep(nanoseconds: 60_000_000)
+        XCTAssertEqual(store.state.connectionState, .connecting)
+        XCTAssertNil(store.state.lastErrorMessage)
         await waitUntil { store.state.connectionState == .failed }
+        XCTAssertNotNil(store.state.lastErrorMessage)
+        await coordinator.detach()
+    }
+
+    func testAttachThatDeliversNothingReconnectsSilently() async {
+        // A transport reports "connected" once its process spawns and the
+        // attach write reaches a local pipe — neither proves the worker got
+        // anything. When no envelope at all comes back, the watchdog must
+        // tear the transport down and reconnect through the retry loop
+        // instead of surfacing a failure: a fresh connection almost always
+        // succeeds immediately.
+        let attachAttempts = AttachAttemptCounter()
+        let hello = Self.hello(sequence: 1)
+        let transport = ChatFixtureTransport { command in
+            guard command.type == "session.attach" else { return [] }
+            return attachAttempts.next() >= 2 ? [hello] : []
+        }
+        let store = ConversationStore()
+        let coordinator = ConversationCoordinator(
+            store: store,
+            transport: transport,
+            identity: ChatTestFixtures.identity,
+            retryPolicy: ChatRetryPolicy(
+                maximumAutomaticRetries: 2,
+                initialDelayNanoseconds: 1_000_000,
+                maximumDelayNanoseconds: 1_000_000,
+                attachResponseGraceNanoseconds: 20_000_000,
+                connectingGraceNanoseconds: 10_000_000_000
+            )
+        )
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+        XCTAssertNil(store.state.lastErrorMessage)
+        await coordinator.detach()
+    }
+
+    func testAttachesThatDeliverNothingExhaustTheRetryBudget() async {
+        // Undelivered attaches must consume the retry budget — the send
+        // "succeeding" into a local pipe must not refresh it — so a truly
+        // unreachable worker still ends in an honest retryable failure
+        // instead of reconnecting forever.
+        let transport = ChatFixtureTransport()
+        let store = ConversationStore()
+        let coordinator = ConversationCoordinator(
+            store: store,
+            transport: transport,
+            identity: ChatTestFixtures.identity,
+            retryPolicy: ChatRetryPolicy(
+                maximumAutomaticRetries: 1,
+                initialDelayNanoseconds: 1_000_000,
+                maximumDelayNanoseconds: 1_000_000,
+                attachResponseGraceNanoseconds: 20_000_000,
+                connectingGraceNanoseconds: 10_000_000_000
+            )
+        )
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .offlineAgentRunning }
         XCTAssertNotNil(store.state.lastErrorMessage)
         await coordinator.detach()
     }
@@ -1803,6 +1870,18 @@ final class ConversationCoordinatorTests: XCTestCase {
             file: file,
             line: line
         )
+    }
+
+    private final class AttachAttemptCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+
+        func next() -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            count += 1
+            return count
+        }
     }
 
     private func makeConnectedTransport() -> ChatFixtureTransport {

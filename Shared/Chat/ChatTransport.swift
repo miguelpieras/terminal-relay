@@ -40,8 +40,8 @@ extension ChatTransport {
 actor ChatFixtureTransport: ChatTransport {
     typealias CommandHandler = @Sendable (ChatEnvelope) -> [ChatEnvelope]
 
-    private let stream: AsyncStream<ChatTransportEvent>
-    private let continuation: AsyncStream<ChatTransportEvent>.Continuation
+    private var stream: AsyncStream<ChatTransportEvent>
+    private var continuation: AsyncStream<ChatTransportEvent>.Continuation
     private let initialEvents: [ChatEnvelope]
     private let commandHandler: CommandHandler
     private var sent: [ChatEnvelope] = []
@@ -80,6 +80,13 @@ actor ChatFixtureTransport: ChatTransport {
         }
         guard isConnected else { return }
         isConnected = false
+        // Real transports finish their event stream on a requested disconnect
+        // (with no `.disconnected` event) and serve a fresh stream on the next
+        // connect; the coordinator's silent-reconnect path depends on that.
+        continuation.finish()
+        let pair = AsyncStream.makeStream(of: ChatTransportEvent.self)
+        stream = pair.stream
+        continuation = pair.continuation
     }
 
     func events() async -> AsyncStream<ChatTransportEvent> {

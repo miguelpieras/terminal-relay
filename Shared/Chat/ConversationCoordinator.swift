@@ -4,11 +4,20 @@ struct ChatRetryPolicy: Equatable, Sendable {
     let maximumAutomaticRetries: Int
     let initialDelayNanoseconds: UInt64
     let maximumDelayNanoseconds: UInt64
-    // How long an attached conversation may sit in "connecting" before the
-    // attach is declared failed. The broker heartbeats "connecting" while a
-    // provider resume is in flight, so a hung resume keeps the transport
-    // alive indefinitely — this deadline is the only escape.
-    var connectingGraceNanoseconds: UInt64 = 45_000_000_000
+    // How long a sent attach may wait for its first inbound envelope before
+    // the transport is presumed undelivered. A transport reports "connected"
+    // once its process spawns and accepts writes into a local pipe, so a sent
+    // attach proves nothing about the worker — when nothing at all comes
+    // back, the coordinator tears the transport down and reconnects through
+    // the normal retry loop instead of surfacing a failure. A healthy attach
+    // answers in under a second.
+    var attachResponseGraceNanoseconds: UInt64 = 10_000_000_000
+    // How long an attached conversation may sit in "connecting" while the
+    // transport IS delivering events (heartbeats, the early-ready placeholder
+    // snapshot). The broker aborts a hung resume itself after 120 seconds and
+    // reports a terminal session.ended, so this fires only when the broker is
+    // wedged past its own deadline — the one case Retry cannot fix.
+    var connectingGraceNanoseconds: UInt64 = 150_000_000_000
 
     static let standard = ChatRetryPolicy(
         maximumAutomaticRetries: 5,
@@ -116,6 +125,7 @@ final class ConversationCoordinator {
     private var attachGeneration: UInt64 = 0
     private var shouldStayConnected = false
     private var isAttached = false
+    private var hasReceivedEnvelopeSinceAttach = false
     private var needsFreshSnapshot = false
     private var pendingInteractionByCommand: [String: String] = [:]
     private var pendingTurnByCommand: [String: PendingTurn] = [:]
@@ -699,13 +709,18 @@ final class ConversationCoordinator {
                 guard canContinueLifecycle(epoch) else { return }
                 isAttached = true
                 needsFreshSnapshot = false
-                retryCount = 0
                 startConnectingWatchdog(lifecycleEpoch: epoch)
 
                 eventLoop: for await event in stream {
                     guard canContinueLifecycle(epoch) else { break eventLoop }
                     switch event {
                     case .envelope(let envelope):
+                        // Only received traffic refreshes the retry budget.
+                        // A sent attach merely reached a local pipe; if it
+                        // reset the budget, a transport that spawns but never
+                        // delivers would be reconnected forever.
+                        retryCount = 0
+                        hasReceivedEnvelopeSinceAttach = true
                         if await apply(envelope, lifecycleEpoch: epoch) {
                             break eventLoop
                         }
@@ -771,17 +786,64 @@ final class ConversationCoordinator {
     private func startConnectingWatchdog(lifecycleEpoch epoch: UInt64) {
         connectingWatchdogTask?.cancel()
         connectingWatchdogTask = nil
+        hasReceivedEnvelopeSinceAttach = false
         let grace = retryPolicy.connectingGraceNanoseconds
         guard grace > 0 else { return }
+        // A zero response grace disables phase one: the watchdog then only
+        // fires the terminal check at the full connecting grace.
+        let responseGrace = retryPolicy.attachResponseGraceNanoseconds > 0
+            ? min(retryPolicy.attachResponseGraceNanoseconds, grace)
+            : grace
         attachGeneration &+= 1
         let generation = attachGeneration
         connectingWatchdogTask = Task { [weak self] in
-            guard (try? await Task.sleep(nanoseconds: grace)) != nil else { return }
-            await self?.handleConnectingWatchdogExpiry(
+            if responseGrace > 0 {
+                guard (try? await Task.sleep(nanoseconds: responseGrace)) != nil
+                else { return }
+            }
+            guard let self else { return }
+            if responseGrace < grace {
+                guard await self.shouldKeepWaitingForConnecting(
+                    lifecycleEpoch: epoch,
+                    attachGeneration: generation
+                ) else { return }
+                guard (try? await Task.sleep(
+                    nanoseconds: grace - responseGrace
+                )) != nil else { return }
+            }
+            await self.handleConnectingWatchdogExpiry(
                 lifecycleEpoch: epoch,
                 attachGeneration: generation
             )
         }
+    }
+
+    /// Phase one of the attach watchdog. Returns whether a still-"connecting"
+    /// attach has earned the long grace: envelopes are arriving, so the
+    /// transport works and the broker is genuinely mid-resume. When nothing at
+    /// all has come back, the transport is torn down instead — the event loop
+    /// then reconnects through the normal retry path, because a sent attach
+    /// only proves the bytes reached a local pipe, and a fresh connection
+    /// almost always succeeds immediately.
+    private func shouldKeepWaitingForConnecting(
+        lifecycleEpoch epoch: UInt64,
+        attachGeneration generation: UInt64
+    ) async -> Bool {
+        guard canContinueLifecycle(epoch),
+              attachGeneration == generation,
+              isAttached,
+              store.workingConnectionState == .connecting else {
+            return false
+        }
+        guard !hasReceivedEnvelopeSinceAttach else { return true }
+        isAttached = false
+        connectingWatchdogTask = nil
+        // Commands sent into the doomed pipe died with it: clear interaction
+        // and history latches exactly like every other reconnect path, or a
+        // tap during the dead window leaves its control disabled forever.
+        resetReconnectScopedState()
+        await transport.disconnect()
+        return false
     }
 
     private func handleConnectingWatchdogExpiry(
