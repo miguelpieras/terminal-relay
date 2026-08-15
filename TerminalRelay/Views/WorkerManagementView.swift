@@ -187,7 +187,7 @@ struct WorkersView: View {
         HStack(alignment: .center, spacing: 11) {
             VStack(alignment: .leading, spacing: 7) {
                 Text(headerTitle)
-                    .font(.system(size: 30, weight: .bold))
+                    .font(.system(size: 26, weight: .bold))
                     .foregroundStyle(WorkersPalette.primary)
 
                 Text(
@@ -195,7 +195,7 @@ struct WorkersView: View {
                         ? "Accounts, capacity, and linked apps across every remote worker."
                         : "SSH connection and remote agent accounts"
                 )
-                .font(.system(size: 16))
+                .font(.system(size: 15))
                 .foregroundStyle(WorkersPalette.secondary)
             }
 
@@ -212,10 +212,10 @@ struct WorkersView: View {
                                 .tint(WorkersPalette.primary)
                         } else {
                             Image(systemName: "arrow.clockwise")
-                                .font(.system(size: 14, weight: .medium))
+                                .font(.system(size: 13, weight: .medium))
                         }
                         Text("Refresh")
-                            .font(.system(size: 16, weight: .medium))
+                            .font(.system(size: 15, weight: .medium))
                     }
                     .foregroundStyle(WorkersPalette.primary)
                     .padding(.horizontal, 18)
@@ -238,9 +238,9 @@ struct WorkersView: View {
                 } label: {
                     HStack(spacing: 9) {
                         Image(systemName: "plus")
-                            .font(.system(size: 16, weight: .regular))
+                            .font(.system(size: 15, weight: .regular))
                         Text("Add worker")
-                            .font(.system(size: 16, weight: .medium))
+                            .font(.system(size: 15, weight: .medium))
                     }
                     .foregroundStyle(.white)
                     .padding(.horizontal, 18)
@@ -545,7 +545,7 @@ private struct SummaryStat: View {
                 switch marker {
                 case .systemImage(let name):
                     Image(systemName: name)
-                        .font(.system(size: 18, weight: .regular))
+                        .font(.system(size: 17, weight: .regular))
                         .foregroundStyle(WorkersPalette.secondary)
                 case .dot(let color):
                     Circle()
@@ -557,13 +557,13 @@ private struct SummaryStat: View {
 
             VStack(alignment: .leading, spacing: 6) {
                 Text(value)
-                    .font(.system(size: 23, weight: .semibold))
+                    .font(.system(size: 22, weight: .semibold))
                     .monospacedDigit()
                     .foregroundStyle(WorkersPalette.primary)
                     .lineLimit(1)
 
                 Text(label)
-                    .font(.system(size: 14))
+                    .font(.system(size: 13))
                     .foregroundStyle(WorkersPalette.secondary)
                     .lineLimit(1)
             }
@@ -787,7 +787,7 @@ private struct WorkerIdentityColumn: View {
     var body: some View {
         HStack(alignment: .top, spacing: 14) {
             Image(systemName: "server.rack")
-                .font(.system(size: 16, weight: .regular))
+                .font(.system(size: 15, weight: .regular))
                 .foregroundStyle(WorkersPalette.secondary)
                 .frame(width: 24, height: 24)
 
@@ -917,7 +917,7 @@ private struct WorkerMetricCell: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Text(title)
-                .font(.system(size: 14))
+                .font(.system(size: 13))
                 .foregroundStyle(WorkersPalette.secondary)
                 .lineLimit(1)
 
@@ -1109,11 +1109,11 @@ private struct WorkerLinkedAppsColumn: View {
         Button(action: onToggle) {
             VStack(alignment: .leading, spacing: 14) {
                 Text("Linked apps")
-                    .font(.system(size: 14))
+                    .font(.system(size: 13))
                     .foregroundStyle(WorkersPalette.secondary)
 
                 Text(linkedAppsTitle)
-                    .font(.system(size: 14))
+                    .font(.system(size: 13))
                     .foregroundStyle(WorkersPalette.secondary)
                     .lineLimit(1)
             }
@@ -1127,7 +1127,7 @@ private struct WorkerLinkedAppsColumn: View {
         .overlay(alignment: .topTrailing) {
             ZStack {
                 Image(systemName: "ellipsis.vertical")
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(WorkersPalette.secondary)
                     .frame(width: 24, height: 24)
                     .allowsHitTesting(false)

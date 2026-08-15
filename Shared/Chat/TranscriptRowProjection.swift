@@ -832,6 +832,10 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
     /// projected separately from body text so a large title/path/type is held
     /// by bounded metadata rows once, never copied into every body tile.
     let metadataText: String?
+    /// Bounded, precomputed single-line headline ("Ran git status") for the
+    /// first tile of a tool item. Derived from the full tool input at
+    /// projection time so the tile itself never carries unbounded input.
+    let compactLine: String?
     let sourceText: String
     let isFirstInItem: Bool
     let isLastInItem: Bool
@@ -855,6 +859,7 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
         let displayItem: ConversationItem
         let sourceText: String
         let metadataText: String?
+        let compactLine: String?
         let accessibilitySummary: String
         let segmentIndex: Int
         let markdownContinuation: TranscriptMarkdownContinuation?
@@ -867,6 +872,7 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
             displayItem: ConversationItem,
             sourceText: String,
             metadataText: String? = nil,
+            compactLine: String? = nil,
             accessibilitySummary: String,
             segmentIndex: Int,
             markdownContinuation: TranscriptMarkdownContinuation?
@@ -878,6 +884,7 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
             self.displayItem = displayItem
             self.sourceText = sourceText
             self.metadataText = metadataText
+            self.compactLine = compactLine
             self.accessibilitySummary = accessibilitySummary
             self.segmentIndex = segmentIndex
             self.markdownContinuation = markdownContinuation
@@ -1194,6 +1201,7 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
                 ),
                 displayItem: draft.displayItem,
                 metadataText: draft.metadataText,
+                compactLine: draft.compactLine,
                 sourceText: draft.sourceText,
                 isFirstInItem: isFirstInItem,
                 isLastInItem: isLastInItem,
@@ -1361,6 +1369,12 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
                 displayItem: .tool(displayed),
                 sourceText: "",
                 metadataText: segment.text,
+                // The compact activity line is derived from the FULL input
+                // here, at projection time, so the tile itself stays bounded.
+                // Both projection paths (full rebuild and first-row fast
+                // path) share this function, keeping the line a pure
+                // function of the item.
+                compactLine: segment.index == 0 ? source.compactHeadline : nil,
                 accessibilitySummary: boundedSummary(source.title),
                 segmentIndex: segment.index,
                 markdownContinuation: nil
@@ -1686,6 +1700,9 @@ struct TranscriptRowProjection: Equatable, Identifiable, Sendable {
         combine(isLastInSection ? "last-section" : "middle-section")
         if let metadataText = draft.metadataText {
             combine(metadataText)
+        }
+        if let compactLine = draft.compactLine {
+            combine(compactLine)
         }
         switch draft.displayItem {
         case .message(let message):

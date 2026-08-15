@@ -819,16 +819,20 @@ struct PreparedMarkdown: Sendable {
     ) -> NSFont {
         let baseSize: CGFloat
         let weight: NSFont.Weight
+        // Heading sizes must match the hosted SwiftUI mapping (title2/
+        // title3/headline = 17/15/13): message rows swap between the two
+        // representations while scrolling, and diverging sizes made the swap
+        // change row heights.
         switch style.headingLevel {
         case 1:
-            baseSize = 20
-            weight = .bold
-        case 2:
             baseSize = 17
             weight = .bold
-        case 3:
+        case 2:
             baseSize = 15
-            weight = .semibold
+            weight = .bold
+        case 3:
+            baseSize = NSFont.systemFontSize
+            weight = .bold
         case .some:
             baseSize = NSFont.systemFontSize
             weight = .semibold
@@ -1670,7 +1674,10 @@ struct CodeBlockView: View {
                 language: language,
                 usesHighlighting: !isStreaming && language?.isEmpty == false
             )
-            .font(.system(.callout, design: .monospaced))
+            // 13pt to match the native TextKit code tiles this block swaps
+            // with at idle; a smaller hosted size made the swap visibly
+            // reflow the row.
+            .font(ChatTypography.monospacedDetail)
             .lineSpacing(3)
             .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)

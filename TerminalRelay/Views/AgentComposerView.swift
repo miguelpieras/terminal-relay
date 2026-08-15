@@ -84,7 +84,7 @@ struct AgentComposerView: View {
 
                 if draft.isEmpty, !isEditorFocused {
                     Text("Ask anything")
-                        .font(.system(size: 14))
+                        .font(.system(size: 13))
                         .foregroundStyle(.tertiary)
                         .padding(.leading, 10)
                         .padding(.top, 5)
@@ -233,7 +233,7 @@ struct AgentComposerView: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 5))
                         } else {
                             Image(systemName: "doc")
-                                .font(.system(size: 16))
+                                .font(.system(size: 15))
                                 .foregroundStyle(.secondary)
                                 .frame(width: 26, height: 26)
                         }
@@ -1396,7 +1396,7 @@ private struct PromptEditor: NSViewRepresentable {
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticTextReplacementEnabled = false
-        textView.font = .systemFont(ofSize: 14)
+        textView.font = .systemFont(ofSize: NSFont.systemFontSize)
         textView.insertionPointColor = .secondaryLabelColor
         textView.textContainerInset = NSSize(width: 5, height: 5)
         textView.minSize = NSSize(width: 0, height: 44)

@@ -605,8 +605,14 @@ final class MacConversationTableViewTests: XCTestCase {
             colorScheme: .light
         ))
         XCTAssertTrue(live.fallbackString.contains("Run command"))
-        XCTAssertTrue(live.fallbackString.contains("Running"))
-        XCTAssertGreaterThanOrEqual(live.minimumTextContainerHeight, 44)
+        XCTAssertEqual(
+            TranscriptTextProjection.logicalLineCount(live.fallbackString),
+            1
+        )
+        XCTAssertEqual(
+            live.minimumTextContainerHeight,
+            ChatTypography.activityLineHeight
+        )
         XCTAssertLessThanOrEqual(
             live.fallbackString.utf8.count,
             TranscriptRowProjection.maximumDisplayBytes
@@ -648,11 +654,14 @@ final class MacConversationTableViewTests: XCTestCase {
         ))
         XCTAssertTrue(live.fallbackString.contains("Run bounded command"))
         XCTAssertFalse(live.fallbackString.contains("hidden line"))
-        XCTAssertLessThanOrEqual(
+        XCTAssertEqual(
             TranscriptTextProjection.logicalLineCount(live.fallbackString),
-            3
+            1
         )
-        XCTAssertGreaterThanOrEqual(live.minimumTextContainerHeight, 44)
+        XCTAssertEqual(
+            live.minimumTextContainerHeight,
+            ChatTypography.activityLineHeight
+        )
     }
 
     func testLiveScrollSemanticHeaderNeverExceedsProjectionLineBudget() throws {
@@ -724,21 +733,16 @@ final class MacConversationTableViewTests: XCTestCase {
             dynamicTypeSize: .large,
             colorScheme: .light
         ))
-        guard case .generic(let displayed) = projection.displayItem else {
-            return XCTFail("Expected bounded generic header")
-        }
-        XCTAssertFalse(displayed.type.isEmpty)
+        // The compact activity line bounds bytes even when the source hides
+        // kilobytes inside one extended grapheme cluster.
+        XCTAssertLessThanOrEqual(live.fallbackString.utf8.count, 256)
         XCTAssertEqual(
-            live.fallbackString,
-            projection.rowText + "\n" + displayed.type
-        )
-        XCTAssertLessThanOrEqual(
-            live.fallbackString.utf8.count,
-            TranscriptRowProjection.maximumDisplayBytes
-        )
-        XCTAssertLessThanOrEqual(
             TranscriptTextProjection.logicalLineCount(live.fallbackString),
-            TranscriptRowProjection.maximumDisplayLines
+            1
+        )
+        XCTAssertEqual(
+            live.minimumTextContainerHeight,
+            ChatTypography.activityLineHeight
         )
     }
 
@@ -780,14 +784,17 @@ final class MacConversationTableViewTests: XCTestCase {
 
         XCTAssertEqual(projection.rowText, title)
         XCTAssertEqual(displayed.type, type)
-        XCTAssertEqual(live.fallbackString, title + "\n" + type)
+        // The compact activity line flattens provider whitespace and control
+        // separators into single spaces and truncates to one bounded line —
+        // exactly what the hosted single-line row renders.
+        XCTAssertTrue(live.fallbackString.hasPrefix("title with controls"))
+        XCTAssertFalse(live.fallbackString.contains("\n"))
+        XCTAssertFalse(live.fallbackString.contains("\t"))
+        XCTAssertTrue(live.fallbackString.hasSuffix("…"))
+        XCTAssertLessThanOrEqual(live.fallbackString.utf8.count, 256)
         XCTAssertEqual(
-            live.fallbackString.utf8.count,
-            TranscriptRowProjection.maximumDisplayBytes
-        )
-        XCTAssertLessThanOrEqual(
             TranscriptTextProjection.logicalLineCount(live.fallbackString),
-            TranscriptRowProjection.maximumDisplayLines
+            1
         )
     }
 

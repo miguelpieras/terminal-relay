@@ -728,7 +728,7 @@ struct ContentView: View {
 
                     if sidebarHasNoMatches {
                         Text("No matching projects")
-                            .font(.system(size: 13.5))
+                            .font(.system(size: 13))
                             .foregroundStyle(SidebarPalette.tertiary)
                             .padding(.horizontal, 15)
                             .padding(.top, 18)
@@ -1163,7 +1163,7 @@ struct ContentView: View {
                 }
             } label: {
                 Text("Terminal Relay")
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(SidebarPalette.primary)
                 .contentShape(Rectangle())
             }
@@ -1181,7 +1181,7 @@ struct ContentView: View {
     private var sidebarCreationButtons: some View {
         HStack(spacing: 6) {
             Text("Projects")
-                .font(.system(size: 13.5, weight: .semibold))
+                .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(SidebarPalette.secondary)
 
             Spacer()
@@ -1221,7 +1221,7 @@ struct ContentView: View {
                 sidebarCreationMenu
             } label: {
                 Image(systemName: "plus")
-                    .font(.system(size: 14, weight: .medium))
+                    .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(SidebarPalette.secondary)
                     .frame(width: 24, height: 26)
                     .contentShape(Rectangle())
@@ -1245,7 +1245,7 @@ struct ContentView: View {
 
             TextField("Filter projects", text: $searchQuery)
                 .textFieldStyle(.plain)
-                .font(.system(size: 12.5))
+                .font(.system(size: 12))
                 .foregroundStyle(SidebarPalette.primary)
                 .focused($isProjectFilterFocused)
                 .onSubmit {
@@ -1984,7 +1984,7 @@ private struct SidebarFooterButton: View {
     var body: some View {
         Button(action: action) {
             Label(title, systemImage: systemImage)
-                .font(.system(size: 12.5, weight: .medium))
+                .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(SidebarPalette.secondary)
                 .padding(.horizontal, 9)
                 .frame(height: 29)
@@ -2018,7 +2018,7 @@ private struct SidebarFolderRow: View {
                 .frame(width: SidebarRowGeometry.iconFrameWidth)
 
             Text(title)
-                .font(.system(size: 12.5, weight: .medium))
+                .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(SidebarPalette.secondary)
                 .lineLimit(1)
 
@@ -2228,7 +2228,7 @@ private struct ProjectSidebarSection: View {
                         .frame(width: SidebarRowGeometry.iconFrameWidth)
 
                     Text(project.displayName)
-                        .font(.system(size: 14, weight: .regular))
+                        .font(.system(size: 13, weight: .regular))
                         .foregroundStyle(SidebarPalette.primary)
                         .lineLimit(1)
 
@@ -2330,7 +2330,7 @@ private struct ProjectSidebarSection: View {
                         .frame(height: 35, alignment: .leading)
                     } else {
                         Text("No conversations")
-                            .font(.system(size: 14))
+                            .font(.system(size: 13))
                             .foregroundStyle(SidebarPalette.tertiary)
                             .padding(.leading, 40)
                             .padding(.trailing, 12)
@@ -2445,7 +2445,7 @@ private struct ProjectSidebarSection: View {
                             isExpanded.toggle()
                         }
                         .buttonStyle(.plain)
-                        .font(.system(size: 14))
+                        .font(.system(size: 13))
                         .foregroundStyle(SidebarPalette.secondary)
                         .padding(.leading, 40)
                         .frame(height: 35)
@@ -2664,7 +2664,7 @@ private struct ProjectThreadRow: View {
                         .frame(width: 18, height: 18)
                         .opacity(isArchived ? 0.55 : 1)
                     Text(thread.title ?? "Untitled thread")
-                        .font(.system(size: 14))
+                        .font(.system(size: 13))
                         .foregroundStyle(
                             isInteractive ? SidebarPalette.primary : SidebarPalette.secondary
                         )
@@ -2672,7 +2672,7 @@ private struct ProjectThreadRow: View {
                     Spacer(minLength: 5)
                     if let projectName {
                         Text(projectName)
-                            .font(.system(size: 10.5, weight: .medium))
+                            .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(SidebarPalette.tertiary)
                             .lineLimit(1)
                             .frame(maxWidth: 72, alignment: .trailing)
@@ -2699,7 +2699,7 @@ private struct ProjectThreadRow: View {
             if let onArchive {
                 Button(action: onArchive) {
                     Image(systemName: "archivebox")
-                        .font(.system(size: 11.5, weight: .medium))
+                        .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(SidebarPalette.secondary)
                         .frame(width: 19, height: 25)
                         .contentShape(Rectangle())
@@ -2750,7 +2750,7 @@ private struct ProjectSessionRow: View {
                         .opacity(session.status.occupiesSlot ? 1 : 0.55)
 
                     Text(session.displayTitle)
-                        .font(.system(size: 14))
+                        .font(.system(size: 13))
                         .foregroundStyle(
                             session.status.occupiesSlot
                                 ? SidebarPalette.primary
@@ -2762,7 +2762,7 @@ private struct ProjectSessionRow: View {
 
                     if let projectName {
                         Text(projectName)
-                            .font(.system(size: 10.5, weight: .medium))
+                            .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(SidebarPalette.tertiary)
                             .lineLimit(1)
                             .frame(maxWidth: 72, alignment: .trailing)
@@ -2798,7 +2798,7 @@ private struct ProjectSessionRow: View {
             HStack(spacing: 1) {
                 if allowsReordering {
                     Image(systemName: "line.3.horizontal")
-                        .font(.system(size: 10.5, weight: .medium))
+                        .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(SidebarPalette.secondary)
                         .frame(width: 19, height: 25)
                         .contentShape(Rectangle())
@@ -2813,7 +2813,7 @@ private struct ProjectSessionRow: View {
 
                 Button(action: onArchive) {
                     Image(systemName: "archivebox")
-                        .font(.system(size: 11.5, weight: .medium))
+                        .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(SidebarPalette.secondary)
                         .frame(width: 19, height: 25)
                         .contentShape(Rectangle())
@@ -2914,11 +2914,11 @@ private struct FlatEmptyProjectRow: View {
                         .font(.system(size: SidebarRowGeometry.iconSize))
                         .frame(width: SidebarRowGeometry.iconFrameWidth)
                     Text(project.displayName)
-                        .font(.system(size: 14))
+                        .font(.system(size: 13))
                         .lineLimit(1)
                     Spacer(minLength: 5)
                     Text("No conversations")
-                        .font(.system(size: 10.5))
+                        .font(.system(size: 10))
                         .foregroundStyle(SidebarPalette.tertiary)
                 }
                 .foregroundStyle(SidebarPalette.secondary)

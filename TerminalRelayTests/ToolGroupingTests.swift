@@ -1,0 +1,276 @@
+import XCTest
+@testable import TerminalRelay
+
+final class ToolGroupingTests: XCTestCase {
+    private func tool(
+        id: String,
+        kind: ToolActivityKind = .shell,
+        title: String = "Bash",
+        status: ToolActivityStatus = .completed,
+        input: String? = nil,
+        exitCode: Int? = nil
+    ) -> ConversationItem {
+        .tool(ToolActivity(
+            id: id,
+            turnID: "turn",
+            kind: kind,
+            title: title,
+            status: status,
+            input: input,
+            output: nil,
+            errorMessage: nil,
+            durationMilliseconds: nil,
+            exitCode: exitCode,
+            occurredAt: nil,
+            isTruncated: false,
+            originalByteCount: nil
+        ))
+    }
+
+    private func message(id: String) -> ConversationItem {
+        .message(ChatMessage(id: id, turnID: "turn", role: .assistant, text: "Hello"))
+    }
+
+    // MARK: Grouping
+
+    func testConsecutiveToolsFormOneGroupAndSingletonsPassThrough() {
+        let entries = TranscriptEntry.entries(of: [
+            message(id: "m1"),
+            tool(id: "t1"),
+            tool(id: "t2"),
+            tool(id: "t3"),
+            message(id: "m2"),
+            tool(id: "t4"),
+        ])
+        XCTAssertEqual(entries.count, 4)
+        guard case .toolGroup(let group) = entries[1] else {
+            return XCTFail("Expected a tool group, got \(entries[1])")
+        }
+        XCTAssertEqual(group.items.map(\.id), ["t1", "t2", "t3"])
+        guard case .item(let single) = entries[3] else {
+            return XCTFail("Expected a singleton tool, got \(entries[3])")
+        }
+        XCTAssertEqual(single.id, "t4")
+    }
+
+    func testGroupIdentityIsStableWhileStreamingAppendsMembers() {
+        let initial = TranscriptEntry.entries(of: [
+            tool(id: "t1"),
+            tool(id: "t2"),
+        ])
+        let grown = TranscriptEntry.entries(of: [
+            tool(id: "t1"),
+            tool(id: "t2"),
+            tool(id: "t3", status: .running),
+        ])
+        XCTAssertEqual(initial.first?.id, "toolgroup:t1")
+        XCTAssertEqual(grown.first?.id, "toolgroup:t1")
+    }
+
+    func testNonToolItemSplitsRuns() {
+        let entries = TranscriptEntry.entries(of: [
+            tool(id: "t1"),
+            tool(id: "t2"),
+            message(id: "m1"),
+            tool(id: "t3"),
+            tool(id: "t4"),
+        ])
+        XCTAssertEqual(
+            entries.map(\.id),
+            ["toolgroup:t1", "m1", "toolgroup:t3"]
+        )
+    }
+
+    func testRunningToolDrivesTheLiveLine() {
+        guard case .toolGroup(let group) = TranscriptEntry.entries(of: [
+            tool(id: "t1"),
+            tool(id: "t2", status: .running, input: #"{"command":"npm test"}"#),
+        ]).first else {
+            return XCTFail("Expected a group")
+        }
+        XCTAssertEqual(group.runningTool?.id, "t2")
+        XCTAssertEqual(group.runningTool?.compactHeadline, "Running npm test")
+
+        guard case .toolGroup(let settled) = TranscriptEntry.entries(of: [
+            tool(id: "t1"),
+            tool(id: "t2"),
+        ]).first else {
+            return XCTFail("Expected a group")
+        }
+        XCTAssertNil(settled.runningTool)
+    }
+
+    // MARK: Summary
+
+    func testSummaryOrdersKindsByFirstAppearanceWithCounts() {
+        guard case .toolGroup(let group) = TranscriptEntry.entries(of: [
+            tool(id: "t1", kind: .fileRead, title: "Read"),
+            tool(id: "t2", kind: .fileRead, title: "Read"),
+            tool(id: "t3", kind: .shell, title: "Bash"),
+            tool(id: "t4", kind: .search, title: "Grep"),
+        ]).first else {
+            return XCTFail("Expected a group")
+        }
+        XCTAssertEqual(group.summaryText, "Read files, ran a command, searched")
+        XCTAssertEqual(group.dominantKind, .fileRead)
+    }
+
+    func testFailureSurfacesOnTheGroup() {
+        guard case .toolGroup(let group) = TranscriptEntry.entries(of: [
+            tool(id: "t1"),
+            tool(id: "t2", status: .failed, exitCode: 1),
+        ]).first else {
+            return XCTFail("Expected a group")
+        }
+        XCTAssertTrue(group.hasFailure)
+    }
+
+    // MARK: Compact headlines
+
+    func testShellHeadlineUsesTheCommand() {
+        let running = ToolActivity.fixture(
+            kind: .shell,
+            title: "Bash",
+            status: .running,
+            input: #"{"command":"git status","description":"Show status"}"#
+        )
+        XCTAssertEqual(running.compactHeadline, "Running git status")
+        var finished = running
+        finished.status = .completed
+        XCTAssertEqual(finished.compactHeadline, "Ran git status")
+    }
+
+    func testFileHeadlinesUseTheBasename() {
+        let read = ToolActivity.fixture(
+            kind: .fileRead,
+            title: "Read",
+            status: .completed,
+            input: #"{"file_path":"/home/example-user/app/checkout.js"}"#
+        )
+        XCTAssertEqual(read.compactHeadline, "Read checkout.js")
+        let edit = ToolActivity.fixture(
+            kind: .edit,
+            title: "Edit",
+            status: .running,
+            input: #"{"file_path":"/tmp/notes.md"}"#
+        )
+        XCTAssertEqual(edit.compactHeadline, "Editing notes.md")
+    }
+
+    func testSearchHeadlineUsesThePattern() {
+        let search = ToolActivity.fixture(
+            kind: .search,
+            title: "Grep",
+            status: .completed,
+            input: #"{"pattern":"employeeType","path":"api"}"#
+        )
+        XCTAssertEqual(search.compactHeadline, "Searched for employeeType")
+    }
+
+    func testNonJSONInputIsTheDetailItself() {
+        let codex = ToolActivity.fixture(
+            kind: .shell,
+            title: "Command",
+            status: .completed,
+            input: "ls -la\n"
+        )
+        XCTAssertEqual(codex.compactHeadline, "Ran ls -la")
+    }
+
+    func testTitleFallbacksWhenInputCarriesNothing() {
+        let bare = ToolActivity.fixture(kind: .shell, title: "Bash", status: .completed, input: nil)
+        XCTAssertEqual(bare.compactHeadline, "Ran a command")
+        let mcp = ToolActivity.fixture(
+            kind: .mcp,
+            title: "mcp__browser__navigate",
+            status: .completed,
+            input: nil
+        )
+        XCTAssertEqual(mcp.compactHeadline, "mcp__browser__navigate")
+    }
+
+    func testHeadlineFlattensAndBoundsLongCommands() {
+        let long = ToolActivity.fixture(
+            kind: .shell,
+            title: "Bash",
+            status: .completed,
+            input: "{\"command\":\"echo \(String(repeating: "a", count: 400))\"}"
+        )
+        XCTAssertFalse(long.compactHeadline.contains("\n"))
+        XCTAssertLessThanOrEqual(long.compactHeadline.count, 210)
+    }
+
+    func testOutcomeOnlySurfacesFailures() {
+        var tool = ToolActivity.fixture(kind: .shell, title: "Bash", status: .completed, input: nil)
+        XCTAssertNil(tool.compactOutcome)
+        tool.status = .failed
+        tool.exitCode = 2
+        XCTAssertEqual(tool.compactOutcome, "exit 2")
+        tool.exitCode = nil
+        XCTAssertEqual(tool.compactOutcome, "failed")
+        tool.status = .cancelled
+        XCTAssertEqual(tool.compactOutcome, "cancelled")
+    }
+
+    // MARK: First-row projection carries the precomputed headline
+
+    func testFirstTitleTileCarriesTheBoundedCompactLine() throws {
+        guard case .tool(let value) = tool(
+            id: "t1",
+            title: "Bash",
+            input: #"{"command":"git status"}"#
+        ) else {
+            return XCTFail("Expected a tool")
+        }
+        let first = try XCTUnwrap(
+            TranscriptRowProjection.makeFirstRow(item: .tool(value))?.row
+        )
+        XCTAssertEqual(first.compactLine, "Ran git status")
+        guard case .tool(let displayed) = first.displayItem else {
+            return XCTFail("Expected a tool display item")
+        }
+        // The tile itself never carries the raw input; the headline is
+        // precomputed so tiles stay bounded.
+        XCTAssertNil(displayed.input)
+
+        // Both projection paths must produce the identical first row.
+        let all = TranscriptRowProjection.makeRows(item: .tool(value))
+        XCTAssertEqual(all.first, first)
+    }
+
+    func testCompactLineStaysBoundedForGraphemeBombInputs() throws {
+        let bomb = "a" + String(repeating: "\u{301}", count: 50_000)
+        let tool = ToolActivity.fixture(
+            kind: .shell,
+            title: "Bash",
+            status: .completed,
+            input: "{\"command\":\"\(bomb)\"}"
+        )
+        XCTAssertLessThanOrEqual(tool.compactHeadline.utf8.count, 1024)
+    }
+}
+
+private extension ToolActivity {
+    static func fixture(
+        kind: ToolActivityKind,
+        title: String,
+        status: ToolActivityStatus,
+        input: String?
+    ) -> ToolActivity {
+        ToolActivity(
+            id: "tool",
+            turnID: "turn",
+            kind: kind,
+            title: title,
+            status: status,
+            input: input,
+            output: nil,
+            errorMessage: nil,
+            durationMilliseconds: nil,
+            exitCode: nil,
+            occurredAt: nil,
+            isTruncated: false,
+            originalByteCount: nil
+        )
+    }
+}
