@@ -770,11 +770,20 @@ struct ContentView: View {
             }
         }
         guard let worker = serverStore.server(id: project.serverID) else { return [] }
+        // A thread whose conversation already has a live or launch-pending
+        // session row must not render a second, dormant row while the
+        // worker's catalog catches up with the session listing.
+        let occupiedThreadKeys = sessionManager.occupiedThreadKeys(
+            forProjectID: project.id,
+            serverKey: worker.concurrencyKey
+        )
         return workerSessionService.threads(
             repositoryName: project.displayName,
             archived: false,
             on: worker
-        ).filter { $0.activityState != .relayActive }
+        ).filter {
+            $0.activityState != .relayActive && !occupiedThreadKeys.contains($0.id)
+        }
     }
 
     private func archivedThreads(for project: ProjectProfile) -> [WorkerThreadSnapshot] {

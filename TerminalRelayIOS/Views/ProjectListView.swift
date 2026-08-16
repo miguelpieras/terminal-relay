@@ -382,11 +382,21 @@ struct ProjectDetailView: View {
     }
 
     private var dormantThreads: [WorkerThreadSnapshot] {
-        model.threads(
+        // A thread whose conversation is already listed as a live session
+        // must not also render as a dormant row while the thread catalog is
+        // staler than the session listing.
+        let sessionThreadKeys = Set(
+            sessions.compactMap { session in
+                session.threadID.map { "\(session.kind.rawValue):\($0)" }
+            }
+        )
+        return model.threads(
             workerID: workerID,
             repositoryName: repositoryName,
             archived: false
-        ).filter { $0.activityState != .relayActive }
+        ).filter {
+            $0.activityState != .relayActive && !sessionThreadKeys.contains($0.id)
+        }
     }
 
     private var archivedThreads: [WorkerThreadSnapshot] {

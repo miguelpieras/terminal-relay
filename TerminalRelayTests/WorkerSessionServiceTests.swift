@@ -1014,6 +1014,171 @@ final class WorkerSessionServiceTests: XCTestCase {
         )
     }
 
+    func testStaleRefreshListingKeepsAJustResumedChatSessionUntilStopped() async {
+        let worker = makeWorker()
+        let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let instanceID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        let capabilities =
+            #"{"protocolVersion":1,"features":["streaming"],"supportsHistory":true,"supportsFilePreview":true,"supportsApprovals":true,"supportsQuestions":true,"supportsAttachments":false}"#
+        let emptyStatus = WorkerSessionCommandResult(
+            exitCode: 0,
+            standardOutput: Data("\(WorkerSessionProtocol.marker)\n".utf8),
+            standardError: Data()
+        )
+        let updateStatus = WorkerSessionCommandResult(
+            exitCode: 0,
+            standardOutput: Data("\(WorkerUpdateStatusProtocol.marker)\n".utf8),
+            standardError: Data()
+        )
+        let recorder = WorkerSessionCommandRecorder(
+            results: [
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data(
+                        """
+                        \(WorkerChatProtocol.marker)
+                        {"relayId":"\(instanceID)","provider":"codex","providerThreadId":"\(threadID)","capabilities":\(capabilities),"launchOptions":{}}
+
+                        """.utf8
+                    ),
+                    standardError: Data()
+                ),
+                emptyStatus,
+                updateStatus,
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data(),
+                    standardError: Data()
+                ),
+                emptyStatus,
+                updateStatus,
+            ]
+        )
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+
+        let snapshot = await service.resumeThread(
+            kind: .codex,
+            repositoryName: "terminal-relay",
+            threadID: threadID,
+            launchDefaults: .standard,
+            on: worker
+        )
+        XCTAssertEqual(snapshot?.instanceToken, instanceID)
+
+        // A listing captured on the worker before the chat-start completed
+        // must not erase the session this client just started.
+        let staleRefresh = await service.refresh(worker: worker)
+        XCTAssertEqual(
+            staleRefresh?.sessions.map(\.instanceToken),
+            [instanceID],
+            "The just-started relay survives a listing that predates it."
+        )
+        XCTAssertEqual(service.response(for: worker.id)?.sessions.first?.threadID, threadID)
+
+        let stopped = await service.stop(
+            kind: .codex,
+            repositoryName: "terminal-relay",
+            instanceToken: instanceID,
+            presentation: .chat,
+            on: worker
+        )
+        XCTAssertTrue(stopped)
+
+        let afterStop = await service.refresh(worker: worker)
+        XCTAssertEqual(
+            afterStop?.sessions,
+            [],
+            "The stop clears the started-session guard; the relay must not resurrect."
+        )
+    }
+
+    func testStoppingAChatDemotesItsThreadCatalogRowImmediately() async {
+        let worker = makeWorker()
+        let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let instanceID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        let capabilities =
+            #"{"protocolVersion":1,"features":["streaming"],"supportsHistory":true,"supportsFilePreview":true,"supportsApprovals":true,"supportsQuestions":true,"supportsAttachments":false}"#
+        let recorder = WorkerSessionCommandRecorder(
+            results: [
+                threadResult(
+                    """
+                    {"threads":[{"provider":"codex","threadID":"\(threadID)","title":"Demote me","updatedAt":100,"archived":false,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":null}
+                    """
+                ),
+                threadResult(
+                    """
+                    {"threads":[],"nextCursor":null}
+                    """
+                ),
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data(
+                        """
+                        \(WorkerChatProtocol.marker)
+                        {"relayId":"\(instanceID)","provider":"codex","providerThreadId":"\(threadID)","capabilities":\(capabilities),"launchOptions":{}}
+
+                        """.utf8
+                    ),
+                    standardError: Data()
+                ),
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data(),
+                    standardError: Data()
+                ),
+            ]
+        )
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+
+        _ = await service.loadThreads(
+            repositoryName: "terminal-relay",
+            archived: false,
+            on: worker
+        )
+        XCTAssertEqual(
+            service.threads(repositoryName: "terminal-relay", archived: false, on: worker)
+                .map(\.activityState),
+            [.inactive]
+        )
+
+        _ = await service.resumeThread(
+            kind: .codex,
+            repositoryName: "terminal-relay",
+            threadID: threadID,
+            launchDefaults: .standard,
+            on: worker
+        )
+        let promoted = service.threads(
+            repositoryName: "terminal-relay",
+            archived: false,
+            on: worker
+        )
+        XCTAssertEqual(promoted.map(\.activityState), [.relayActive])
+        XCTAssertEqual(promoted.first?.activeInstanceToken, instanceID)
+
+        _ = await service.stop(
+            kind: .codex,
+            repositoryName: "terminal-relay",
+            instanceToken: instanceID,
+            presentation: .chat,
+            on: worker
+        )
+        let demoted = service.threads(
+            repositoryName: "terminal-relay",
+            archived: false,
+            on: worker
+        )
+        XCTAssertEqual(
+            demoted.map(\.activityState),
+            [.inactive],
+            "The dormant thread row must return the moment its chat stops, not a refresh cycle later."
+        )
+    }
+
     private func threadResult(_ json: String) -> WorkerSessionCommandResult {
         WorkerSessionCommandResult(
             exitCode: 0,

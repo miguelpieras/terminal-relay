@@ -439,11 +439,25 @@ struct ConversationReducer {
             throw ConversationReducerError.invalidEvent(envelope.type)
         }
 
+        // The apply functions below can still throw after the cursor has
+        // advanced; an early-advanced cursor would survive the throw (inout
+        // state writes back), and a later Retry would then attach past the
+        // failed event and drop it permanently. Roll the cursor back on any
+        // throwing exit so the event stays replayable.
+        let sequenceCursorBeforeEvent = state.lastAppliedSequence
+        var eventApplied = false
+        defer {
+            if !eventApplied {
+                state.lastAppliedSequence = sequenceCursorBeforeEvent
+            }
+        }
+
         // `session.hello` and a pre-attach `error` are attachment-local control
         // records with seq 0. They must be applied without advancing or
         // participating in the durable replay cursor.
         if let sequence = envelope.sequence, sequence > 0 {
             if sequence <= state.lastAppliedSequence {
+                eventApplied = true
                 return false
             }
             let expectedSequence = state.lastAppliedSequence + 1
@@ -469,9 +483,11 @@ struct ConversationReducer {
                 || envelope.payload["blocking"]?.boolValue == true {
                 state.lastErrorMessage = "This agent interaction is not supported in native chat."
                 state.connectionState = .failed
+                eventApplied = true
                 return true
             }
             applyUnknown(envelope, to: &state, itemIndex: &itemIndex)
+            eventApplied = true
             return true
         }
 
@@ -600,6 +616,7 @@ struct ConversationReducer {
             break
         }
 
+        eventApplied = true
         return true
     }
 

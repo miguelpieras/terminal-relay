@@ -2945,6 +2945,53 @@ final class ConversationStoreTests: XCTestCase {
         }
     }
 
+    func testThrowingEventLeavesTheReplayCursorOnTheLastAppliedEvent() throws {
+        let store = ConversationStore()
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.completed",
+                sequence: 1,
+                itemID: "message-1",
+                payload: .object(["role": .string("assistant"), "text": .string("One")])
+            )
+        )
+
+        // A malformed sequenced event (message.started without any item ID)
+        // throws after the cursor would have advanced; the cursor must roll
+        // back so a retry replays this event instead of skipping it forever.
+        XCTAssertThrowsError(
+            try store.apply(
+                ChatTestFixtures.event(
+                    "message.started",
+                    sequence: 2,
+                    payload: .object([
+                        "role": .string("assistant"),
+                        "text": .string("Malformed"),
+                    ])
+                )
+            )
+        )
+        XCTAssertEqual(
+            store.lastAppliedSequence,
+            1,
+            "A throwing apply must leave the durable replay cursor on the last applied event."
+        )
+
+        // The repaired event at the same sequence still applies.
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.started",
+                sequence: 2,
+                itemID: "message-2",
+                payload: .object([
+                    "role": .string("assistant"),
+                    "text": .string("Repaired"),
+                ])
+            )
+        )
+        XCTAssertEqual(store.lastAppliedSequence, 2)
+    }
+
     func testToolNullErrorCompletesSuccessfully() throws {
         let store = ConversationStore()
         try store.apply(

@@ -74,6 +74,14 @@ final class WorkerSessionService: ObservableObject {
     private var stoppedSessionTombstones: [String: Date] = [:]
     private var archivedThreadTombstones: [String: Date] = [:]
     private static let tombstoneLifetime: TimeInterval = 60
+    // Sessions this client just started, per worker. A periodic refresh
+    // whose listing was captured on the worker before the chat-start
+    // completed would otherwise erase the optimistic snapshot, demote its
+    // thread back to dormant, and resurrect the duplicate row. Entries are
+    // dropped once a listing confirms the token, on stop, or after the
+    // lifetime.
+    private var startedSessionGuards: [UUID: [String: (snapshot: WorkerSessionSnapshot, at: Date)]] = [:]
+    private static let startedSessionGuardLifetime: TimeInterval = 60
 
     private static let threadCatalogStorageKey = "workerThreadCatalogs.v1"
     private static let sessionResponseStorageKey = "workerSessionResponses.v1"
@@ -243,8 +251,10 @@ final class WorkerSessionService: ObservableObject {
 
     @discardableResult
     func refresh(worker: ServerProfile) async -> WorkerSessionResponse? {
-        guard refreshTasks[worker.id] == nil else { return nil }
-        return await startRefresh(worker: worker)
+        // Await an in-flight refresh instead of bailing with nil: callers
+        // like the archive flow treat nil as failure, so a collision with
+        // the periodic loop used to silently no-op the user's action.
+        await refreshCoalescing(worker: worker)
     }
 
     private func refreshCoalescing(worker: ServerProfile) async -> WorkerSessionResponse? {
@@ -283,8 +293,11 @@ final class WorkerSessionService: ObservableObject {
                 throw WorkerSessionServiceError.statusFailed
             }
 
-            let response = withoutRecentlyStopped(
-                try WorkerSessionProtocol.parse(result.standardOutput)
+            let response = withRecentlyStarted(
+                withoutRecentlyStopped(
+                    try WorkerSessionProtocol.parse(result.standardOutput)
+                ),
+                workerID: worker.id
             )
             if inspectsRuntimeOnRefresh {
                 await inspectRuntime(worker: worker)
@@ -516,6 +529,8 @@ final class WorkerSessionService: ObservableObject {
                 projects: projects,
                 sessions: sessions
             )
+            startedSessionGuards[worker.id, default: [:]][snapshot.instanceToken] =
+                (snapshot: snapshot, at: Date())
             persistSessionResponses()
             errors[worker.id] = nil
             workerSessionLogger.notice(
@@ -595,7 +610,16 @@ final class WorkerSessionService: ObservableObject {
                 )
                 responses[worker.id] = response
                 persistSessionResponses()
+                // Demote the stopped conversation's thread back to dormant
+                // right away; leaving it relay-active until the next
+                // periodic refresh hides the conversation entirely (no
+                // session row, no thread row).
+                mergeLiveSessionsIntoThreadCatalogs(
+                    workerID: worker.id,
+                    sessions: response.sessions
+                )
             }
+            startedSessionGuards[worker.id]?[instanceToken] = nil
             stoppedSessionTombstones[instanceToken] = Date()
             errors[worker.id] = nil
             workerSessionLogger.notice(
@@ -800,6 +824,8 @@ final class WorkerSessionService: ObservableObject {
                     return $0.instanceToken < $1.instanceToken
                 }
             )
+            startedSessionGuards[worker.id, default: [:]][snapshot.instanceToken] =
+                (snapshot: snapshot, at: Date())
             persistSessionResponses()
             mergeLiveSessionsIntoThreadCatalogs(
                 workerID: worker.id,
@@ -929,6 +955,9 @@ final class WorkerSessionService: ObservableObject {
                 workerID: workerID
             )
         }
+        // Persist the promotion: a cached catalog that still says "inactive"
+        // next to a cached live session replays the duplicate row at launch.
+        persistThreadCatalogs()
     }
 
     private static func threadTombstoneKey(
@@ -954,6 +983,41 @@ final class WorkerSessionService: ObservableObject {
             projects: response.projects,
             sessions: response.sessions.filter {
                 stoppedSessionTombstones[$0.instanceToken] == nil
+            }
+        )
+    }
+
+    /// Re-injects sessions this client just started into a listing that was
+    /// captured on the worker before the start completed; without this, the
+    /// stale listing erases the optimistic row and its thread promotion.
+    private func withRecentlyStarted(
+        _ response: WorkerSessionResponse,
+        workerID: UUID
+    ) -> WorkerSessionResponse {
+        let cutoff = Date().addingTimeInterval(-Self.startedSessionGuardLifetime)
+        var guards = (startedSessionGuards[workerID] ?? [:]).filter {
+            $0.value.at > cutoff
+        }
+        defer { startedSessionGuards[workerID] = guards.isEmpty ? nil : guards }
+        guard !guards.isEmpty else { return response }
+        let listedTokens = Set(response.sessions.map(\.instanceToken))
+        var preserved: [WorkerSessionSnapshot] = []
+        for (token, entry) in guards {
+            if listedTokens.contains(token) {
+                guards[token] = nil
+            } else if stoppedSessionTombstones[token] == nil {
+                preserved.append(entry.snapshot)
+            }
+        }
+        guard !preserved.isEmpty else { return response }
+        return WorkerSessionResponse(
+            projects: response.projects,
+            sessions: (response.sessions + preserved).sorted {
+                if $0.repositoryName != $1.repositoryName {
+                    return $0.repositoryName.localizedStandardCompare($1.repositoryName)
+                        == .orderedAscending
+                }
+                return $0.instanceToken < $1.instanceToken
             }
         )
     }

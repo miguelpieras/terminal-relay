@@ -152,6 +152,12 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
     @Published private(set) var threadID: String?
     @Published private(set) var isWorking = false
     @Published private(set) var lastActivityAt: Date
+    /// True while lastActivityAt holds a row-creation fallback rather than
+    /// observed activity. The first real worker-reported epoch replaces a
+    /// fallback even when older; without this, a row materialized with an
+    /// unknown activity time is pinned at "now" forever and sorts above
+    /// genuinely recent conversations.
+    private(set) var lastActivityIsFallback: Bool
     @Published private(set) var taskCompletionCount = 0
     @Published private(set) var remoteAttachedClientCount: Int?
     @Published private(set) var launchState: TerminalSessionLaunchState
@@ -180,6 +186,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         terminalViewIdentity: UUID = UUID(),
         startedAt: Date = Date(),
         lastActivityAt: Date? = nil,
+        lastActivityIsFallback: Bool? = nil,
         initialStatus: TerminalSessionStatus = .connecting,
         terminalTitle: String? = nil,
         threadID: String? = nil,
@@ -201,6 +208,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         self.sequenceNumber = sequenceNumber
         self.startedAt = startedAt
         self.lastActivityAt = lastActivityAt ?? startedAt
+        self.lastActivityIsFallback = lastActivityIsFallback ?? (lastActivityAt == nil)
         self.instanceToken = instanceToken
         self.presentation = presentation
         self.status = initialStatus
@@ -262,7 +270,11 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
 
         if let terminalTitle {
             applyTerminalTitle(terminalTitle)
+            // Applying the initial title is materialization, not activity;
+            // undo its timestamp bump and restore the fallback marker.
             self.lastActivityAt = lastActivityAt ?? startedAt
+            self.lastActivityIsFallback =
+                lastActivityIsFallback ?? (lastActivityAt == nil)
         }
 
         if let chatCoordinator {
@@ -639,8 +651,11 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         remoteAttachedClientCount = snapshot.attachedClientCount
         if let timestamp = snapshot.lastActivityAt {
             let reportedActivityAt = Date(timeIntervalSince1970: TimeInterval(timestamp))
-            if reportedActivityAt > lastActivityAt {
+            // The first observed epoch replaces a row-creation fallback even
+            // when older; observed activity itself only ever moves forward.
+            if lastActivityIsFallback || reportedActivityAt > lastActivityAt {
                 lastActivityAt = reportedActivityAt
+                lastActivityIsFallback = false
             }
         }
         if let threadID = snapshot.threadID {
@@ -759,6 +774,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         }
         if terminalTitle != previousTitle {
             lastActivityAt = Date()
+            lastActivityIsFallback = false
         }
         updateWorkingState()
     }
@@ -785,6 +801,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         }
         if terminalTitle != previousTitle {
             lastActivityAt = Date()
+            lastActivityIsFallback = false
         }
     }
 
@@ -827,6 +844,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
            taskCompletionCount += 1
         }
         lastActivityAt = Date()
+        lastActivityIsFallback = false
     }
 
     private func applyChatState(_ state: ConversationState) {

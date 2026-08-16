@@ -135,6 +135,30 @@ final class SessionManager: ObservableObject {
         return defaultOrder.filter { !savedTokenSet.contains($0.instanceToken) } + savedSessions
     }
 
+    /// Thread identities already represented by a live or launch-pending
+    /// session row, keyed like WorkerThreadSnapshot.id ("kind:threadID").
+    /// The sidebar must not also render a dormant thread row for these: a
+    /// resume click appends the session row synchronously while the worker's
+    /// thread catalog only reports relay-active after the chat-start round
+    /// trip, and relying on the catalog alone briefly duplicated the
+    /// conversation.
+    func occupiedThreadKeys(
+        forProjectID projectID: UUID,
+        serverKey: String
+    ) -> Set<String> {
+        Set(
+            sessions.compactMap { session -> String? in
+                guard session.projectID == projectID,
+                      session.serverKey == serverKey,
+                      session.isLaunchPending || session.status.occupiesSlot,
+                      let threadID = session.threadID else {
+                    return nil
+                }
+                return "\(session.kind.rawValue):\(threadID)"
+            }
+        )
+    }
+
     func moveSidebarSession(id sessionID: UUID, before targetSessionID: UUID?) {
         guard let movingSession = sessions.first(where: { $0.id == sessionID }) else { return }
         var orderedSessions = sidebarSessions(forProjectID: movingSession.projectID)
@@ -282,6 +306,17 @@ final class SessionManager: ObservableObject {
                 selectSession(existingSession.id)
             }
             return .selectedExisting(existingSession)
+        }
+
+        // A previous failed or exited row for this thread would sit beside
+        // the new pending row as a dead duplicate; the fresh resume replaces
+        // it.
+        for leftover in sessions where leftover.projectID == project.id
+            && leftover.serverKey == server.concurrencyKey
+            && leftover.kind == thread.kind
+            && leftover.threadID == thread.threadID
+            && leftover.status != .stopping {
+            removeSession(id: leftover.id)
         }
 
         invalidatePendingOpenSelection()
@@ -491,6 +526,7 @@ final class SessionManager: ObservableObject {
             id: existing.id,
             startedAt: existing.startedAt,
             lastActivityAt: existing.lastActivityAt,
+            lastActivityIsFallback: existing.lastActivityIsFallback,
             initialStatus: .connecting,
             terminalTitle: existing.terminalTitle,
             threadID: confirmedSnapshot.threadID ?? existing.threadID,
@@ -555,6 +591,7 @@ final class SessionManager: ObservableObject {
             terminalViewIdentity: pendingSession.terminalViewIdentity,
             startedAt: pendingSession.startedAt,
             lastActivityAt: pendingSession.lastActivityAt,
+            lastActivityIsFallback: pendingSession.lastActivityIsFallback,
             initialStatus: .connecting,
             terminalTitle: terminalTitle,
             threadID: snapshot.threadID,
@@ -691,6 +728,11 @@ final class SessionManager: ObservableObject {
             // report; drop it silently instead of leaving a dimmed ghost.
             if cacheSeededSessionIDs.contains(session.id) {
                 removeSession(id: session.id)
+            } else if session.presentation == .chat, session.threadID != nil {
+                // The conversation lives on as a dormant thread row; an
+                // exited chat relay row beside it would render the same
+                // conversation twice and accumulate on every re-resume.
+                removeSession(id: session.id)
             } else {
                 session.markRemoteExited()
             }
@@ -712,6 +754,24 @@ final class SessionManager: ObservableObject {
                 cacheSeededSessionIDs.remove(existing.id)
                 existing.applyRemoteSnapshot(snapshot)
             } else {
+                // A launch-pending row is mid-flight to adopt this relay's
+                // token via replacePendingSession; adopting it here too
+                // would render the conversation twice and then fail the
+                // pending launch on the duplicate-token guard. If the
+                // launch never claims it, the next refresh adopts it.
+                if snapshot.presentation == .chat,
+                   sessions.contains(where: {
+                       $0.projectID == project.id
+                           && $0.serverKey == worker.concurrencyKey
+                           && $0.kind == snapshot.kind
+                           && $0.isLaunchPending
+                           && ($0.threadID == nil || $0.threadID == snapshot.threadID)
+                   }) {
+                    sessionOrderLogger.notice(
+                        "Deferring adoption of \(snapshot.kind.rawValue, privacy: .public) session \(snapshot.instanceToken, privacy: .public) for \(snapshot.repositoryName, privacy: .public) while a launch is pending"
+                    )
+                    continue
+                }
                 sessionOrderLogger.notice(
                     "Adopting remote \(snapshot.kind.rawValue, privacy: .public) session \(snapshot.instanceToken, privacy: .public) for \(snapshot.repositoryName, privacy: .public); reported activity \(snapshot.lastActivityAt.map(String.init) ?? "none", privacy: .public)"
                 )

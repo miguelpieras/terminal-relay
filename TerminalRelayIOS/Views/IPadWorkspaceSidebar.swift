@@ -28,21 +28,33 @@ struct IPadWorkspaceSidebar: View {
         model.profiles.flatMap { profile -> [IPadSidebarProject] in
             guard let overview = model.workerOverviews[profile.id] else { return [] }
             return overview.projects.map { repositoryName in
-                IPadSidebarProject(
+                let sessions = overview.sessions
+                    .filter { $0.repositoryName == repositoryName }
+                    .sorted {
+                        ($0.title ?? "").localizedStandardCompare($1.title ?? "")
+                            == .orderedAscending
+                    }
+                // A thread whose conversation is already listed as a live
+                // session must not also render as a dormant row while the
+                // thread catalog is staler than the session listing.
+                let sessionThreadKeys = Set(
+                    sessions.compactMap { session in
+                        session.threadID.map { "\(session.kind.rawValue):\($0)" }
+                    }
+                )
+                return IPadSidebarProject(
                     workerID: profile.id,
                     workerName: profile.displayName,
                     repositoryName: repositoryName,
-                    sessions: overview.sessions
-                        .filter { $0.repositoryName == repositoryName }
-                        .sorted {
-                            ($0.title ?? "").localizedStandardCompare($1.title ?? "")
-                                == .orderedAscending
-                        },
+                    sessions: sessions,
                     threads: model.threads(
                         workerID: profile.id,
                         repositoryName: repositoryName,
                         archived: false
-                    ).filter { $0.activityState != .relayActive }
+                    ).filter {
+                        $0.activityState != .relayActive
+                            && !sessionThreadKeys.contains($0.id)
+                    }
                 )
             }
         }

@@ -529,7 +529,7 @@ final class SessionManagerTests: XCTestCase {
         )
     }
 
-    func testRestoredCachedSessionConfirmedByARefreshKeepsTheExitedTreatment() {
+    func testWorkerConfirmedChatRowIsRemovedWhenItsRelayVanishes() {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let project = makeProject(name: "Terminal Relay", server: server)
         let manager = SessionManager()
@@ -553,7 +553,6 @@ final class SessionManagerTests: XCTestCase {
             response: response,
             launchDefaults: .standard
         )
-        let restored = manager.session(projectID: project.id, kind: .claude)
         manager.reconcile(
             worker: server,
             projects: [project],
@@ -567,11 +566,54 @@ final class SessionManagerTests: XCTestCase {
             launchDefaults: .standard
         )
 
-        XCTAssertTrue(manager.session(projectID: project.id, kind: .claude) === restored)
+        XCTAssertTrue(
+            manager.sessions.isEmpty,
+            "The dormant thread row is the conversation's single remaining representation; an exited chat relay row beside it would duplicate the conversation."
+        )
+    }
+
+    func testWorkerConfirmedTerminalRowKeepsTheExitedTreatmentWhenItVanishes() {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let manager = SessionManager()
+        let instanceToken = "01234567-89ab-" + "4def-8abc-0123456789ab"
+        let response = WorkerSessionResponse(
+            projects: [project.displayName],
+            sessions: [
+                WorkerSessionSnapshot(
+                    kind: .codex,
+                    repositoryName: project.displayName,
+                    attachedClientCount: 0,
+                    instanceToken: instanceToken
+                )
+            ]
+        )
+
+        manager.restoreCachedSessions(
+            worker: server,
+            projects: [project],
+            response: response,
+            launchDefaults: .standard
+        )
+        let restored = manager.session(projectID: project.id, kind: .codex)
+        manager.reconcile(
+            worker: server,
+            projects: [project],
+            response: response,
+            launchDefaults: .standard
+        )
+        manager.reconcile(
+            worker: server,
+            projects: [project],
+            response: WorkerSessionResponse(projects: [project.displayName], sessions: []),
+            launchDefaults: .standard
+        )
+
+        XCTAssertTrue(manager.session(projectID: project.id, kind: .codex) === restored)
         XCTAssertEqual(
             restored?.status,
             .exited(nil),
-            "A worker-confirmed row keeps the normal exited treatment when it vanishes."
+            "A terminal row has no thread row standing in for it, so it keeps the exited treatment when it vanishes."
         )
     }
 
@@ -1102,6 +1144,206 @@ final class SessionManagerTests: XCTestCase {
                 )
             ]
         )
+    }
+
+    func testPendingResumeOccupiesItsThreadAndDefersRelayAdoption() async {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let manager = SessionManager()
+        let recorder = BlockingWorkerSessionCommandRecorder()
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+        let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let relayID = "01234567-89ab-4def-8abc-0123456789ab"
+        let thread = WorkerThreadSnapshot(
+            kind: .codex,
+            repositoryName: project.displayName,
+            threadID: threadID,
+            title: "Sidebar duplication",
+            updatedAt: 100,
+            isArchived: false,
+            activeInstanceToken: nil,
+            reportedWorking: nil,
+            capabilities: .dormant
+        )
+        let relayListing = WorkerSessionSnapshot(
+            kind: .codex,
+            repositoryName: project.displayName,
+            attachedClientCount: 0,
+            instanceToken: relayID,
+            threadID: threadID,
+            presentation: .chat
+        )
+
+        let resume = Task {
+            await manager.resumeThread(
+                thread,
+                project: project,
+                on: server,
+                launchDefaults: .standard,
+                using: service
+            )
+        }
+        while recorder.callCount == 0 {
+            await Task.yield()
+        }
+
+        // The pending row claims the thread identity at click time, so the
+        // sidebar can hide the dormant thread row without waiting for the
+        // worker round trip.
+        XCTAssertEqual(
+            manager.occupiedThreadKeys(
+                forProjectID: project.id,
+                serverKey: server.concurrencyKey
+            ),
+            ["codex:\(threadID)"]
+        )
+
+        // A refresh listing the new relay before the chat-start returns must
+        // not adopt it as a second row for the same conversation.
+        manager.reconcile(
+            worker: server,
+            projects: [project],
+            response: WorkerSessionResponse(
+                projects: [project.displayName],
+                sessions: [relayListing]
+            ),
+            launchDefaults: .standard
+        )
+        XCTAssertEqual(
+            manager.sessions.count,
+            1,
+            "The in-flight resume already represents this conversation."
+        )
+
+        recorder.finish(with: Self.statusResult(snapshot: relayListing))
+        let result = await resume.value
+        guard case .opened(let session) = result else {
+            return XCTFail("The pending launch must claim the relay the refresh already listed")
+        }
+        XCTAssertEqual(session.instanceToken, relayID)
+        XCTAssertEqual(manager.sessions.count, 1)
+        XCTAssertEqual(
+            manager.occupiedThreadKeys(
+                forProjectID: project.id,
+                serverKey: server.concurrencyKey
+            ),
+            ["codex:\(threadID)"]
+        )
+    }
+
+    func testFailedResumeRowIsReplacedWhenTheThreadIsClickedAgain() async {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let manager = SessionManager()
+        let failingService = WorkerSessionService { _ in
+            WorkerSessionCommandResult(
+                exitCode: 255,
+                standardOutput: Data(),
+                standardError: Data("connection interrupted".utf8)
+            )
+        }
+        let thread = WorkerThreadSnapshot(
+            kind: .codex,
+            repositoryName: project.displayName,
+            threadID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            title: "Flaky worker",
+            updatedAt: 100,
+            isArchived: false,
+            activeInstanceToken: nil,
+            reportedWorking: nil,
+            capabilities: .dormant
+        )
+
+        let first = await manager.resumeThread(
+            thread,
+            project: project,
+            on: server,
+            launchDefaults: .standard,
+            using: failingService
+        )
+        XCTAssertNil(first)
+        guard let failedSession = manager.sessions.first else {
+            return XCTFail("The failed resume should leave its row for the error state")
+        }
+        XCTAssertEqual(
+            manager.occupiedThreadKeys(
+                forProjectID: project.id,
+                serverKey: server.concurrencyKey
+            ),
+            [],
+            "A dead row must not suppress the dormant thread row."
+        )
+
+        let second = await manager.resumeThread(
+            thread,
+            project: project,
+            on: server,
+            launchDefaults: .standard,
+            using: failingService
+        )
+        XCTAssertNil(second)
+        XCTAssertEqual(
+            manager.sessions.count,
+            1,
+            "A re-clicked thread replaces its dead row instead of accumulating duplicates."
+        )
+        XCTAssertNotEqual(manager.sessions.first?.id, failedSession.id)
+    }
+
+    func testUnknownActivityRowAcceptsTheFirstRealEpochEvenWhenOlder() {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let manager = SessionManager()
+        let instanceToken = "01234567-89ab-" + "4def-8abc-0123456789ab"
+
+        func snapshot(lastActivityAt: Int?) -> WorkerSessionSnapshot {
+            WorkerSessionSnapshot(
+                kind: .codex,
+                repositoryName: project.displayName,
+                attachedClientCount: 0,
+                instanceToken: instanceToken,
+                lastActivityAt: lastActivityAt,
+                threadID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                presentation: .chat
+            )
+        }
+
+        manager.reconcile(
+            worker: server,
+            projects: [project],
+            response: WorkerSessionResponse(
+                projects: [project.displayName],
+                sessions: [snapshot(lastActivityAt: nil)]
+            ),
+            launchDefaults: .standard
+        )
+        guard let session = manager.session(projectID: project.id, kind: .codex) else {
+            return XCTFail("Expected the remote session to be adopted")
+        }
+        XCTAssertLessThan(
+            abs(session.lastActivityAt.timeIntervalSinceNow),
+            5,
+            "Unknown activity falls back to the adoption time until a real epoch arrives."
+        )
+
+        session.applyRemoteSnapshot(snapshot(lastActivityAt: 1_000_000))
+        XCTAssertEqual(
+            session.lastActivityAt,
+            Date(timeIntervalSince1970: 1_000_000),
+            "The first observed epoch replaces the fallback even though it is older."
+        )
+
+        session.applyRemoteSnapshot(snapshot(lastActivityAt: 500_000))
+        XCTAssertEqual(
+            session.lastActivityAt,
+            Date(timeIntervalSince1970: 1_000_000),
+            "Observed activity only moves forward."
+        )
+
+        session.applyRemoteSnapshot(snapshot(lastActivityAt: 2_000_000))
+        XCTAssertEqual(session.lastActivityAt, Date(timeIntervalSince1970: 2_000_000))
     }
 
     func testNewSessionDoesNotReplaceKnownSameRepositorySession() async {
