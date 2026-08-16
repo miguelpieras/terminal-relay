@@ -76,6 +76,11 @@ final class SessionManager: ObservableObject {
     private var backgroundAttachmentAttemptedSessionIDs = Set<UUID>()
     private var stopsInFlight = Set<UUID>()
     private var cacheSeededSessionIDs = Set<UUID>()
+    // Chat rows one refresh has failed to list. Removal requires a second
+    // consecutive miss: a transient listing hiccup (a failed chat-status
+    // probe on a live worker) must revive the same row on the next refresh
+    // instead of destroying its identity, selection, and unread state.
+    private var unlistedChatSessionIDs = Set<UUID>()
 
     init(
         defaults: UserDefaults = .standard,
@@ -148,9 +153,14 @@ final class SessionManager: ObservableObject {
     ) -> Set<String> {
         Set(
             sessions.compactMap { session -> String? in
+                // A chat row in the one-refresh removal debounce still
+                // represents its conversation; showing the dormant thread
+                // beside it would reopen the duplicate window.
                 guard session.projectID == projectID,
                       session.serverKey == serverKey,
-                      session.isLaunchPending || session.status.occupiesSlot,
+                      session.isLaunchPending
+                          || session.status.occupiesSlot
+                          || unlistedChatSessionIDs.contains(session.id),
                       let threadID = session.threadID else {
                     return nil
                 }
@@ -712,6 +722,7 @@ final class SessionManager: ObservableObject {
             ] = snapshot
         }
 
+        let previouslyUnlistedChatSessionIDs = unlistedChatSessionIDs
         for session in sessions(for: worker) where session.status.occupiesSlot {
             let remote = remoteSessions[
                 RemoteSessionKey(
@@ -729,12 +740,35 @@ final class SessionManager: ObservableObject {
             if cacheSeededSessionIDs.contains(session.id) {
                 removeSession(id: session.id)
             } else if session.presentation == .chat, session.threadID != nil {
-                // The conversation lives on as a dormant thread row; an
-                // exited chat relay row beside it would render the same
-                // conversation twice and accumulate on every re-resume.
-                removeSession(id: session.id)
+                // First miss: keep the row (a transient listing hiccup must
+                // not destroy its identity) but mark it; the follow-up sweep
+                // below removes it if a second refresh confirms the relay is
+                // really gone. The dormant thread row then becomes the
+                // conversation's single representation.
+                unlistedChatSessionIDs.insert(session.id)
+                session.markRemoteExited()
             } else {
                 session.markRemoteExited()
+            }
+        }
+
+        // Second consecutive refresh without the relay: drop the exited chat
+        // row so it cannot duplicate the dormant thread row or accumulate on
+        // re-resume. A relay listed again instead revives the same row via
+        // applyRemoteSnapshot below.
+        for session in sessions(for: worker)
+        where !session.status.occupiesSlot
+            && previouslyUnlistedChatSessionIDs.contains(session.id) {
+            let remote = remoteSessions[
+                RemoteSessionKey(
+                    serverKey: worker.concurrencyKey,
+                    instanceToken: session.instanceToken
+                )
+            ]
+            if remote?.kind == session.kind, remote?.repositoryName == session.projectName {
+                unlistedChatSessionIDs.remove(session.id)
+            } else {
+                removeSession(id: session.id)
             }
         }
 
@@ -926,6 +960,7 @@ final class SessionManager: ObservableObject {
         unreadSessionIDs.remove(id)
         backgroundAttachmentAttemptedSessionIDs.remove(id)
         cacheSeededSessionIDs.remove(id)
+        unlistedChatSessionIDs.remove(id)
         sidebarSessionInstanceTokensByProject[removedProjectID.uuidString]?.removeAll {
             $0 == removedInstanceToken
         }

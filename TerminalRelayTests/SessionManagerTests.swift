@@ -559,16 +559,98 @@ final class SessionManagerTests: XCTestCase {
             response: response,
             launchDefaults: .standard
         )
+        let emptyResponse = WorkerSessionResponse(
+            projects: [project.displayName],
+            sessions: []
+        )
+        manager.reconcile(
+            worker: server,
+            projects: [project],
+            response: emptyResponse,
+            launchDefaults: .standard
+        )
+
+        // First miss keeps the row (a transient listing hiccup must not
+        // destroy its identity) and keeps suppressing the dormant thread
+        // row so the two never render together.
+        let survivor = manager.session(projectID: project.id, kind: .claude)
+        XCTAssertEqual(survivor?.status, .exited(nil))
+        XCTAssertEqual(
+            manager.occupiedThreadKeys(
+                forProjectID: project.id,
+                serverKey: server.concurrencyKey
+            ),
+            ["claude:\(instanceToken)"]
+        )
+
+        manager.reconcile(
+            worker: server,
+            projects: [project],
+            response: emptyResponse,
+            launchDefaults: .standard
+        )
+        XCTAssertTrue(
+            manager.sessions.isEmpty,
+            "After a second refresh confirms the relay is gone, the dormant thread row is the conversation's single representation; an exited chat relay row beside it would duplicate the conversation."
+        )
+    }
+
+    func testTransientListingMissRevivesTheSameChatRow() {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let manager = SessionManager()
+        let instanceToken = "01234567-89ab-" + "4def-8abc-0123456789ab"
+        let response = WorkerSessionResponse(
+            projects: [project.displayName],
+            sessions: [
+                WorkerSessionSnapshot(
+                    kind: .claude,
+                    repositoryName: project.displayName,
+                    attachedClientCount: 0,
+                    instanceToken: instanceToken,
+                    presentation: .chat
+                )
+            ]
+        )
+
+        manager.reconcile(
+            worker: server,
+            projects: [project],
+            response: response,
+            launchDefaults: .standard
+        )
+        let adopted = manager.session(projectID: project.id, kind: .claude)
         manager.reconcile(
             worker: server,
             projects: [project],
             response: WorkerSessionResponse(projects: [project.displayName], sessions: []),
             launchDefaults: .standard
         )
+        manager.reconcile(
+            worker: server,
+            projects: [project],
+            response: response,
+            launchDefaults: .standard
+        )
 
+        let revived = manager.session(projectID: project.id, kind: .claude)
         XCTAssertTrue(
-            manager.sessions.isEmpty,
-            "The dormant thread row is the conversation's single remaining representation; an exited chat relay row beside it would duplicate the conversation."
+            revived === adopted,
+            "One missed listing must revive the same row, not adopt a replacement."
+        )
+        XCTAssertEqual(revived?.status, .remoteRunning)
+
+        // The mark is cleared: the next single miss starts a fresh debounce
+        // instead of removing the row immediately.
+        manager.reconcile(
+            worker: server,
+            projects: [project],
+            response: WorkerSessionResponse(projects: [project.displayName], sessions: []),
+            launchDefaults: .standard
+        )
+        XCTAssertTrue(
+            manager.session(projectID: project.id, kind: .claude) === adopted,
+            "A fresh first miss keeps the row again."
         )
     }
 
