@@ -1042,6 +1042,11 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertTrue(pendingSession.isLoadingExistingConversation)
         XCTAssertEqual(pendingSession.threadID, threadID)
         XCTAssertEqual(pendingSession.displayTitle, "Review initial loading")
+        XCTAssertEqual(
+            pendingSession.lastActivityAt,
+            Date(timeIntervalSince1970: 100),
+            "A resumed conversation keeps the thread's recency so its row does not jump."
+        )
         XCTAssertEqual(manager.selectedSessionID, pendingSession.id)
         let pendingID = pendingSession.id
 
@@ -1080,6 +1085,11 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(session.threadID, threadID)
         XCTAssertEqual(session.displayTitle, "Review initial loading")
         XCTAssertFalse(session.isLaunchPending)
+        XCTAssertEqual(
+            session.lastActivityAt,
+            Date(timeIntervalSince1970: 100),
+            "The confirmed session keeps the inherited recency across the swap."
+        )
         XCTAssertEqual(
             recorder.configurations,
             [

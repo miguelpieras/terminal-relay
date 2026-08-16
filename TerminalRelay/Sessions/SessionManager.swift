@@ -279,12 +279,16 @@ final class SessionManager: ObservableObject {
         }
 
         invalidatePendingOpenSelection()
+        // The resumed conversation keeps the thread's own recency so the row
+        // stays where the user clicked it instead of teleporting to the top;
+        // real activity bumps it later.
         let pendingSession = TerminalSession(
             project: project,
             server: server,
             kind: thread.kind,
             sequenceNumber: nextSequenceNumber(projectID: project.id, kind: thread.kind),
             instanceToken: UUID().uuidString.lowercased(),
+            lastActivityAt: Date(timeIntervalSince1970: TimeInterval(thread.updatedAt)),
             terminalTitle: thread.title,
             threadID: thread.threadID,
             presentation: .chat,

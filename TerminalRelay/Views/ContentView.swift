@@ -63,6 +63,11 @@ private enum FlatSidebarItem {
     var priority: Int {
         switch self {
         case .session(_, let session):
+            // Resuming an existing conversation keeps its place; only fresh
+            // launches and working sessions bubble to the top.
+            if session.isLaunchPending, session.isLoadingExistingConversation {
+                return 1
+            }
             if session.isLaunchPending || session.isWorking { return 0 }
             return session.status.occupiesSlot ? 1 : 3
         case .thread(_, let thread):
@@ -863,6 +868,7 @@ struct ContentView: View {
     }
 
     private func sessionPriority(_ session: TerminalSession) -> Int {
+        if session.isLaunchPending, session.isLoadingExistingConversation { return 1 }
         if session.isLaunchPending || session.isWorking { return 0 }
         return session.status.occupiesSlot ? 1 : 3
     }
@@ -2142,6 +2148,7 @@ private struct ProjectSidebarSection: View {
     }
 
     private func sessionPriority(_ session: TerminalSession) -> Int {
+        if session.isLaunchPending, session.isLoadingExistingConversation { return 1 }
         if session.isLaunchPending || session.isWorking { return 0 }
         return session.status.occupiesSlot ? 1 : 3
     }
