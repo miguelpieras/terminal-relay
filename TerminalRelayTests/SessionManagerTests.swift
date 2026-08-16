@@ -490,6 +490,91 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertTrue(manager.sessions.contains { $0.id == secondSession.id })
     }
 
+    func testRestoredCachedSessionVanishesWhenTheWorkerNoLongerListsIt() {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let manager = SessionManager()
+
+        manager.restoreCachedSessions(
+            worker: server,
+            projects: [project],
+            response: WorkerSessionResponse(
+                projects: [project.displayName],
+                sessions: [
+                    WorkerSessionSnapshot(
+                        kind: .claude,
+                        repositoryName: project.displayName,
+                        attachedClientCount: 0,
+                        instanceToken: "01234567-89ab-" + "4def-8abc-0123456789ab",
+                        presentation: .chat
+                    )
+                ]
+            ),
+            launchDefaults: .standard
+        )
+
+        let restored = manager.session(projectID: project.id, kind: .claude)
+        XCTAssertEqual(restored?.status, .remoteRunning)
+
+        manager.reconcile(
+            worker: server,
+            projects: [project],
+            response: WorkerSessionResponse(projects: [project.displayName], sessions: []),
+            launchDefaults: .standard
+        )
+
+        XCTAssertTrue(
+            manager.sessions.isEmpty,
+            "An unconfirmed cached row must be removed, not left as an exited ghost."
+        )
+    }
+
+    func testRestoredCachedSessionConfirmedByARefreshKeepsTheExitedTreatment() {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let manager = SessionManager()
+        let instanceToken = "01234567-89ab-" + "4def-8abc-0123456789ab"
+        let response = WorkerSessionResponse(
+            projects: [project.displayName],
+            sessions: [
+                WorkerSessionSnapshot(
+                    kind: .claude,
+                    repositoryName: project.displayName,
+                    attachedClientCount: 0,
+                    instanceToken: instanceToken,
+                    presentation: .chat
+                )
+            ]
+        )
+
+        manager.restoreCachedSessions(
+            worker: server,
+            projects: [project],
+            response: response,
+            launchDefaults: .standard
+        )
+        let restored = manager.session(projectID: project.id, kind: .claude)
+        manager.reconcile(
+            worker: server,
+            projects: [project],
+            response: response,
+            launchDefaults: .standard
+        )
+        manager.reconcile(
+            worker: server,
+            projects: [project],
+            response: WorkerSessionResponse(projects: [project.displayName], sessions: []),
+            launchDefaults: .standard
+        )
+
+        XCTAssertTrue(manager.session(projectID: project.id, kind: .claude) === restored)
+        XCTAssertEqual(
+            restored?.status,
+            .exited(nil),
+            "A worker-confirmed row keeps the normal exited treatment when it vanishes."
+        )
+    }
+
     func testReconcileRestoresDetachedRemoteSessionUnderMatchingProject() {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let project = makeProject(name: "Terminal Relay", server: server)

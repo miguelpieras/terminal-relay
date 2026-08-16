@@ -1,11 +1,11 @@
 import Foundation
 
-enum WorkerSessionPresentation: String, Equatable {
+enum WorkerSessionPresentation: String, Codable, Equatable {
     case terminal
     case chat
 }
 
-struct WorkerSessionSnapshot: Equatable, Identifiable {
+struct WorkerSessionSnapshot: Codable, Equatable, Identifiable {
     let kind: AgentKind
     let repositoryName: String
     let attachedClientCount: Int
@@ -49,7 +49,7 @@ struct WorkerSessionSnapshot: Equatable, Identifiable {
     }
 }
 
-struct WorkerSessionResponse: Equatable {
+struct WorkerSessionResponse: Codable, Equatable {
     let projects: [String]
     let sessions: [WorkerSessionSnapshot]
 }

@@ -76,6 +76,7 @@ final class WorkerSessionService: ObservableObject {
     private static let tombstoneLifetime: TimeInterval = 60
 
     private static let threadCatalogStorageKey = "workerThreadCatalogs.v1"
+    private static let sessionResponseStorageKey = "workerSessionResponses.v1"
     private static let threadCatalogFreshness: TimeInterval = 30
 
     convenience init() {
@@ -112,6 +113,7 @@ final class WorkerSessionService: ObservableObject {
         self.persistsThreadCatalogs = persistsThreadCatalogs
         if persistsThreadCatalogs {
             loadPersistedThreadCatalogs()
+            loadPersistedSessionResponses()
         }
     }
 
@@ -145,6 +147,53 @@ final class WorkerSessionService: ObservableObject {
         }
         guard let data = try? JSONEncoder().encode(entries) else { return }
         UserDefaults.standard.set(data, forKey: Self.threadCatalogStorageKey)
+    }
+
+    /// Cached session responses let the sidebar render a worker's last-known
+    /// session rows immediately at launch; the first SSH refresh reconciles
+    /// them. Attachment and working state are transient, so they reset on load.
+    private struct PersistedSessionResponse: Codable {
+        let workerID: UUID
+        let response: WorkerSessionResponse
+    }
+
+    private func loadPersistedSessionResponses() {
+        guard let data = UserDefaults.standard.data(
+            forKey: Self.sessionResponseStorageKey
+        ),
+        let entries = try? JSONDecoder().decode(
+            [PersistedSessionResponse].self,
+            from: data
+        ) else {
+            return
+        }
+        for entry in entries {
+            responses[entry.workerID] = WorkerSessionResponse(
+                projects: entry.response.projects,
+                sessions: entry.response.sessions.map {
+                    WorkerSessionSnapshot(
+                        kind: $0.kind,
+                        repositoryName: $0.repositoryName,
+                        attachedClientCount: 0,
+                        instanceToken: $0.instanceToken,
+                        title: $0.title,
+                        lastActivityAt: $0.lastActivityAt,
+                        reportedWorking: nil,
+                        threadID: $0.threadID,
+                        presentation: $0.presentation
+                    )
+                }
+            )
+        }
+    }
+
+    private func persistSessionResponses() {
+        guard persistsThreadCatalogs else { return }
+        let entries = responses.map {
+            PersistedSessionResponse(workerID: $0.key, response: $0.value)
+        }
+        guard let data = try? JSONEncoder().encode(entries) else { return }
+        UserDefaults.standard.set(data, forKey: Self.sessionResponseStorageKey)
     }
 
     func response(for workerID: UUID) -> WorkerSessionResponse? {
@@ -242,6 +291,7 @@ final class WorkerSessionService: ObservableObject {
             }
             apply(await fetchUpdateStatus(worker: worker), to: worker.id)
             responses[worker.id] = response
+            persistSessionResponses()
             mergeLiveSessionsIntoThreadCatalogs(
                 workerID: worker.id,
                 sessions: response.sessions
@@ -466,6 +516,7 @@ final class WorkerSessionService: ObservableObject {
                 projects: projects,
                 sessions: sessions
             )
+            persistSessionResponses()
             errors[worker.id] = nil
             workerSessionLogger.notice(
                 "Started \(kind.rawValue, privacy: .public) session \(snapshot.instanceToken, privacy: .public) for \(repositoryName, privacy: .public) on \(worker.destination, privacy: .public)"
@@ -543,6 +594,7 @@ final class WorkerSessionService: ObservableObject {
                     }
                 )
                 responses[worker.id] = response
+                persistSessionResponses()
             }
             stoppedSessionTombstones[instanceToken] = Date()
             errors[worker.id] = nil
@@ -748,6 +800,7 @@ final class WorkerSessionService: ObservableObject {
                     return $0.instanceToken < $1.instanceToken
                 }
             )
+            persistSessionResponses()
             mergeLiveSessionsIntoThreadCatalogs(
                 workerID: worker.id,
                 sessions: responses[worker.id]?.sessions ?? []

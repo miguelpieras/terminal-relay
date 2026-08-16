@@ -69,6 +69,7 @@ final class SessionManager: ObservableObject {
     private var taskCompletionObservers: [UUID: AnyCancellable] = [:]
     private var backgroundAttachmentAttemptedSessionIDs = Set<UUID>()
     private var stopsInFlight = Set<UUID>()
+    private var cacheSeededSessionIDs = Set<UUID>()
 
     init(
         defaults: UserDefaults = .standard,
@@ -601,6 +602,27 @@ final class SessionManager: ObservableObject {
         }
     }
 
+    /// Materializes last-known session rows from a persisted response so the
+    /// sidebar renders them at launch without waiting for SSH. Rows the next
+    /// real refresh does not confirm are removed rather than marked exited.
+    func restoreCachedSessions(
+        worker: ServerProfile,
+        projects: [ProjectProfile],
+        response: WorkerSessionResponse,
+        launchDefaults: AgentLaunchDefaults
+    ) {
+        let existingIDs = Set(sessions.map(\.id))
+        reconcile(
+            worker: worker,
+            projects: projects,
+            response: response,
+            launchDefaults: launchDefaults
+        )
+        cacheSeededSessionIDs.formUnion(
+            sessions.map(\.id).filter { !existingIDs.contains($0) }
+        )
+    }
+
     @discardableResult
     func refresh(
         worker: ServerProfile,
@@ -645,8 +667,16 @@ final class SessionManager: ObservableObject {
                     instanceToken: session.instanceToken
                 )
             ]
-            if session.status.canReconnect,
-               (remote?.kind != session.kind || remote?.repositoryName != session.projectName) {
+            guard session.status.canReconnect,
+                  remote?.kind != session.kind
+                    || remote?.repositoryName != session.projectName else {
+                continue
+            }
+            // A cache-restored row the worker never confirmed has no exit to
+            // report; drop it silently instead of leaving a dimmed ghost.
+            if cacheSeededSessionIDs.contains(session.id) {
+                removeSession(id: session.id)
+            } else {
                 session.markRemoteExited()
             }
         }
@@ -664,6 +694,7 @@ final class SessionManager: ObservableObject {
                     && $0.instanceToken == snapshot.instanceToken
             }
             if let existing {
+                cacheSeededSessionIDs.remove(existing.id)
                 existing.applyRemoteSnapshot(snapshot)
             } else {
                 let session = TerminalSession(
@@ -816,6 +847,7 @@ final class SessionManager: ObservableObject {
         taskCompletionObservers[id] = nil
         unreadSessionIDs.remove(id)
         backgroundAttachmentAttemptedSessionIDs.remove(id)
+        cacheSeededSessionIDs.remove(id)
         sidebarSessionInstanceTokensByProject[removedProjectID.uuidString]?.removeAll {
             $0 == removedInstanceToken
         }

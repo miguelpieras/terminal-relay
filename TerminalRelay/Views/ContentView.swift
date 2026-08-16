@@ -414,6 +414,7 @@ struct ContentView: View {
     @State private var selectedSessionIDs: Set<UUID> = []
     @State private var sessionArchiveRequest: SessionArchiveRequest?
     @State private var liveThreadArchiveRequest: LiveThreadArchiveRequest?
+    @State private var didSeedCachedSessionRows = false
     @State private var isNamingSidebarFolder = false
     @State private var newSidebarFolderName = ""
     @State private var expandedSidebarFolderIDs: Set<UUID> = []
@@ -647,6 +648,7 @@ struct ContentView: View {
                 Task { await refreshWorkerSessions() }
             }
             .task(id: workerStatusTaskID) {
+                seedCachedSessionRows()
                 repeat {
                     await refreshWorkerSessions()
                     do {
@@ -1566,6 +1568,27 @@ struct ContentView: View {
             .sorted()
             .joined(separator: ",")
         return "\(workers)|\(projects)"
+    }
+
+    /// Renders each worker's last-known session rows from the persisted
+    /// response cache so they appear together with the cached thread rows at
+    /// launch; the first real refresh reconciles them.
+    private func seedCachedSessionRows() {
+        guard !didSeedCachedSessionRows else { return }
+        didSeedCachedSessionRows = true
+        guard !ScreenshotDemoMode.isEnabled else { return }
+        for worker in serverStore.servers {
+            guard sessionManager.sessions(for: worker).isEmpty,
+                  let cached = workerSessionService.response(for: worker.id) else {
+                continue
+            }
+            sessionManager.restoreCachedSessions(
+                worker: worker,
+                projects: projectStore.projects,
+                response: cached,
+                launchDefaults: launchDefaults
+            )
+        }
     }
 
     private func refreshWorkerSessions() async {
