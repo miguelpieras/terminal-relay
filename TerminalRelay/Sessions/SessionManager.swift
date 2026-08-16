@@ -1,5 +1,11 @@
 import Combine
 import Foundation
+import OSLog
+
+private let sessionOrderLogger = Logger(
+    subsystem: "com.mpieras.TerminalRelay",
+    category: "session-order"
+)
 
 @MainActor
 struct SessionOccupant {
@@ -282,6 +288,9 @@ final class SessionManager: ObservableObject {
         // The resumed conversation keeps the thread's own recency so the row
         // stays where the user clicked it instead of teleporting to the top;
         // real activity bumps it later.
+        sessionOrderLogger.notice(
+            "Resuming \(thread.kind.rawValue, privacy: .public) thread \(thread.threadID, privacy: .public) for \(thread.repositoryName, privacy: .public); inherited activity \(thread.updatedAt, privacy: .public)"
+        )
         let pendingSession = TerminalSession(
             project: project,
             server: server,
@@ -622,8 +631,10 @@ final class SessionManager: ObservableObject {
             response: response,
             launchDefaults: launchDefaults
         )
-        cacheSeededSessionIDs.formUnion(
-            sessions.map(\.id).filter { !existingIDs.contains($0) }
+        let seededIDs = sessions.map(\.id).filter { !existingIDs.contains($0) }
+        cacheSeededSessionIDs.formUnion(seededIDs)
+        sessionOrderLogger.notice(
+            "Seeded \(seededIDs.count, privacy: .public) cached session rows for \(worker.destination, privacy: .public)"
         )
     }
 
@@ -701,6 +712,9 @@ final class SessionManager: ObservableObject {
                 cacheSeededSessionIDs.remove(existing.id)
                 existing.applyRemoteSnapshot(snapshot)
             } else {
+                sessionOrderLogger.notice(
+                    "Adopting remote \(snapshot.kind.rawValue, privacy: .public) session \(snapshot.instanceToken, privacy: .public) for \(snapshot.repositoryName, privacy: .public); reported activity \(snapshot.lastActivityAt.map(String.init) ?? "none", privacy: .public)"
+                )
                 let session = TerminalSession(
                     project: project,
                     server: worker,

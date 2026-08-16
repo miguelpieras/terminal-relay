@@ -177,7 +177,7 @@ final class WorkerSessionService: ObservableObject {
                         attachedClientCount: 0,
                         instanceToken: $0.instanceToken,
                         title: $0.title,
-                        lastActivityAt: $0.lastActivityAt,
+                        lastActivityAt: $0.lastActivityAt == 0 ? nil : $0.lastActivityAt,
                         reportedWorking: nil,
                         threadID: $0.threadID,
                         presentation: $0.presentation

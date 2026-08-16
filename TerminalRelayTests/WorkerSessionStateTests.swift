@@ -57,6 +57,20 @@ final class WorkerSessionStateTests: XCTestCase {
         XCTAssertEqual(response.sessions.first?.isWorking(now: Date(timeIntervalSince1970: 121)), false)
     }
 
+    func testTreatsZeroActivityAsUnknownRatherThanEpoch() throws {
+        let response = try WorkerSessionProtocol.parse(
+            """
+            __TERMINAL_RELAY_SESSION_V1__
+            session|codex|terminal-relay|0|01234567-89ab-4def-8abc-0123456789ab|0||0
+            """
+        )
+
+        XCTAssertNil(
+            response.sessions.first?.lastActivityAt,
+            "A reported 0 means the worker has no activity data; it must not sort as 1970."
+        )
+    }
+
     func testParsesThreadIDsAndCanonicalizesThem() throws {
         let response = try WorkerSessionProtocol.parse(
             """

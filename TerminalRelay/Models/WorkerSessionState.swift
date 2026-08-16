@@ -127,7 +127,10 @@ enum WorkerSessionProtocol {
                           decodedTitle.count <= 200 else {
                         throw WorkerSessionProtocolError.invalidRecord
                     }
-                    lastActivityAt = activity
+                    // The worker emits 0 when it has no activity data for a
+                    // session (broker chats); epoch zero must not masquerade
+                    // as a real timestamp in recency sorts.
+                    lastActivityAt = activity == 0 ? nil : activity
                     title = decodedTitle.isEmpty ? nil : decodedTitle
                     if fields.count >= 8 {
                         guard fields[7].isEmpty || fields[7] == "0" || fields[7] == "1" else {
