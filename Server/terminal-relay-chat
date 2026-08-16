@@ -61,6 +61,10 @@ MAX_REPLAY_RECORDS = 2048
 MAX_REPLAY_BYTES = 8 * 1024 * 1024
 MAX_COMMAND_RESULTS = 1024
 HEARTBEAT_SECONDS = 20
+# The broker's last-event time is persisted into broker.json (throttled to
+# one rewrite per window) so status listings can sort conversations by real
+# recency without a write per streamed delta.
+ACTIVITY_PERSIST_SECONDS = 30
 ATTACHMENT_ORPHAN_SECONDS = 10 * 60
 ATTACHMENT_SWEEP_SECONDS = 60
 ATTACH_TIMEOUT_SECONDS = 10
@@ -86,6 +90,13 @@ PUBLIC_LAUNCH_OPTION_KEYS = frozenset(
 )
 ATTACHMENT_FILE_PATTERN = re.compile(
     r"^([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})(?:\.([a-z0-9]{1,10}))?$"
+)
+# Broadcast records that are not conversation activity: session.* lifecycle
+# and keepalive records are exempted by prefix, and these are read-only
+# client requests (history scrollback, file previews) that must not bump a
+# conversation's recency.
+ACTIVITY_EXEMPT_EVENTS = frozenset(
+    {"history.page", "file.preview", "conversation.snapshot"}
 )
 
 
@@ -3681,6 +3692,12 @@ class ChatBroker:
         self.last_attachment_sweep = 0.0
         self.provider_lock_descriptor: int | None = None
         self.rebuilding_snapshot = False
+        # Epoch seconds of the last conversation event; 0 until one occurs.
+        # Persisted in broker.json (throttled) and re-seeded across broker
+        # restarts so status listings sort conversations by real recency.
+        self.activity_at = 0
+        self.persisted_activity_at = 0
+        self.state_status: str | None = None
         self.buffered_provider_events: list[
             tuple[str, dict[str, Any], str | None, str | None, bool]
         ] = []
@@ -3796,7 +3813,22 @@ class ChatBroker:
         if event_type in {"turn.completed", "turn.failed", "turn.interrupted"}:
             self._finish_turn_attachments(turn_id)
         self.last_emit = time.monotonic()
+        if (
+            not event_type.startswith("session.")
+            and event_type not in ACTIVITY_EXEMPT_EVENTS
+        ):
+            self._note_activity()
         return value
+
+    def _note_activity(self) -> None:
+        self.activity_at = int(time.time())
+        if (
+            self.state_status == "ready"
+            and self.activity_at - self.persisted_activity_at
+            >= ACTIVITY_PERSIST_SECONDS
+        ):
+            with contextlib.suppress(OSError):
+                self._write_state("ready")
 
     async def _broadcast_encoded(self, encoded: bytes) -> None:
         stale: list[ClientConnection] = []
@@ -4125,6 +4157,7 @@ class ChatBroker:
             "socket": self.socket_path,
             "capabilities": chat_capabilities(self.provider_name),
             "launchOptions": public_launch_options(self.launch_options),
+            "activityAt": self.activity_at,
         }
         temporary = f"{self.state_path}.{os.getpid()}.{new_uuid()}.tmp"
         descriptor = os.open(
@@ -4137,6 +4170,28 @@ class ChatBroker:
         finally:
             os.close(descriptor)
         os.replace(temporary, self.state_path)
+        self.state_status = status
+        self.persisted_activity_at = self.activity_at
+
+    def _seed_activity_from_prior_state(self) -> None:
+        """Carry the last event time across broker restarts (worker reboots,
+        replacement brokers) so a restored conversation keeps its recency
+        instead of resetting to unknown."""
+        try:
+            info = os.lstat(self.state_path)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                return
+            with open(self.state_path, "r", encoding="utf-8") as stream:
+                prior = json.load(stream)
+        except (OSError, ValueError):
+            return
+        activity = prior.get("activityAt") if isinstance(prior, dict) else None
+        if (
+            isinstance(activity, int)
+            and not isinstance(activity, bool)
+            and activity > 0
+        ):
+            self.activity_at = max(self.activity_at, activity)
 
     def _acquire_provider_lock(self) -> None:
         assert self.provider_thread_id is not None
@@ -4256,6 +4311,7 @@ class ChatBroker:
 
     async def run(self) -> None:
         prepare_session_directory(self.runtime_directory, self.relay_id)
+        self._seed_activity_from_prior_state()
         self._clear_all_attachments()
         if os.path.lexists(self.socket_path):
             socket_stat = os.lstat(self.socket_path)
@@ -5406,18 +5462,23 @@ def load_state(runtime_directory: str, relay_id: str) -> dict[str, Any]:
         )
     ):
         raise ChatError("unsafeState", "The chat relay state is invalid.")
+    # Brokers from before the activity field wrote no activityAt; 0 means
+    # the last-event time is unknown.
+    activity = state_value.get("activityAt")
+    if not isinstance(activity, int) or isinstance(activity, bool) or activity < 0:
+        activity = 0
+    state_value["activityAt"] = activity
     return state_value
 
 
 STOPPED_RELAY_SWEEP_SECONDS = 24 * 60 * 60
 
 
-def emit_chat_bindings(runtime_directory: str, provider: str, repository: str) -> None:
-    """Scan every chat relay in ONE process: print 'threadId|relayId|chat'
-    for live brokers matching provider+repository, and sweep relay
-    directories that have been stopped (or dead) for a day. Replaces a
-    per-relay python spawn that made thread catalogs cost seconds once
-    stopped relays accumulated."""
+def scan_chat_relays(runtime_directory: str) -> collections.abc.Iterator[dict[str, Any]]:
+    """Yield every live chat relay's state in ONE process, sweeping relay
+    directories that have been stopped (or dead) for a day. Replaces
+    per-relay python spawns that made listings cost seconds once stopped
+    relays accumulated."""
     try:
         entries = sorted(os.listdir(runtime_directory))
     except OSError:
@@ -5434,19 +5495,11 @@ def emit_chat_bindings(runtime_directory: str, provider: str, repository: str) -
             state = load_state(runtime_directory, relay_id)
             if state["status"] == "ready":
                 validate_live_state_process(state)
-                if (
-                    state["provider"] == provider
-                    and state["repository"] == repository
-                ):
-                    print(
-                        "{}|{}|chat".format(
-                            state["providerThreadId"], state["relayId"]
-                        )
-                    )
+                yield state
                 continue
         except ChatError:
             pass
-        # Stopped, crashed, or unreadable relays contribute no bindings; the
+        # Stopped, crashed, or unreadable relays contribute no listings; the
         # age guard keeps a mid-start directory (state not yet written) and
         # any concurrent attach race out of the sweep.
         try:
@@ -5454,6 +5507,36 @@ def emit_chat_bindings(runtime_directory: str, provider: str, repository: str) -
                 shutil.rmtree(session_directory, ignore_errors=True)
         except OSError:
             continue
+
+
+def emit_chat_bindings(runtime_directory: str, provider: str, repository: str) -> None:
+    """Print 'threadId|relayId|chat|activityAt' for live brokers matching
+    provider+repository; thread catalogs raise relay-active rows' updatedAt
+    to the broker's last-event time."""
+    for state in scan_chat_relays(runtime_directory):
+        if state["provider"] == provider and state["repository"] == repository:
+            print(
+                "{}|{}|chat|{}".format(
+                    state["providerThreadId"],
+                    state["relayId"],
+                    state["activityAt"],
+                )
+            )
+
+
+def emit_chat_status(runtime_directory: str) -> None:
+    """Print 'provider|repository|relayId|threadId|activityAt' for every
+    live broker; the status listing consumes this in one spawn."""
+    for state in scan_chat_relays(runtime_directory):
+        print(
+            "{}|{}|{}|{}|{}".format(
+                state["provider"],
+                state["repository"],
+                state["relayId"],
+                state["providerThreadId"],
+                state["activityAt"],
+            )
+        )
 
 
 def validate_live_state_process(state: dict[str, Any]) -> None:
@@ -5653,6 +5736,9 @@ def build_parser() -> argparse.ArgumentParser:
     bindings.add_argument("--provider", choices=("codex", "claude"), required=True)
     bindings.add_argument("--repository", required=True)
 
+    chat_status = subparsers.add_parser("inspect-status", add_help=False)
+    chat_status.add_argument("--runtime-directory", required=True)
+
     attach = subparsers.add_parser("attach", add_help=False)
     attach.add_argument("--runtime-directory", required=True)
     attach.add_argument("--relay-id", required=True)
@@ -5827,6 +5913,12 @@ def main() -> int:
             arguments.provider,
             canonical_repository(arguments.repository),
         )
+        return 0
+    if arguments.command == "inspect-status":
+        runtime_directory = canonical_directory(
+            arguments.runtime_directory, "runtime directory"
+        )
+        emit_chat_status(runtime_directory)
         return 0
     return asyncio.run(async_main(arguments))
 

@@ -349,8 +349,15 @@ The V1 parser contract retains the original five-field record for older clients.
 Current workers emit one extended record for each active agent:
 
 ```text
-session|<codex|claude>|<repository>|<attached-client-count>|<instance-uuid>|<activity-epoch>|<hex-UTF-8-title>|<0|1|empty-working>|<provider-thread-uuid>
+session|<codex|claude>|<repository>|<attached-client-count>|<instance-uuid>|<activity-epoch>|<hex-UTF-8-title>|<0|1|empty-working>|<provider-thread-uuid>|<terminal|chat>
 ```
+
+The activity epoch is seconds since the Unix epoch, with 0 meaning unknown.
+Terminal records take it from tmux window activity; chat records report the
+broker's last conversation event, which the broker persists into its state
+file on a 30-second throttle and re-seeds across restarts. The status
+listing gathers every live broker's identity and activity in a single
+`terminal-relay-chat inspect-status` invocation.
 
 The relay instance UUID is a new immutable terminal identity on every launch.
 The provider thread UUID is the persisted conversation identity. Current app
@@ -418,7 +425,10 @@ Current clients use the provider-aware V2 commands. Their catalog begins with
 
 The activity state is `inactive`, `relay-active`, `external-active`, or
 `unknown`. Only a proven-inactive row can be resumed or mutated. An active
-instance token is returned only for a live Terminal Relay terminal.
+instance token is returned only for a live Terminal Relay terminal. A
+relay-active chat row's `updatedAt` is raised to the live broker's
+last-event time when that outranks the provider catalog's own activity
+time, which lags (or reads 0) while the broker holds the conversation open.
 
 Claude discovery, metadata read, and rename use the exact pinned official
 Claude Agent SDK. The adapter asks Claude Code for its agent registry, validates

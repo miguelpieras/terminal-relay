@@ -251,6 +251,9 @@ except BlockingIOError:
             ]
             assert fields[8] == thread_id
             assert fields[9] == "chat"
+            # A fresh broker has no conversation events yet, so its activity
+            # field reports 0 (unknown).
+            assert fields[5] == "0"
 
             # Session supervision keeps an identifier-only intent and rebuilds
             # provider history after the broker is lost or the worker reboots.
@@ -458,6 +461,15 @@ except BlockingIOError:
                 relay_id,
                 attachment_request_id,
             )
+
+            # The turn's provider events gave the broker a real last-event
+            # time, which the status listing reports in the activity field.
+            active_record = next(
+                line
+                for line in helper("status").stdout.splitlines()
+                if f"|{relay_id}|" in line
+            )
+            assert int(active_record.split("|")[5]) > 0
 
             detach_id, detach = protocol_command(
                 "session.detach", relay_id, thread_id, {}

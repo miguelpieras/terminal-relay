@@ -488,6 +488,28 @@ async def exercise_protocol(module, root: pathlib.Path) -> None:
     assert (await second.read_type("message.delta"))["seq"] == event["seq"]
     assert broker.snapshot_payload()["items"][-1]["occurredAt"] == event["occurredAt"]
 
+    # The delta was the first conversation event, so the broker persisted its
+    # last-event time immediately. Keepalives and read-only requests must not
+    # bump it, and a follow-up event inside the throttle window updates only
+    # the in-memory value.
+    on_disk = json.loads(
+        pathlib.Path(broker.state_path).read_text(encoding="utf-8")
+    )
+    assert on_disk["activityAt"] == broker.activity_at > 0
+    noted_activity = broker.activity_at
+    await broker._publish("session.heartbeat", {"connectionState": "streaming"})
+    await broker.emit(
+        "history.page",
+        {"items": [], "hasOlderHistory": False, "oldestItemId": None},
+    )
+    assert broker.activity_at == noted_activity
+    broker._note_activity()
+    on_disk = json.loads(
+        pathlib.Path(broker.state_path).read_text(encoding="utf-8")
+    )
+    assert on_disk["activityAt"] == broker.persisted_activity_at == noted_activity
+    assert broker.activity_at >= noted_activity
+
     # Every command receives an acknowledgement and turn.start is idempotent.
     ping_id, ping = first.command("ping", {})
     await first.send(ping)
@@ -3210,7 +3232,13 @@ def exercise_chat_bindings(module, root: pathlib.Path) -> None:
     runtime = root / "bindings"
     runtime.mkdir(mode=0o700)
 
-    def write_relay(relay_id: str, status: str, pid: int, age_seconds: int) -> pathlib.Path:
+    def write_relay(
+        relay_id: str,
+        status: str,
+        pid: int,
+        age_seconds: int,
+        activity_at=None,
+    ) -> pathlib.Path:
         directory = runtime / f"chat-{relay_id}"
         directory.mkdir(mode=0o700)
         state = {
@@ -3224,6 +3252,8 @@ def exercise_chat_bindings(module, root: pathlib.Path) -> None:
             "processStart": "proc_1",
             "socket": str(directory / "broker.sock"),
         }
+        if activity_at is not None:
+            state["activityAt"] = activity_at
         state_file = directory / "broker.json"
         state_file.write_text(json.dumps(state), encoding="utf-8")
         state_file.chmod(0o600)
@@ -3232,6 +3262,7 @@ def exercise_chat_bindings(module, root: pathlib.Path) -> None:
         return directory
 
     live_relay = "11111111-2222-4333-8444-555555555555"
+    active_relay = "dddddddd-4444-4444-8444-444444444444"
     stale_stopped = write_relay(
         "aaaaaaaa-1111-4111-8111-111111111111", "stopped", 1,
         module.STOPPED_RELAY_SWEEP_SECONDS + 60,
@@ -3244,22 +3275,39 @@ def exercise_chat_bindings(module, root: pathlib.Path) -> None:
         module.STOPPED_RELAY_SWEEP_SECONDS + 60,
     )
     live_directory = write_relay(live_relay, "ready", os.getpid(), 60)
+    active_directory = write_relay(
+        active_relay, "ready", os.getpid(), 60, activity_at=1755000000
+    )
 
     original_validate = module.validate_live_state_process
     module.validate_live_state_process = lambda state: None if state[
         "pid"
     ] == os.getpid() else original_validate(state)
     try:
+        # A pre-activity state reads as 0 (unknown); a recorded last-event
+        # time passes through as the fourth binding field.
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             module.emit_chat_bindings(str(runtime), "codex", "example-repository")
         lines = [line for line in output.getvalue().splitlines() if line]
-        assert lines == [f"{THREAD_ID}|{live_relay}|chat"]
+        assert lines == [
+            f"{THREAD_ID}|{live_relay}|chat|0",
+            f"{THREAD_ID}|{active_relay}|chat|1755000000",
+        ]
         # Repository mismatch yields no bindings but must not touch live state.
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             module.emit_chat_bindings(str(runtime), "codex", "other-repository")
         assert output.getvalue() == ""
+        # The status listing reads every live broker in one spawn.
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            module.emit_chat_status(str(runtime))
+        lines = [line for line in output.getvalue().splitlines() if line]
+        assert lines == [
+            f"codex|example-repository|{live_relay}|{THREAD_ID}|0",
+            f"codex|example-repository|{active_relay}|{THREAD_ID}|1755000000",
+        ]
     finally:
         module.validate_live_state_process = original_validate
 
@@ -3268,6 +3316,21 @@ def exercise_chat_bindings(module, root: pathlib.Path) -> None:
     assert not dead_ready.exists()
     assert fresh_stopped.exists()
     assert live_directory.exists()
+    assert active_directory.exists()
+
+    # A replacement broker for the same relay re-seeds the persisted
+    # last-event time so a worker reboot does not reset recency.
+    seeded = module.ChatBroker(
+        "codex",
+        "example-repository",
+        str(root),
+        str(runtime),
+        active_relay,
+        module.FakeProvider(str(root), THREAD_ID, {}),
+        {},
+    )
+    seeded._seed_activity_from_prior_state()
+    assert seeded.activity_at == 1755000000
 
 
 def run() -> None:

@@ -3070,9 +3070,12 @@ if not isinstance(value, dict) or not isinstance(value.get("threads"), list):
 active = {}
 for binding in bindings:
     fields = binding.split("|")
-    if len(fields) != 3 or fields[2] not in ("terminal", "chat"):
+    if len(fields) not in (3, 4) or fields[2] not in ("terminal", "chat"):
         raise SystemExit(70)
-    active[fields[0]] = (fields[1], fields[2])
+    if len(fields) == 4 and not fields[3].isdigit():
+        raise SystemExit(70)
+    last_event = int(fields[3]) if len(fields) == 4 else 0
+    active[fields[0]] = (fields[1], fields[2], last_event)
 for row in value["threads"]:
     if not isinstance(row, dict) or row.get("provider") != provider:
         raise SystemExit(70)
@@ -3087,6 +3090,15 @@ for row in value["threads"]:
         activity = "relay-active"
         row["activeInstanceToken"] = active[thread_id][0]
         row["activePresentation"] = active[thread_id][1]
+        # The last-event time of a live broker outranks the activity time
+        # from the provider catalog, which lags (or reads 0) while the
+        # broker holds the conversation open.
+        last_event = active[thread_id][2]
+        updated_at = row.get("updatedAt")
+        if last_event and (
+            not isinstance(updated_at, int) or updated_at < last_event
+        ):
+            row["updatedAt"] = last_event
     else:
         row["activeInstanceToken"] = None
         row["activePresentation"] = None
@@ -3863,9 +3875,8 @@ session_display_fields() {
 
 status_sessions() {
     local metadata_file
-    local chat_directory
-    local chat_state
-    local chat_fields
+    local chat_activity
+    local -a chat_directories
     local instance
     local tool
     local repository
@@ -3956,46 +3967,24 @@ status_sessions() {
         fi
         records+=("session|$tool|$repository|$attached_client_count|$instance|$session_activity|$session_title_hex|$session_working|$session_thread_id|terminal")
     done
-    for chat_directory in "$runtime_directory"/chat-*; do
-        [[ -d "$chat_directory" && ! -L "$chat_directory" ]] || continue
-        instance="${chat_directory##*/chat-}"
-        is_valid_instance "$instance" || continue
-        chat_state="$("$default_python_path" "$chat_path" inspect \
-            --runtime-directory "$runtime_directory" \
-            --relay-id "$instance" 2>/dev/null)" || continue
-        chat_fields="$("$default_python_path" - "$chat_state" <<'PYTHON_CHAT_STATUS'
-import json
-import re
-import sys
-
-try:
-    value = json.loads(sys.argv[1])
-except ValueError:
-    raise SystemExit(70)
-uuid_pattern = re.compile(
-    r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
-)
-if (
-    value.get("status") != "ready"
-    or value.get("provider") not in ("codex", "claude")
-    or not isinstance(value.get("repository"), str)
-    or not uuid_pattern.fullmatch(str(value.get("relayId", "")))
-    or not uuid_pattern.fullmatch(str(value.get("providerThreadId", "")))
-):
-    raise SystemExit(75)
-print("{}|{}|{}|{}".format(
-    value["provider"],
-    value["repository"],
-    value["relayId"],
-    value["providerThreadId"],
-))
-PYTHON_CHAT_STATUS
-)" || continue
-        IFS='|' read -r tool repository instance bound_thread_id <<< "$chat_fields"
-        session_name="$(chat_session_name_for "$tool" "$instance")"
-        tmux_command has-session -t "$session_name" 2>/dev/null || continue
-        records+=("session|$tool|$repository|0|$instance|0|||$bound_thread_id|chat")
-    done
+    # One python invocation reports every live broker's identity and
+    # last-event time; a per-relay inspect spawn made status cost seconds
+    # once relay directories accumulated.
+    chat_directories=("$runtime_directory"/chat-*)
+    if [[ ${#chat_directories[@]} -gt 0 ]]; then
+        while IFS='|' read -r tool repository instance bound_thread_id \
+            chat_activity; do
+            [[ "$tool" == "codex" || "$tool" == "claude" ]] || continue
+            [[ "$repository" =~ ^[A-Za-z0-9._-]{1,100}$ ]] || continue
+            is_valid_instance "$instance" || continue
+            is_valid_instance "$bound_thread_id" || continue
+            [[ "$chat_activity" =~ ^[0-9]+$ ]] || chat_activity=0
+            session_name="$(chat_session_name_for "$tool" "$instance")"
+            tmux_command has-session -t "$session_name" 2>/dev/null || continue
+            records+=("session|$tool|$repository|0|$instance|$chat_activity|||$bound_thread_id|chat")
+        done < <("$default_python_path" "$chat_path" inspect-status \
+            --runtime-directory "$runtime_directory" 2>/dev/null || true)
+    fi
     shopt -u nullglob
 
     printf '%s\n' "$protocol_marker"
