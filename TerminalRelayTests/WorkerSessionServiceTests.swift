@@ -964,39 +964,58 @@ final class WorkerSessionServiceTests: XCTestCase {
     func testStaleOpenCatalogFetchCannotResurrectARecentlyArchivedThread() async {
         let worker = makeWorker()
         let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let empty = "{\"threads\":[],\"nextCursor\":null}"
         let archivedRow = """
         {"threads":[{"provider":"claude","threadID":"\(threadID)","title":"Done","updatedAt":10,"archived":true,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":false,"rename":false,"archive":false,"unarchive":true}}],"nextCursor":null}
         """
         let staleOpenRow = """
         {"threads":[{"provider":"claude","threadID":"\(threadID)","title":"Done","updatedAt":10,"archived":false,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":null}
         """
-        let recorder = WorkerSessionCommandRecorder(
-            results: [
+        let recorder = BlockingFirstWorkerSessionCommandRecorder(
+            subsequentResults: [
                 threadResult(archivedRow),
-                threadResult("{\"threads\":[],\"nextCursor\":null}"),
-                threadResult("{\"threads\":[],\"nextCursor\":null}"),
-                threadResult("{\"threads\":[],\"nextCursor\":null}"),
+                threadResult(staleOpenRow),
+                threadResult(empty),
+                threadResult(empty),
+                threadResult(empty),
                 threadResult(archivedRow),
-                threadResult("{\"threads\":[],\"nextCursor\":null}"),
-                threadResult(staleOpenRow)
             ]
         )
         let service = WorkerSessionService { configuration in
             await recorder.run(configuration)
         }
 
-        let archived = await service.setThreadArchived(
-            kind: .claude,
-            repositoryName: "terminal-relay",
-            threadID: threadID,
-            archived: true,
-            on: worker
-        )
-        let stale = await service.loadThreads(
-            repositoryName: "terminal-relay",
-            archived: false,
-            on: worker
-        )
+        // The open-catalog fetch starts before the archive...
+        let staleLoad = Task {
+            await service.loadThreads(
+                repositoryName: "terminal-relay",
+                archived: false,
+                on: worker
+            )
+        }
+        while recorder.configurations.isEmpty {
+            await Task.yield()
+        }
+
+        // ...the archive lands while that fetch is still in flight...
+        let archiveTask = Task {
+            await service.setThreadArchived(
+                kind: .claude,
+                repositoryName: "terminal-relay",
+                threadID: threadID,
+                archived: true,
+                on: worker
+            )
+        }
+        while recorder.configurations.count < 2 {
+            await Task.yield()
+        }
+
+        // ...and the stale listing lands afterwards, still naming the
+        // thread open.
+        recorder.finishFirst(with: threadResult(empty))
+        let stale = await staleLoad.value
+        let archived = await archiveTask.value
 
         XCTAssertTrue(archived)
         XCTAssertEqual(
@@ -1011,6 +1030,144 @@ final class WorkerSessionServiceTests: XCTestCase {
                 on: worker
             ),
             []
+        )
+        XCTAssertEqual(
+            service.threads(
+                repositoryName: "terminal-relay",
+                archived: true,
+                on: worker
+            ).map(\.threadID),
+            [threadID]
+        )
+    }
+
+    func testUnarchiveFromAnotherClientShowsAsSoonAsAFreshListingReportsIt() async {
+        let worker = makeWorker()
+        let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let empty = "{\"threads\":[],\"nextCursor\":null}"
+        let archivedRow = """
+        {"threads":[{"provider":"claude","threadID":"\(threadID)","title":"Done","updatedAt":10,"archived":true,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":false,"rename":false,"archive":false,"unarchive":true}}],"nextCursor":null}
+        """
+        let openRow = """
+        {"threads":[{"provider":"claude","threadID":"\(threadID)","title":"Done","updatedAt":10,"archived":false,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":null}
+        """
+        let recorder = WorkerSessionCommandRecorder(
+            results: [
+                threadResult(archivedRow),
+                threadResult(empty),
+                threadResult(empty),
+                threadResult(empty),
+                threadResult(archivedRow),
+                threadResult(empty),
+                threadResult(openRow),
+            ]
+        )
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+
+        let archived = await service.setThreadArchived(
+            kind: .claude,
+            repositoryName: "terminal-relay",
+            threadID: threadID,
+            archived: true,
+            on: worker
+        )
+        XCTAssertTrue(archived)
+        XCTAssertEqual(
+            service.threads(repositoryName: "terminal-relay", archived: false, on: worker),
+            []
+        )
+
+        // Another client unarchives; a fetch that starts after the archive
+        // is authoritative, so the thread reappears immediately instead of
+        // staying hidden for the tombstone lifetime.
+        let refreshed = await service.loadThreads(
+            repositoryName: "terminal-relay",
+            archived: false,
+            on: worker
+        )
+        XCTAssertEqual(
+            refreshed?.threads.map(\.threadID),
+            [threadID],
+            "An unarchive from another client must not be vetoed by the local archive tombstone."
+        )
+    }
+
+    func testConcurrentCatalogLoadsCoalesceAndForcedReloadsSerialize() async {
+        let worker = makeWorker()
+        let firstThreadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let secondThreadID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        let empty = "{\"threads\":[],\"nextCursor\":null}"
+        func codexRow(_ threadID: String) -> String {
+            """
+            {"threads":[{"provider":"codex","threadID":"\(threadID)","title":"T","updatedAt":10,"archived":false,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":null}
+            """
+        }
+        let recorder = BlockingFirstWorkerSessionCommandRecorder(
+            subsequentResults: [
+                threadResult(empty),
+                threadResult(codexRow(secondThreadID)),
+                threadResult(empty),
+            ]
+        )
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+
+        let first = Task {
+            await service.loadThreads(
+                repositoryName: "terminal-relay",
+                archived: false,
+                on: worker
+            )
+        }
+        while recorder.configurations.isEmpty {
+            await Task.yield()
+        }
+        let coalesced = Task {
+            await service.loadThreads(
+                repositoryName: "terminal-relay",
+                archived: false,
+                on: worker,
+                skipIfFresh: true
+            )
+        }
+        let forced = Task {
+            await service.loadThreads(
+                repositoryName: "terminal-relay",
+                archived: false,
+                on: worker
+            )
+        }
+        await Task.yield()
+        recorder.finishFirst(with: threadResult(codexRow(firstThreadID)))
+
+        let firstValue = await first.value
+        let coalescedValue = await coalesced.value
+        let forcedValue = await forced.value
+
+        XCTAssertEqual(firstValue?.threads.map(\.threadID), [firstThreadID])
+        XCTAssertEqual(
+            coalescedValue,
+            firstValue,
+            "A freshness-tolerant caller shares the in-flight fetch."
+        )
+        XCTAssertEqual(
+            forcedValue?.threads.map(\.threadID),
+            [secondThreadID],
+            "A forced reload runs after the in-flight fetch, so its listing is newer."
+        )
+        XCTAssertEqual(
+            service.threads(repositoryName: "terminal-relay", archived: false, on: worker)
+                .map(\.threadID),
+            [secondThreadID],
+            "The later fetch's listing is what remains; an older fetch can never overwrite it."
+        )
+        XCTAssertEqual(
+            recorder.configurations.count,
+            4,
+            "Two fetches of two pages each; the coalesced caller issues no commands."
         )
     }
 

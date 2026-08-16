@@ -82,6 +82,7 @@ final class WorkerSessionService: ObservableObject {
     // lifetime.
     private var startedSessionGuards: [UUID: [String: (snapshot: WorkerSessionSnapshot, at: Date)]] = [:]
     private static let startedSessionGuardLifetime: TimeInterval = 60
+    private var threadLoadTasks: [WorkerThreadCatalogKey: Task<WorkerThreadResponse?, Never>] = [:]
 
     private static let threadCatalogStorageKey = "workerThreadCatalogs.v1"
     private static let sessionResponseStorageKey = "workerSessionResponses.v1"
@@ -682,6 +683,41 @@ final class WorkerSessionService: ObservableObject {
             errors[worker.id] = WorkerSessionServiceError.threadFailed.localizedDescription
             return nil
         }
+        // One fetch per catalog key at a time: concurrent fetches could land
+        // out of order and let an older listing overwrite a newer one. A
+        // freshness-tolerant caller shares the in-flight result; a forced
+        // caller (after a mutation) runs behind it so its listing postdates
+        // the mutation.
+        if let inFlight = threadLoadTasks[catalogKey] {
+            if skipIfFresh {
+                return await inFlight.value
+            }
+            _ = await inFlight.value
+        }
+        let task = Task { [weak self] () -> WorkerThreadResponse? in
+            guard let self else { return nil }
+            defer { self.threadLoadTasks[catalogKey] = nil }
+            return await self.fetchThreads(
+                catalogKey: catalogKey,
+                repositoryName: repositoryName,
+                archived: archived,
+                on: worker
+            )
+        }
+        threadLoadTasks[catalogKey] = task
+        return await task.value
+    }
+
+    private func fetchThreads(
+        catalogKey: WorkerThreadCatalogKey,
+        repositoryName: String,
+        archived: Bool,
+        on worker: ServerProfile
+    ) async -> WorkerThreadResponse? {
+        // The listing's content is as-of the fetch start; the archive
+        // tombstones compare against this to tell a stale capture from a
+        // genuine post-archive state.
+        let fetchStartedAt = Date()
         do {
             var remainingCursor: String?
             var threads: [WorkerThreadSnapshot] = []
@@ -734,10 +770,14 @@ final class WorkerSessionService: ObservableObject {
                         $0.repositoryName == repositoryName
                     } ?? []
                 )
-                response = withoutRecentlyArchived(response, workerID: worker.id)
+                response = withoutRecentlyArchived(
+                    response,
+                    workerID: worker.id,
+                    fetchedAt: fetchStartedAt
+                )
             }
             threadCatalogs[catalogKey] = response
-            threadCatalogFetchTimes[catalogKey] = Date()
+            threadCatalogFetchTimes[catalogKey] = fetchStartedAt
             persistThreadCatalogs()
             errors[worker.id] = nil
             return response
@@ -952,7 +992,11 @@ final class WorkerSessionService: ObservableObject {
                         $0.repositoryName == key.repositoryName
                     }
                 ),
-                workerID: workerID
+                workerID: workerID,
+                // Re-merged content is only as fresh as the catalog's own
+                // fetch; a persisted catalog with no recorded fetch is
+                // treated as arbitrarily stale.
+                fetchedAt: threadCatalogFetchTimes[key] ?? .distantPast
             )
         }
         // Persist the promotion: a cached catalog that still says "inactive"
@@ -1024,19 +1068,25 @@ final class WorkerSessionService: ObservableObject {
 
     private func withoutRecentlyArchived(
         _ response: WorkerThreadResponse,
-        workerID: UUID
+        workerID: UUID,
+        fetchedAt: Date
     ) -> WorkerThreadResponse {
         pruneTombstones()
         guard !archivedThreadTombstones.isEmpty else { return response }
         return WorkerThreadResponse(
-            threads: response.threads.filter {
-                archivedThreadTombstones[
+            threads: response.threads.filter { thread in
+                guard let archivedAt = archivedThreadTombstones[
                     Self.threadTombstoneKey(
                         workerID: workerID,
-                        kind: $0.kind,
-                        threadID: $0.threadID
+                        kind: thread.kind,
+                        threadID: thread.threadID
                     )
-                ] == nil
+                ] else { return true }
+                // A listing fetched after the archive is authoritative: it
+                // either confirms the archive (thread absent) or reports a
+                // genuine unarchive from another client. Only listings that
+                // may predate the archive are vetoed.
+                return fetchedAt > archivedAt
             },
             nextCursor: response.nextCursor
         )
