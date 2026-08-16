@@ -67,6 +67,13 @@ final class WorkerSessionService: ObservableObject {
     private var dismissedUpdateTimestamps: [UUID: Int] = [:]
     private var runtimeUpdateTasks: [UUID: Task<Void, Never>] = [:]
     private var threadCatalogFetchTimes: [WorkerThreadCatalogKey: Date] = [:]
+    /// The worker can keep listing a chat session for a few seconds after a
+    /// successful stop (broker teardown outlives the acknowledgement), and an
+    /// in-flight listing can land after a mutation it predates. Tombstones veto
+    /// those stale rows until the worker catches up.
+    private var stoppedSessionTombstones: [String: Date] = [:]
+    private var archivedThreadTombstones: [String: Date] = [:]
+    private static let tombstoneLifetime: TimeInterval = 60
 
     private static let threadCatalogStorageKey = "workerThreadCatalogs.v1"
     private static let threadCatalogFreshness: TimeInterval = 30
@@ -227,7 +234,9 @@ final class WorkerSessionService: ObservableObject {
                 throw WorkerSessionServiceError.statusFailed
             }
 
-            let response = try WorkerSessionProtocol.parse(result.standardOutput)
+            let response = withoutRecentlyStopped(
+                try WorkerSessionProtocol.parse(result.standardOutput)
+            )
             if inspectsRuntimeOnRefresh {
                 await inspectRuntime(worker: worker)
             }
@@ -535,6 +544,7 @@ final class WorkerSessionService: ObservableObject {
                 )
                 responses[worker.id] = response
             }
+            stoppedSessionTombstones[instanceToken] = Date()
             errors[worker.id] = nil
             workerSessionLogger.notice(
                 "Stopped \(kind.rawValue, privacy: .public) session \(instanceToken, privacy: .public) on \(worker.destination, privacy: .public)"
@@ -648,6 +658,7 @@ final class WorkerSessionService: ObservableObject {
                         $0.repositoryName == repositoryName
                     } ?? []
                 )
+                response = withoutRecentlyArchived(response, workerID: worker.id)
             }
             threadCatalogs[catalogKey] = response
             threadCatalogFetchTimes[catalogKey] = Date()
@@ -803,6 +814,16 @@ final class WorkerSessionService: ObservableObject {
         ) != nil else {
             return false
         }
+        let tombstoneKey = Self.threadTombstoneKey(
+            workerID: worker.id,
+            kind: kind,
+            threadID: threadID
+        )
+        if archived {
+            archivedThreadTombstones[tombstoneKey] = Date()
+        } else {
+            archivedThreadTombstones.removeValue(forKey: tombstoneKey)
+        }
         _ = await loadThreads(repositoryName: repositoryName, archived: false, on: worker)
         _ = await loadThreads(repositoryName: repositoryName, archived: true, on: worker)
         return true
@@ -846,12 +867,62 @@ final class WorkerSessionService: ObservableObject {
         }
         for key in keys {
             guard let catalog = threadCatalogs[key] else { continue }
-            threadCatalogs[key] = catalog.merging(
-                liveSessions: sessions.filter {
-                    $0.repositoryName == key.repositoryName
-                }
+            threadCatalogs[key] = withoutRecentlyArchived(
+                catalog.merging(
+                    liveSessions: sessions.filter {
+                        $0.repositoryName == key.repositoryName
+                    }
+                ),
+                workerID: workerID
             )
         }
+    }
+
+    private static func threadTombstoneKey(
+        workerID: UUID,
+        kind: AgentKind,
+        threadID: String
+    ) -> String {
+        "\(workerID.uuidString):\(kind.rawValue):\(threadID)"
+    }
+
+    private func pruneTombstones() {
+        let cutoff = Date().addingTimeInterval(-Self.tombstoneLifetime)
+        stoppedSessionTombstones = stoppedSessionTombstones.filter { $0.value > cutoff }
+        archivedThreadTombstones = archivedThreadTombstones.filter { $0.value > cutoff }
+    }
+
+    private func withoutRecentlyStopped(
+        _ response: WorkerSessionResponse
+    ) -> WorkerSessionResponse {
+        pruneTombstones()
+        guard !stoppedSessionTombstones.isEmpty else { return response }
+        return WorkerSessionResponse(
+            projects: response.projects,
+            sessions: response.sessions.filter {
+                stoppedSessionTombstones[$0.instanceToken] == nil
+            }
+        )
+    }
+
+    private func withoutRecentlyArchived(
+        _ response: WorkerThreadResponse,
+        workerID: UUID
+    ) -> WorkerThreadResponse {
+        pruneTombstones()
+        guard !archivedThreadTombstones.isEmpty else { return response }
+        return WorkerThreadResponse(
+            threads: response.threads.filter {
+                archivedThreadTombstones[
+                    Self.threadTombstoneKey(
+                        workerID: workerID,
+                        kind: $0.kind,
+                        threadID: $0.threadID
+                    )
+                ] == nil
+            },
+            nextCursor: response.nextCursor
+        )
     }
 
     private static func logDetail(_ data: Data) -> String {

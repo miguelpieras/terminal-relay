@@ -879,6 +879,141 @@ final class WorkerSessionServiceTests: XCTestCase {
         )
     }
 
+    func testArchivedChatStaysHiddenWhenTheWorkerBrieflyRelistsItsStoppedSession() async {
+        let worker = makeWorker()
+        let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let instanceID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        let archivedRow = """
+        {"threads":[{"provider":"claude","threadID":"\(threadID)","title":"Done","updatedAt":10,"archived":true,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":false,"rename":false,"archive":false,"unarchive":true}}],"nextCursor":null}
+        """
+        let recorder = WorkerSessionCommandRecorder(
+            results: [
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data(),
+                    standardError: Data()
+                ),
+                threadResult(archivedRow),
+                threadResult("{\"threads\":[],\"nextCursor\":null}"),
+                threadResult("{\"threads\":[],\"nextCursor\":null}"),
+                threadResult("{\"threads\":[],\"nextCursor\":null}"),
+                threadResult(archivedRow),
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data(
+                        """
+                        \(WorkerSessionProtocol.marker)
+                        session|claude|terminal-relay|1|\(instanceID)|30|4c697665|1|\(threadID)|chat
+                        """.utf8
+                    ),
+                    standardError: Data()
+                ),
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data("\(WorkerUpdateStatusProtocol.marker)\n".utf8),
+                    standardError: Data()
+                )
+            ]
+        )
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+
+        let stopped = await service.stop(
+            kind: .claude,
+            repositoryName: "terminal-relay",
+            instanceToken: instanceID,
+            presentation: .chat,
+            on: worker
+        )
+        let archived = await service.setThreadArchived(
+            kind: .claude,
+            repositoryName: "terminal-relay",
+            threadID: threadID,
+            archived: true,
+            on: worker
+        )
+        _ = await service.refresh(worker: worker)
+
+        XCTAssertTrue(stopped)
+        XCTAssertTrue(archived)
+        XCTAssertEqual(
+            service.response(for: worker.id)?.sessions,
+            [],
+            "A stop's teardown lag must not resurrect the stopped session."
+        )
+        XCTAssertEqual(
+            service.threads(
+                repositoryName: "terminal-relay",
+                archived: false,
+                on: worker
+            ),
+            [],
+            "A stale status listing must not resurrect an archived thread."
+        )
+        XCTAssertEqual(
+            service.threads(
+                repositoryName: "terminal-relay",
+                archived: true,
+                on: worker
+            ).map(\.threadID),
+            [threadID]
+        )
+    }
+
+    func testStaleOpenCatalogFetchCannotResurrectARecentlyArchivedThread() async {
+        let worker = makeWorker()
+        let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let archivedRow = """
+        {"threads":[{"provider":"claude","threadID":"\(threadID)","title":"Done","updatedAt":10,"archived":true,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":false,"rename":false,"archive":false,"unarchive":true}}],"nextCursor":null}
+        """
+        let staleOpenRow = """
+        {"threads":[{"provider":"claude","threadID":"\(threadID)","title":"Done","updatedAt":10,"archived":false,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":null}
+        """
+        let recorder = WorkerSessionCommandRecorder(
+            results: [
+                threadResult(archivedRow),
+                threadResult("{\"threads\":[],\"nextCursor\":null}"),
+                threadResult("{\"threads\":[],\"nextCursor\":null}"),
+                threadResult("{\"threads\":[],\"nextCursor\":null}"),
+                threadResult(archivedRow),
+                threadResult("{\"threads\":[],\"nextCursor\":null}"),
+                threadResult(staleOpenRow)
+            ]
+        )
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+
+        let archived = await service.setThreadArchived(
+            kind: .claude,
+            repositoryName: "terminal-relay",
+            threadID: threadID,
+            archived: true,
+            on: worker
+        )
+        let stale = await service.loadThreads(
+            repositoryName: "terminal-relay",
+            archived: false,
+            on: worker
+        )
+
+        XCTAssertTrue(archived)
+        XCTAssertEqual(
+            stale?.threads,
+            [],
+            "A listing captured before the archive must not restore the thread."
+        )
+        XCTAssertEqual(
+            service.threads(
+                repositoryName: "terminal-relay",
+                archived: false,
+                on: worker
+            ),
+            []
+        )
+    }
+
     private func threadResult(_ json: String) -> WorkerSessionCommandResult {
         WorkerSessionCommandResult(
             exitCode: 0,
