@@ -1414,6 +1414,31 @@ async def exercise_codex_adapter(module, root: pathlib.Path) -> None:
         }
     )
     assert next_result["clientUserMessageId"] == next_request_id
+
+    # A failed turn must surface the provider's own error text so clients can
+    # show it instead of a generic banner (e.g. Codex usage limits).
+    transport.incoming.put(
+        {
+            "method": "turn/completed",
+            "params": {
+                "turn": {
+                    "id": next_result["turnId"],
+                    "status": "failed",
+                    "error": {
+                        "message": "You've hit your usage limit.",
+                        "codexErrorInfo": "usageLimitExceeded",
+                    },
+                }
+            },
+        }
+    )
+    for _ in range(100):
+        if any(event["type"] == "turn.failed" for event in events):
+            break
+        await asyncio.sleep(0.01)
+    failed = next(event for event in events if event["type"] == "turn.failed")
+    assert failed["payload"]["message"] == "You've hit your usage limit."
+    assert failed["turnId"] == next_result["turnId"]
     await adapter.close()
     assert transport.closed is True
 
@@ -1536,6 +1561,69 @@ async def exercise_codex_reconnect(module, root: pathlib.Path) -> None:
         if adapter.active_turn is None:
             break
         await asyncio.sleep(0.01)
+    assert adapter.active_turn is None
+    await adapter.close()
+
+
+async def exercise_codex_reconcile_failed_turn(module, root: pathlib.Path) -> None:
+    # A turn that fails while the provider connection is down is delivered
+    # via the thread/read reconcile, not a live notification; the reconciled
+    # turn.failed must still carry the provider's error text.
+    project = root / "codex-reconcile-failed-project"
+    project.mkdir()
+    command_id = "38383838-3838-4838-8838-383838383838"
+    failed_turn_id = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+    first = FakeCodexWebSocket()
+    second = FakeCodexWebSocket(
+        thread_turns=[
+            {
+                "id": failed_turn_id,
+                "status": "failed",
+                "error": {
+                    "message": "You've hit your usage limit.",
+                    "codexErrorInfo": "usageLimitExceeded",
+                },
+                "items": [],
+            }
+        ]
+    )
+    adapter = module.CodexAdapter(
+        str(project), THREAD_ID, {}, str(root / "codex-reconcile-failed.sock")
+    )
+    adapter.websocket = first
+    adapter.websocket_factory = lambda: second
+    events: list[dict] = []
+
+    async def emit(event_type, payload, *, turn_id=None, item_id=None):
+        event = {
+            "type": event_type,
+            "payload": payload,
+            "turnId": turn_id,
+            "itemId": item_id,
+        }
+        events.append(event)
+        return event
+
+    await adapter.start(emit)
+    result = await adapter.start_turn(
+        {
+            "requestId": command_id,
+            "payload": {"text": "will fail", "attachments": [], "options": {}},
+        }
+    )
+    assert result["turnId"] == failed_turn_id
+    assert adapter.active_turn == failed_turn_id
+    first.incoming.put(None)
+    for _ in range(200):
+        if any(event["type"] == "turn.failed" for event in events):
+            break
+        await asyncio.sleep(0.01)
+    failed_event = next(
+        event for event in events if event["type"] == "turn.failed"
+    )
+    assert failed_event["turnId"] == failed_turn_id
+    assert failed_event["payload"]["reconciled"] is True
+    assert failed_event["payload"]["message"] == "You've hit your usage limit."
     assert adapter.active_turn is None
     await adapter.close()
 
@@ -2304,6 +2392,28 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
             break
         await asyncio.sleep(0.01)
     assert adapter.active_turn is None
+
+    # An is_error ResultMessage carries the provider's error text in
+    # "result"; turn.failed must forward it instead of the generic banner.
+    failed_command_id = "26262626-2626-4626-8626-262626262626"
+    await adapter.start_turn(
+        {"requestId": failed_command_id, "payload": {"text": "will fail"}}
+    )
+    failed_result = ResultMessage()
+    failed_result.is_error = True
+    failed_result.result = "Claude usage limit reached for this billing cycle."
+    failed_result.usage = {}
+    await received.put(failed_result)
+    for _ in range(100):
+        if any(event["type"] == "turn.failed" for event in events):
+            break
+        await asyncio.sleep(0.01)
+    failed_event = next(
+        event for event in events if event["type"] == "turn.failed"
+    )
+    assert failed_event["payload"]["message"] == (
+        "Claude usage limit reached for this billing cycle."
+    )
     await adapter.close()
     assert adapter.client.disconnected is True
 
@@ -2509,6 +2619,19 @@ async def exercise_claude_reconnect(module, root: pathlib.Path) -> None:
 
 
 def exercise_validation(module) -> None:
+    # turn_error_message powers both the live and the reconcile turn.failed
+    # paths; it must tolerate every malformed turn shape.
+    assert module.turn_error_message(
+        {"status": "failed", "error": {"message": "limit hit"}}
+    ) == "limit hit"
+    assert module.turn_error_message({"error": {"message": "  "}}) is None
+    assert module.turn_error_message({"error": "boom"}) is None
+    assert module.turn_error_message({"status": "failed"}) is None
+    assert module.turn_error_message(None) is None
+    assert module.turn_error_message(
+        {"error": {"message": "x" * 2000}}
+    ) == "x" * 1000
+
     codex_capabilities = module.chat_capabilities("codex")
     claude_capabilities = module.chat_capabilities("claude")
     assert codex_capabilities["supportsAttachments"] is True
@@ -3157,6 +3280,33 @@ def exercise_snapshot_trim(module, root: pathlib.Path) -> None:
         }
     )
     assert broker.items[tool_id]["payload"]["output"] == "authoritative"
+
+    # The snapshot must carry the last turn failure so cold attaches can
+    # reproduce the honest error banner, and clear it once a turn starts.
+    broker._apply_to_snapshot(
+        {
+            "type": "turn.failed",
+            "turnId": THREAD_ID,
+            "payload": {"status": "failed", "message": "usage limit reached"},
+        }
+    )
+    assert broker.snapshot_payload()["lastErrorMessage"] == "usage limit reached"
+    broker._apply_to_snapshot(
+        {
+            "type": "turn.started",
+            "turnId": THREAD_ID,
+            "payload": {"status": "streaming"},
+        }
+    )
+    assert broker.snapshot_payload()["lastErrorMessage"] is None
+    broker._apply_to_snapshot(
+        {
+            "type": "turn.completed",
+            "turnId": THREAD_ID,
+            "payload": {"status": "completed"},
+        }
+    )
+    assert broker.snapshot_payload()["lastErrorMessage"] is None
     broker.items.clear()
     broker.snapshot_text_chunks.clear()
 
@@ -3350,6 +3500,7 @@ def run() -> None:
         exercise_chat_bindings(module, root_path)
         asyncio.run(exercise_codex_adapter(module, root_path))
         asyncio.run(exercise_codex_reconnect(module, root_path))
+        asyncio.run(exercise_codex_reconcile_failed_turn(module, root_path))
         asyncio.run(exercise_codex_close_timeout(module, root_path))
         asyncio.run(exercise_claude_adapter(module, root_path))
         asyncio.run(exercise_claude_history_paging(module, root_path))

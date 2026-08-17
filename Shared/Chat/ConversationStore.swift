@@ -601,7 +601,10 @@ struct ConversationReducer {
             state.turnState = .failed
             state.activeTurnID = nil
             state.connectionState = .streaming
+            // Older workers omit "message" but still forward the provider's
+            // turn object, which carries the real failure text.
             state.lastErrorMessage = envelope.payload["message"]?.stringValue
+                ?? envelope.payload["turn"]?["error"]?["message"]?.stringValue
                 ?? "The agent could not finish this turn."
         case .turnInterrupted:
             finishTurnItems(
@@ -651,7 +654,6 @@ struct ConversationReducer {
             state.lastAppliedSequence = snapshot.baseSequence
             state.connectionState = snapshot.connectionState
             state.capabilities = snapshot.capabilities
-            state.lastErrorMessage = nil
             return
         }
         // Prepared-payload gating keeps this decision aligned with the
@@ -659,12 +661,15 @@ struct ConversationReducer {
         // payload; every production snapshot apply is prepared.
         if case .conversationSnapshot = preparedPayload,
            snapshotIsContinuousAndCovering(snapshot, for: state) {
+            // A continuous snapshot missed no events, so the local banner is
+            // already correct — and possibly locally dismissed. Overwriting it
+            // from the snapshot would resurrect dismissed banners on every
+            // peer-attach broadcast.
             state.snapshotGeneration = snapshot.snapshotGeneration
             state.lastAppliedSequence = snapshot.baseSequence
             state.connectionState = snapshot.connectionState
             state.capabilities = snapshot.capabilities
             state.usage = snapshot.usage ?? state.usage
-            state.lastErrorMessage = nil
             return
         }
         state.snapshotGeneration = snapshot.snapshotGeneration
@@ -690,7 +695,7 @@ struct ConversationReducer {
         state.usage = snapshot.usage
         state.hasOlderHistory = snapshot.hasOlderHistory
         state.oldestItemID = snapshot.oldestItemID
-        state.lastErrorMessage = nil
+        state.lastErrorMessage = snapshot.lastErrorMessage
     }
 
     private func applyHello(_ envelope: ChatEnvelope, to state: inout ConversationState) {
@@ -2276,7 +2281,11 @@ final class ConversationStore: ObservableObject {
         }
         var state = cached
         state.connectionState = .connecting
-        state.lastErrorMessage = nil
+        // Keep the cached failure banner: a reopened conversation whose
+        // cursor is still current replays nothing, so this is the only
+        // carrier of the last turn's error (a dismissed banner is cached as
+        // nil and stays dismissed). Replay or an authoritative snapshot
+        // corrects it when the worker has newer state.
         state.filePreview = nil
         // Interactive prompts and turn activity are only meaningful live: a
         // cached pending approval would render actionable buttons wired to a

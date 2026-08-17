@@ -3085,6 +3085,198 @@ final class ConversationStoreTests: XCTestCase {
         )
     }
 
+    func testTurnFailedSurfacesProviderErrorMessage() throws {
+        // Current workers hoist the provider error into "message"; older
+        // workers only forward the raw turn object. Both must beat the
+        // generic banner, which stays the last resort.
+        let store = ConversationStore()
+        try store.apply(
+            ChatTestFixtures.event(
+                "turn.started",
+                sequence: 1,
+                turnID: "turn-1",
+                payload: .object(["status": .string("streaming")])
+            )
+        )
+        try store.apply(
+            ChatTestFixtures.event(
+                "turn.failed",
+                sequence: 2,
+                turnID: "turn-1",
+                payload: .object([
+                    "status": .string("failed"),
+                    "turn": .object([
+                        "id": .string("turn-1"),
+                        "status": .string("failed"),
+                        "error": .object([
+                            "message": .string("You've hit your usage limit."),
+                            "codexErrorInfo": .string("usageLimitExceeded"),
+                        ]),
+                    ]),
+                ])
+            )
+        )
+        XCTAssertEqual(store.state.turnState, .failed)
+        XCTAssertEqual(
+            store.state.lastErrorMessage,
+            "You've hit your usage limit."
+        )
+
+        // The hoisted top-level "message" (Claude's only shape, and what
+        // current workers emit) must win over the turn-object fallback.
+        let messageStore = ConversationStore()
+        try messageStore.apply(
+            ChatTestFixtures.event(
+                "turn.failed",
+                sequence: 1,
+                turnID: "turn-1",
+                payload: .object([
+                    "status": .string("failed"),
+                    "message": .string("Claude usage limit reached."),
+                ])
+            )
+        )
+        XCTAssertEqual(
+            messageStore.state.lastErrorMessage,
+            "Claude usage limit reached."
+        )
+
+        let precedenceStore = ConversationStore()
+        try precedenceStore.apply(
+            ChatTestFixtures.event(
+                "turn.failed",
+                sequence: 1,
+                turnID: "turn-1",
+                payload: .object([
+                    "status": .string("failed"),
+                    "message": .string("hoisted message"),
+                    "turn": .object([
+                        "error": .object(["message": .string("nested message")])
+                    ]),
+                ])
+            )
+        )
+        XCTAssertEqual(
+            precedenceStore.state.lastErrorMessage,
+            "hoisted message"
+        )
+
+        let genericStore = ConversationStore()
+        try genericStore.apply(
+            ChatTestFixtures.event(
+                "turn.failed",
+                sequence: 1,
+                turnID: "turn-1",
+                payload: .object(["status": .string("failed")])
+            )
+        )
+        XCTAssertEqual(
+            genericStore.state.lastErrorMessage,
+            "The agent could not finish this turn."
+        )
+    }
+
+    func testSnapshotCarriesLastErrorMessage() throws {
+        let store = ConversationStore()
+        try store.apply(
+            ChatTestFixtures.snapshotEvent(
+                baseSequence: 1,
+                items: [
+                    .message(ChatMessage(id: "user-1", role: .user, text: "hola"))
+                ],
+                turnState: .failed,
+                lastErrorMessage: "You've hit your usage limit."
+            )
+        )
+        XCTAssertEqual(store.state.turnState, .failed)
+        XCTAssertEqual(
+            store.state.lastErrorMessage,
+            "You've hit your usage limit."
+        )
+
+        try store.apply(
+            ChatTestFixtures.snapshotEvent(
+                baseSequence: 2,
+                items: [
+                    .message(ChatMessage(id: "user-1", role: .user, text: "hola"))
+                ]
+            )
+        )
+        XCTAssertNil(store.state.lastErrorMessage)
+    }
+
+    func testContinuousCoveringSnapshotDoesNotResurrectDismissedBanner() async throws {
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        try store.apply(
+            ChatTestFixtures.event(
+                "message.completed",
+                sequence: 1,
+                itemID: "message-1",
+                turnID: "turn-1",
+                payload: .object([
+                    "role": .string("user"),
+                    "text": .string("hola"),
+                ])
+            )
+        )
+        try store.apply(
+            ChatTestFixtures.event(
+                "turn.failed",
+                sequence: 2,
+                turnID: "turn-1",
+                payload: .object([
+                    "status": .string("failed"),
+                    "message": .string("You've hit your usage limit."),
+                ])
+            )
+        )
+        XCTAssertEqual(
+            store.state.lastErrorMessage,
+            "You've hit your usage limit."
+        )
+        store.clearLastError()
+        XCTAssertNil(store.state.lastErrorMessage)
+
+        // A peer attach broadcasts a continuous covering snapshot that still
+        // carries the broker's lastErrorMessage; it must not resurrect the
+        // locally dismissed banner.
+        let snapshot = ConversationSnapshot(
+            snapshotGeneration: ChatTestFixtures.generation,
+            baseSequence: 3,
+            items: store.state.items,
+            turnState: .failed,
+            lastErrorMessage: "You've hit your usage limit."
+        )
+        let payload = PreparedConversationReducerPayload
+            .conversationSnapshot(snapshot)
+        let currentState = store.stateForTranscriptProjectionPreparation
+        let preserved = await ConversationStore.preparePreservedSnapshotItemIDs(
+            for: payload,
+            retaining: currentState.items,
+            currentState: currentState
+        )
+        let envelope = ChatTestFixtures.event(
+            "conversation.snapshot",
+            sequence: 3,
+            payload: .string("prepared payload must bypass this JSON")
+        )
+        let prepared = await ConversationStore.prepareTranscriptProjections(
+            for: envelope,
+            retaining: currentState.items,
+            currentState: currentState,
+            preparedReducerPayload: payload,
+            preservingSnapshotItemIDs: preserved
+        )
+        try store.apply(
+            envelope,
+            preparedTranscriptProjections: prepared,
+            preparedReducerPayload: payload,
+            preservedSnapshotItemIDs: preserved
+        )
+        XCTAssertEqual(store.state.lastAppliedSequence, 3)
+        XCTAssertNil(store.state.lastErrorMessage)
+    }
+
     func testHistoryPagePrependsWithoutDuplicates() throws {
         let current = ConversationItem.message(
             ChatMessage(id: "current", role: .assistant, text: "Current")

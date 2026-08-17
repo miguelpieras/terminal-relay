@@ -953,6 +953,17 @@ def content_text(value: Any, separator: str = "\n") -> str:
     return separator.join(parts)
 
 
+def turn_error_message(turn: Any) -> str | None:
+    """Extract the provider's failure message from a turn object, if any."""
+    if not isinstance(turn, dict):
+        return None
+    error = turn.get("error")
+    message = error.get("message") if isinstance(error, dict) else None
+    if isinstance(message, str) and message.strip():
+        return message[:1000]
+    return None
+
+
 def normalized_tool_status(value: Any, completed: bool) -> str:
     if value in {"failed", "error"}:
         return "failed"
@@ -1816,11 +1827,12 @@ class CodexAdapter(ProviderAdapter):
             "interrupted": "turn.interrupted",
             "failed": "turn.failed",
         }.get(turn_status, "turn.completed")
-        await self.emit(
-            event_type,
-            {"status": turn_status or "completed", "reconciled": True},
-            turn_id=turn_id,
-        )
+        payload = {"status": turn_status or "completed", "reconciled": True}
+        if event_type == "turn.failed":
+            message = turn_error_message(target)
+            if message:
+                payload["message"] = message
+        await self.emit(event_type, payload, turn_id=turn_id)
         self.active_turn = None
         return reconciled
 
@@ -1987,11 +1999,12 @@ class CodexAdapter(ProviderAdapter):
                 "interrupted": "turn.interrupted",
                 "failed": "turn.failed",
             }.get(status, "turn.completed")
-            await self.emit(
-                event_type,
-                {"status": status, "turn": sanitize_json(turn or params)},
-                turn_id=turn_id,
-            )
+            payload = {"status": status, "turn": sanitize_json(turn or params)}
+            if event_type == "turn.failed":
+                message = turn_error_message(turn)
+                if message:
+                    payload["message"] = message
+            await self.emit(event_type, payload, turn_id=turn_id)
             self.active_turn = None
             return
         if method == "item/started" and isinstance(item, dict):
@@ -3119,16 +3132,19 @@ class ClaudeAdapter(ProviderAdapter):
                 await self.emit(
                     "usage.updated", usage, turn_id=self.active_turn
                 )
+            failure_message = None
+            if status == "failed":
+                # An is_error ResultMessage carries the provider's error text
+                # in "result" (e.g. usage limits, API failures).
+                result_text = value.get("result")
+                failure_message = (
+                    result_text[:1000]
+                    if isinstance(result_text, str) and result_text.strip()
+                    else "Claude could not complete this turn."
+                )
             await self.emit(
                 event_type,
-                {
-                    "status": status,
-                    "message": (
-                        "Claude could not complete this turn."
-                        if status == "failed"
-                        else None
-                    ),
-                },
+                {"status": status, "message": failure_message},
                 turn_id=self.active_turn,
             )
             self.active_turn = None
@@ -3665,6 +3681,7 @@ class ChatBroker:
         self.usage: dict[str, Any] | None = None
         self.connection_state = "connecting"
         self.turn_state = "idle"
+        self.last_error_message: str | None = None
         self.active_turn_id: str | None = None
         self.has_older_history = False
         self.oldest_item_id: str | None = None
@@ -4003,12 +4020,19 @@ class ChatBroker:
             self.turn_state = "streaming"
             self.connection_state = "streaming"
             self.active_turn_id = turn_id
+            self.last_error_message = None
         elif event_type in {"turn.completed", "turn.failed", "turn.interrupted"}:
             self.turn_state = event_type.partition(".")[2]
             self.connection_state = (
                 "interrupted" if event_type == "turn.interrupted" else "streaming"
             )
             self.active_turn_id = None
+            message = payload.get("message")
+            self.last_error_message = (
+                message
+                if event_type == "turn.failed" and isinstance(message, str)
+                else None
+            )
         elif event_type == "session.state":
             self.connection_state = payload.get(
                 "connectionState", self.connection_state
@@ -4065,6 +4089,7 @@ class ChatBroker:
             "connectionState": self.connection_state,
             "turnState": self.turn_state,
             "activeTurnId": self.active_turn_id,
+            "lastErrorMessage": self.last_error_message,
             "capabilities": chat_capabilities(self.provider_name),
             "usage": self.usage,
             "hasOlderHistory": self.has_older_history,

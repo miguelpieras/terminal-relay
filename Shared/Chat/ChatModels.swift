@@ -1322,6 +1322,7 @@ struct ConversationSnapshot: Codable, Equatable, Sendable {
     var connectionState: ChatConnectionState
     var turnState: TurnState
     var activeTurnID: String?
+    var lastErrorMessage: String?
     var capabilities: ChatCapabilities
     var usage: ChatUsage?
     var hasOlderHistory: Bool
@@ -1336,6 +1337,7 @@ struct ConversationSnapshot: Codable, Equatable, Sendable {
         case connectionState
         case turnState
         case activeTurnID = "activeTurnId"
+        case lastErrorMessage
         case capabilities
         case usage
         case hasOlderHistory
@@ -1351,6 +1353,7 @@ struct ConversationSnapshot: Codable, Equatable, Sendable {
         connectionState: ChatConnectionState = .streaming,
         turnState: TurnState = .idle,
         activeTurnID: String? = nil,
+        lastErrorMessage: String? = nil,
         capabilities: ChatCapabilities = ChatCapabilities(),
         usage: ChatUsage? = nil,
         hasOlderHistory: Bool = false,
@@ -1364,6 +1367,7 @@ struct ConversationSnapshot: Codable, Equatable, Sendable {
         self.connectionState = connectionState
         self.turnState = turnState
         self.activeTurnID = activeTurnID
+        self.lastErrorMessage = lastErrorMessage
         self.capabilities = capabilities
         self.usage = usage
         self.hasOlderHistory = hasOlderHistory

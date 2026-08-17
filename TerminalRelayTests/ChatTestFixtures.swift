@@ -48,6 +48,7 @@ enum ChatTestFixtures {
         questions: [QuestionRequest] = [],
         turnState: TurnState = .idle,
         activeTurnID: String? = nil,
+        lastErrorMessage: String? = nil,
         hasOlderHistory: Bool = false
     ) throws -> ChatEnvelope {
         let snapshot = ConversationSnapshot(
@@ -59,6 +60,7 @@ enum ChatTestFixtures {
             connectionState: .streaming,
             turnState: turnState,
             activeTurnID: activeTurnID,
+            lastErrorMessage: lastErrorMessage,
             capabilities: ChatCapabilities(features: ["streaming"]),
             hasOlderHistory: hasOlderHistory,
             oldestItemID: items.first?.id

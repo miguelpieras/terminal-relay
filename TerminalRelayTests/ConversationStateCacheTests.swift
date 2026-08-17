@@ -99,6 +99,7 @@ final class ConversationStateCacheTests: XCTestCase {
         var cached = try populatedState()
         cached.turnState = .running
         cached.activeTurnID = "turn-1"
+        cached.lastErrorMessage = "You've hit your usage limit."
         cached.approvals = [
             ApprovalRequest(
                 id: "approval-1",
@@ -139,6 +140,11 @@ final class ConversationStateCacheTests: XCTestCase {
             store.state.approvals.map(\.id),
             ["approval-2"],
             "Pending prompts wired to a dead worker generation must not render actionable."
+        )
+        XCTAssertEqual(
+            store.state.lastErrorMessage,
+            "You've hit your usage limit.",
+            "A reopened conversation with a current cursor replays nothing; the cache is the only carrier of the last failure."
         )
     }
 }
