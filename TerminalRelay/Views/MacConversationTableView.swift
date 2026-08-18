@@ -864,6 +864,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         private var selectionDragScrolled = false
         private var selectionDragLastWindowPoint: NSPoint?
         private var selectionAutoscrollTimer: Timer?
+        private weak var selectionPreviousResponder: NSResponder?
         private var pendingLiveScrollRestorationAnchor: Anchor?
         private var pendingLiveScrollRestorationFollowsBottom = false
         private var pendingLiveScrollRestorationExpectedOriginY: CGFloat?
@@ -964,6 +965,24 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                     queue: .main
                 ) { [weak self] _ in
                     MainActor.assumeIsolated { self?.trackpadLiveScrollWillStart() }
+                },
+                center.addObserver(
+                    forName: NSWindow.didBecomeKeyNotification,
+                    object: nil,
+                    queue: .main
+                ) { [weak self] notification in
+                    MainActor.assumeIsolated {
+                        self?.windowKeyStateChanged(notification)
+                    }
+                },
+                center.addObserver(
+                    forName: NSWindow.didResignKeyNotification,
+                    object: nil,
+                    queue: .main
+                ) { [weak self] notification in
+                    MainActor.assumeIsolated {
+                        self?.windowKeyStateChanged(notification)
+                    }
                 },
                 center.addObserver(
                     forName: NSScrollView.didEndLiveScrollNotification,
@@ -1434,6 +1453,13 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             )
         }
 
+        private func windowKeyStateChanged(_ notification: Notification) {
+            guard let window = tableView?.window,
+                  notification.object as? NSWindow === window,
+                  selection.hasSelection else { return }
+            refreshVisibleSelectionHighlights()
+        }
+
         func refreshVisibleSelectionHighlights() {
             guard let tableView, let scrollView else { return }
             let visible = tableView.rows(in: scrollView.contentView.bounds)
@@ -1474,12 +1500,23 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             if selection.hasSelection {
                 selection.clear()
                 refreshVisibleSelectionHighlights()
+                returnSelectionFocus()
             }
             let resolved = selectionEndpoint(
                 atWindowPoint: event.locationInWindow
             )
             selectionDragAnchor = resolved?.endpoint
             selectionDragLinkURL = resolved?.linkURL
+            if event.clickCount >= 2,
+               let endpoint = resolved?.endpoint,
+               !endpoint.isRowGranular {
+                selectionDragBegan = true
+                selectionDragLinkURL = nil
+                establishMultiClickSelection(
+                    at: endpoint,
+                    paragraph: event.clickCount >= 3
+                )
+            }
         }
 
         func selectionMouseDragged(_ event: NSEvent) {
@@ -1497,7 +1534,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 // First responder moves only once a selection is actually
                 // established, never on a plain click — a click that merely
                 // dismisses a selection must not steal composer focus.
-                tableView?.window?.makeFirstResponder(tableView)
+                takeSelectionFocus()
             }
             guard let resolved = selectionEndpoint(atWindowPoint: location)
             else { return }
@@ -1635,10 +1672,205 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             guard snapshot.count > 0 else { return }
             selection.selectAll()
             refreshVisibleSelectionHighlights()
-            tableView?.window?.makeFirstResponder(tableView)
+            takeSelectionFocus()
         }
 
         var selectionIsActive: Bool { selection.hasSelection }
+
+        /// First responder moves to the table only for an established
+        /// selection, and returns to whoever held it (the composer) when the
+        /// selection clears — a transcript selection must never permanently
+        /// steal typing focus.
+        private func takeSelectionFocus() {
+            guard let tableView, let window = tableView.window else { return }
+            if window.firstResponder !== tableView {
+                var previous = window.firstResponder
+                // A focused control's actual first responder is its field
+                // editor, which is dismantled the moment focus moves; capture
+                // the owning control so focus can genuinely return.
+                if let editor = previous as? NSTextView,
+                   editor.isFieldEditor,
+                   let owner = editor.delegate as? NSResponder {
+                    previous = owner
+                }
+                selectionPreviousResponder = previous
+            }
+            window.makeFirstResponder(tableView)
+        }
+
+        private func returnSelectionFocus() {
+            guard let tableView, let window = tableView.window,
+                  window.firstResponder === tableView else { return }
+            window.makeFirstResponder(selectionPreviousResponder)
+            selectionPreviousResponder = nil
+        }
+
+        func selectionCancel() -> Bool {
+            guard selection.hasSelection else {
+                returnSelectionFocus()
+                return false
+            }
+            selection.clear()
+            refreshVisibleSelectionHighlights()
+            returnSelectionFocus()
+            return true
+        }
+
+        func selectionContextMenu(atWindowPoint point: NSPoint) -> NSMenu? {
+            if selection.hasSelection {
+                let menu = NSMenu()
+                let item = NSMenuItem(
+                    title: "Copy",
+                    action: #selector(MacTranscriptTableView.copy(_:)),
+                    keyEquivalent: ""
+                )
+                item.target = tableView
+                menu.addItem(item)
+                return menu
+            }
+            guard let tableView else { return nil }
+            let tablePoint = tableView.convert(point, from: nil)
+            let rowIndex = tableView.row(at: tablePoint)
+            guard let row = snapshotRow(atFlatIndex: rowIndex),
+                  row.selectionRoleLabel != nil else { return nil }
+            let menu = NSMenu()
+            let item = NSMenuItem(
+                title: "Copy Message",
+                action: #selector(selectionCopyMessageMenuAction(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = row.mutationSourceID
+            menu.addItem(item)
+            return menu
+        }
+
+        @objc private func selectionCopyMessageMenuAction(_ sender: NSMenuItem) {
+            guard let itemID = sender.representedObject as? String else {
+                return
+            }
+            onNativeCopyMessage(itemID)
+        }
+
+        func selectionCursor(atWindowPoint point: NSPoint) -> NSCursor? {
+            guard let tableView else { return nil }
+            let tablePoint = tableView.convert(point, from: nil)
+            let rowIndex = tableView.row(at: tablePoint)
+            guard rowIndex >= 0,
+                  let cell = tableView.view(
+                    atColumn: 0,
+                    row: rowIndex,
+                    makeIfNecessary: false
+                  ) as? MacConversationReusableCell,
+                  let hit = cell.selectionHit(
+                    at: cell.convert(point, from: nil)
+                  ) else {
+                return nil
+            }
+            return hit.linkURL != nil ? .pointingHand : .iBeam
+        }
+
+        /// Double-click selects the word, triple-click the paragraph. For
+        /// rows displaying their model source, boundaries are computed in the
+        /// SECTION's concatenated source — tiles rejoin byte-for-byte, so a
+        /// word straddling a tile seam selects whole across both rows. On
+        /// promoted rich tiles boundaries stay row-local (no seam crossing
+        /// there; an accepted scope limit).
+        private func establishMultiClickSelection(
+            at endpoint: MacTranscriptSelectionEndpoint,
+            paragraph: Bool
+        ) {
+            guard let rowIndex = (0..<snapshot.count).first(
+                where: { snapshot[$0].id == endpoint.rowID }
+            ) else { return }
+            let row = snapshot[rowIndex]
+            let displaysSource = endpoint.displayedText == row.selectionText
+            if !displaysSource {
+                let source = endpoint.displayedText as NSString
+                guard source.length > 0 else { return }
+                let probe = min(max(0, endpoint.offset), source.length - 1)
+                let range = paragraph
+                    ? source.paragraphRange(
+                        for: NSRange(location: probe, length: 0)
+                    )
+                    : NSAttributedString(
+                        string: endpoint.displayedText
+                    ).doubleClick(at: probe)
+                selection.begin(at: MacTranscriptSelectionEndpoint(
+                    rowID: row.id,
+                    offset: range.location,
+                    displayedText: endpoint.displayedText,
+                    isRowGranular: false
+                ))
+                selection.extend(to: MacTranscriptSelectionEndpoint(
+                    rowID: row.id,
+                    offset: NSMaxRange(range),
+                    displayedText: endpoint.displayedText,
+                    isRowGranular: false
+                ))
+                refreshVisibleSelectionHighlights()
+                takeSelectionFocus()
+                return
+            }
+            let sectionID = row.selectionSectionID ?? row.id
+            var startIndex = rowIndex
+            while startIndex > 0,
+                  (snapshot[startIndex - 1].selectionSectionID
+                    ?? snapshot[startIndex - 1].id) == sectionID {
+                startIndex -= 1
+            }
+            var sectionText = ""
+            var rowStarts: [(id: String, start: Int, text: String)] = []
+            var absolute = endpoint.offset
+            var walker = startIndex
+            while walker < snapshot.count,
+                  (snapshot[walker].selectionSectionID
+                    ?? snapshot[walker].id) == sectionID {
+                let text = snapshot[walker].selectionText ?? ""
+                let start = (sectionText as NSString).length
+                if snapshot[walker].id == endpoint.rowID {
+                    absolute = start + endpoint.offset
+                }
+                rowStarts.append((snapshot[walker].id, start, text))
+                sectionText += text
+                walker += 1
+            }
+            let source = sectionText as NSString
+            guard source.length > 0 else { return }
+            let probe = min(max(0, absolute), source.length - 1)
+            let range = paragraph
+                ? source.paragraphRange(for: NSRange(location: probe, length: 0))
+                : NSAttributedString(string: sectionText).doubleClick(at: probe)
+            func sectionEndpoint(
+                at absoluteOffset: Int
+            ) -> MacTranscriptSelectionEndpoint? {
+                var candidate: (id: String, start: Int, text: String)?
+                for entry in rowStarts {
+                    let length = (entry.text as NSString).length
+                    if absoluteOffset <= entry.start + length {
+                        candidate = entry
+                        break
+                    }
+                }
+                guard let candidate = candidate ?? rowStarts.last else {
+                    return nil
+                }
+                return MacTranscriptSelectionEndpoint(
+                    rowID: candidate.id,
+                    offset: max(0, absoluteOffset - candidate.start),
+                    displayedText: candidate.text,
+                    isRowGranular: false
+                )
+            }
+            guard let start = sectionEndpoint(at: range.location),
+                  let end = sectionEndpoint(at: NSMaxRange(range)) else {
+                return
+            }
+            selection.begin(at: start)
+            selection.extend(to: end)
+            refreshVisibleSelectionHighlights()
+            takeSelectionFocus()
+        }
 
         private func applyPreciseChanges(
             from oldSnapshot: MacConversationTableSnapshot<Row>,
@@ -3008,6 +3240,18 @@ private class MacConversationReusableCell: NSTableCellView {
     }
 }
 
+@MainActor
+extension NSView {
+    /// Selection wash color: emphasized while our window is key, the
+    /// unemphasized system color otherwise (matching every native text
+    /// surface on macOS).
+    var transcriptSelectionColor: NSColor {
+        window?.isKeyWindow == true
+            ? .selectedTextBackgroundColor
+            : .unemphasizedSelectedTextBackgroundColor
+    }
+}
+
 /// Result of hit-testing a transcript cell for selection: the nearest
 /// insertion index in the cell's displayed string, that string, and the link
 /// under the pointer when one exists (clicks route through the table now
@@ -3094,8 +3338,7 @@ private final class MacConversationHostedCell: MacConversationReusableCell {
             )
             selectionOverlay = overlay
         }
-        selectionOverlay?.layer?.backgroundColor = NSColor
-            .selectedTextBackgroundColor
+        selectionOverlay?.layer?.backgroundColor = transcriptSelectionColor
             .withAlphaComponent(0.45)
             .cgColor
     }
@@ -3637,7 +3880,7 @@ final class MacConversationSelectionUnderlay: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         guard !highlightRects.isEmpty else { return }
-        NSColor.selectedTextBackgroundColor.setFill()
+        transcriptSelectionColor.setFill()
         for rect in highlightRects where rect.intersects(dirtyRect) {
             rect.fill()
         }
@@ -4194,7 +4437,7 @@ private final class MacConversationNativeTextCell:
         }
         layoutManager.addTemporaryAttribute(
             .backgroundColor,
-            value: NSColor.selectedTextBackgroundColor,
+            value: transcriptSelectionColor,
             forCharacterRange: range
         )
     }

@@ -10,6 +10,16 @@ protocol MacTranscriptTableSelectionDelegate: AnyObject {
     func selectionMouseUp(_ event: NSEvent)
     func selectionCopy()
     func selectionSelectAll()
+    /// Esc pressed while the table is first responder. Returns true when the
+    /// press was consumed (a selection was cleared); false lets the event
+    /// take the normal responder path.
+    func selectionCancel() -> Bool
+    /// Context menu for a right-click at the given window point: "Copy" over
+    /// an active selection, "Copy Message" over a message row otherwise.
+    func selectionContextMenu(atWindowPoint point: NSPoint) -> NSMenu?
+    /// Pointer feedback: I-beam over text, pointing hand over links, nil for
+    /// the arrow default.
+    func selectionCursor(atWindowPoint point: NSPoint) -> NSCursor?
     var selectionIsActive: Bool { get }
 }
 
@@ -44,6 +54,43 @@ final class MacTranscriptTableView: NSTableView {
 
     override func selectAll(_ sender: Any?) {
         selectionDelegate?.selectionSelectAll()
+    }
+
+    override func cancelOperation(_ sender: Any?) {
+        if selectionDelegate?.selectionCancel() == true { return }
+        nextResponder?.tryToPerform(
+            #selector(cancelOperation(_:)),
+            with: sender
+        )
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        selectionDelegate?.selectionContextMenu(
+            atWindowPoint: event.locationInWindow
+        )
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas where area.owner === self {
+            removeTrackingArea(area)
+        }
+        addTrackingArea(NSTrackingArea(
+            rect: .zero,
+            options: [.cursorUpdate, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        ))
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        guard let cursor = selectionDelegate?.selectionCursor(
+            atWindowPoint: event.locationInWindow
+        ) else {
+            super.cursorUpdate(with: event)
+            return
+        }
+        cursor.set()
     }
 
     override func validateUserInterfaceItem(

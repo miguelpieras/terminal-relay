@@ -39,10 +39,12 @@ final class MacConversationTableViewTests: XCTestCase {
         var usesLiveScrollText = false
         var linkURL: URL? = nil
         var mutationSourceIDOverride: String? = nil
+        var selectionRoleLabelOverride: String? = nil
 
         var reuseIdentifier: String { "test.mixed-row" }
         var mutationSourceID: String { mutationSourceIDOverride ?? id }
         var selectionText: String? { text }
+        var selectionRoleLabel: String? { selectionRoleLabelOverride }
         var selectionSectionID: String? { "mixed-section" }
 
         func nativeTextPresentation(
@@ -1048,6 +1050,183 @@ final class MacConversationTableViewTests: XCTestCase {
             accuracy: 0.5,
             "An off-bottom autoscroll release must leave follow disengaged."
         )
+    }
+
+    func testEscapeClearsSelectionAndReturnsFocus() throws {
+        let rows = fastSelectableRows(count: 8)
+        let mounted = mountMixed(rows: rows)
+        let priorResponder = NSTextField(frame: NSRect(x: 0, y: 0, width: 80, height: 20))
+        mounted.window.contentView?.addSubview(priorResponder)
+        mounted.window.makeFirstResponder(priorResponder)
+
+        let rect = mounted.table.rect(ofRow: 1)
+        dragSelection(
+            in: mounted,
+            fromTablePoint: NSPoint(x: rect.minX + 40, y: rect.minY + 6),
+            toTablePoint: NSPoint(x: rect.minX + 160, y: rect.maxY + 20)
+        )
+        XCTAssertTrue(
+            mounted.window.firstResponder === mounted.table,
+            "An established selection takes first responder."
+        )
+
+        let table = try XCTUnwrap(mounted.table as? MacTranscriptTableView)
+        table.cancelOperation(nil)
+        NSPasteboard.general.clearContents()
+        table.copy(nil)
+        XCTAssertNil(
+            NSPasteboard.general.string(forType: .string),
+            "Escape must clear the selection."
+        )
+        XCTAssertTrue(
+            mounted.window.firstResponder === priorResponder.currentEditor()
+                || mounted.window.firstResponder === priorResponder,
+            "Escape must hand focus back to the previous responder."
+        )
+    }
+
+    func testContextMenuOffersCopyOrCopyMessage() throws {
+        var rows = fastSelectableRows(count: 4)
+        rows[1] = MixedRow(
+            id: rows[1].id,
+            contentRevision: 1,
+            text: rows[1].text,
+            usesNativeText: true,
+            usesFastPlainTextRenderer: true,
+            mutationSourceIDOverride: "drag-item",
+            selectionRoleLabelOverride: "You:"
+        )
+        let mounted = mountMixed(rows: rows)
+        let table = try XCTUnwrap(mounted.table as? MacTranscriptTableView)
+        let rect = mounted.table.rect(ofRow: 1)
+        let windowPoint = mounted.table.convert(
+            NSPoint(x: rect.minX + 40, y: rect.minY + 6),
+            to: nil
+        )
+
+        // No selection: a message row offers Copy Message.
+        let messageMenu = table.selectionDelegate?.selectionContextMenu(
+            atWindowPoint: windowPoint
+        )
+        XCTAssertEqual(messageMenu?.items.first?.title, "Copy Message")
+
+        // No selection over a non-message row: no menu.
+        let plainRect = mounted.table.rect(ofRow: 2)
+        let plainPoint = mounted.table.convert(
+            NSPoint(x: plainRect.minX + 40, y: plainRect.minY + 6),
+            to: nil
+        )
+        XCTAssertNil(table.selectionDelegate?.selectionContextMenu(
+            atWindowPoint: plainPoint
+        ))
+
+        // With a selection: Copy.
+        dragSelection(
+            in: mounted,
+            fromTablePoint: NSPoint(x: rect.minX + 40, y: rect.minY + 6),
+            toTablePoint: NSPoint(x: rect.minX + 160, y: rect.maxY + 10)
+        )
+        let copyMenu = table.selectionDelegate?.selectionContextMenu(
+            atWindowPoint: windowPoint
+        )
+        XCTAssertEqual(copyMenu?.items.first?.title, "Copy")
+    }
+
+    func testDoubleClickSelectsAWordAcrossATileSeam() throws {
+        let rows = [
+            MixedRow(
+                id: "seam-a",
+                contentRevision: 1,
+                text: "wor",
+                usesNativeText: true,
+                usesFastPlainTextRenderer: true,
+                mutationSourceIDOverride: "seam-item"
+            ),
+            MixedRow(
+                id: "seam-b",
+                contentRevision: 1,
+                text: "d tail",
+                usesNativeText: true,
+                usesFastPlainTextRenderer: true,
+                mutationSourceIDOverride: "seam-item"
+            ),
+        ]
+        let mounted = mountMixed(rows: rows)
+        let rect = mounted.table.rect(ofRow: 0)
+        let windowPoint = mounted.table.convert(
+            NSPoint(x: rect.minX + 34, y: rect.minY + 12),
+            to: nil
+        )
+        mounted.table.mouseDown(with: NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: windowPoint,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: mounted.window.windowNumber,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 2,
+            pressure: 1
+        )!)
+        mounted.table.mouseUp(with: NSEvent.mouseEvent(
+            with: .leftMouseUp,
+            location: windowPoint,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: mounted.window.windowNumber,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 2,
+            pressure: 1
+        )!)
+
+        NSPasteboard.general.clearContents()
+        (mounted.table as? MacTranscriptTableView)?.copy(nil)
+        XCTAssertEqual(
+            NSPasteboard.general.string(forType: .string),
+            "word",
+            "A word straddling a tile seam must select whole across both rows."
+        )
+    }
+
+    func testSelectionCursorsMatchContentUnderThePointer() throws {
+        let link = URL(string: "https://example.com/cursor")!
+        let rows = [
+            MixedRow(
+                id: "cursor-text",
+                contentRevision: 1,
+                text: "plain cursor text row",
+                usesNativeText: true,
+                usesFastPlainTextRenderer: true
+            ),
+            MixedRow(
+                id: "cursor-link",
+                contentRevision: 1,
+                text: "linked cursor text row",
+                usesNativeText: true,
+                maximumContentWidth: nil,
+                linkURL: link
+            ),
+        ]
+        let mounted = mountMixed(rows: rows)
+        let table = try XCTUnwrap(mounted.table as? MacTranscriptTableView)
+        let textRect = mounted.table.rect(ofRow: 0)
+        let textCursor = table.selectionDelegate?.selectionCursor(
+            atWindowPoint: mounted.table.convert(
+                NSPoint(x: textRect.minX + 40, y: textRect.minY + 12),
+                to: nil
+            )
+        )
+        XCTAssertTrue(textCursor === NSCursor.iBeam)
+
+        let linkRect = mounted.table.rect(ofRow: 1)
+        let linkCursor = table.selectionDelegate?.selectionCursor(
+            atWindowPoint: mounted.table.convert(
+                NSPoint(x: linkRect.minX + 44, y: linkRect.minY + 16),
+                to: nil
+            )
+        )
+        XCTAssertTrue(linkCursor === NSCursor.pointingHand)
     }
 
     func testFollowOwnerSurvivesLateDocumentGrowth() throws {
