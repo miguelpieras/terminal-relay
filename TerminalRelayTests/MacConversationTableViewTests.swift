@@ -800,6 +800,188 @@ final class MacConversationTableViewTests: XCTestCase {
         )
     }
 
+    private func fastSelectableRows(count: Int) -> [MixedRow] {
+        (0..<count).map { index in
+            MixedRow(
+                id: "drag-row-\(index)",
+                contentRevision: 1,
+                text: "drag line one \(index)\ndrag line two \(index)\n",
+                usesNativeText: true,
+                usesFastPlainTextRenderer: true,
+                mutationSourceIDOverride: "drag-item"
+            )
+        }
+    }
+
+    func testHeldDragPinsTheViewportAgainstStreamingBatches() throws {
+        var rows = fastSelectableRows(count: 60)
+        let mounted = mountMixed(rows: rows)
+        let scrollView = try XCTUnwrap(mounted.table.enclosingScrollView)
+        XCTAssertLessThanOrEqual(distanceFromBottom(in: mounted.table), 8)
+
+        let visible = mounted.table.rows(in: scrollView.contentView.bounds)
+        XCTAssertNotEqual(visible.location, NSNotFound)
+        let anchorRect = mounted.table.rect(ofRow: visible.location + 1)
+        let startWindow = mounted.table.convert(
+            NSPoint(x: anchorRect.minX + 40, y: anchorRect.minY + 6),
+            to: nil
+        )
+        let endWindow = mounted.table.convert(
+            NSPoint(x: anchorRect.minX + 120, y: anchorRect.maxY + 20),
+            to: nil
+        )
+        mounted.table.mouseDown(
+            with: mouseEvent(.leftMouseDown, at: startWindow, in: mounted.window)
+        )
+        mounted.table.mouseDragged(
+            with: mouseEvent(.leftMouseDragged, at: endWindow, in: mounted.window)
+        )
+
+        // Streaming keeps publishing while the button is held: batches must
+        // neither move the clip origin nor drop the selection.
+        let heldOrigin = scrollView.contentView.bounds.origin.y
+        for revision in UInt64(2)...5 {
+            rows.append(MixedRow(
+                id: "drag-row-appended-\(revision)",
+                contentRevision: revision,
+                text: "appended \(revision)\n",
+                usesNativeText: true,
+                usesFastPlainTextRenderer: true,
+                mutationSourceIDOverride: "drag-item"
+            ))
+            mounted.hosting.rootView = mixedTable(rows: rows)
+            settle(mounted.hosting)
+            XCTAssertEqual(
+                scrollView.contentView.bounds.origin.y,
+                heldOrigin,
+                accuracy: 0.5,
+                "A streaming batch moved the viewport under a held drag."
+            )
+        }
+
+        mounted.table.mouseUp(
+            with: mouseEvent(.leftMouseUp, at: endWindow, in: mounted.window)
+        )
+        NSPasteboard.general.clearContents()
+        (mounted.table as? MacTranscriptTableView)?.copy(nil)
+        XCTAssertEqual(
+            NSPasteboard.general.string(forType: .string)?.isEmpty,
+            false,
+            "The selection survives the streaming churn under the drag."
+        )
+    }
+
+    func testNoScrollDragDuringStreamingRetainsStickyFollow() throws {
+        var rows = fastSelectableRows(count: 60)
+        let mounted = mountMixed(rows: rows)
+        XCTAssertLessThanOrEqual(distanceFromBottom(in: mounted.table), 8)
+
+        let visible = mounted.table.rows(
+            in: mounted.table.enclosingScrollView!.contentView.bounds
+        )
+        let anchorRect = mounted.table.rect(ofRow: visible.location + 1)
+        dragSelection(
+            in: mounted,
+            fromTablePoint: NSPoint(
+                x: anchorRect.minX + 40,
+                y: anchorRect.minY + 6
+            ),
+            toTablePoint: NSPoint(
+                x: anchorRect.minX + 160,
+                y: anchorRect.maxY + 30
+            )
+        )
+
+        // Follow was restored at mouse-up (the drag never scrolled), so the
+        // next streamed batch pins the new content into view.
+        rows.append(MixedRow(
+            id: "post-drag-append",
+            contentRevision: 9,
+            text: String(
+                repeating: "post drag growth line\n",
+                count: 12
+            ),
+            usesNativeText: true,
+            usesFastPlainTextRenderer: true,
+            mutationSourceIDOverride: "drag-item"
+        ))
+        mounted.hosting.rootView = mixedTable(rows: rows)
+        settle(mounted.hosting)
+        XCTAssertLessThanOrEqual(
+            distanceFromBottom(in: mounted.table),
+            8,
+            "A no-scroll selection drag must not disengage sticky follow."
+        )
+    }
+
+    func testWheelEventDuringDragMountsNoStandIns() throws {
+        let initial = MixedRow(
+            id: "drag-wheel-row",
+            contentRevision: 1,
+            text: "wheel target text",
+            usesNativeText: true,
+            usesFastPlainTextRenderer: true,
+            usesLiveScrollText: true
+        )
+        let mounted = mountMixed(rows: [initial])
+        let scrollView = try XCTUnwrap(mounted.table.enclosingScrollView)
+        let rect = mounted.table.rect(ofRow: 0)
+        let startWindow = mounted.table.convert(
+            NSPoint(x: rect.minX + 40, y: rect.minY + 6),
+            to: nil
+        )
+        mounted.table.mouseDown(
+            with: mouseEvent(.leftMouseDown, at: startWindow, in: mounted.window)
+        )
+        mounted.table.mouseDragged(
+            with: mouseEvent(
+                .leftMouseDragged,
+                at: NSPoint(x: startWindow.x + 60, y: startWindow.y - 8),
+                in: mounted.window
+            )
+        )
+
+        // A phase-less wheel tick mid-drag must not open the synthesized
+        // live-scroll window: a changed row keeps its real cell instead of a
+        // draw-only stand-in.
+        let cgEvent = try XCTUnwrap(CGEvent(
+            scrollWheelEvent2Source: nil,
+            units: .pixel,
+            wheelCount: 1,
+            wheel1: -30,
+            wheel2: 0,
+            wheel3: 0
+        ))
+        scrollView.scrollWheel(with: try XCTUnwrap(NSEvent(cgEvent: cgEvent)))
+        var changed = initial
+        changed = MixedRow(
+            id: "drag-wheel-row",
+            contentRevision: 2,
+            text: "wheel target text changed",
+            usesNativeText: true,
+            usesFastPlainTextRenderer: true,
+            usesLiveScrollText: true
+        )
+        mounted.hosting.rootView = mixedTable(rows: [changed])
+        settle(mounted.hosting)
+        let cell = try XCTUnwrap(mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: true
+        ))
+        XCTAssertFalse(
+            cell.identifier?.rawValue.hasSuffix(".native-scroll") == true,
+            "Wheel events under a held drag must not mount stand-in cells."
+        )
+        mounted.table.mouseUp(
+            with: mouseEvent(
+                .leftMouseUp,
+                at: startWindow,
+                in: mounted.window
+            )
+        )
+    }
+
     func testFollowOwnerSurvivesLateDocumentGrowth() throws {
         let mounted = mount(rowCount: 60)
         let scrollView = try XCTUnwrap(mounted.table.enclosingScrollView)

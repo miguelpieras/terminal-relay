@@ -80,10 +80,22 @@ final class MacTranscriptScrollActivity: @unchecked Sendable {
 
     @MainActor private var isLiveScrolling = false
     @MainActor private var isIncrementalRestorationActive = false
+    @MainActor private var isSelectionDragActive = false
     @MainActor private var idleAdoptions: [IdleAdoption] = []
     @MainActor private var isIdleAdoptionScheduled = false
     @MainActor private var idleAdoptionTimer: Timer?
     @MainActor private var onHeightChangingContentWillAdopt: (() -> Void)?
+
+    /// A held selection drag pauses idle promotions exactly like a live
+    /// gesture: the 60Hz timer runs in .common mode and would otherwise swap
+    /// row content and heights under the user's held button.
+    @MainActor
+    func setSelectionDragActive(_ value: Bool) {
+        guard isSelectionDragActive != value else { return }
+        isSelectionDragActive = value
+        guard !value else { return }
+        scheduleNextIdleAdoption()
+    }
 
     @MainActor
     func setHeightChangeHandler(_ handler: (() -> Void)?) {
@@ -176,7 +188,9 @@ final class MacTranscriptScrollActivity: @unchecked Sendable {
     private func performNextIdleAdoption() {
         idleAdoptionTimer = nil
         isIdleAdoptionScheduled = false
-        guard !isLiveScrolling, !isIncrementalRestorationActive else { return }
+        guard !isLiveScrolling,
+              !isIncrementalRestorationActive,
+              !isSelectionDragActive else { return }
         while !idleAdoptions.isEmpty,
               idleAdoptions[0].cancellationToken.isCancelled {
             idleAdoptions.removeFirst().continuation.resume()
@@ -198,6 +212,7 @@ final class MacTranscriptScrollActivity: @unchecked Sendable {
     private func scheduleNextIdleAdoption() {
         guard !isLiveScrolling,
               !isIncrementalRestorationActive,
+              !isSelectionDragActive,
               !idleAdoptions.isEmpty,
               !isIdleAdoptionScheduled else { return }
         isIdleAdoptionScheduled = true
@@ -840,6 +855,13 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         private var selectionDragOrigin: NSPoint?
         private var selectionDragBegan = false
         private var selectionDragLinkURL: URL?
+        /// A held primary-button press owns the viewport like a live-scroll
+        /// gesture (corrections pause, heights defer, idle adoptions wait) —
+        /// but WITHOUT stand-in cells and WITHOUT freezing store
+        /// publications, so streamed text keeps arriving under the drag.
+        private var selectionDragActive = false
+        private var selectionWasFollowingBottom = false
+        private var selectionDragScrolled = false
         private var pendingLiveScrollRestorationAnchor: Anchor?
         private var pendingLiveScrollRestorationFollowsBottom = false
         private var pendingLiveScrollRestorationExpectedOriginY: CGFloat?
@@ -1151,10 +1173,12 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             // one-shot correction already consumed its follow flag — the 8pt
             // isAtBottom sample alone reads that moment as "not at bottom"
             // and silently downgraded a followed stream to a frozen anchor.
-            let wasPinned = !isLiveScrolling
+            let wasPinned = !isLiveScrolling && !selectionDragActive
                 && (needsInitialAnchor || isAtBottom || isFollowingBottom)
-            let anchor = isLiveScrolling || wasPinned ? nil : captureAnchor()
-            if !isLiveScrolling {
+            let anchor = isLiveScrolling || selectionDragActive || wasPinned
+                ? nil
+                : captureAnchor()
+            if !isLiveScrolling, !selectionDragActive {
                 prepareMutationStabilization(
                     followsBottom: wasPinned,
                     anchor: anchor
@@ -1218,17 +1242,18 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 )
             }
             if !heightInvalidations.isEmpty {
-                if isLiveScrolling {
+                if isLiveScrolling || selectionDragActive {
                     pendingLiveScrollHeightInvalidations.formUnion(heightInvalidations)
                 } else {
                     tableView.noteHeightOfRows(withIndexesChanged: heightInvalidations)
                     MacConversationTableDiagnostics.recordedHeightInvalidation()
                 }
             }
-            if pendingMutationFollowsBottom, !isLiveScrolling {
+            if pendingMutationFollowsBottom, !isLiveScrolling,
+               !selectionDragActive {
                 primePinnedDocumentGeometry()
             }
-            if !isLiveScrolling,
+            if !isLiveScrolling, !selectionDragActive,
                pendingMutationFollowsBottom || pendingMutationAnchor != nil {
                 pendingExpectedClipOriginY = scrollView?.contentView.bounds.origin.y
             }
@@ -1245,7 +1270,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                     onAnchoredChange(false)
                 }
             }
-            if newSnapshot.count > 0, !isLiveScrolling {
+            if newSnapshot.count > 0, !isLiveScrolling, !selectionDragActive {
                 scheduleMutationStabilization()
                 if needsInitialAnchor {
                     DispatchQueue.main.async { [onAnchoredChange] in
@@ -1422,7 +1447,18 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
 
         func selectionMouseDown(_ event: NSEvent) {
             selectionDragBegan = false
+            selectionDragScrolled = false
             selectionDragOrigin = event.locationInWindow
+            // The held button owns the viewport from this instant: capture
+            // the follow decision, silence every correction owner, and pause
+            // idle promotions — a no-scroll press restores all of it at
+            // mouse-up, so selecting inside a streaming reply never
+            // disengages sticky follow.
+            selectionWasFollowingBottom = isFollowingBottom
+            selectionDragActive = true
+            scrollActivity.setSelectionDragActive(true)
+            isFollowingBottom = false
+            cancelMutationStabilization()
             // A synthesized wheel window must not stay open under a primary
             // drag: close it now (same path as its quiescence timer) so no
             // stand-in cells mount beneath the selection.
@@ -1472,6 +1508,22 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 selectionDragOrigin = nil
                 selectionDragLinkURL = nil
                 selectionDragBegan = false
+                selectionDragScrolled = false
+                selectionWasFollowingBottom = false
+            }
+            selectionDragActive = false
+            scrollActivity.setSelectionDragActive(false)
+            flushSelectionDragDeferredHeights()
+            if selectionDragScrolled {
+                // Edge autoscroll moved the viewport: the resting position is
+                // the user's decision, same as a gesture ending.
+                isFollowingBottom = isAtBottom
+            } else if selectionWasFollowingBottom {
+                // The viewport never moved — restore follow and re-pin to
+                // absorb whatever streamed in while the button was down.
+                isFollowingBottom = true
+                prepareMutationStabilization(followsBottom: true, anchor: nil)
+                scheduleMutationStabilization()
             }
             guard !selectionDragBegan else { return }
             // A movement-free click: open the link under the pointer through
@@ -1480,6 +1532,19 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             if let url = selectionDragLinkURL {
                 _ = onNativeLink(url)
             }
+        }
+
+        /// Height invalidations accumulated while the button was down (same
+        /// deferral set the live-scroll window uses) land in one batch once
+        /// the drag releases the viewport.
+        private func flushSelectionDragDeferredHeights() {
+            guard !isLiveScrolling,
+                  let tableView,
+                  !pendingLiveScrollHeightInvalidations.isEmpty else { return }
+            let indexes = pendingLiveScrollHeightInvalidations
+            pendingLiveScrollHeightInvalidations.removeAll()
+            tableView.noteHeightOfRows(withIndexesChanged: indexes)
+            MacConversationTableDiagnostics.recordedHeightInvalidation()
         }
 
         func selectionCopy() {
@@ -2042,7 +2107,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             followsBottom: Bool,
             anchor: Anchor?
         ) {
-            guard !isLiveScrolling else { return }
+            guard !isLiveScrolling, !selectionDragActive else { return }
             // General model/style mutations own the viewport first. A
             // display-linked row restoration resumes only after that batch's
             // anchor has settled, so two independent correction owners can
@@ -2068,6 +2133,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         /// Phase-less wheel events synthesize the same live-scroll window a
         /// trackpad gets, ended by a short quiescence timer.
         private func wheelEventDidArrive(_ event: NSEvent) {
+            guard !selectionDragActive else { return }
             guard event.phase == [] && event.momentumPhase == [] else { return }
             if !isLiveScrolling {
                 liveScrollDidBegin()
@@ -2098,6 +2164,10 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         }
 
         private func liveScrollDidBegin() {
+            // A held selection drag owns the viewport outright: no gesture
+            // window may open under it (no stand-ins, no store freeze). The
+            // drag's own gates already pause every correction owner.
+            guard !selectionDragActive else { return }
             guard !isLiveScrolling else { return }
             scrollActivity.setLiveScrolling(true)
             scrollActivity.setIncrementalRestorationActive(false)
@@ -2131,7 +2201,11 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             // ending at the bottom (re)engages follow, ending above releases
             // it. Late momentum that moves the viewport afterwards is handled
             // by the upward-move check in applyPendingScrollCorrectionIfReady.
-            isFollowingBottom = isAtBottom
+            // A held selection drag owns that decision instead (restored or
+            // re-derived at mouse-up).
+            if !selectionDragActive {
+                isFollowingBottom = isAtBottom
+            }
             scrollActivity.setIncrementalRestorationActive(true)
             scrollActivity.setLiveScrolling(false)
             guard let tableView else {
@@ -2338,6 +2412,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         private func applyPendingLiveScrollRestorationCorrection(
             keepPending: Bool = false
         ) {
+            guard !selectionDragActive else { return }
             guard pendingLiveScrollRestorationFollowsBottom
                     || pendingLiveScrollRestorationAnchor != nil else { return }
             if !keepPending,
@@ -2445,7 +2520,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         }
 
         private func tableGeometryDidChange() {
-            guard !isLiveScrolling,
+            guard !isLiveScrolling, !selectionDragActive,
                   pendingMutationFollowsBottom || pendingMutationAnchor != nil else {
                 return
             }
@@ -2460,6 +2535,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
 
         @discardableResult
         private func applyPendingScrollCorrectionIfReady() -> Bool {
+            guard !selectionDragActive else { return false }
             guard pendingMutationFollowsBottom || pendingMutationAnchor != nil else {
                 return false
             }
@@ -2520,7 +2596,8 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         }
 
         private func scheduleMutationStabilization() {
-            guard !isLiveScrolling, !stabilizationScheduled else { return }
+            guard !isLiveScrolling, !selectionDragActive,
+                  !stabilizationScheduled else { return }
             stabilizationScheduled = true
             let generation = stabilizationGeneration
             DispatchQueue.main.async { [weak self] in
