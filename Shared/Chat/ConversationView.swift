@@ -137,6 +137,58 @@ enum MacTranscriptRow: MacConversationTableRow {
         }
     }
 
+    /// Plain text this row contributes to a cross-transcript selection.
+    /// Tiles contribute their model text; collapsed disclosure first rows and
+    /// tool-group lines contribute the exact composed headline they render;
+    /// hidden collapsed bodies and non-text rows contribute nothing.
+    var selectionText: String? {
+        switch self {
+        case .item(let projection, let isExpanded, _):
+            guard projection.kind.isDisclosure else {
+                return projection.rowText
+            }
+            if projection.isFirstInItem {
+                switch projection.displayItem {
+                case .tool(let tool):
+                    return tool.composedHeadline(
+                        compactLine: projection.compactLine
+                    )
+                case .reasoning(let reasoning):
+                    return reasoning.isStreaming
+                        ? "Thinking…"
+                        : "Reasoning summary"
+                case .diff(let diff):
+                    return diff.path ?? "File changes"
+                case .generic(let generic):
+                    return generic.title
+                case .message, .plan:
+                    return projection.rowText
+                }
+            }
+            guard isExpanded else { return nil }
+            return projection.rowText
+        case .toolGroupHeader(let header, _):
+            return header.summary
+        case .toolGroupLive(let live, _):
+            return live.headline
+        case .history, .messageFooter, .pendingTurn, .approval, .question:
+            return nil
+        }
+    }
+
+    var selectionRoleLabel: String? {
+        guard case .item(let projection, _, _) = self,
+              case .message(let message) = projection.displayItem else {
+            return nil
+        }
+        return message.role == .user ? "You:" : "Assistant:"
+    }
+
+    var selectionSectionID: String? {
+        guard case .item(let projection, _, _) = self else { return id }
+        return projection.projectionSectionID
+    }
+
     /// Stable text tiles bypass SwiftUI hosting entirely. Interactive rows,
     /// streaming tails, image content, and disclosure headers stay hosted; a
     /// completed message footer is a separate small native control row, so the
@@ -2629,18 +2681,7 @@ private struct ToolActivityCard: View {
     }
 
     private var headline: String {
-        var components = [segment?.compactLine ?? tool.compactHeadline]
-        if let duration = tool.durationMilliseconds, duration >= 1000 {
-            components.append(
-                Duration.milliseconds(duration).formatted(
-                    .units(allowed: [.seconds], width: .abbreviated)
-                )
-            )
-        }
-        if let outcome = tool.compactOutcome {
-            components.append(outcome)
-        }
-        return components.joined(separator: " · ")
+        tool.composedHeadline(compactLine: segment?.compactLine)
     }
 
     @ViewBuilder

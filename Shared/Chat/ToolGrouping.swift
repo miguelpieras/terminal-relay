@@ -222,6 +222,25 @@ extension ToolActivity {
         }
     }
 
+    /// The exact collapsed headline the transcript renders for this tool row:
+    /// compact line, a duration of one second or more, and the outcome joined
+    /// with " · ". Shared by the SwiftUI header and macOS selection copy so
+    /// copied text always matches the rendered pixels.
+    func composedHeadline(compactLine: String?) -> String {
+        var components = [compactLine ?? compactHeadline]
+        if let duration = durationMilliseconds, duration >= 1000 {
+            components.append(
+                Duration.milliseconds(duration).formatted(
+                    .units(allowed: [.seconds], width: .abbreviated)
+                )
+            )
+        }
+        if let outcome = compactOutcome {
+            components.append(outcome)
+        }
+        return components.joined(separator: " · ")
+    }
+
     /// Status suffix for the compact line; only outcomes worth a glance
     /// ("failed", "exit 1", "cancelled") — success stays silent.
     var compactOutcome: String? {

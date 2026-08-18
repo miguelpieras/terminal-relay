@@ -458,10 +458,26 @@ protocol MacConversationTableRow: Equatable, Identifiable where ID == String {
     /// record can project into many reusable table rows, so mutation IDs from
     /// the store do not necessarily match `id`.
     var mutationSourceID: String { get }
+    /// Plain text this row contributes to a cross-transcript selection.
+    /// nil rows are excluded from selection painting and copying entirely
+    /// (footers, pending indicators, interactive approval/question rows,
+    /// collapsed disclosure bodies).
+    var selectionText: String? { get }
+    /// Label line ("You:") inserted before this row's item when a copied
+    /// slice spans more than one transcript item. Only message rows label.
+    var selectionRoleLabel: String? { get }
+    /// Content-section grouping for copy separators: adjacent selected rows
+    /// with the same section ID rejoin without a separator (tiles of one
+    /// text run recompose byte-for-byte), different sections of one item
+    /// join with one newline, different items with a blank line.
+    var selectionSectionID: String? { get }
 }
 
 extension MacConversationTableRow {
     var mutationSourceID: String { id }
+    var selectionText: String? { nil }
+    var selectionRoleLabel: String? { nil }
+    var selectionSectionID: String? { nil }
     @MainActor
     func nativeTextPresentation(
         dynamicTypeSize: DynamicTypeSize,

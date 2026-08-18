@@ -358,4 +358,345 @@ final class MacTranscriptSelectionTests: XCTestCase {
             }
         }
     }
+
+    // MARK: - Row-model selection surface (task 1.2)
+
+    private func makeTool(
+        id: String = "tool-1",
+        status: ToolActivityStatus = .completed,
+        output: String? = "total 3\nfile-a\nfile-b",
+        durationMilliseconds: Int64? = 2_500,
+        exitCode: Int? = nil
+    ) -> ToolActivity {
+        ToolActivity(
+            id: id,
+            turnID: "turn",
+            kind: .shell,
+            title: "Bash",
+            status: status,
+            input: "{\"command\": \"ls -la\"}",
+            output: output,
+            errorMessage: nil,
+            durationMilliseconds: durationMilliseconds,
+            exitCode: exitCode,
+            occurredAt: 1,
+            isTruncated: false,
+            originalByteCount: nil
+        )
+    }
+
+    func testMessageTilesExposeRowTextRoleLabelsAndSectionIDs() {
+        let source = (1...400).map { "line \($0)" }.joined(separator: "\n")
+        let item = ConversationItem.message(
+            ChatMessage(
+                id: "assistant-1",
+                turnID: "turn",
+                role: .assistant,
+                text: source,
+                occurredAt: 1
+            )
+        )
+        let projections = TranscriptRowProjection.makeRows(item: item)
+        XCTAssertGreaterThan(projections.count, 1, "Fixture must tile")
+        let rows = projections.map {
+            MacTranscriptRow.item($0, isExpanded: false, copiedItemID: nil)
+        }
+        for (projection, row) in zip(projections, rows) {
+            XCTAssertEqual(row.selectionText, projection.rowText)
+            XCTAssertEqual(row.selectionRoleLabel, "Assistant:")
+            XCTAssertEqual(
+                row.selectionSectionID,
+                projection.projectionSectionID
+            )
+        }
+        XCTAssertEqual(
+            rows.compactMap(\.selectionText).joined(),
+            source,
+            "Tiles of one content section must recompose the source exactly."
+        )
+
+        let userRow = MacTranscriptRow.item(
+            TranscriptRowProjection.makeRows(
+                item: .message(ChatMessage(
+                    id: "user-1",
+                    turnID: "turn",
+                    role: .user,
+                    text: "hi",
+                    occurredAt: 1
+                ))
+            )[0],
+            isExpanded: false,
+            copiedItemID: nil
+        )
+        XCTAssertEqual(userRow.selectionRoleLabel, "You:")
+        XCTAssertEqual(userRow.selectionText, "hi")
+    }
+
+    func testToolRowsExposeTheRenderedHeadlineAndGateBodiesOnExpansion() {
+        let tool = makeTool(status: .failed, exitCode: 1)
+        let projections = TranscriptRowProjection.makeRows(
+            item: .tool(tool)
+        )
+        XCTAssertGreaterThan(projections.count, 1)
+
+        let collapsed = projections.map {
+            MacTranscriptRow.item($0, isExpanded: false, copiedItemID: nil)
+        }
+        XCTAssertEqual(
+            collapsed[0].selectionText,
+            tool.composedHeadline(compactLine: projections[0].compactLine),
+            "Collapsed tool first rows must copy exactly the rendered headline."
+        )
+        XCTAssertNil(collapsed[0].selectionRoleLabel)
+        for row in collapsed.dropFirst() {
+            XCTAssertNil(
+                row.selectionText,
+                "Hidden collapsed bodies must not contribute to a selection."
+            )
+        }
+
+        let expanded = projections.map {
+            MacTranscriptRow.item($0, isExpanded: true, copiedItemID: nil)
+        }
+        for (projection, row) in zip(projections, expanded).dropFirst() {
+            XCTAssertEqual(row.selectionText, projection.rowText)
+        }
+    }
+
+    func testActivityChromeAndInteractiveRowsAreExcluded() {
+        XCTAssertEqual(
+            MacTranscriptRow.toolGroupHeader(
+                ToolGroupHeaderModel(
+                    groupID: "g1",
+                    summary: "Ran 3 commands",
+                    symbol: "terminal",
+                    hasFailure: false,
+                    isExpanded: false
+                ),
+                revision: 1
+            ).selectionText,
+            "Ran 3 commands"
+        )
+        XCTAssertEqual(
+            MacTranscriptRow.toolGroupLive(
+                ToolGroupLiveModel(groupID: "g1", headline: "Running ls"),
+                revision: 1
+            ).selectionText,
+            "Running ls"
+        )
+        XCTAssertNil(MacTranscriptRow.pendingTurn.selectionText)
+        XCTAssertNil(
+            MacTranscriptRow.history(id: "history", revision: 1).selectionText
+        )
+        XCTAssertNil(
+            MacTranscriptRow.messageFooter(
+                MacMessageFooter(
+                    itemID: "assistant-1",
+                    turnID: "turn",
+                    occurredAt: 1,
+                    role: .assistant
+                ),
+                revision: 1
+            ).selectionText
+        )
+        XCTAssertNil(
+            MacTranscriptRow.approval(
+                ChatTestFixtures.pendingApproval(),
+                revision: 1
+            ).selectionText
+        )
+        XCTAssertNil(
+            MacTranscriptRow.question(
+                ChatTestFixtures.pendingQuestion(),
+                revision: 1
+            ).selectionText
+        )
+    }
+
+    // MARK: - Copy slicer (task 1.2)
+
+    private struct SliceRow: MacConversationTableRow {
+        let id: String
+        var contentRevision: UInt64 = 1
+        var reuseIdentifier: String { "slice-row" }
+        var mutationSourceID: String
+        var selectionText: String?
+        var selectionRoleLabel: String?
+        var selectionSectionID: String?
+    }
+
+    func testSliceWithinOneSectionRejoinsTilesWithoutSeparators() {
+        let rows = [
+            SliceRow(
+                id: "a1",
+                mutationSourceID: "a",
+                selectionText: "Hello, ",
+                selectionRoleLabel: "Assistant:",
+                selectionSectionID: "a:text"
+            ),
+            SliceRow(
+                id: "a2",
+                mutationSourceID: "a",
+                selectionText: "world!",
+                selectionRoleLabel: "Assistant:",
+                selectionSectionID: "a:text"
+            ),
+        ]
+        let text = MacTranscriptSelectionSlicer.copyText(
+            rows: rows,
+            start: MacTranscriptSelectionEndpoint(
+                rowID: "a1",
+                offset: 3,
+                displayedText: "Hello, ",
+                isRowGranular: false
+            ),
+            end: MacTranscriptSelectionEndpoint(
+                rowID: "a2",
+                offset: 3,
+                displayedText: "world!",
+                isRowGranular: false
+            )
+        )
+        XCTAssertEqual(
+            text,
+            "lo, wor",
+            "Same-section tiles must rejoin without separators or labels."
+        )
+    }
+
+    func testMultiItemSliceInsertsLabelsAndSeparators() {
+        let rows = [
+            SliceRow(
+                id: "u1",
+                mutationSourceID: "user-1",
+                selectionText: "hi",
+                selectionRoleLabel: "You:",
+                selectionSectionID: "user-1:text"
+            ),
+            SliceRow(
+                id: "footer",
+                mutationSourceID: "user-1",
+                selectionText: nil,
+                selectionRoleLabel: nil,
+                selectionSectionID: nil
+            ),
+            SliceRow(
+                id: "t1",
+                mutationSourceID: "tool-1",
+                selectionText: "Ran ls · exit 1",
+                selectionRoleLabel: nil,
+                selectionSectionID: "tool-1:title"
+            ),
+            SliceRow(
+                id: "m1",
+                mutationSourceID: "assistant-1",
+                selectionText: "First section",
+                selectionRoleLabel: "Assistant:",
+                selectionSectionID: "assistant-1:s1"
+            ),
+            SliceRow(
+                id: "m2",
+                mutationSourceID: "assistant-1",
+                selectionText: "Second section",
+                selectionRoleLabel: "Assistant:",
+                selectionSectionID: "assistant-1:s2"
+            ),
+        ]
+        let text = MacTranscriptSelectionSlicer.copyText(
+            rows: rows,
+            start: nil,
+            end: nil
+        )
+        XCTAssertEqual(
+            text,
+            """
+            You:
+            hi
+
+            Ran ls · exit 1
+
+            Assistant:
+            First section
+            Second section
+            """,
+            """
+            Items separate with a blank line, message items carry their role \
+            label, sections of one item separate with one newline, excluded \
+            rows vanish.
+            """
+        )
+    }
+
+    func testSingleItemSliceStaysRawWithoutLabels() {
+        let rows = [
+            SliceRow(
+                id: "m1",
+                mutationSourceID: "assistant-1",
+                selectionText: "only text",
+                selectionRoleLabel: "Assistant:",
+                selectionSectionID: "assistant-1:s1"
+            )
+        ]
+        XCTAssertEqual(
+            MacTranscriptSelectionSlicer.copyText(
+                rows: rows,
+                start: nil,
+                end: nil
+            ),
+            "only text"
+        )
+    }
+
+    func testRowGranularEndpointsUseWholeRowsAndOffsetsClampSafely() {
+        let rows = [
+            SliceRow(
+                id: "hosted",
+                mutationSourceID: "assistant-1",
+                selectionText: "whole hosted row",
+                selectionRoleLabel: "Assistant:",
+                selectionSectionID: "assistant-1:s1"
+            ),
+            SliceRow(
+                id: "m2",
+                mutationSourceID: "assistant-1",
+                selectionText: "ab🎉cd",
+                selectionRoleLabel: "Assistant:",
+                selectionSectionID: "assistant-1:s1"
+            ),
+        ]
+        let text = MacTranscriptSelectionSlicer.copyText(
+            rows: rows,
+            start: MacTranscriptSelectionEndpoint(
+                rowID: "hosted",
+                offset: 5,
+                displayedText: "ignored",
+                isRowGranular: true
+            ),
+            end: MacTranscriptSelectionEndpoint(
+                rowID: "m2",
+                offset: 3,
+                displayedText: "ab🎉cd",
+                isRowGranular: false
+            )
+        )
+        XCTAssertEqual(
+            text,
+            "whole hosted rowab🎉",
+            """
+            Row-granular endpoints contribute their whole row; an offset \
+            landing mid-surrogate expands to the full composed character \
+            instead of tearing it.
+            """
+        )
+
+        XCTAssertEqual(
+            MacTranscriptSelectionSlicer.utf16Substring(
+                "ab🎉cd",
+                from: -5,
+                to: 99
+            ),
+            "ab🎉cd",
+            "Out-of-range offsets clamp to the string bounds."
+        )
+    }
 }
