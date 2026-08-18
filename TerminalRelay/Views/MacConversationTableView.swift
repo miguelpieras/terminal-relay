@@ -1,7 +1,17 @@
 import AppKit
 import CoreText
+import OSLog
 import QuartzCore
 import SwiftUI
+
+/// Persisted (default-level) attribution for every whole-table reload and
+/// visible row replacement: a full-view blink in the field traces back to the
+/// exact trigger with one `log show` under this category. Counts and reasons
+/// only, never content.
+private let transcriptTableLogger = Logger(
+    subsystem: "com.mpieras.TerminalRelay",
+    category: "transcript-table"
+)
 
 @MainActor
 private final class MacConversationTranscriptScrollView: NSScrollView {
@@ -782,6 +792,15 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         private var pendingMutationAnchor: Anchor?
         private var pendingMutationFollowsBottom = false
         private var pendingExpectedClipOriginY: CGFloat?
+        /// Sticky bottom-follow mode. Set whenever a mutation batch finds the
+        /// viewport at the bottom; cleared only by a user-owned move away (a
+        /// gesture ending off-bottom, or an unexpected viewport move outside
+        /// every owned correction). While set, the follows-bottom correction
+        /// owner stays armed after each pin, so hosted row heights that land
+        /// after the batch settled still re-pin on the next layout pass — a
+        /// streaming tail can never silently outrun the viewport the way the
+        /// consumed one-shot correction allowed.
+        private var isFollowingBottom = false
         private var stabilizationScheduled = false
         private var stabilizationGeneration: UInt64 = 0
         private var isLiveScrolling = false
@@ -793,6 +812,10 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         private var liveScrollRestorationQueue: [LiveScrollRestoration] = []
         private var liveScrollRestorationIndex = 0
         private var liveScrollRestorationTimer: Timer?
+        private var liveScrollRestorationStarvedTicks = 0
+        /// ~300ms at the 60Hz restoration pace before a starved queue runs
+        /// anyway despite a pending mutation correction.
+        private let maximumRestorationStarvationTicks = 18
         private var pendingLiveScrollRestorationAnchor: Anchor?
         private var pendingLiveScrollRestorationFollowsBottom = false
         private var pendingLiveScrollRestorationExpectedOriginY: CGFloat?
@@ -1099,26 +1122,53 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             // the first table layout its empty document geometry can report a
             // spurious non-bottom origin, so do not derive the initial anchor
             // from that provisional range.
-            let wasPinned = !isLiveScrolling && (needsInitialAnchor || isAtBottom)
+            // isFollowingBottom keeps the pin armed across the window where a
+            // hosted streaming row's height lands after the previous batch's
+            // one-shot correction already consumed its follow flag — the 8pt
+            // isAtBottom sample alone reads that moment as "not at bottom"
+            // and silently downgraded a followed stream to a frozen anchor.
+            let wasPinned = !isLiveScrolling
+                && (needsInitialAnchor || isAtBottom || isFollowingBottom)
             let anchor = isLiveScrolling || wasPinned ? nil : captureAnchor()
             if !isLiveScrolling {
                 prepareMutationStabilization(
                     followsBottom: wasPinned,
                     anchor: anchor
                 )
+                if wasPinned {
+                    isFollowingBottom = true
+                }
             }
 
             var heightInvalidations = IndexSet()
             var didReload = false
             TranscriptPerformance.measureTableMutation {
-                if generationChanged || hasNewAuthoritativeReset
-                    || snapshot.count == 0 || newSnapshot.count == 0 {
+                if hasNewAuthoritativeReset
+                    || snapshot.count == 0 || newSnapshot.count == 0
+                    || (generationChanged && rowsChanged) {
+                    transcriptTableLogger.log(
+                        """
+                        full reload \
+                        reset=\(hasNewAuthoritativeReset, privacy: .public) \
+                        generationChanged=\(generationChanged, privacy: .public) \
+                        rows=\(self.snapshot.count, privacy: .public)->\
+                        \(newSnapshot.count, privacy: .public)
+                        """
+                    )
                     snapshot = newSnapshot
                     rebuildSectionIndex()
                     snapshotGeneration = newSnapshotGeneration
                     tableView.reloadData()
                     MacConversationTableDiagnostics.recordedReload()
                     didReload = true
+                } else if generationChanged {
+                    // A rebroadcast or rebuilt snapshot that produced
+                    // identical rows only needs cursor bookkeeping.
+                    // Reloading here repainted every row with pixel-identical
+                    // content — a pure full-view blink.
+                    snapshot = newSnapshot
+                    rebuildSectionIndex()
+                    snapshotGeneration = newSnapshotGeneration
                 } else if rowsChanged {
                     let newMutation = transcriptMutation.flatMap {
                         $0.revision == lastTranscriptMutationRevision ? nil : $0
@@ -1163,6 +1213,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 didInitialAnchor = true
             } else if newSnapshot.count == 0 {
                 didInitialAnchor = false
+                isFollowingBottom = false
                 pendingMutationAnchor = nil
                 pendingMutationFollowsBottom = false
                 pendingExpectedClipOriginY = nil
@@ -1265,6 +1316,9 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             }
 
             guard oldCommonOrder == newCommonOrder else {
+                transcriptTableLogger.log(
+                    "full reload: common section order changed"
+                )
                 snapshot = newSnapshot
                 rebuildSectionIndex()
                 tableView.reloadData()
@@ -1315,6 +1369,9 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                     oldRowIndex[$0.id] == nil ? nil : $0.id
                 }
                 guard oldRowOrder == newRowOrder else {
+                    transcriptTableLogger.log(
+                        "full reload: common row order changed in one section"
+                    )
                     snapshot = newSnapshot
                     rebuildSectionIndex()
                     tableView.reloadData()
@@ -1442,6 +1499,22 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             at indexes: IndexSet,
             in tableView: NSTableView
         ) {
+            if let scrollView {
+                let visible = tableView.rows(in: scrollView.contentView.bounds)
+                let visibleReplacements = visible.location == NSNotFound
+                    ? 0
+                    : indexes.count(in:
+                        visible.location..<NSMaxRange(visible)
+                    )
+                if visibleReplacements > 0 {
+                    transcriptTableLogger.log(
+                        """
+                        replaced \(indexes.count, privacy: .public) rows, \
+                        \(visibleReplacements, privacy: .public) visible
+                        """
+                    )
+                }
+            }
             tableView.beginUpdates()
             tableView.removeRows(at: indexes, withAnimation: [])
             tableView.insertRows(at: indexes, withAnimation: [])
@@ -1840,6 +1913,11 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 )
             }
             isLiveScrolling = false
+            // The gesture's resting position is the user's viewport decision:
+            // ending at the bottom (re)engages follow, ending above releases
+            // it. Late momentum that moves the viewport afterwards is handled
+            // by the upward-move check in applyPendingScrollCorrectionIfReady.
+            isFollowingBottom = isAtBottom
             scrollActivity.setIncrementalRestorationActive(true)
             scrollActivity.setLiveScrolling(false)
             guard let tableView else {
@@ -1935,11 +2013,24 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         @objc
         private func restoreNextLiveScrollRow(_ sender: Any) {
             guard !isLiveScrolling else { return }
-            guard !stabilizationScheduled,
-                  pendingMutationAnchor == nil,
-                  !pendingMutationFollowsBottom else {
-                return
+            if stabilizationScheduled
+                || pendingMutationAnchor != nil
+                || pendingMutationFollowsBottom {
+                // Mutation batches own the viewport first, but a streaming
+                // turn re-arms them every ~33ms, which starved restoration
+                // for entire long replies: stand-in cells stayed mounted and
+                // idle rich-text adoption stayed latched off. Yield a bounded
+                // number of ticks, then restore anyway — a following batch
+                // and the restoration correction both target the same bottom
+                // pin, and the batch below recaptures its own anchor when
+                // the viewport is not following.
+                liveScrollRestorationStarvedTicks += 1
+                guard liveScrollRestorationStarvedTicks
+                        > maximumRestorationStarvationTicks else {
+                    return
+                }
             }
+            liveScrollRestorationStarvedTicks = 0
             let startedAt = CACurrentMediaTime()
             applyPendingLiveScrollRestorationCorrection()
 
@@ -1975,7 +2066,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 }
             }
             if !batchIndexes.isEmpty {
-                let followsBottom = isAtBottom
+                let followsBottom = isAtBottom || isFollowingBottom
                 pendingLiveScrollRestorationFollowsBottom = followsBottom
                 pendingLiveScrollRestorationAnchor = followsBottom
                     ? nil
@@ -1983,13 +2074,13 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 pendingLiveScrollRestorationExpectedOriginY = scrollView
                     .contentView.bounds.origin.y
                 if !reloadIndexes.isEmpty {
-                    tableView.reloadData(
-                        forRowIndexes: reloadIndexes,
-                        columnIndexes: IndexSet(integer: 0)
-                    )
-                    MacConversationTableDiagnostics.recordedTargetedRowReload(
-                        count: reloadIndexes.count
-                    )
+                    // Every restored row is a cell-class swap (.nativeScroll
+                    // stand-in back to its settled cell), so it must go
+                    // through replaceRows: reloadData(forRowIndexes:) leaves
+                    // the row view owning the old cell and the promoted cell
+                    // keeps its own fitting width, shifting the transcript
+                    // column out of line with every other row.
+                    replaceRows(at: reloadIndexes, in: tableView)
                 }
                 tableView.noteHeightOfRows(withIndexesChanged: batchIndexes)
                 MacConversationTableDiagnostics.recordedHeightInvalidation()
@@ -2072,6 +2163,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 : []
             liveScrollRestorationQueue.removeAll(keepingCapacity: true)
             liveScrollRestorationIndex = 0
+            liveScrollRestorationStarvedTicks = 0
             pendingLiveScrollRestorationAnchor = nil
             pendingLiveScrollRestorationFollowsBottom = false
             pendingLiveScrollRestorationExpectedOriginY = nil
@@ -2083,6 +2175,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             liveScrollRestorationTimer = nil
             liveScrollRestorationQueue.removeAll(keepingCapacity: true)
             liveScrollRestorationIndex = 0
+            liveScrollRestorationStarvedTicks = 0
             scrollActivity.setIncrementalRestorationActive(false)
             sampleNearBottom()
             scheduleViewportPrefetch()
@@ -2094,7 +2187,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         /// changes so the post-gesture update cannot move the viewport.
         private func preparedContentWillChangeHeight() {
             guard !isLiveScrolling else { return }
-            let followsBottom = isAtBottom
+            let followsBottom = isAtBottom || isFollowingBottom
             prepareMutationStabilization(
                 followsBottom: followsBottom,
                 anchor: followsBottom ? nil : captureAnchor()
@@ -2162,7 +2255,12 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 if userMovedViewport && (!pendingMutationFollowsBottom || !isAtBottom) {
                     // A keyboard, scrollbar, programmatic, or late momentum
                     // move happened after the mutation captured ownership.
-                    // Never overwrite that newer viewport decision.
+                    // Never overwrite that newer viewport decision — and
+                    // stop following so later document growth cannot fight
+                    // it either. (An AppKit clamp after an inflated height
+                    // estimate settles leaves the viewport exactly at the new
+                    // bottom, so isAtBottom spares it from this drop.)
+                    isFollowingBottom = false
                     pendingMutationAnchor = nil
                     pendingMutationFollowsBottom = false
                     pendingExpectedClipOriginY = nil
@@ -2189,9 +2287,20 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             } else if let anchor = pendingMutationAnchor {
                 restore(anchor)
             }
-            pendingMutationAnchor = nil
-            pendingMutationFollowsBottom = false
-            pendingExpectedClipOriginY = nil
+            if pendingMutationFollowsBottom, isFollowingBottom {
+                // Keep the follow owner alive: hosted streaming rows publish
+                // their intrinsic heights after this pass, and consuming the
+                // flag here left that late growth with no owner to pin it —
+                // the viewport silently fell behind the stream. Subsequent
+                // layout passes re-enter through the same owner until a user
+                // move releases follow.
+                pendingExpectedClipOriginY = scrollView?.contentView.bounds
+                    .origin.y
+            } else {
+                pendingMutationAnchor = nil
+                pendingMutationFollowsBottom = false
+                pendingExpectedClipOriginY = nil
+            }
             sampleNearBottom()
             return true
         }
@@ -2384,6 +2493,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
 
         private func jumpToLatest() {
             guard let scrollView else { return }
+            isFollowingBottom = true
             if reduceMotion {
                 pinToBottom()
                 sampleNearBottom()
@@ -2413,7 +2523,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             }
             lastViewportWidth = width
             guard snapshot.count > 0 else { return }
-            let followsBottom = isAtBottom
+            let followsBottom = isAtBottom || isFollowingBottom
             if !isLiveScrolling {
                 tableView.rowHeight = estimatedAutomaticRowHeight(
                     in: snapshot,

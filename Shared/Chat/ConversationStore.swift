@@ -672,6 +672,29 @@ struct ConversationReducer {
             state.usage = snapshot.usage ?? state.usage
             return
         }
+        if !state.items.isEmpty {
+            // Persisted attribution for full-view transcript resets: a
+            // mid-stream authoritative snapshot replace is the one store
+            // event that forces the table to repaint everything.
+            let snapshotItemIDs = Set(snapshot.items.map(\.id))
+            let missingPaintedItems = state.items
+                .lazy.filter { !snapshotItemIDs.contains($0.id) }.count
+            let sameGeneration =
+                state.snapshotGeneration == snapshot.snapshotGeneration
+            let lastApplied = state.lastAppliedSequence
+            let paintedCount = state.items.count
+            conversationTranscriptLogger.log(
+                """
+                snapshot replace \
+                sameGeneration=\(sameGeneration, privacy: .public) \
+                baseSeq=\(snapshot.baseSequence, privacy: .public) \
+                lastApplied=\(lastApplied, privacy: .public) \
+                missingPainted=\(missingPaintedItems, privacy: .public) \
+                items=\(paintedCount, privacy: .public)->\
+                \(snapshot.items.count, privacy: .public)
+                """
+            )
+        }
         state.snapshotGeneration = snapshot.snapshotGeneration
         state.lastAppliedSequence = snapshot.baseSequence
         state.items = stableDeduplicated(snapshot.items)

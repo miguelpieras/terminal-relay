@@ -447,6 +447,272 @@ final class MacConversationTableViewTests: XCTestCase {
         XCTAssertTrue(restored.identifier?.rawValue.hasSuffix(".hosted") == true)
         XCTAssertNotNil(descendant(of: restored, type: NSHostingView<AnyView>.self))
         XCTAssertFalse(restored === transitioned)
+        // Promotion is always a cell-class swap, so it must rebuild the row
+        // view. reloadData(forRowIndexes:) left the row view owning the old
+        // stand-in cell, and the promoted cell kept its own fitting width —
+        // the transcript column stopped lining up with every other row.
+        let rowView = try XCTUnwrap(restored.superview as? NSTableRowView)
+        XCTAssertFalse(
+            rowView.subviews.contains(transitioned),
+            "The stand-in cell must leave the row view when its row promotes."
+        )
+    }
+
+    func testVisibleStandInPromotionRebuildsTheRowView() throws {
+        let rows = (0..<40).map { index in
+            MixedRow(
+                id: "visible-live-\(index)",
+                contentRevision: 1,
+                text: "Visible stand-in row \(index)",
+                usesNativeText: false,
+                usesLiveScrollText: true
+            )
+        }
+        let mounted = mountMixed(rows: rows)
+        let scrollView = try XCTUnwrap(mounted.table.enclosingScrollView)
+        let settledVisible = mounted.table.rows(in: scrollView.contentView.bounds)
+        XCTAssertNotEqual(settledVisible.location, NSNotFound)
+        let referenceCell = try XCTUnwrap(mounted.table.view(
+            atColumn: 0,
+            row: settledVisible.location,
+            makeIfNecessary: false
+        ), "Expected a settled cell to reference for width parity")
+        let referenceWidth = referenceCell.frame.width
+
+        NotificationCenter.default.post(
+            name: NSScrollView.willStartLiveScrollNotification,
+            object: scrollView
+        )
+        // Scroll upward inside the gesture window so unrealized rows enter
+        // the viewport and mount as draw-only stand-ins.
+        var proposed = scrollView.contentView.bounds
+        proposed.origin.y = max(0, proposed.origin.y - 400)
+        scrollView.contentView.setBoundsOrigin(
+            scrollView.contentView.constrainBoundsRect(proposed).origin
+        )
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        settle(mounted.hosting)
+        let visible = mounted.table.rows(in: scrollView.contentView.bounds)
+        XCTAssertNotEqual(visible.location, NSNotFound)
+        var standInRow: Int?
+        var standInCell: NSView?
+        for row in visible.location..<NSMaxRange(visible) {
+            if let cell = mounted.table.view(
+                atColumn: 0,
+                row: row,
+                makeIfNecessary: false
+            ), cell.identifier?.rawValue.hasSuffix(".native-scroll") == true {
+                standInRow = row
+                standInCell = cell
+                break
+            }
+        }
+        let row = try XCTUnwrap(
+            standInRow,
+            "Expected a visible stand-in mounted inside the gesture window"
+        )
+        let standIn = try XCTUnwrap(standInCell)
+        NotificationCenter.default.post(
+            name: NSScrollView.didEndLiveScrollNotification,
+            object: scrollView
+        )
+        settle(mounted.hosting)
+
+        let promoted = try XCTUnwrap(mounted.table.view(
+            atColumn: 0,
+            row: row,
+            makeIfNecessary: false
+        ))
+        XCTAssertTrue(
+            promoted.identifier?.rawValue.hasSuffix(".hosted") == true,
+            "The visible stand-in must promote to its settled cell class."
+        )
+        // Promotion is a cell-class swap and must rebuild the row view.
+        // reloadData(forRowIndexes:) left the row view owning the stand-in,
+        // and the promoted cell kept its own fitting width — sibling tiles of
+        // one message rendered at different x-offsets after a manual scroll.
+        let rowView = try XCTUnwrap(promoted.superview as? NSTableRowView)
+        XCTAssertFalse(
+            rowView.subviews.contains(standIn),
+            "The stand-in cell must leave the row view when its row promotes."
+        )
+        XCTAssertEqual(
+            promoted.frame.width,
+            referenceWidth,
+            accuracy: 0.5,
+            "The promoted cell must adopt the table's cell width, not its own fitting width."
+        )
+    }
+
+    func testFollowOwnerSurvivesLateDocumentGrowth() throws {
+        let mounted = mount(rowCount: 60)
+        let scrollView = try XCTUnwrap(mounted.table.enclosingScrollView)
+        mounted.hosting.rootView = table(rows: makeRows(count: 61))
+        settle(mounted.hosting)
+        XCTAssertLessThanOrEqual(distanceFromBottom(in: mounted.table), 8)
+
+        // Hosted streaming rows publish their intrinsic height after the
+        // mutation batch's correction pass. Grow the document without any
+        // snapshot mutation and run one synchronous scroll-view layout: the
+        // still-armed follow owner must pin to the new bottom instead of
+        // letting the growth slip below the viewport.
+        let originBefore = scrollView.contentView.bounds.origin.y
+        var frame = mounted.table.frame
+        frame.size.height += 600
+        mounted.table.frame = frame
+        scrollView.needsLayout = true
+        scrollView.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(
+            scrollView.contentView.bounds.origin.y,
+            originBefore + 300,
+            "Late document growth while following must re-pin to the bottom."
+        )
+    }
+
+    func testUserScrollUpReleasesFollowAndLaterGrowthDoesNotFightIt() throws {
+        let mounted = mount(rowCount: 60)
+        let scrollView = try XCTUnwrap(mounted.table.enclosingScrollView)
+        mounted.hosting.rootView = table(rows: makeRows(count: 61))
+        settle(mounted.hosting)
+        XCTAssertLessThanOrEqual(distanceFromBottom(in: mounted.table), 8)
+
+        var proposed = scrollView.contentView.bounds
+        proposed.origin.y = max(0, proposed.origin.y - 240)
+        let requestedOrigin = scrollView.contentView
+            .constrainBoundsRect(proposed).origin
+        scrollView.contentView.setBoundsOrigin(requestedOrigin)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        scrollView.needsLayout = true
+        scrollView.layoutSubtreeIfNeeded()
+
+        // The move away from the bottom released follow, so neither manual
+        // document growth nor a later mutation batch may pull the viewport
+        // back down.
+        var frame = mounted.table.frame
+        frame.size.height += 600
+        mounted.table.frame = frame
+        scrollView.needsLayout = true
+        scrollView.layoutSubtreeIfNeeded()
+        XCTAssertEqual(
+            scrollView.contentView.bounds.origin.y,
+            requestedOrigin.y,
+            accuracy: 0.5,
+            "Growth after the user leaves the bottom must not move the viewport."
+        )
+        mounted.hosting.rootView = table(rows: makeRows(count: 62))
+        settle(mounted.hosting)
+        XCTAssertEqual(
+            scrollView.contentView.bounds.origin.y,
+            requestedOrigin.y,
+            accuracy: 0.5,
+            "Mutations after the user leaves the bottom must anchor, not pin."
+        )
+    }
+
+    func testStreamingMutationPressureCannotStarveRestorationForever() throws {
+        let rows = (0..<30).map { index in
+            MixedRow(
+                id: "starved-live-\(index)",
+                contentRevision: 1,
+                text: "Starved row \(index)",
+                usesNativeText: false,
+                usesLiveScrollText: true
+            )
+        }
+        let mounted = mountMixed(rows: rows)
+        let scrollView = try XCTUnwrap(mounted.table.enclosingScrollView)
+        NotificationCenter.default.post(
+            name: NSScrollView.willStartLiveScrollNotification,
+            object: scrollView
+        )
+        let transitioned = try XCTUnwrap(mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: true
+        ))
+        XCTAssertTrue(
+            transitioned.identifier?.rawValue.hasSuffix(".native-scroll") == true
+        )
+        NotificationCenter.default.post(
+            name: NSScrollView.didEndLiveScrollNotification,
+            object: scrollView
+        )
+
+        // A streaming turn re-arms the mutation correction every ~33ms.
+        // Restoration used to yield to that ownership unconditionally, so the
+        // stand-in stayed mounted for the entire reply. Keep the pressure on
+        // for ~0.7s and require the promotion to land anyway.
+        var revision: UInt64 = 1
+        let deadline = Date().addingTimeInterval(0.7)
+        while Date() < deadline {
+            revision += 1
+            var mutated = rows
+            mutated[rows.count - 1] = MixedRow(
+                id: mutated[rows.count - 1].id,
+                contentRevision: revision,
+                text: "Streamed update \(revision)",
+                usesNativeText: false,
+                usesLiveScrollText: true
+            )
+            mounted.hosting.rootView = mixedTable(rows: mutated)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.033))
+        }
+        let promoted = try XCTUnwrap(mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: true
+        ))
+        XCTAssertTrue(
+            promoted.identifier?.rawValue.hasSuffix(".hosted") == true,
+            "Continuous mutation pressure must not keep stand-in cells mounted."
+        )
+    }
+
+    func testGenerationOnlyChangeWithIdenticalRowsDoesNotReloadTheTable() {
+        let rows = makeRows(count: 40)
+        let mounted = mount(rows: rows)
+        settle(mounted.hosting)
+
+        MacConversationTableDiagnostics.reset()
+        mounted.hosting.rootView = MacConversationTableView(
+            sections: sections(rows),
+            snapshotGeneration: "rebroadcast-generation",
+            styleRevision: 0,
+            reduceMotion: true,
+            commandHandle: MacConversationTableCommandHandle(),
+            onNearBottomChange: { _ in },
+            onLiveScrollingChange: { _ in },
+            onAnchoredChange: { _ in },
+            prefetchRows: { _ in },
+            makeRow: { row, _, _ in
+                AnyView(
+                    Text(row.id)
+                        .frame(
+                            maxWidth: .infinity,
+                            minHeight: 56,
+                            maxHeight: 56,
+                            alignment: .leading
+                        )
+                )
+            }
+        )
+        settle(mounted.hosting)
+        let diagnostics = MacConversationTableDiagnostics.snapshot()
+        XCTAssertEqual(
+            diagnostics.reloadDataCalls,
+            0,
+            "A rebroadcast generation with identical rows is bookkeeping, not a repaint."
+        )
+    }
+
+    private func distanceFromBottom(in table: NSTableView) -> CGFloat {
+        guard let scrollView = table.enclosingScrollView else { return 0 }
+        let clip = scrollView.contentView
+        let maximumOriginY = max(
+            0,
+            table.frame.height - clip.bounds.height
+        )
+        return maximumOriginY - clip.bounds.origin.y
     }
 
     func testCompletedAssistantUsesNativeTextForEveryTileAndASeparateNativeFooter() {
