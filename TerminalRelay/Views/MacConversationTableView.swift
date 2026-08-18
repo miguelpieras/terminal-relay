@@ -718,7 +718,9 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
     }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let table = NSTableView()
+        let table = MacTranscriptTableView()
+        table.selectionDelegate = context.coordinator
+        table.allowsTypeSelect = false
         table.headerView = nil
         table.backgroundColor = .clear
         table.gridStyleMask = []
@@ -775,7 +777,8 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
     }
 
     @MainActor
-    final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+    final class Coordinator: NSObject, NSTableViewDataSource,
+        NSTableViewDelegate, MacTranscriptTableSelectionDelegate {
         private enum PrefetchDirection: Equatable {
             case earlier
             case later
@@ -832,6 +835,11 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         /// ~300ms at the 60Hz restoration pace before a starved queue runs
         /// anyway despite a pending mutation correction.
         private let maximumRestorationStarvationTicks = 18
+        let selection = MacTranscriptSelectionController<Row>()
+        private var selectionDragAnchor: MacTranscriptSelectionEndpoint?
+        private var selectionDragOrigin: NSPoint?
+        private var selectionDragBegan = false
+        private var selectionDragLinkURL: URL?
         private var pendingLiveScrollRestorationAnchor: Anchor?
         private var pendingLiveScrollRestorationFollowsBottom = false
         private var pendingLiveScrollRestorationExpectedOriginY: CGFloat?
@@ -1245,6 +1253,14 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                     }
                 }
             }
+            selection.updateRows(
+                (0..<snapshot.count).map { snapshot[$0] },
+                isAuthoritativeReset: hasNewAuthoritativeReset
+                    || newSnapshot.count == 0
+            )
+            if selection.hasSelection {
+                refreshVisibleSelectionHighlights()
+            }
             sampleNearBottom()
             scheduleViewportPrefetch()
         }
@@ -1308,6 +1324,180 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             }
             return cell
         }
+
+        func tableView(
+            _ tableView: NSTableView,
+            rowViewForRow row: Int
+        ) -> NSTableRowView? {
+            // Hit-test-transparent row containers: clicks on text surfaces
+            // and row padding fall through to the table, which owns every
+            // selection drag (cells are destroyed mid-drag by streaming
+            // churn; the table never is).
+            let identifier = NSUserInterfaceItemIdentifier(
+                "transcript.rowview"
+            )
+            if let reused = tableView.makeView(
+                withIdentifier: identifier,
+                owner: nil
+            ) as? MacTranscriptRowView {
+                return reused
+            }
+            let rowView = MacTranscriptRowView()
+            rowView.identifier = identifier
+            return rowView
+        }
+
+        // MARK: - Transcript selection
+
+        private func snapshotRow(atFlatIndex index: Int) -> Row? {
+            guard index >= 0, index < snapshot.count else { return nil }
+            return snapshot[index]
+        }
+
+        /// Resolves a window point to a selection endpoint: character-exact
+        /// through the cell's active text surface when it can answer,
+        /// row-granular otherwise (hosted rows, stand-ins, row padding).
+        /// Points above the first or below the last row clamp to the
+        /// transcript's edges so edge-autoscroll drags keep extending.
+        private func selectionEndpoint(
+            atWindowPoint windowPoint: NSPoint
+        ) -> (endpoint: MacTranscriptSelectionEndpoint, linkURL: URL?)? {
+            guard let tableView, snapshot.count > 0 else { return nil }
+            let tablePoint = tableView.convert(windowPoint, from: nil)
+            var rowIndex = tableView.row(at: tablePoint)
+            if rowIndex < 0 {
+                let lastRect = tableView.rect(ofRow: snapshot.count - 1)
+                rowIndex = tablePoint.y >= lastRect.maxY
+                    ? snapshot.count - 1
+                    : 0
+            }
+            guard let row = snapshotRow(atFlatIndex: rowIndex) else {
+                return nil
+            }
+            if let cell = tableView.view(
+                atColumn: 0,
+                row: rowIndex,
+                makeIfNecessary: false
+            ) as? MacConversationReusableCell,
+               let hit = cell.selectionHit(
+                    at: cell.convert(windowPoint, from: nil)
+               ) {
+                return (
+                    MacTranscriptSelectionEndpoint(
+                        rowID: row.id,
+                        offset: hit.index,
+                        displayedText: hit.displayedText,
+                        isRowGranular: false
+                    ),
+                    hit.linkURL
+                )
+            }
+            let rowRect = tableView.rect(ofRow: rowIndex)
+            let coversFromStart = tablePoint.y < rowRect.midY
+            let text = row.selectionText ?? ""
+            return (
+                MacTranscriptSelectionEndpoint(
+                    rowID: row.id,
+                    offset: coversFromStart ? 0 : (text as NSString).length,
+                    displayedText: text,
+                    isRowGranular: true
+                ),
+                nil
+            )
+        }
+
+        func refreshVisibleSelectionHighlights() {
+            guard let tableView, let scrollView else { return }
+            let visible = tableView.rows(in: scrollView.contentView.bounds)
+            guard visible.location != NSNotFound else { return }
+            for index in visible.location..<NSMaxRange(visible) {
+                guard let cell = tableView.view(
+                    atColumn: 0,
+                    row: index,
+                    makeIfNecessary: false
+                ) as? MacConversationReusableCell else { continue }
+                cell.applyResolvedSelectionHighlight()
+            }
+        }
+
+        func selectionMouseDown(_ event: NSEvent) {
+            selectionDragBegan = false
+            selectionDragOrigin = event.locationInWindow
+            // A synthesized wheel window must not stay open under a primary
+            // drag: close it now (same path as its quiescence timer) so no
+            // stand-in cells mount beneath the selection.
+            if wheelScrollWindowActive {
+                wheelQuiescenceTimer?.invalidate()
+                wheelQuiescenceTimer = nil
+                wheelScrollWindowActive = false
+                liveScrollDidEnd()
+            }
+            if selection.hasSelection {
+                selection.clear()
+                refreshVisibleSelectionHighlights()
+            }
+            let resolved = selectionEndpoint(
+                atWindowPoint: event.locationInWindow
+            )
+            selectionDragAnchor = resolved?.endpoint
+            selectionDragLinkURL = resolved?.linkURL
+        }
+
+        func selectionMouseDragged(_ event: NSEvent) {
+            guard let anchor = selectionDragAnchor,
+                  let origin = selectionDragOrigin else { return }
+            let location = event.locationInWindow
+            if !selectionDragBegan {
+                let dx = location.x - origin.x
+                let dy = location.y - origin.y
+                // Sub-hysteresis movement stays a click (link opening).
+                guard (dx * dx) + (dy * dy) >= 9 else { return }
+                selectionDragBegan = true
+                selectionDragLinkURL = nil
+                selection.begin(at: anchor)
+                // First responder moves only once a selection is actually
+                // established, never on a plain click — a click that merely
+                // dismisses a selection must not steal composer focus.
+                tableView?.window?.makeFirstResponder(tableView)
+            }
+            guard let resolved = selectionEndpoint(atWindowPoint: location)
+            else { return }
+            selection.extend(to: resolved.endpoint)
+            refreshVisibleSelectionHighlights()
+        }
+
+        func selectionMouseUp(_ event: NSEvent) {
+            defer {
+                selectionDragAnchor = nil
+                selectionDragOrigin = nil
+                selectionDragLinkURL = nil
+                selectionDragBegan = false
+            }
+            guard !selectionDragBegan else { return }
+            // A movement-free click: open the link under the pointer through
+            // the same policy handler hosted rows use (text views are
+            // hit-test transparent now, so clicks route here).
+            if let url = selectionDragLinkURL {
+                _ = onNativeLink(url)
+            }
+        }
+
+        func selectionCopy() {
+            let text = selection.copyText()
+            guard !text.isEmpty else { return }
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(text, forType: .string)
+        }
+
+        func selectionSelectAll() {
+            guard snapshot.count > 0 else { return }
+            selection.selectAll()
+            refreshVisibleSelectionHighlights()
+            tableView?.window?.makeFirstResponder(tableView)
+        }
+
+        var selectionIsActive: Bool { selection.hasSelection }
 
         private func applyPreciseChanges(
             from oldSnapshot: MacConversationTableSnapshot<Row>,
@@ -1623,6 +1813,13 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             cell.contentRevision = row.contentRevision
             cell.isFirst = isFirst
             cell.isLast = isLast
+            let rowID = row.id
+            cell.selectionHighlightResolver = { [weak self] in
+                self?.selection.highlight(forRowID: rowID) ?? .none
+            }
+            cell.selectionPromotionVeto = { [weak self] in
+                self?.selection.hasEndpoint(inRowWithID: rowID) ?? false
+            }
             cell.setContent(
                 preparedContent ?? cellContent(
                     for: row,
@@ -1633,6 +1830,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 nativeLinkHandler: onNativeLink,
                 nativeCopyMessageHandler: onNativeCopyMessage
             )
+            cell.applyResolvedSelectionHighlight()
             if let footerCell = cell as? MacConversationNativeFooterCell {
                 footerCell.setControlsRevealed(
                     revealedFooterItemID != nil
@@ -2621,13 +2819,50 @@ private class MacConversationReusableCell: NSTableCellView {
         false
     }
 
+    /// Re-asks the selection controller for this row's highlight. Set at
+    /// configure time; content swaps that bypass configure (idle rich-text
+    /// adoption) re-apply through it so highlights survive the swap.
+    var selectionHighlightResolver: (@MainActor () -> MacTranscriptRowHighlight)?
+    /// True while this row holds a selection endpoint; such rows defer their
+    /// fast-to-rich promotion, which would swap the string the endpoint's
+    /// offsets refer to mid-selection.
+    var selectionPromotionVeto: (@MainActor () -> Bool)?
+
+    /// Hit-tests a point in CELL coordinates to a UTF-16 insertion index in
+    /// the string this cell currently displays. nil means the surface has no
+    /// character access (hosted SwiftUI rows, draw-only stand-ins) and the
+    /// selection treats the row as one unit.
+    func selectionHit(at point: NSPoint) -> MacConversationSelectionHit? {
+        nil
+    }
+
+    /// Paints or clears this cell's part of the transcript selection.
+    func setSelectionHighlight(_ highlight: MacTranscriptRowHighlight) {}
+
+    func applyResolvedSelectionHighlight() {
+        setSelectionHighlight(selectionHighlightResolver?() ?? .none)
+    }
+
     override func prepareForReuse() {
         super.prepareForReuse()
         representedRowID = nil
         contentRevision = 0
         isFirst = false
         isLast = false
+        selectionHighlightResolver = nil
+        selectionPromotionVeto = nil
+        setSelectionHighlight(.none)
     }
+}
+
+/// Result of hit-testing a transcript cell for selection: the nearest
+/// insertion index in the cell's displayed string, that string, and the link
+/// under the pointer when one exists (clicks route through the table now
+/// that text views are hit-test transparent).
+struct MacConversationSelectionHit {
+    let index: Int
+    let displayedText: String
+    let linkURL: URL?
 }
 
 @MainActor
@@ -2684,6 +2919,35 @@ private final class MacConversationHostedCell: MacConversationReusableCell {
         let leadingEdge = (bounds.width - columnWidth) / 2
         return point.x >= leadingEdge && point.x <= leadingEdge + columnWidth
     }
+
+    /// Hosted rows have no character access, so any selection membership
+    /// shows as a full-row wash behind the SwiftUI content.
+    override func setSelectionHighlight(
+        _ highlight: MacTranscriptRowHighlight
+    ) {
+        guard highlight != .none else {
+            selectionOverlay?.removeFromSuperview()
+            selectionOverlay = nil
+            return
+        }
+        if selectionOverlay == nil {
+            let overlay = NSView(frame: bounds)
+            overlay.autoresizingMask = [.width, .height]
+            overlay.wantsLayer = true
+            addSubview(
+                overlay,
+                positioned: .below,
+                relativeTo: subviews.first
+            )
+            selectionOverlay = overlay
+        }
+        selectionOverlay?.layer?.backgroundColor = NSColor
+            .selectedTextBackgroundColor
+            .withAlphaComponent(0.45)
+            .cgColor
+    }
+
+    private var selectionOverlay: NSView?
 }
 
 /// Borderless icon button that paints a rounded grey wash while the pointer
@@ -2971,6 +3235,13 @@ private final class MacConversationScrollTextCell: MacConversationReusableCell {
         let height: CGFloat
     }
 
+    /// Stand-ins are draw-only and exist for at most a beat after a gesture
+    /// (selection mouse-down force-closes wheel windows, and restoration is
+    /// capped). They stay hit-test transparent like every text row so the
+    /// table owns drags; selection over them is row-granular until the row
+    /// promotes, and they paint no highlight (accepted scope limit).
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
     private let textContainerView = NSView(frame: .zero)
     private let scrollTextView = MacConversationScrollTextView(frame: .zero)
     private var presentation: MacConversationNativeTextPresentation?
@@ -3199,7 +3470,27 @@ private final class MacConversationScrollTextCell: MacConversationReusableCell {
     }
 }
 
+/// Draws the selection wash behind a fast plain text field (the field has no
+/// layout manager to carry temporary background attributes). Internal so
+/// integration tests can assert painted rects.
 @MainActor
+final class MacConversationSelectionUnderlay: NSView {
+    var highlightRects: [NSRect] = [] {
+        didSet { needsDisplay = true }
+    }
+
+    override var isFlipped: Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard !highlightRects.isEmpty else { return }
+        NSColor.selectedTextBackgroundColor.setFill()
+        for rect in highlightRects where rect.intersects(dirtyRect) {
+            rect.fill()
+        }
+    }
+}
+
 private final class MacConversationNativeTextCell:
     MacConversationReusableCell,
     NSTextViewDelegate
@@ -3208,6 +3499,12 @@ private final class MacConversationNativeTextCell:
         textContainerView.convert(textContainerView.bounds, to: self)
             .contains(point)
     }
+
+    /// Text rows are hit-test transparent: the table owns every selection
+    /// drag, so streaming's remove+insert churn can never destroy the view
+    /// that owns an in-flight mouse-down. Links, cursor, and context menus
+    /// route through the table instead.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
     private let layoutContainer = NSView(frame: .zero)
     private let textContainerView = NSView(frame: .zero)
@@ -3239,6 +3536,11 @@ private final class MacConversationNativeTextCell:
     private var linkHandler: MacConversationNativeTextPresentation.LinkHandler?
     private var deferredPreparationTask: Task<Void, Never>?
     private var presentationGeneration: UInt64 = 0
+    private let selectionUnderlay = MacConversationSelectionUnderlay(frame: .zero)
+    private var currentSelectionHighlight = MacTranscriptRowHighlight.none
+    private var fastContentRevision: UInt64 = 0
+    private var fastHitLayout: MacTranscriptFastTextLayout?
+    private var fastHitLayoutKey: (revision: UInt64, width: CGFloat) = (0, -1)
 
     init() {
         super.init(kind: .native)
@@ -3247,12 +3549,28 @@ private final class MacConversationNativeTextCell:
         textContainerView.translatesAutoresizingMaskIntoConstraints = false
         nativeTextView.translatesAutoresizingMaskIntoConstraints = false
         fastTextField.translatesAutoresizingMaskIntoConstraints = false
+        selectionUnderlay.translatesAutoresizingMaskIntoConstraints = false
         fastTextField.isHidden = true
         nativeTextView.delegate = self
         addSubview(layoutContainer)
         layoutContainer.addSubview(textContainerView)
+        textContainerView.addSubview(selectionUnderlay)
         textContainerView.addSubview(nativeTextView)
         textContainerView.addSubview(fastTextField)
+        NSLayoutConstraint.activate([
+            selectionUnderlay.leadingAnchor.constraint(
+                equalTo: fastTextField.leadingAnchor
+            ),
+            selectionUnderlay.trailingAnchor.constraint(
+                equalTo: fastTextField.trailingAnchor
+            ),
+            selectionUnderlay.topAnchor.constraint(
+                equalTo: fastTextField.topAnchor
+            ),
+            selectionUnderlay.bottomAnchor.constraint(
+                equalTo: fastTextField.bottomAnchor
+            ),
+        ])
 
         leadingLimitConstraint = layoutContainer.leadingAnchor.constraint(
             greaterThanOrEqualTo: leadingAnchor
@@ -3532,6 +3850,12 @@ private final class MacConversationNativeTextCell:
                     guard let self,
                           self.presentationGeneration == generation,
                           self.representedRowID == representedRowID else { return }
+                    // A row holding a selection endpoint keeps its fast
+                    // plain string: promotion would swap the text the
+                    // endpoint's offsets refer to mid-selection. The tile
+                    // stays plain until the selection releases it (accepted
+                    // scope limit).
+                    guard self.selectionPromotionVeto?() != true else { return }
                     let resolved = deferredArtifact?.resolve() ?? immediate
                     guard let resolved else { return }
                     self.adoptRichText(
@@ -3606,10 +3930,171 @@ private final class MacConversationNativeTextCell:
         return linkHandler(url)
     }
 
+    override func selectionHit(
+        at point: NSPoint
+    ) -> MacConversationSelectionHit? {
+        if !fastTextField.isHidden {
+            guard let layout = currentFastHitLayout() else { return nil }
+            let fieldPoint = convert(point, to: fastTextField)
+            let index = layout.insertionIndex(
+                atFieldPoint: fieldPoint,
+                fieldHeight: fastTextField.bounds.height
+            )
+            return MacConversationSelectionHit(
+                index: index,
+                displayedText: fastTextField.attributedStringValue.string,
+                linkURL: nil
+            )
+        }
+        guard !nativeTextView.isHidden,
+              let layoutManager = nativeTextView.layoutManager,
+              let container = nativeTextView.textContainer,
+              let storage = nativeTextView.textStorage else {
+            return nil
+        }
+        var viewPoint = convert(point, to: nativeTextView)
+        viewPoint.x -= nativeTextView.textContainerInset.width
+        viewPoint.y -= nativeTextView.textContainerInset.height
+        var fraction: CGFloat = 0
+        let raw = layoutManager.characterIndex(
+            for: viewPoint,
+            in: container,
+            fractionOfDistanceBetweenInsertionPoints: &fraction
+        )
+        let text = storage.string as NSString
+        let insertion: Int
+        if raw < text.length {
+            let sequence = text.rangeOfComposedCharacterSequence(at: raw)
+            insertion = fraction >= 0.5
+                ? NSMaxRange(sequence)
+                : sequence.location
+        } else {
+            insertion = text.length
+        }
+        var linkURL: URL?
+        if text.length > 0 {
+            // Only report a link when the pointer is really on its glyphs —
+            // characterIndex snaps trailing-whitespace clicks to the nearest
+            // character, which must not open a link at the end of a line.
+            let lookupIndex = min(raw, text.length - 1)
+            let glyphIndex = layoutManager.glyphIndexForCharacter(
+                at: lookupIndex
+            )
+            let used = layoutManager.lineFragmentUsedRect(
+                forGlyphAt: glyphIndex,
+                effectiveRange: nil
+            )
+            if viewPoint.x >= used.minX - 2,
+               viewPoint.x <= used.maxX + 2,
+               viewPoint.y >= used.minY,
+               viewPoint.y <= used.maxY {
+                let value = storage.attribute(
+                    .link,
+                    at: lookupIndex,
+                    effectiveRange: nil
+                )
+                if let url = value as? URL {
+                    linkURL = url
+                } else if let string = value as? String {
+                    linkURL = URL(string: string)
+                }
+            }
+        }
+        return MacConversationSelectionHit(
+            index: insertion,
+            displayedText: text as String,
+            linkURL: linkURL
+        )
+    }
+
+    override func setSelectionHighlight(
+        _ highlight: MacTranscriptRowHighlight
+    ) {
+        currentSelectionHighlight = highlight
+        renderSelectionHighlight()
+    }
+
+    private func renderSelectionHighlight() {
+        if !fastTextField.isHidden {
+            clearRichTemporaryHighlight()
+            let length = (
+                fastTextField.attributedStringValue.string as NSString
+            ).length
+            guard let range = clampedHighlightRange(length: length),
+                  let layout = currentFastHitLayout() else {
+                selectionUnderlay.highlightRects = []
+                return
+            }
+            selectionUnderlay.highlightRects = layout.highlightRects(
+                forRange: range,
+                fieldHeight: fastTextField.bounds.height
+            )
+            return
+        }
+        selectionUnderlay.highlightRects = []
+        clearRichTemporaryHighlight()
+        guard let layoutManager = nativeTextView.layoutManager,
+              let storage = nativeTextView.textStorage else { return }
+        let length = (storage.string as NSString).length
+        guard let range = clampedHighlightRange(length: length) else {
+            return
+        }
+        layoutManager.addTemporaryAttribute(
+            .backgroundColor,
+            value: NSColor.selectedTextBackgroundColor,
+            forCharacterRange: range
+        )
+    }
+
+    private func clampedHighlightRange(length: Int) -> NSRange? {
+        let range: NSRange
+        switch currentSelectionHighlight {
+        case .none:
+            return nil
+        case .full:
+            range = NSRange(location: 0, length: length)
+        case .range(let requested):
+            range = NSIntersectionRange(
+                requested,
+                NSRange(location: 0, length: length)
+            )
+        }
+        return range.length > 0 ? range : nil
+    }
+
+    private func clearRichTemporaryHighlight() {
+        guard let layoutManager = nativeTextView.layoutManager,
+              let storage = nativeTextView.textStorage else { return }
+        let full = NSRange(location: 0, length: (storage.string as NSString).length)
+        guard full.length > 0 else { return }
+        layoutManager.removeTemporaryAttribute(
+            .backgroundColor,
+            forCharacterRange: full
+        )
+    }
+
+    private func currentFastHitLayout() -> MacTranscriptFastTextLayout? {
+        let width = fastTextField.bounds.width
+        guard width > 1 else { return nil }
+        let key = (revision: fastContentRevision, width: width.rounded())
+        if let fastHitLayout, fastHitLayoutKey == key {
+            return fastHitLayout
+        }
+        let layout = MacTranscriptFastTextLayout(
+            attributedString: fastTextField.attributedStringValue,
+            width: width
+        )
+        fastHitLayout = layout
+        fastHitLayoutKey = key
+        return layout
+    }
+
     override func prepareForReuse() {
         presentationGeneration &+= 1
         deferredPreparationTask?.cancel()
         deferredPreparationTask = nil
+        fastHitLayout = nil
+        fastHitLayoutKey = (0, -1)
         linkHandler = nil
         nativeTextView.setAccessibilityLabel(nil)
         nativeTextView.setAccessibilityIdentifier(nil)
@@ -3631,8 +4116,11 @@ private final class MacConversationNativeTextCell:
         _ attributedString: NSAttributedString,
         renderer: Renderer
     ) {
+        defer { renderSelectionHighlight() }
         switch renderer {
         case .selectableFast:
+            fastContentRevision &+= 1
+            fastHitLayout = nil
             fastTextField.attributedStringValue = attributedString
             fastTextField.invalidateIntrinsicContentSize()
         case .rich:
@@ -3735,7 +4223,10 @@ private final class MacConversationWrappingTextField: NSTextField {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         isEditable = false
-        isSelectable = true
+        // The table-level cross-transcript selection is the single selection
+        // authority; per-view selection would fight its painting and swallow
+        // the drags it routes.
+        isSelectable = false
         isBordered = false
         drawsBackground = false
         focusRingType = .none
@@ -4045,7 +4536,8 @@ private final class MacConversationIntrinsicTextView: NSTextView {
 
     private func configure() {
         isEditable = false
-        isSelectable = true
+        // Table-level selection is the single authority (see the fast field).
+        isSelectable = false
         isRichText = true
         importsGraphics = false
         allowsUndo = false

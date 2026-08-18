@@ -1,5 +1,176 @@
 import AppKit
 
+/// Receives raw transcript mouse events from `MacTranscriptTableView` and
+/// the standard editing actions. Implemented by the table coordinator, which
+/// owns the selection controller and the cells.
+@MainActor
+protocol MacTranscriptTableSelectionDelegate: AnyObject {
+    func selectionMouseDown(_ event: NSEvent)
+    func selectionMouseDragged(_ event: NSEvent)
+    func selectionMouseUp(_ event: NSEvent)
+    func selectionCopy()
+    func selectionSelectAll()
+    var selectionIsActive: Bool { get }
+}
+
+/// The transcript's table view. Text rows and row backgrounds are hit-test
+/// transparent down to this view (their cells return nil), so the WINDOW's
+/// mouse-down view for every selection drag is the table itself — a view
+/// that streaming's remove+insert churn can never destroy mid-drag. Hosted
+/// rows (SwiftUI controls) and footer cells keep normal hit-testing and
+/// never reach these overrides.
+final class MacTranscriptTableView: NSTableView {
+    weak var selectionDelegate: MacTranscriptTableSelectionDelegate?
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        // Deliberately no super: NSTableView's row-selection tracking loop
+        // would swallow the drag events the selection state machine needs.
+        selectionDelegate?.selectionMouseDown(event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        selectionDelegate?.selectionMouseDragged(event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        selectionDelegate?.selectionMouseUp(event)
+    }
+
+    @objc func copy(_ sender: Any?) {
+        selectionDelegate?.selectionCopy()
+    }
+
+    override func selectAll(_ sender: Any?) {
+        selectionDelegate?.selectionSelectAll()
+    }
+
+    override func validateUserInterfaceItem(
+        _ item: any NSValidatedUserInterfaceItem
+    ) -> Bool {
+        if item.action == #selector(copy(_:)) {
+            return selectionDelegate?.selectionIsActive == true
+        }
+        if item.action == #selector(selectAll(_:)) {
+            return numberOfRows > 0
+        }
+        return super.validateUserInterfaceItem(item)
+    }
+}
+
+/// Row container that never claims hits for itself: clicks on text surfaces
+/// and row padding fall through to the table (the drag owner), while real
+/// subview controls (hosted SwiftUI rows, footer buttons) still receive
+/// theirs.
+final class MacTranscriptRowView: NSTableRowView {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let hit = super.hitTest(point)
+        return hit === self ? nil : hit
+    }
+}
+
+/// TextKit layout mirror for a fast plain tile (`NSTextField` has no
+/// hit-test or highlight-geometry API). Line breaks match NSStringDrawing
+/// exactly; per-line heights do not (16.0 vs 17.0 for SF 13), so all
+/// conversions scale y by the ratio of total heights — exact because fast
+/// tiles are single-font and every line shares one height (pinned by the
+/// task 1.1 spike).
+@MainActor
+final class MacTranscriptFastTextLayout {
+    private let storage: NSTextStorage
+    private let layoutManager: NSLayoutManager
+    private let container: NSTextContainer
+    let width: CGFloat
+    let sourceString: NSAttributedString
+
+    init(attributedString: NSAttributedString, width: CGFloat) {
+        sourceString = attributedString
+        self.width = width
+        storage = NSTextStorage(attributedString: attributedString)
+        layoutManager = NSLayoutManager()
+        container = NSTextContainer(
+            containerSize: NSSize(
+                width: max(1, width),
+                height: CGFloat.greatestFiniteMagnitude
+            )
+        )
+        container.lineFragmentPadding = 0
+        storage.addLayoutManager(layoutManager)
+        layoutManager.addTextContainer(container)
+        layoutManager.ensureLayout(for: container)
+    }
+
+    private var usedHeight: CGFloat {
+        layoutManager.usedRect(for: container).height
+    }
+
+    private func scale(forFieldHeight fieldHeight: CGFloat) -> CGFloat {
+        guard fieldHeight > 0, usedHeight > 0 else { return 1 }
+        return usedHeight / fieldHeight
+    }
+
+    /// Nearest insertion index (UTF-16, composed-boundary aligned) for a
+    /// point in the FIELD's coordinate space.
+    func insertionIndex(
+        atFieldPoint point: NSPoint,
+        fieldHeight: CGFloat
+    ) -> Int {
+        let mapped = NSPoint(
+            x: point.x,
+            y: point.y * scale(forFieldHeight: fieldHeight)
+        )
+        var fraction: CGFloat = 0
+        let index = layoutManager.characterIndex(
+            for: mapped,
+            in: container,
+            fractionOfDistanceBetweenInsertionPoints: &fraction
+        )
+        let text = storage.string as NSString
+        guard index < text.length else { return text.length }
+        let sequence = text.rangeOfComposedCharacterSequence(at: index)
+        return fraction >= 0.5 ? NSMaxRange(sequence) : sequence.location
+    }
+
+    /// Highlight rectangles for a UTF-16 range, in FIELD coordinates.
+    func highlightRects(
+        forRange range: NSRange,
+        fieldHeight: CGFloat
+    ) -> [NSRect] {
+        let text = storage.string as NSString
+        let clamped = NSIntersectionRange(
+            range,
+            NSRange(location: 0, length: text.length)
+        )
+        guard clamped.length > 0 else { return [] }
+        let glyphRange = layoutManager.glyphRange(
+            forCharacterRange: clamped,
+            actualCharacterRange: nil
+        )
+        var rects: [NSRect] = []
+        layoutManager.enumerateEnclosingRects(
+            forGlyphRange: glyphRange,
+            withinSelectedGlyphRange: NSRange(
+                location: NSNotFound,
+                length: 0
+            ),
+            in: container
+        ) { rect, _ in
+            rects.append(rect)
+        }
+        let scale = scale(forFieldHeight: fieldHeight)
+        guard scale > 0 else { return rects }
+        return rects.map { rect in
+            NSRect(
+                x: rect.minX,
+                y: rect.minY / scale,
+                width: rect.width,
+                height: rect.height / scale
+            )
+        }
+    }
+}
+
 /// One end of a cross-transcript selection. Endpoints live in model space
 /// (row ID + UTF-16 offset) and additionally snapshot the displayed string
 /// they were hit-tested against: a promoted rich tile displays a different

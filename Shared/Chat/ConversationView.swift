@@ -2346,11 +2346,11 @@ struct ChatMessageView: View {
                 .foregroundStyle(.secondary)
         case .plainText where message.role == .user:
             Text(content.text)
-                .textSelection(.enabled)
+                .transcriptTextSelection()
                 .fixedSize(horizontal: false, vertical: true)
         case .generic where message.role == .user:
             Text(content.text)
-                .textSelection(.enabled)
+                .transcriptTextSelection()
                 .fixedSize(horizontal: false, vertical: true)
         default:
             RichMarkdownView(
@@ -2584,7 +2584,7 @@ private struct ReasoningCard: View {
         Text(text)
             .font(ChatTypography.activityLine)
             .foregroundStyle(.secondary)
-            .textSelection(.enabled)
+            .transcriptTextSelection()
             .fixedSize(horizontal: false, vertical: true)
     }
 }
@@ -2618,7 +2618,7 @@ private struct ToolActivityCard: View {
                 Text(verbatim: metadataText)
                     .font(ChatTypography.activityLine)
                     .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
+                    .transcriptTextSelection()
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.leading, 23)
                     .padding(.bottom, 4)
@@ -2711,7 +2711,7 @@ private struct ToolActivityCard: View {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
                     .font(ChatTypography.activityLine)
                     .foregroundStyle(.red)
-                    .textSelection(.enabled)
+                    .transcriptTextSelection()
             }
             if tool.input == nil, tool.output == nil, tool.errorMessage == nil {
                 Text(tool.status == .running ? "Waiting for output…" : "No additional output")
@@ -2862,7 +2862,7 @@ private struct ToolSection: View {
             // not change layout. Boxed code chrome would re-measure taller.
             Text(verbatim: content)
                 .font(ChatTypography.monospacedDetail)
-                .textSelection(.enabled)
+                .transcriptTextSelection()
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -2895,7 +2895,7 @@ private struct DiffCard: View {
                 Text(verbatim: metadataText)
                     .font(ChatTypography.activityLine)
                     .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
+                    .transcriptTextSelection()
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.leading, 23)
                     .padding(.bottom, 4)
@@ -2998,7 +2998,7 @@ private struct DiffTextView: View {
             .padding(.horizontal, 8)
             .padding(.vertical, 1)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .textSelection(.enabled)
+            .transcriptTextSelection()
             .background(Color.secondary.opacity(0.05))
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         #else
@@ -3023,7 +3023,7 @@ private struct DiffTextView: View {
                     .background(lineBackground(line.kind))
             }
         }
-        .textSelection(.enabled)
+        .transcriptTextSelection()
     }
 
     private func lineColor(_ kind: Line.Kind) -> Color {
@@ -3058,7 +3058,7 @@ private struct PlanCard: View {
                 Text(plan.title ?? "Plan")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
+                    .transcriptTextSelection()
                     .fixedSize(horizontal: false, vertical: true)
             } else if segment?.isFirstInItem == true {
                 Text("Plan")
@@ -3107,7 +3107,7 @@ private struct GenericActivityCard: View {
                 Text(verbatim: metadataText)
                     .font(ChatTypography.activityLine)
                     .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
+                    .transcriptTextSelection()
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.leading, 23)
                     .padding(.bottom, 4)
@@ -3140,7 +3140,7 @@ private struct GenericActivityCard: View {
             if let detail = item.detail {
                 Text(detail)
                     .font(ChatTypography.monospacedDetail)
-                    .textSelection(.enabled)
+                    .transcriptTextSelection()
                     .fixedSize(horizontal: false, vertical: true)
             } else {
                 Text("No additional details")
@@ -3249,7 +3249,7 @@ private struct ApprovalCard: View {
             if let reason = approval.reason {
                 Text(reason)
                     .font(.callout)
-                    .textSelection(.enabled)
+                    .transcriptTextSelection()
             }
             if let context = approval.context {
                 CodeBlockView(

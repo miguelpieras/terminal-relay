@@ -37,21 +37,30 @@ final class MacConversationTableViewTests: XCTestCase {
         var usesFastPlainTextRenderer = false
         var promotesFastRendererWhenIdle = false
         var usesLiveScrollText = false
+        var linkURL: URL? = nil
+        var mutationSourceIDOverride: String? = nil
 
         var reuseIdentifier: String { "test.mixed-row" }
+        var mutationSourceID: String { mutationSourceIDOverride ?? id }
+        var selectionText: String? { text }
+        var selectionSectionID: String? { "mixed-section" }
 
         func nativeTextPresentation(
             dynamicTypeSize: DynamicTypeSize,
             colorScheme: ColorScheme
         ) -> MacConversationNativeTextPresentation? {
             guard usesNativeText else { return nil }
+            var attributes: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 14),
+                .foregroundColor: NSColor.labelColor,
+            ]
+            if let linkURL {
+                attributes[.link] = linkURL
+            }
             return MacConversationNativeTextPresentation(
                 attributedString: NSAttributedString(
                     string: text,
-                    attributes: [
-                        .font: NSFont.systemFont(ofSize: 14),
-                        .foregroundColor: NSColor.labelColor,
-                    ]
+                    attributes: attributes
                 ),
                 fallbackString: text,
                 contentInsets: NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12),
@@ -158,7 +167,9 @@ final class MacConversationTableViewTests: XCTestCase {
         XCTAssertNil(descendant(of: nativeCell, type: NSHostingView<AnyView>.self))
         XCTAssertEqual(hostedRows, ["hosted"])
         XCTAssertEqual(nativeTextView?.string, "Selectable native row")
-        XCTAssertEqual(nativeTextView?.isSelectable, true)
+        // Table-level cross-transcript selection is the single selection
+        // authority; per-view selection stays off.
+        XCTAssertEqual(nativeTextView?.isSelectable, false)
         XCTAssertEqual(nativeTextView?.isEditable, false)
         XCTAssertEqual(nativeTextView?.textContainer?.widthTracksTextView, true)
         XCTAssertGreaterThan(nativeTextView?.intrinsicContentSize.height ?? 0, 0)
@@ -204,7 +215,9 @@ final class MacConversationTableViewTests: XCTestCase {
         XCTAssertEqual(textView?.isHidden, true)
         XCTAssertEqual(textField?.isHidden, false)
         XCTAssertEqual(textField?.attributedStringValue.string, source)
-        XCTAssertEqual(textField?.isSelectable, true)
+        // Table-level cross-transcript selection is the single selection
+        // authority; per-view selection stays off.
+        XCTAssertEqual(textField?.isSelectable, false)
         XCTAssertEqual(textField?.isEditable, false)
         XCTAssertGreaterThan(textField?.frame.height ?? 0, 0)
     }
@@ -541,6 +554,249 @@ final class MacConversationTableViewTests: XCTestCase {
             referenceWidth,
             accuracy: 0.5,
             "The promoted cell must adopt the table's cell width, not its own fitting width."
+        )
+    }
+
+    // MARK: - Cross-transcript selection integration
+
+    private func mouseEvent(
+        _ type: NSEvent.EventType,
+        at windowPoint: NSPoint,
+        in window: NSWindow,
+        clickCount: Int = 1
+    ) -> NSEvent {
+        NSEvent.mouseEvent(
+            with: type,
+            location: windowPoint,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 0,
+            clickCount: clickCount,
+            pressure: 1
+        )!
+    }
+
+    private func dragSelection(
+        in mounted: (
+            window: NSWindow,
+            hosting: NSHostingView<MacConversationTableView<MixedRow>>,
+            table: NSTableView
+        ),
+        fromTablePoint start: NSPoint,
+        toTablePoint end: NSPoint,
+        mutateBetween: (() -> Void)? = nil
+    ) {
+        let startWindow = mounted.table.convert(start, to: nil)
+        let endWindow = mounted.table.convert(end, to: nil)
+        mounted.table.mouseDown(
+            with: mouseEvent(.leftMouseDown, at: startWindow, in: mounted.window)
+        )
+        let midWindow = NSPoint(
+            x: (startWindow.x + endWindow.x) / 2,
+            y: (startWindow.y + endWindow.y) / 2
+        )
+        mounted.table.mouseDragged(
+            with: mouseEvent(.leftMouseDragged, at: midWindow, in: mounted.window)
+        )
+        if let mutateBetween {
+            mutateBetween()
+            settle(mounted.hosting)
+        }
+        mounted.table.mouseDragged(
+            with: mouseEvent(.leftMouseDragged, at: endWindow, in: mounted.window)
+        )
+        mounted.table.mouseUp(
+            with: mouseEvent(.leftMouseUp, at: endWindow, in: mounted.window)
+        )
+    }
+
+    func testSelectionDragAcrossRowsPaintsAndCopiesTheExactSpan() throws {
+        let rows = [
+            MixedRow(
+                id: "fast-a",
+                contentRevision: 1,
+                text: "alpha one\nalpha two\n",
+                usesNativeText: true,
+                usesFastPlainTextRenderer: true,
+                mutationSourceIDOverride: "shared-item"
+            ),
+            MixedRow(
+                id: "fast-b",
+                contentRevision: 1,
+                text: "beta one\nbeta two",
+                usesNativeText: true,
+                usesFastPlainTextRenderer: true,
+                mutationSourceIDOverride: "shared-item"
+            ),
+        ]
+        let mounted = mountMixed(rows: rows)
+
+        // The routing guarantee: text rows are hit-test transparent down to
+        // the table, so the drag owner can never be destroyed mid-drag.
+        let firstRect = mounted.table.rect(ofRow: 0)
+        let probeInContent = mounted.window.contentView!.convert(
+            NSPoint(x: firstRect.midX, y: firstRect.minY + 4),
+            from: mounted.table
+        )
+        XCTAssertTrue(
+            mounted.window.contentView!.hitTest(probeInContent)
+                === mounted.table,
+            "Text rows must hit-test through to the table."
+        )
+
+        let lastRect = mounted.table.rect(ofRow: 1)
+        dragSelection(
+            in: mounted,
+            fromTablePoint: NSPoint(x: firstRect.minX + 1, y: firstRect.minY + 1),
+            toTablePoint: NSPoint(x: lastRect.maxX - 1, y: lastRect.maxY - 1)
+        )
+
+        for row in 0...1 {
+            let cell = try XCTUnwrap(mounted.table.view(
+                atColumn: 0,
+                row: row,
+                makeIfNecessary: false
+            ))
+            let underlay = try XCTUnwrap(descendant(
+                of: cell,
+                type: MacConversationSelectionUnderlay.self
+            ))
+            XCTAssertFalse(
+                underlay.highlightRects.isEmpty,
+                "Row \(row) must paint its part of the selection."
+            )
+        }
+
+        NSPasteboard.general.clearContents()
+        (mounted.table as? MacTranscriptTableView)?.copy(nil)
+        XCTAssertEqual(
+            NSPasteboard.general.string(forType: .string),
+            rows[0].text + rows[1].text,
+            "A full-span drag must copy both rows joined seamlessly."
+        )
+    }
+
+    func testStreamingChurnMidDragKeepsSelectionAndDragAlive() throws {
+        var rows = [
+            MixedRow(
+                id: "fast-a",
+                contentRevision: 1,
+                text: "alpha one\nalpha two\n",
+                usesNativeText: true,
+                usesFastPlainTextRenderer: true,
+                mutationSourceIDOverride: "shared-item"
+            ),
+            MixedRow(
+                id: "fast-b",
+                contentRevision: 1,
+                text: "beta one\nbeta two",
+                usesNativeText: true,
+                usesFastPlainTextRenderer: true,
+                mutationSourceIDOverride: "shared-item"
+            ),
+        ]
+        let mounted = mountMixed(rows: rows)
+        let firstRect = mounted.table.rect(ofRow: 0)
+        let lastRect = mounted.table.rect(ofRow: 1)
+        dragSelection(
+            in: mounted,
+            fromTablePoint: NSPoint(x: firstRect.minX + 1, y: firstRect.minY + 1),
+            toTablePoint: NSPoint(x: lastRect.maxX - 1, y: lastRect.maxY - 1),
+            mutateBetween: {
+                // A streaming-style model churn while the button is down.
+                rows[1] = MixedRow(
+                    id: "fast-b",
+                    contentRevision: 2,
+                    text: "beta one\nbeta two",
+                    usesNativeText: true,
+                    usesFastPlainTextRenderer: true,
+                    mutationSourceIDOverride: "shared-item"
+                )
+                mounted.hosting.rootView = self.mixedTable(rows: rows)
+            }
+        )
+
+        NSPasteboard.general.clearContents()
+        (mounted.table as? MacTranscriptTableView)?.copy(nil)
+        XCTAssertEqual(
+            NSPasteboard.general.string(forType: .string),
+            rows[0].text + rows[1].text,
+            "A mid-drag model mutation must not strand the drag or the selection."
+        )
+    }
+
+    func testPlainClickOpensLinksAndDragsDoNot() throws {
+        var opened: [URL] = []
+        let link = URL(string: "https://example.com/docs")!
+        let rows = [
+            MixedRow(
+                id: "rich-link",
+                contentRevision: 1,
+                text: "Open the documentation link now",
+                usesNativeText: true,
+                maximumContentWidth: nil,
+                linkURL: link
+            )
+        ]
+        let mounted = mountMixed(rows: rows, onNativeLink: { url in
+            opened.append(url)
+            return true
+        })
+        let rect = mounted.table.rect(ofRow: 0)
+        // Fill alignment: the text begins at the content insets, so a point
+        // just inside the first line sits on the link's glyphs.
+        let onText = NSPoint(x: rect.minX + 44, y: rect.minY + 16)
+        let windowPoint = mounted.table.convert(onText, to: nil)
+        mounted.table.mouseDown(
+            with: mouseEvent(.leftMouseDown, at: windowPoint, in: mounted.window)
+        )
+        mounted.table.mouseUp(
+            with: mouseEvent(.leftMouseUp, at: windowPoint, in: mounted.window)
+        )
+        XCTAssertEqual(
+            opened,
+            [link],
+            "A movement-free click on link glyphs must route to the policy handler."
+        )
+
+        opened.removeAll()
+        dragSelection(
+            in: mounted,
+            fromTablePoint: onText,
+            toTablePoint: NSPoint(x: rect.maxX - 1, y: rect.minY + 16)
+        )
+        XCTAssertTrue(
+            opened.isEmpty,
+            "A drag that selects text must never open the link under it."
+        )
+    }
+
+    func testHostedPlainTextFallsThroughWhileControlsKeepHits() throws {
+        let rows = [
+            MixedRow(
+                id: "hosted-row",
+                contentRevision: 1,
+                text: "Plain hosted streaming text",
+                usesNativeText: false
+            )
+        ]
+        let mounted = mountMixed(rows: rows)
+        let rect = mounted.table.rect(ofRow: 0)
+        // With transcript textSelection disabled, plain SwiftUI text is
+        // hit-test transparent: the table receives the event, so drags can
+        // START on hosted rows (row-granular). Interactive controls inside
+        // hosted rows still take their own hits (covered by the footer copy
+        // button test and the disclosure toggle tests).
+        let probe = mounted.window.contentView!.convert(
+            NSPoint(x: rect.midX, y: rect.midY),
+            from: mounted.table
+        )
+        let hit = mounted.window.contentView!.hitTest(probe)
+        XCTAssertTrue(
+            hit === mounted.table,
+            "Non-interactive hosted content must not block table drags."
         )
     }
 
@@ -3108,7 +3364,8 @@ final class MacConversationTableViewTests: XCTestCase {
 
     private func mixedTable(
         rows: [MixedRow],
-        onMakeHostedRow: @escaping (MixedRow) -> Void = { _ in }
+        onMakeHostedRow: @escaping (MixedRow) -> Void = { _ in },
+        onNativeLink: @escaping @MainActor (URL) -> Bool = { _ in true }
     ) -> MacConversationTableView<MixedRow> {
         MacConversationTableView(
             sections: mixedSections(rows),
@@ -3117,6 +3374,7 @@ final class MacConversationTableViewTests: XCTestCase {
             commandHandle: MacConversationTableCommandHandle(),
             onNearBottomChange: { _ in },
             onAnchoredChange: { _ in },
+            onNativeLink: onNativeLink,
             makeRow: { row, _, _ in
                 onMakeHostedRow(row)
                 return AnyView(
@@ -3197,6 +3455,7 @@ final class MacConversationTableViewTests: XCTestCase {
     private func mountMixed(
         rows: [MixedRow],
         onMakeHostedRow: @escaping (MixedRow) -> Void = { _ in },
+        onNativeLink: @escaping @MainActor (URL) -> Bool = { _ in true },
         windowWidth: CGFloat = 800
     ) -> (
         window: NSWindow,
@@ -3206,7 +3465,8 @@ final class MacConversationTableViewTests: XCTestCase {
         let hosting = NSHostingView(
             rootView: mixedTable(
                 rows: rows,
-                onMakeHostedRow: onMakeHostedRow
+                onMakeHostedRow: onMakeHostedRow,
+                onNativeLink: onNativeLink
             )
         )
         let window = NSWindow(

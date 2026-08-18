@@ -9,6 +9,21 @@ import AppKit
 import UIKit
 #endif
 
+extension View {
+    /// Transcript rows disable SwiftUI's own text selection on macOS: the
+    /// table-level cross-transcript selection is the single selection
+    /// authority there, and a second per-view selection would both fight its
+    /// painting and swallow the drags it needs. iOS keeps system selection.
+    @ViewBuilder
+    func transcriptTextSelection() -> some View {
+        #if os(macOS)
+        textSelection(.disabled)
+        #else
+        textSelection(.enabled)
+        #endif
+    }
+}
+
 enum ChatInteractionTargetLayout {
     static let minimumIOSDimension: CGFloat = 44
 
@@ -502,7 +517,7 @@ private struct TerminalRelayMarkdownTable: View {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .strokeBorder(Color.secondary.opacity(0.18))
         }
-        .textSelection(.enabled)
+        .transcriptTextSelection()
     }
 
     private var tableGrid: some View {
@@ -1478,7 +1493,7 @@ struct RichMarkdownView: View {
                     onOpenRepository: onOpenRepository
                 )
             )
-            .textSelection(.enabled)
+            .transcriptTextSelection()
     }
 
     private func safeOpenURLAction(
@@ -1577,7 +1592,7 @@ private struct PreparedMarkdownText: View {
             }
         }
         .fixedSize(horizontal: false, vertical: true)
-        .textSelection(.enabled)
+        .transcriptTextSelection()
         .task(id: source) {
             guard preparedSource != source || prepared == nil else {
                 return
@@ -1679,7 +1694,7 @@ struct CodeBlockView: View {
             // reflow the row.
             .font(ChatTypography.monospacedDetail)
             .lineSpacing(3)
-            .textSelection(.enabled)
+            .transcriptTextSelection()
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(12)
             #else
@@ -1692,7 +1707,7 @@ struct CodeBlockView: View {
                 .font(.system(.callout, design: .monospaced))
                 .lineSpacing(3)
                 .fixedSize(horizontal: true, vertical: false)
-                .textSelection(.enabled)
+                .transcriptTextSelection()
                 .padding(12)
             }
             .scrollIndicators(.visible)
