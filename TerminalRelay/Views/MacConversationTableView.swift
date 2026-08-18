@@ -862,6 +862,8 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         private var selectionDragActive = false
         private var selectionWasFollowingBottom = false
         private var selectionDragScrolled = false
+        private var selectionDragLastWindowPoint: NSPoint?
+        private var selectionAutoscrollTimer: Timer?
         private var pendingLiveScrollRestorationAnchor: Anchor?
         private var pendingLiveScrollRestorationFollowsBottom = false
         private var pendingLiveScrollRestorationExpectedOriginY: CGFloat?
@@ -974,6 +976,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         }
 
         func detach() {
+            stopSelectionAutoscroll()
             if isLiveScrolling {
                 onLiveScrollingChange(false)
             }
@@ -1498,8 +1501,79 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             }
             guard let resolved = selectionEndpoint(atWindowPoint: location)
             else { return }
+            selectionDragLastWindowPoint = location
             selection.extend(to: resolved.endpoint)
             refreshVisibleSelectionHighlights()
+            updateSelectionAutoscroll(forWindowPoint: location)
+        }
+
+        /// A pointer held near the viewport's top or bottom edge scrolls the
+        /// transcript at a bounded velocity on a .common run-loop timer,
+        /// extending the selection to the (stationary) pointer as rows flow
+        /// underneath it.
+        private func updateSelectionAutoscroll(forWindowPoint point: NSPoint) {
+            guard selectionDragBegan, let scrollView else {
+                stopSelectionAutoscroll()
+                return
+            }
+            let clip = scrollView.contentView
+            let local = clip.convert(point, from: nil)
+            let margin: CGFloat = 24
+            let nearTop = local.y < clip.bounds.minY + margin
+            let nearBottom = local.y > clip.bounds.maxY - margin
+            guard nearTop || nearBottom else {
+                stopSelectionAutoscroll()
+                return
+            }
+            guard selectionAutoscrollTimer == nil else { return }
+            let timer = Timer(
+                timeInterval: 1.0 / 30.0,
+                repeats: true
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.selectionAutoscrollTick() }
+            }
+            selectionAutoscrollTimer = timer
+            RunLoop.main.add(timer, forMode: .common)
+        }
+
+        private func selectionAutoscrollTick() {
+            guard selectionDragActive,
+                  selectionDragBegan,
+                  let scrollView,
+                  let point = selectionDragLastWindowPoint else {
+                stopSelectionAutoscroll()
+                return
+            }
+            let clip = scrollView.contentView
+            let local = clip.convert(point, from: nil)
+            let margin: CGFloat = 24
+            let step: CGFloat
+            if local.y < clip.bounds.minY + margin {
+                step = -min(28, max(4, clip.bounds.minY + margin - local.y))
+            } else if local.y > clip.bounds.maxY - margin {
+                step = min(28, max(4, local.y - (clip.bounds.maxY - margin)))
+            } else {
+                stopSelectionAutoscroll()
+                return
+            }
+            var proposed = clip.bounds
+            proposed.origin.y += step
+            let constrained = clip.constrainBoundsRect(proposed).origin
+            guard abs(constrained.y - clip.bounds.origin.y) > 0.5 else {
+                return
+            }
+            selectionDragScrolled = true
+            clip.setBoundsOrigin(constrained)
+            scrollView.reflectScrolledClipView(clip)
+            if let resolved = selectionEndpoint(atWindowPoint: point) {
+                selection.extend(to: resolved.endpoint)
+            }
+            refreshVisibleSelectionHighlights()
+        }
+
+        private func stopSelectionAutoscroll() {
+            selectionAutoscrollTimer?.invalidate()
+            selectionAutoscrollTimer = nil
         }
 
         func selectionMouseUp(_ event: NSEvent) {
@@ -1510,7 +1584,9 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 selectionDragBegan = false
                 selectionDragScrolled = false
                 selectionWasFollowingBottom = false
+                selectionDragLastWindowPoint = nil
             }
+            stopSelectionAutoscroll()
             selectionDragActive = false
             scrollActivity.setSelectionDragActive(false)
             flushSelectionDragDeferredHeights()

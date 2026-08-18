@@ -982,6 +982,74 @@ final class MacConversationTableViewTests: XCTestCase {
         )
     }
 
+    func testEdgeAutoscrollExtendsTheSelectionAndReleasesFollow() throws {
+        var rows = fastSelectableRows(count: 60)
+        let mounted = mountMixed(rows: rows)
+        let scrollView = try XCTUnwrap(mounted.table.enclosingScrollView)
+        XCTAssertLessThanOrEqual(distanceFromBottom(in: mounted.table), 8)
+        let originBefore = scrollView.contentView.bounds.origin.y
+
+        // Anchor mid-viewport, then hold the pointer 4pt under the top edge.
+        let visible = mounted.table.rows(in: scrollView.contentView.bounds)
+        let anchorRect = mounted.table.rect(ofRow: visible.location + 3)
+        let startWindow = mounted.table.convert(
+            NSPoint(x: anchorRect.minX + 40, y: anchorRect.minY + 6),
+            to: nil
+        )
+        let clipTopInTable = scrollView.contentView.bounds.minY + 4
+        let holdWindow = mounted.table.convert(
+            NSPoint(x: anchorRect.minX + 40, y: clipTopInTable),
+            to: nil
+        )
+        mounted.table.mouseDown(
+            with: mouseEvent(.leftMouseDown, at: startWindow, in: mounted.window)
+        )
+        mounted.table.mouseDragged(
+            with: mouseEvent(.leftMouseDragged, at: holdWindow, in: mounted.window)
+        )
+        // Let the .common-mode autoscroll timer tick with the pointer held.
+        RunLoop.main.run(until: Date().addingTimeInterval(0.5))
+        XCTAssertLessThan(
+            scrollView.contentView.bounds.origin.y,
+            originBefore - 40,
+            "Holding the pointer at the top edge must scroll the transcript up."
+        )
+        mounted.table.mouseUp(
+            with: mouseEvent(.leftMouseUp, at: holdWindow, in: mounted.window)
+        )
+
+        // The selection extended upward across rows realized during the
+        // autoscroll: the copied text reaches rows above the anchor.
+        NSPasteboard.general.clearContents()
+        (mounted.table as? MacTranscriptTableView)?.copy(nil)
+        let copied = try XCTUnwrap(NSPasteboard.general.string(forType: .string))
+        let anchorRowIndex = visible.location + 3
+        XCTAssertTrue(
+            copied.contains("drag line one \(anchorRowIndex - 2)"),
+            "Autoscroll must extend the selection across newly realized rows."
+        )
+
+        // The drag scrolled, so follow re-derives from the resting position
+        // (off-bottom): a new streamed batch must NOT yank the viewport down.
+        let restingOrigin = scrollView.contentView.bounds.origin.y
+        rows.append(MixedRow(
+            id: "post-autoscroll-append",
+            contentRevision: 7,
+            text: "appended after autoscroll\n",
+            usesNativeText: true,
+            usesFastPlainTextRenderer: true,
+            mutationSourceIDOverride: "drag-item"
+        ))
+        mounted.hosting.rootView = mixedTable(rows: rows)
+        settle(mounted.hosting)
+        XCTAssertEqual(
+            scrollView.contentView.bounds.origin.y,
+            restingOrigin,
+            accuracy: 0.5,
+            "An off-bottom autoscroll release must leave follow disengaged."
+        )
+    }
+
     func testFollowOwnerSurvivesLateDocumentGrowth() throws {
         let mounted = mount(rowCount: 60)
         let scrollView = try XCTUnwrap(mounted.table.enclosingScrollView)
