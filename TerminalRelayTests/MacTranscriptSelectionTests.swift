@@ -699,4 +699,183 @@ final class MacTranscriptSelectionTests: XCTestCase {
             "Out-of-range offsets clamp to the string bounds."
         )
     }
+
+    // MARK: - Selection controller mutation rules (task 1.3)
+
+    private func sliceRow(
+        _ id: String,
+        item: String = "item",
+        section: String = "item:text",
+        text: String?
+    ) -> SliceRow {
+        SliceRow(
+            id: id,
+            mutationSourceID: item,
+            selectionText: text,
+            selectionRoleLabel: nil,
+            selectionSectionID: section
+        )
+    }
+
+    private func endpoint(
+        _ rowID: String,
+        offset: Int,
+        text: String,
+        rowGranular: Bool = false
+    ) -> MacTranscriptSelectionEndpoint {
+        MacTranscriptSelectionEndpoint(
+            rowID: rowID,
+            offset: offset,
+            displayedText: text,
+            isRowGranular: rowGranular
+        )
+    }
+
+    func testTailResegmentationRemapsTheEndpointToTheSuccessorRow() {
+        let controller = MacTranscriptSelectionController<SliceRow>()
+        controller.updateRows([
+            sliceRow("r1", text: "AAAA"),
+            sliceRow("r2", text: "BBBBCC"),
+        ])
+        controller.begin(at: endpoint("r1", offset: 1, text: "AAAA"))
+        controller.extend(to: endpoint("r2", offset: 6, text: "BBBBCC"))
+
+        // The tail re-segments: r2 keeps its ID but sheds "CC" into a new
+        // successor row. The focus must follow the text, not the row.
+        controller.updateRows([
+            sliceRow("r1", text: "AAAA"),
+            sliceRow("r2", text: "BBBB"),
+            sliceRow("r3", text: "CC"),
+        ])
+        XCTAssertEqual(controller.focus?.rowID, "r3")
+        XCTAssertEqual(controller.focus?.offset, 2)
+        XCTAssertEqual(controller.anchor?.rowID, "r1")
+        XCTAssertEqual(
+            controller.copyText(),
+            "AAABBBBCC",
+            "The remapped selection must cover exactly the same characters."
+        )
+    }
+
+    func testHeadEvictionReanchorsInsteadOfClearing() {
+        let controller = MacTranscriptSelectionController<SliceRow>()
+        controller.updateRows([
+            sliceRow("a", item: "one", section: "one:text", text: "first"),
+            sliceRow("b", item: "two", section: "two:text", text: "second"),
+            sliceRow("c", item: "three", section: "three:text", text: "third"),
+        ])
+        controller.selectAll()
+        XCTAssertTrue(controller.hasSelection)
+
+        // Retention evicts the head item mid-turn.
+        controller.updateRows([
+            sliceRow("b", item: "two", section: "two:text", text: "second"),
+            sliceRow("c", item: "three", section: "three:text", text: "third"),
+        ])
+        XCTAssertTrue(
+            controller.hasSelection,
+            "Head eviction must re-anchor, not drop a held selection."
+        )
+        XCTAssertEqual(controller.anchor?.rowID, "b")
+        XCTAssertEqual(controller.anchor?.offset, 0)
+        XCTAssertEqual(controller.copyText(), "second\n\nthird")
+    }
+
+    func testSameIDChurnLeavesEndpointsUntouched() {
+        let controller = MacTranscriptSelectionController<SliceRow>()
+        let rows = [
+            sliceRow("r1", text: "hello "),
+            sliceRow("r2", text: "world"),
+        ]
+        controller.updateRows(rows)
+        controller.begin(at: endpoint("r1", offset: 2, text: "hello "))
+        controller.extend(to: endpoint("r2", offset: 3, text: "world"))
+        let anchorBefore = controller.anchor
+        let focusBefore = controller.focus
+
+        // A streaming seal or gesture restoration replaces cells but leaves
+        // the model identical — remove+insert of the same IDs.
+        controller.updateRows(rows)
+        XCTAssertEqual(controller.anchor, anchorBefore)
+        XCTAssertEqual(controller.focus, focusBefore)
+        XCTAssertEqual(controller.copyText(), "llo wor")
+    }
+
+    func testRemapLandingMidGraphemeRoundsToTheComposedBoundary() {
+        let controller = MacTranscriptSelectionController<SliceRow>()
+        controller.updateRows([
+            sliceRow("x", text: "ab🎉cd"),
+        ])
+        controller.begin(at: endpoint("x", offset: 0, text: "ab🎉cd"))
+        controller.extend(to: endpoint("x", offset: 3, text: "ab🎉cd"))
+
+        // The row re-tiles so the absolute offset 3 now lands inside the
+        // emoji's surrogate pair in the successor row.
+        controller.updateRows([
+            sliceRow("y1", text: "ab"),
+            sliceRow("y2", text: "🎉cd"),
+        ])
+        XCTAssertEqual(controller.focus?.rowID, "y2")
+        XCTAssertEqual(
+            controller.focus?.offset,
+            0,
+            "A mid-surrogate landing must round down to the grapheme start."
+        )
+        XCTAssertEqual(controller.anchor?.rowID, "y1")
+    }
+
+    func testAuthoritativeResetAndTrueEndRemovalClear() {
+        let controller = MacTranscriptSelectionController<SliceRow>()
+        let rows = [
+            sliceRow("r1", item: "one", section: "one:text", text: "alpha"),
+            sliceRow("r2", item: "two", section: "two:text", text: "beta"),
+        ]
+        controller.updateRows(rows)
+        controller.selectAll()
+        controller.updateRows(rows, isAuthoritativeReset: true)
+        XCTAssertFalse(controller.hasSelection)
+
+        controller.updateRows(rows)
+        controller.selectAll()
+        // The END endpoint's item leaves the model (not a head eviction).
+        controller.updateRows([
+            sliceRow("r1", item: "one", section: "one:text", text: "alpha")
+        ])
+        XCTAssertFalse(
+            controller.hasSelection,
+            "Losing the selection's tail content must release the selection."
+        )
+    }
+
+    func testHighlightStatesAcrossCoveredRows() {
+        let controller = MacTranscriptSelectionController<SliceRow>()
+        controller.updateRows([
+            sliceRow("r1", text: "first "),
+            sliceRow("r2", text: "middle "),
+            sliceRow("r3", text: "last"),
+            sliceRow("r4", text: "outside"),
+        ])
+        controller.begin(at: endpoint("r1", offset: 2, text: "first "))
+        controller.extend(to: endpoint("r3", offset: 2, text: "last"))
+
+        XCTAssertEqual(
+            controller.highlight(forRowID: "r1"),
+            .range(NSRange(location: 2, length: 4))
+        )
+        XCTAssertEqual(controller.highlight(forRowID: "r2"), .full)
+        XCTAssertEqual(
+            controller.highlight(forRowID: "r3"),
+            .range(NSRange(location: 0, length: 2))
+        )
+        XCTAssertEqual(controller.highlight(forRowID: "r4"), .none)
+
+        // Reversed drags order themselves.
+        controller.begin(at: endpoint("r3", offset: 2, text: "last"))
+        controller.extend(to: endpoint("r1", offset: 2, text: "first "))
+        XCTAssertEqual(
+            controller.highlight(forRowID: "r1"),
+            .range(NSRange(location: 2, length: 4))
+        )
+        XCTAssertEqual(controller.copyText(), "rst middle la")
+    }
 }
