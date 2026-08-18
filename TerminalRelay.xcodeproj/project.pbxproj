@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		00C6AC1598D2FD88F0CF5CDD /* TerminalHostView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E31E6BD2ECBE42BE1EFFDD00 /* TerminalHostView.swift */; };
+		01AD4625667C8EA88EEAA974 /* MacTranscriptSelectionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1E37E65E4A3B27D1DE35B0D6 /* MacTranscriptSelectionTests.swift */; };
 		034F2FEC41EB660A56480C8C /* TerminalRelayIOSApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A69DA6CF7B2592BF444DB18E /* TerminalRelayIOSApp.swift */; };
 		040CA3D96665635AD86CD343 /* SessionSlotRegistryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7DC204D99814E9F11DA7D053 /* SessionSlotRegistryTests.swift */; };
 		04AAF91C7451D8FD6D15EA28 /* ToolGrouping.swift in Sources */ = {isa = PBXBuildFile; fileRef = D076F925ED184237E527B318 /* ToolGrouping.swift */; };
@@ -223,6 +224,7 @@
 		1C681D55FCC5367DD2051E01 /* WorkerSessionStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerSessionStateTests.swift; sourceTree = "<group>"; };
 		1D4C48C2869FBA491D8ADD03 /* WorkerRuntimeStatusTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerRuntimeStatusTests.swift; sourceTree = "<group>"; };
 		1DE6522EBC904D332CAE4925 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		1E37E65E4A3B27D1DE35B0D6 /* MacTranscriptSelectionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacTranscriptSelectionTests.swift; sourceTree = "<group>"; };
 		1FFB1080667036ED5786F005 /* ChatTestFixtures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatTestFixtures.swift; sourceTree = "<group>"; };
 		20DDC4D787D741BAF50C5483 /* ProjectGitServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectGitServiceTests.swift; sourceTree = "<group>"; };
 		22149A5F4D1EEEA6422079FD /* AgentComposerPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentComposerPolicyTests.swift; sourceTree = "<group>"; };
@@ -416,6 +418,7 @@
 				7AB6ED13164833C92AD88D6C /* MacChatProcessConnectionTests.swift */,
 				A7AFA5750E78A1E1FD3E5442 /* MacChatTransportTests.swift */,
 				711C9D8EA53576E2E35FEC84 /* MacConversationTableViewTests.swift */,
+				1E37E65E4A3B27D1DE35B0D6 /* MacTranscriptSelectionTests.swift */,
 				5BBF47FBF6B34F0D16E93884 /* MobilePairingTests.swift */,
 				20DDC4D787D741BAF50C5483 /* ProjectGitServiceTests.swift */,
 				CDED8E0950703DD0CEB6F15B /* ProjectProfileTests.swift */,
@@ -992,6 +995,7 @@
 				7AD3D03A4345F531ADC441CC /* MacChatProcessConnectionTests.swift in Sources */,
 				98491D7F93B6DB93C56B2FE0 /* MacChatTransportTests.swift in Sources */,
 				2C098EC0A7AE1E08D1B2591E /* MacConversationTableViewTests.swift in Sources */,
+				01AD4625667C8EA88EEAA974 /* MacTranscriptSelectionTests.swift in Sources */,
 				13D5D2117CCAAB899A0E301B /* MobilePairingTests.swift in Sources */,
 				9271FF5CDD1B8FDF00EA1FE6 /* ProjectGitServiceTests.swift in Sources */,
 				4F35926FD66E6ACA4FC3AAB6 /* ProjectProfileTests.swift in Sources */,
