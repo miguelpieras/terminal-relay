@@ -397,6 +397,113 @@ final class RichChatRenderingTests: XCTestCase {
         }
     }
 
+    /// End to end: what the model wrote is what the transcript shows. A reply
+    /// of N line-structured lines must render as N lines, not as one paragraph
+    /// reflowed at the window width (which also made every ~340-byte tile wrap
+    /// independently and end on a ragged short line).
+    func testLineStructuredReplyRendersWithItsOwnLineCount() async throws {
+        let source = (0..<12)
+            .map { index in
+                (1...10)
+                    .map { String(index * 10 + $0) }
+                    .joined(separator: " ")
+            }
+            .joined(separator: "\n")
+
+        let resolved = await SanitizedMarkdownCache.shared
+            .preparedMarkdown(raw: source)
+        let prepared = try XCTUnwrap(resolved)
+        let rendered = await MainActor.run {
+            String(prepared.attributedText.characters)
+        }
+
+        XCTAssertEqual(
+            rendered.split(separator: "\n", omittingEmptySubsequences: false).count,
+            12,
+            "Rendered Markdown must keep one line per authored line."
+        )
+        XCTAssertTrue(rendered.hasPrefix("1 2 3 4 5 6 7 8 9 10\n11 12"))
+    }
+
+    func testAuthoredLineBreaksSurviveMarkdownReflow() {
+        let source = """
+        1 2 3 4 5 6 7 8 9 10
+        11 12 13 14 15 16 17 18 19 20
+        21 22 23 24 25 26 27 28 29 30
+        """
+
+        let sanitized = MarkdownSafety.sanitizedSource(source)
+        let lines = sanitized.split(separator: "\n", omittingEmptySubsequences: false)
+
+        XCTAssertTrue(
+            lines[0].hasSuffix("  "),
+            """
+            A line the next one continues must carry a hard break, or \
+            Markdown reflows line-structured output into paragraphs that \
+            wrap at the window width instead of where the model wrote them.
+            """
+        )
+        XCTAssertTrue(lines[1].hasSuffix("  "))
+        XCTAssertFalse(
+            lines[2].hasSuffix("  "),
+            "A break at the end of a block is pointless; leave it out."
+        )
+        XCTAssertEqual(
+            sanitized.replacingOccurrences(of: "  \n", with: "\n"),
+            source,
+            "Preserving breaks must not otherwise alter the source."
+        )
+    }
+
+    func testAuthoredLineBreaksLeaveCodeAndBlankLinesAlone() {
+        let source = """
+        Prose line one
+        Prose line two
+
+        ```swift
+        let a = 1
+        let b = 2
+        ```
+
+            indented code line
+            second indented line
+
+        Table | Head
+        ----- | ----
+        a | b
+        """
+
+        let sanitized = MarkdownSafety.sanitizedSource(source)
+
+        XCTAssertTrue(sanitized.contains("Prose line one  \nProse line two"))
+        XCTAssertTrue(
+            sanitized.contains("let a = 1\nlet b = 2"),
+            "Fenced code content must stay byte-exact."
+        )
+        XCTAssertTrue(
+            sanitized.contains("    indented code line\n"),
+            "Indented code content must stay byte-exact."
+        )
+        XCTAssertFalse(
+            sanitized.contains("Prose line two  \n\n"),
+            "The last line before a blank line ends its block already."
+        )
+        XCTAssertTrue(
+            sanitized.contains("Table | Head  \n----- | ----  \na | b"),
+            "Trailing whitespace never changes block structure, tables included."
+        )
+    }
+
+    func testPreservingAuthoredLineBreaksIsIdempotent() {
+        let source = "already broken  \nnext line\nlast line"
+        let once = MarkdownSafety.preservingAuthoredLineBreaks(source)
+        let twice = MarkdownSafety.preservingAuthoredLineBreaks(once)
+
+        XCTAssertEqual(once, twice)
+        XCTAssertTrue(once.hasPrefix("already broken  \n"))
+        XCTAssertFalse(once.contains("already broken    "))
+    }
+
     func testRawHTMLIsEscapedWithoutDamagingInlineOrFencedCode() {
         let source = """
         Before <script>alert("x")</script>

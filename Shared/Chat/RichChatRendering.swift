@@ -174,7 +174,50 @@ enum ChatURLPolicy {
 
 enum MarkdownSafety {
     static func sanitizedSource(_ source: String) -> String {
-        neutralizingImages(in: escapedRawHTML(source))
+        preservingAuthoredLineBreaks(
+            neutralizingImages(in: escapedRawHTML(source))
+        )
+    }
+
+    /// Keeps the line structure the author actually wrote. CommonMark folds a
+    /// single newline inside a paragraph into a space, which silently reflows
+    /// line-oriented output — numbered runs, ASCII layouts, hand-wrapped
+    /// notes — into prose that wraps at the window width, so the transcript
+    /// showed a different shape than the model produced (and a different one
+    /// again at every tile boundary, since tiles wrap independently).
+    /// Appending the standard two-space hard break makes both Markdown
+    /// renderers emit the author's break. Trailing whitespace can never change
+    /// block structure, so the only place it must not go is code, where it
+    /// would be content.
+    static func preservingAuthoredLineBreaks(_ source: String) -> String {
+        var lines = source
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+        var insideFence = false
+        for index in lines.indices {
+            let line = lines[index]
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
+                insideFence.toggle()
+                continue
+            }
+            guard !insideFence,
+                  !trimmed.isEmpty,
+                  !line.hasPrefix("    "),
+                  !line.hasPrefix("\t"),
+                  !line.hasSuffix("  "),
+                  !line.hasSuffix("\\") else {
+                continue
+            }
+            // Only a line the next one continues needs the break; CommonMark
+            // ignores one at the end of a block.
+            let next = index + 1 < lines.count
+                ? lines[index + 1].trimmingCharacters(in: .whitespaces)
+                : ""
+            guard !next.isEmpty else { continue }
+            lines[index] = line + "  "
+        }
+        return lines.joined(separator: "\n")
     }
 
     static func sanitizedSourceOffMain(
