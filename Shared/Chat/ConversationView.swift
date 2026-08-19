@@ -518,14 +518,15 @@ enum MacTranscriptRow: MacConversationTableRow {
             // The prepared attributed representation flattens tables to text
             // lines; rows carrying one stay hosted for real grid rendering.
             if MarkdownSafety.containsTableCandidate(source) { return nil }
-            // Assistant rows paint exact text first and adopt rich Markdown
-            // only after scrolling. Avoid even a warm AppKit artifact lookup
-            // while a gesture is realizing cells; user bubbles keep their
-            // immediate rich presentation because they are not the worker
-            // output hot path.
-            let cached = message.role == .user
-                ? SanitizedMarkdownCache.shared.lookupPrepared(raw: source)
-                : nil
+            // Every role mounts its rich Markdown immediately when the AppKit
+            // artifact is already translated for this style: both probes are
+            // pure lookups (one NSCache read, one single-slot memo read) and
+            // never parse or translate, so they are safe on the gesture
+            // realization and height-estimation paths. Mounting plain first
+            // when the rich artifact is right there made a settled message
+            // visibly reformat on every scroll pass — Markdown collapses soft
+            // line breaks, so line-structured replies changed shape entirely.
+            let cached = SanitizedMarkdownCache.shared.lookupPrepared(raw: source)
             let immediate = cached?.cachedAppKitAttributedText(
                 fontScale: fontScale,
                 colorScheme: colorScheme
@@ -563,6 +564,9 @@ enum MacTranscriptRow: MacConversationTableRow {
                     deferredAttributedString: deferred
                 )
             }
+            // A warm artifact mounts as rich text directly; only genuinely
+            // cold tiles paint exact source first and promote when idle.
+            let isWarmRich = immediate != nil
             return MacConversationNativeTextPresentation(
                 attributedString: immediate,
                 fallbackString: projection.sourceText,
@@ -582,8 +586,8 @@ enum MacTranscriptRow: MacConversationTableRow {
                 accessibilityLabel: projection.accessibilitySummary,
                 accessibilityIdentifier: identifier,
                 deferredAttributedString: deferred,
-                usesFastPlainTextRenderer: true,
-                promotesFastRendererWhenIdle: true
+                usesFastPlainTextRenderer: !isWarmRich,
+                promotesFastRendererWhenIdle: !isWarmRich
             )
 
         case .reasoning(let reasoning):

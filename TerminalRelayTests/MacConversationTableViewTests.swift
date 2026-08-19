@@ -1246,6 +1246,150 @@ final class MacConversationTableViewTests: XCTestCase {
         table.enclosingScrollView?.scrollWheel(with: NSEvent(cgEvent: cgEvent)!)
     }
 
+    /// A line-structured assistant reply: Markdown collapses its soft line
+    /// breaks, so the plain and rich renderings differ in shape entirely —
+    /// exactly the content that made format flips obvious in the field.
+    private func lineStructuredAssistantMessage(
+        id: String = "assistant-warm"
+    ) -> ConversationItem {
+        // The prepared-markdown cache is process-wide and keyed by text, so
+        // each test needs its own source or one test warms another's cold case.
+        .message(ChatMessage(
+            id: id,
+            turnID: "turn",
+            role: .assistant,
+            text: "\(id)\n" + (0..<40)
+                .map { index in
+                    (1...10)
+                        .map { String(index * 10 + $0) }
+                        .joined(separator: " ")
+                }
+                .joined(separator: "\n"),
+            occurredAt: 1
+        ))
+    }
+
+    private func warmPreparedArtifact(
+        for row: MacTranscriptRow,
+        fontScale: CGFloat = 1,
+        colorScheme: ColorScheme = .light
+    ) async {
+        guard case .item(let projection, _, _) = row,
+              case .message(let message) = projection.displayItem,
+              let source = message.contents.first?.text,
+              let prepared = await SanitizedMarkdownCache.shared
+                .preparedMarkdown(raw: source) else {
+            return XCTFail("Expected a preparable markdown tile")
+        }
+        // Populating the style-keyed AppKit memo is what makes the artifact
+        // mountable without any main-actor translation at realization time.
+        _ = await MainActor.run {
+            prepared.appKitAttributedText(
+                fontScale: fontScale,
+                colorScheme: colorScheme
+            )
+        }
+    }
+
+    func testWarmMarkdownArtifactMountsRichInsteadOfPlainSource() async {
+        let projections = TranscriptRowProjection.makeRows(
+            item: lineStructuredAssistantMessage()
+        )
+        XCTAssertGreaterThan(projections.count, 1, "Fixture must tile")
+        let row = MacTranscriptRow.item(
+            projections[0],
+            isExpanded: false,
+            copiedItemID: nil
+        )
+
+        let cold = await MainActor.run {
+            row.nativeTextPresentation(
+                dynamicTypeSize: .large,
+                colorScheme: .light
+            )
+        }
+        XCTAssertEqual(
+            cold?.usesFastPlainTextRenderer,
+            true,
+            "A cold tile still paints exact source first."
+        )
+        XCTAssertNil(cold?.attributedString)
+
+        await warmPreparedArtifact(for: row)
+
+        let warm = await MainActor.run {
+            row.nativeTextPresentation(
+                dynamicTypeSize: .large,
+                colorScheme: .light
+            )
+        }
+        XCTAssertNotNil(
+            warm?.attributedString,
+            """
+            An assistant tile whose rich artifact is already translated must \
+            mount it directly; mounting plain source first made every scroll \
+            pass reformat the message.
+            """
+        )
+        XCTAssertEqual(warm?.usesFastPlainTextRenderer, false)
+        XCTAssertEqual(
+            warm?.promotesFastRendererWhenIdle,
+            false,
+            "A directly-mounted rich tile has nothing left to promote."
+        )
+        XCTAssertNotEqual(
+            warm?.attributedString?.string,
+            cold?.fallbackString,
+            "The rich rendering must differ from raw source for this fixture."
+        )
+    }
+
+    func testWarmLiveScrollStandInDrawsTheRichRenderingNotRawSource() async {
+        let projections = TranscriptRowProjection.makeRows(
+            item: lineStructuredAssistantMessage(id: "assistant-standin")
+        )
+        let row = MacTranscriptRow.item(
+            projections[0],
+            isExpanded: false,
+            copiedItemID: nil
+        )
+
+        let coldStandIn = await MainActor.run {
+            row.liveScrollTextPresentation(
+                dynamicTypeSize: .large,
+                colorScheme: .light
+            )
+        }
+        XCTAssertNil(
+            coldStandIn?.attributedString,
+            "Cold stand-ins keep exact source, matching the cell they settle into."
+        )
+
+        await warmPreparedArtifact(for: row)
+
+        let warmStandIn = await MainActor.run {
+            row.liveScrollTextPresentation(
+                dynamicTypeSize: .large,
+                colorScheme: .light
+            )
+        }
+        XCTAssertNotNil(
+            warmStandIn?.attributedString,
+            """
+            A row realized mid-gesture must draw the same rich rendering its \
+            settled neighbours show, or one message appears in two shapes.
+            """
+        )
+        XCTAssertNil(
+            warmStandIn?.linkHandler,
+            "Stand-ins stay non-interactive."
+        )
+        XCTAssertNil(
+            warmStandIn?.deferredAttributedString,
+            "Stand-ins never carry deferred work."
+        )
+    }
+
     func testMachineOriginDriftCannotKillStickyFollow() throws {
         // The seal kill-chain from the 2026-08-19 field repro: a visible-row
         // remove+insert drops the row's height cache, the frame transiently
@@ -3066,7 +3210,15 @@ final class MacConversationTableViewTests: XCTestCase {
         await second.value
 
         XCTAssertEqual(resumedWaiters, [1, 2])
-        XCTAssertEqual(heightChangePreparations, 2)
+        XCTAssertEqual(
+            heightChangePreparations,
+            1,
+            """
+            Ready adoptions land in one batch under a single viewport anchor \
+            capture, matching the batched live-scroll restoration pass; a \
+            per-row capture went with the per-row ripple this replaced.
+            """
+        )
     }
 
     func testDeferredNativeArtifactResolvesOnlyAfterLiveScrollEnds() async {
@@ -3657,10 +3809,16 @@ final class MacConversationTableViewTests: XCTestCase {
             16.7,
             "Ending the gesture must stay within one 60 Hz frame."
         )
-        XCTAssertEqual(
+        // Visible rows restore in ONE batch so the viewport reaches its
+        // resting rendering atomically (a row-per-frame walk read as a
+        // quarter-second ripple); off-screen rows keep the incremental pace.
+        // The binding budget is therefore the pass duration below, not a row
+        // count — this assertion demanded one row per pass and had been
+        // failing since batched restoration shipped.
+        XCTAssertLessThanOrEqual(
             restoredDiagnostics.maximumLiveScrollRestorationsPerPass,
-            1,
-            "Restoration must rebuild at most one bounded row per display frame."
+            visible + 12,
+            "A restoration pass must stay bounded by the viewport."
         )
         XCTAssertLessThan(
             restoredDiagnostics.maximumLiveScrollRestorationMilliseconds,

@@ -196,17 +196,47 @@ final class MacTranscriptScrollActivity: @unchecked Sendable {
             idleAdoptions.removeFirst().continuation.resume()
         }
         guard !idleAdoptions.isEmpty else { return }
-        let adoption = idleAdoptions.removeFirst()
-        guard adoption.cancellationToken.claim() else {
+        // Adopt every ready row in ONE pass, bounded by a frame budget, and
+        // arm the viewport anchor once for the whole batch — the same shape
+        // the live-scroll restoration queue uses for its visible page. A
+        // strict one-row-per-tick drain read as a visible ripple: rows
+        // reformatting one after another for half a second after every
+        // scroll, because rich Markdown collapses soft line breaks and each
+        // row changed shape as it landed.
+        let deadline = CACurrentMediaTime() + Self.idleAdoptionBatchBudget
+        var didArmAnchor = false
+        while !idleAdoptions.isEmpty {
+            // An adoption's own action can hand the viewport back to the user
+            // (a gesture starting, a selection drag, restoration): re-check
+            // ownership before every row so the rest of the batch waits.
+            guard !isLiveScrolling,
+                  !isIncrementalRestorationActive,
+                  !isSelectionDragActive else { break }
+            while !idleAdoptions.isEmpty,
+                  idleAdoptions[0].cancellationToken.isCancelled {
+                idleAdoptions.removeFirst().continuation.resume()
+            }
+            guard !idleAdoptions.isEmpty else { break }
+            let adoption = idleAdoptions.removeFirst()
+            guard adoption.cancellationToken.claim() else {
+                adoption.continuation.resume()
+                continue
+            }
+            if !didArmAnchor {
+                onHeightChangingContentWillAdopt?()
+                didArmAnchor = true
+            }
+            adoption.action()
             adoption.continuation.resume()
-            performNextIdleAdoption()
-            return
+            if CACurrentMediaTime() >= deadline { break }
         }
-        onHeightChangingContentWillAdopt?()
-        adoption.action()
-        adoption.continuation.resume()
         scheduleNextIdleAdoption()
     }
+
+    /// Half a display frame at 60 Hz. Batched adoption keeps a settled
+    /// viewport from reformatting row by row while still leaving the rest of
+    /// the frame for layout and drawing.
+    private static let idleAdoptionBatchBudget: CFTimeInterval = 0.008
 
     @MainActor
     private func scheduleNextIdleAdoption() {
@@ -394,10 +424,13 @@ struct MacConversationNativeTextPresentation {
         self.promotesFastRendererWhenIdle = promotesFastRendererWhenIdle
     }
 
-    /// Copies only layout and plain styling into the frame-critical scroll
-    /// presentation. Rich artifacts, links, and deferred work deliberately do
-    /// not cross this boundary; the exact source is restored to the ordinary
-    /// selectable presentation when the gesture ends.
+    /// Copies layout and styling into the frame-critical scroll presentation.
+    /// Links and deferred work deliberately do not cross this boundary, but an
+    /// ALREADY-TRANSLATED rich artifact does: it is inert data the draw-only
+    /// cell can paint, and dropping it made rows realized mid-gesture show raw
+    /// source beside settled rich rows — the same message in two shapes, since
+    /// Markdown collapses soft line breaks. Cold tiles still carry exact
+    /// source, matching the plain cell they will settle into.
     @MainActor
     func liveScrollCopy(
         fallbackString: String,
@@ -405,6 +438,7 @@ struct MacConversationNativeTextPresentation {
         minimumTextContainerHeight: CGFloat? = nil
     ) -> Self {
         Self(
+            attributedString: attributedString,
             fallbackString: fallbackString,
             contentInsets: contentInsets,
             firstRowTopInsetAdjustment: firstRowTopInsetAdjustment,
@@ -847,6 +881,13 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         private var liveScrollRestorationIndex = 0
         private var liveScrollRestorationTimer: Timer?
         private var liveScrollRestorationStarvedTicks = 0
+        /// Running estimate of what one restored row costs, seeded at the
+        /// price of a plain remount and re-blended after every pass; a rich
+        /// TextKit remount is several times that, so the batch size has to
+        /// follow the content rather than a fixed row count.
+        private var restorationSecondsPerRow: CFTimeInterval = 0.001
+        /// Leaves the rest of the 60 Hz frame for layout and drawing.
+        private let restorationFrameBudget: CFTimeInterval = 0.010
         /// ~300ms at the 60Hz restoration pace before a starved queue runs
         /// anyway despite a pending mutation correction.
         private let maximumRestorationStarvationTicks = 18
@@ -2651,11 +2692,19 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 finishLiveScrollRestoration()
                 return
             }
-            // All still-visible transitioned rows restore in one batch so the
-            // viewport flips to its resting rendering atomically; a row-per-
-            // frame walk over the visible page read as a quarter-second of
-            // rippling reflows. Off-screen rows keep the incremental pace.
+            // Still-visible transitioned rows restore together so the viewport
+            // reaches its resting rendering in one step; a row-per-frame walk
+            // over the visible page read as a quarter-second of rippling
+            // reflows. The batch is sized to the measured cost of a restored
+            // row so one pass still fits a 60 Hz frame — settled rows now
+            // mount their rich text directly, which costs a TextKit layout
+            // each, and an unbounded page overran the frame. Off-screen rows
+            // keep the incremental pace.
             let visibleRange = tableView.rows(in: scrollView.contentView.bounds)
+            let rowBudget = max(
+                3,
+                Int(restorationFrameBudget / restorationSecondsPerRow)
+            )
             var batchIndexes = IndexSet()
             var reloadIndexes = IndexSet()
             var remaining: [LiveScrollRestoration] = []
@@ -2667,9 +2716,11 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 }
                 let isVisible = visibleRange.location != NSNotFound
                     && NSLocationInRange(index, visibleRange)
-                if isVisible {
+                if isVisible, batchIndexes.count < rowBudget {
                     batchIndexes.insert(index)
                     if restoration.reloadsCell { reloadIndexes.insert(index) }
+                } else if isVisible {
+                    remaining.append(restoration)
                 } else if batchIndexes.isEmpty && !tookOffscreenFallback {
                     tookOffscreenFallback = true
                     batchIndexes.insert(index)
@@ -2704,9 +2755,23 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             liveScrollRestorationQueue = remaining
             liveScrollRestorationIndex = 0
 
+            let elapsed = CACurrentMediaTime() - startedAt
+            if batchIndexes.count > 0 {
+                // Blend the observed cost into the estimate that sizes the
+                // next pass, so the budget tracks this machine and this
+                // content instead of a compiled-in row count.
+                let observed = elapsed / Double(batchIndexes.count)
+                restorationSecondsPerRow = min(
+                    0.008,
+                    max(
+                        0.0002,
+                        (restorationSecondsPerRow * 0.5) + (observed * 0.5)
+                    )
+                )
+            }
             MacConversationTableDiagnostics.recordedLiveScrollRestoration(
                 restoredRows: batchIndexes.count,
-                milliseconds: (CACurrentMediaTime() - startedAt) * 1_000
+                milliseconds: elapsed * 1_000
             )
             if remaining.isEmpty,
                pendingLiveScrollRestorationAnchor == nil,

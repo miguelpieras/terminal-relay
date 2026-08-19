@@ -3161,6 +3161,10 @@ final class ConversationStore: ObservableObject {
                         rows[0] = first.row
                         recordFirstProjection(bytes: first.projectedSourceBytes)
                     }
+                    warmNewlySealedMarkdownTiles(
+                        previousRowCount: cached.rows.count,
+                        rows: rows
+                    )
                     projectionCache[itemID] = ProjectionCacheEntry(
                         itemRevision: itemRevision,
                         rows: rows
@@ -3193,6 +3197,36 @@ final class ConversationStore: ObservableObject {
             }
         }
         pendingProjectionChanges.removeAll(keepingCapacity: true)
+    }
+
+    /// A streamed tail re-segmentation just sealed one or more tiles. Their
+    /// hosted-to-native flip publishes within ~33ms; warming the prepared
+    /// markdown artifact now usually wins that race, so the flip mounts the
+    /// rich rendering directly instead of flashing raw source and promoting
+    /// a beat later.
+    private func warmNewlySealedMarkdownTiles(
+        previousRowCount: Int,
+        rows: [TranscriptRowProjection]
+    ) {
+        guard rows.count > previousRowCount else { return }
+        let sealedStart = max(0, previousRowCount - 1)
+        let sealed = rows[sealedStart..<(rows.count - 1)]
+        let warmTexts = sealed.compactMap { row -> String? in
+            guard case .message(let message) = row.displayItem,
+                  let content = message.contents.first,
+                  content.isComplete,
+                  !message.isStreaming else { return nil }
+            switch content.kind {
+            case .markdown, .plainText, .generic:
+                return content.text
+            case .code, .imagePlaceholder:
+                return nil
+            }
+        }
+        guard !warmTexts.isEmpty else { return }
+        Task(priority: .userInitiated) {
+            await SanitizedMarkdownCache.shared.prefetch(texts: warmTexts)
+        }
     }
 
     private func recordIncrementalProjection(bytes: Int) {
