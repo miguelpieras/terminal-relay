@@ -865,6 +865,19 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         private var selectionDragLastWindowPoint: NSPoint?
         private var selectionAutoscrollTimer: Timer?
         private weak var selectionPreviousResponder: NSResponder?
+        /// Timestamp of the last REAL user scroll input. Every input that can
+        /// move the transcript passes through an intercepted funnel (wheel /
+        /// trackpad events, scroller gestures, selection drags, table keys),
+        /// so an unexpected origin move WITHOUT a recent mark is machine
+        /// drift — a seal's height-cache reset clamping the clip, an estimate
+        /// settling — and must re-pin instead of releasing follow. The
+        /// 2026-08-19 field repro: one such clamp mid-stream silently killed
+        /// sticky follow and froze the transcript behind the 180pt gate.
+        private var lastUserScrollInput: CFTimeInterval = 0
+
+        func selectionMarkUserScrollInput() {
+            lastUserScrollInput = CACurrentMediaTime()
+        }
         private var pendingLiveScrollRestorationAnchor: Anchor?
         private var pendingLiveScrollRestorationFollowsBottom = false
         private var pendingLiveScrollRestorationExpectedOriginY: CGFloat?
@@ -2441,6 +2454,9 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         /// Phase-less wheel events synthesize the same live-scroll window a
         /// trackpad gets, ended by a short quiescence timer.
         private func wheelEventDidArrive(_ event: NSEvent) {
+            // Every wheel/trackpad event is user input, including phases the
+            // window synthesis ignores (gesture and momentum tails).
+            selectionMarkUserScrollInput()
             guard !selectionDragActive else { return }
             guard event.phase == [] && event.momentumPhase == [] else { return }
             if !isLiveScrolling {
@@ -2465,6 +2481,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         /// A trackpad gesture takes ownership of any synthesized wheel
         /// window; its own didEnd notification will close the mode.
         private func trackpadLiveScrollWillStart() {
+            selectionMarkUserScrollInput()
             wheelScrollWindowActive = false
             wheelQuiescenceTimer?.invalidate()
             wheelQuiescenceTimer = nil
@@ -2851,13 +2868,22 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 let currentOrigin = scrollView.contentView.bounds.origin.y
                 let userMovedViewport = abs(currentOrigin - expectedOrigin) > 0.5
                 if userMovedViewport && (!pendingMutationFollowsBottom || !isAtBottom) {
-                    // A keyboard, scrollbar, programmatic, or late momentum
-                    // move happened after the mutation captured ownership.
-                    // Never overwrite that newer viewport decision — and
+                    let userInputWasRecent =
+                        CACurrentMediaTime() - lastUserScrollInput < 1.0
+                    if pendingMutationFollowsBottom, isFollowingBottom,
+                       !userInputWasRecent {
+                        // The origin moved with NO user input anywhere in the
+                        // funnels: machine drift — a seal's remove+insert
+                        // resetting the row height cache, an estimate clamp
+                        // settling. Not a viewport decision; stay armed with
+                        // a fresh baseline and re-pin on the next pass.
+                        pendingExpectedClipOriginY = currentOrigin
+                        return false
+                    }
+                    // A user moved the viewport after the mutation captured
+                    // ownership. Never overwrite that newer decision — and
                     // stop following so later document growth cannot fight
-                    // it either. (An AppKit clamp after an inflated height
-                    // estimate settles leaves the viewport exactly at the new
-                    // bottom, so isAtBottom spares it from this drop.)
+                    // it either.
                     isFollowingBottom = false
                     pendingMutationAnchor = nil
                     pendingMutationFollowsBottom = false

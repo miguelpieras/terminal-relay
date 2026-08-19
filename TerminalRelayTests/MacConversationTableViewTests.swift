@@ -1229,6 +1229,95 @@ final class MacConversationTableViewTests: XCTestCase {
         XCTAssertTrue(linkCursor === NSCursor.pointingHand)
     }
 
+    /// Marks user scroll intent without opening a gesture window or moving
+    /// content: a momentum-phase wheel event reaches the scroll view's
+    /// scrollWheel (the user-input funnel) but is ignored by the window
+    /// synthesis, exactly like the tail of a real momentum scroll.
+    private func markUserScrollInput(in table: NSTableView) {
+        let cgEvent = CGEvent(
+            scrollWheelEvent2Source: nil,
+            units: .pixel,
+            wheelCount: 1,
+            wheel1: 0,
+            wheel2: 0,
+            wheel3: 0
+        )!
+        cgEvent.setIntegerValueField(.scrollWheelEventMomentumPhase, value: 1)
+        table.enclosingScrollView?.scrollWheel(with: NSEvent(cgEvent: cgEvent)!)
+    }
+
+    func testMachineOriginDriftCannotKillStickyFollow() throws {
+        // The seal kill-chain from the 2026-08-19 field repro: a visible-row
+        // remove+insert drops the row's height cache, the frame transiently
+        // shrinks, the clip clamps, and when the real height lands the origin
+        // sits above the bottom with NO user input — that must re-pin, never
+        // release follow.
+        var rows = fastSelectableRows(count: 60)
+        let mounted = mountMixed(rows: rows)
+        let scrollView = try XCTUnwrap(mounted.table.enclosingScrollView)
+        XCTAssertLessThanOrEqual(distanceFromBottom(in: mounted.table), 8)
+
+        // Machine drift: the origin moves up with no user-input funnel fired.
+        var proposed = scrollView.contentView.bounds
+        proposed.origin.y = max(0, proposed.origin.y - 120)
+        scrollView.contentView.setBoundsOrigin(
+            scrollView.contentView.constrainBoundsRect(proposed).origin
+        )
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        settle(mounted.hosting)
+
+        // The next streamed batch must still pin to the bottom.
+        rows.append(MixedRow(
+            id: "post-drift-append",
+            contentRevision: 3,
+            text: "post drift line\n",
+            usesNativeText: true,
+            usesFastPlainTextRenderer: true,
+            mutationSourceIDOverride: "drag-item"
+        ))
+        mounted.hosting.rootView = mixedTable(rows: rows)
+        settle(mounted.hosting)
+        XCTAssertLessThanOrEqual(
+            distanceFromBottom(in: mounted.table),
+            8,
+            "Machine origin drift must re-pin, not silently release follow."
+        )
+    }
+
+    func testUserWheelInputStillReleasesFollowOnDrift() throws {
+        var rows = fastSelectableRows(count: 60)
+        let mounted = mountMixed(rows: rows)
+        let scrollView = try XCTUnwrap(mounted.table.enclosingScrollView)
+        XCTAssertLessThanOrEqual(distanceFromBottom(in: mounted.table), 8)
+
+        // The same origin move, but preceded by real user wheel input.
+        markUserScrollInput(in: mounted.table)
+        var proposed = scrollView.contentView.bounds
+        proposed.origin.y = max(0, proposed.origin.y - 120)
+        let requested = scrollView.contentView
+            .constrainBoundsRect(proposed).origin
+        scrollView.contentView.setBoundsOrigin(requested)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        settle(mounted.hosting)
+
+        rows.append(MixedRow(
+            id: "post-user-append",
+            contentRevision: 3,
+            text: "post user line\n",
+            usesNativeText: true,
+            usesFastPlainTextRenderer: true,
+            mutationSourceIDOverride: "drag-item"
+        ))
+        mounted.hosting.rootView = mixedTable(rows: rows)
+        settle(mounted.hosting)
+        XCTAssertEqual(
+            scrollView.contentView.bounds.origin.y,
+            requested.y,
+            accuracy: 0.5,
+            "A user-initiated move away from the bottom must release follow."
+        )
+    }
+
     func testFollowOwnerSurvivesLateDocumentGrowth() throws {
         let mounted = mount(rowCount: 60)
         let scrollView = try XCTUnwrap(mounted.table.enclosingScrollView)
@@ -1261,6 +1350,7 @@ final class MacConversationTableViewTests: XCTestCase {
         settle(mounted.hosting)
         XCTAssertLessThanOrEqual(distanceFromBottom(in: mounted.table), 8)
 
+        markUserScrollInput(in: mounted.table)
         var proposed = scrollView.contentView.bounds
         proposed.origin.y = max(0, proposed.origin.y - 240)
         let requestedOrigin = scrollView.contentView
@@ -2848,7 +2938,9 @@ final class MacConversationTableViewTests: XCTestCase {
         }
 
         // Move away from either transcript boundary so the full explicit
-        // overscan is available on both sides of the viewport.
+        // overscan is available on both sides of the viewport. This models
+        // user scrolling, so declare it through the input funnel.
+        markUserScrollInput(in: mounted.table)
         prefetchedBatches.removeAll()
         var proposed = scrollView.contentView.bounds
         proposed.origin.y = mounted.table.rect(ofRow: 100).minY
@@ -3156,6 +3248,7 @@ final class MacConversationTableViewTests: XCTestCase {
         guard let scrollView = mounted.table.enclosingScrollView else {
             return XCTFail("Expected enclosing scroll view")
         }
+        markUserScrollInput(in: mounted.table)
         var proposed = scrollView.contentView.bounds
         proposed.origin.y = max(0, proposed.origin.y - 600)
         scrollView.contentView.setBoundsOrigin(
@@ -3329,6 +3422,7 @@ final class MacConversationTableViewTests: XCTestCase {
         mounted.hosting.needsLayout = true
         mounted.hosting.layoutSubtreeIfNeeded()
 
+        markUserScrollInput(in: mounted.table)
         var userOwned = scrollView.contentView.bounds
         userOwned.origin.y = max(0, userOwned.origin.y - 240)
         let userOwnedOrigin = scrollView.contentView

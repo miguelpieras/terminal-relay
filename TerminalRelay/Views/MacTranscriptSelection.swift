@@ -20,6 +20,9 @@ protocol MacTranscriptTableSelectionDelegate: AnyObject {
     /// Pointer feedback: I-beam over text, pointing hand over links, nil for
     /// the arrow default.
     func selectionCursor(atWindowPoint point: NSPoint) -> NSCursor?
+    /// A key or event that can scroll the transcript passed through a user
+    /// input funnel (used to distinguish user moves from machine drift).
+    func selectionMarkUserScrollInput()
     var selectionIsActive: Bool { get }
 }
 
@@ -54,6 +57,13 @@ final class MacTranscriptTableView: NSTableView {
 
     override func selectAll(_ sender: Any?) {
         selectionDelegate?.selectionSelectAll()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        // Keys reach the table only while a selection holds first responder;
+        // any of them may scroll (page/arrow/home/end), which is user intent.
+        selectionDelegate?.selectionMarkUserScrollInput()
+        super.keyDown(with: event)
     }
 
     override func cancelOperation(_ sender: Any?) {
