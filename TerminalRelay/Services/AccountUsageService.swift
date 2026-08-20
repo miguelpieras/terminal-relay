@@ -117,6 +117,17 @@ final class AccountUsageService: ObservableObject {
     struct Key: Hashable {
         let workerID: UUID
         let kind: AgentKind
+        let accountID: ProviderAccountID?
+
+        init(
+            workerID: UUID,
+            kind: AgentKind,
+            accountID: ProviderAccountID? = nil
+        ) {
+            self.workerID = workerID
+            self.kind = kind
+            self.accountID = accountID
+        }
     }
 
     @Published private(set) var snapshots: [Key: AccountUsageSnapshot] = [:]
@@ -127,6 +138,7 @@ final class AccountUsageService: ObservableObject {
     private let cacheDuration: TimeInterval = 60
     private var resetRedemptionKeys: [ResetRedemptionKey: UUID] = [:]
     private var workersRedeemingCodexReset: Set<UUID> = []
+    private var accountResetRedemptionKeys: Set<Key> = []
 
     init(screenshotDemoWorkerID: UUID? = nil) {
 #if DEBUG
@@ -186,16 +198,140 @@ final class AccountUsageService: ObservableObject {
         snapshots[Key(workerID: workerID, kind: kind)]
     }
 
+    func snapshot(
+        for workerID: UUID,
+        account: ProviderAccountProfile
+    ) -> AccountUsageSnapshot? {
+        snapshots[
+            Key(
+                workerID: workerID,
+                kind: account.provider,
+                accountID: account.accountID
+            )
+        ]
+    }
+
     func error(for workerID: UUID, kind: AgentKind) -> String? {
         errors[Key(workerID: workerID, kind: kind)]
+    }
+
+    func error(for workerID: UUID, account: ProviderAccountProfile) -> String? {
+        errors[
+            Key(
+                workerID: workerID,
+                kind: account.provider,
+                accountID: account.accountID
+            )
+        ]
     }
 
     func isLoading(workerID: UUID, kind: AgentKind) -> Bool {
         loadingKeys.contains(Key(workerID: workerID, kind: kind))
     }
 
+    func isLoading(workerID: UUID, account: ProviderAccountProfile) -> Bool {
+        loadingKeys.contains(
+            Key(
+                workerID: workerID,
+                kind: account.provider,
+                accountID: account.accountID
+            )
+        )
+    }
+
     func requiresNewSessionSignIn(workerID: UUID, kind: AgentKind) -> Bool {
         newSessionSignInRequiredKeys.contains(Key(workerID: workerID, kind: kind))
+    }
+
+    func requiresNewSessionSignIn(
+        workerID: UUID,
+        account: ProviderAccountProfile
+    ) -> Bool {
+        newSessionSignInRequiredKeys.contains(
+            Key(
+                workerID: workerID,
+                kind: account.provider,
+                accountID: account.accountID
+            )
+        )
+    }
+
+    func refresh(
+        worker: ServerProfile,
+        accounts: [ProviderAccountProfile],
+        force: Bool = false
+    ) async {
+        let now = Date()
+        let accounts = accounts.filter { account in
+            let key = Key(
+                workerID: worker.id,
+                kind: account.provider,
+                accountID: account.accountID
+            )
+            guard !accountResetRedemptionKeys.contains(key) else { return false }
+            guard !loadingKeys.contains(key) else { return false }
+            guard !force, let snapshot = snapshots[key] else { return true }
+            return now.timeIntervalSince(snapshot.fetchedAt) >= cacheDuration
+        }
+        guard !accounts.isEmpty else { return }
+
+        for account in accounts {
+            let key = Key(
+                workerID: worker.id,
+                kind: account.provider,
+                accountID: account.accountID
+            )
+            loadingKeys.insert(key)
+            errors[key] = nil
+        }
+
+        await withTaskGroup(
+            of: (ProviderAccountProfile, Result<AccountUsageSnapshot, Error>).self
+        ) { group in
+            for account in accounts {
+                group.addTask {
+                    do {
+                        return (
+                            account,
+                            .success(try await Self.fetch(account: account, worker: worker))
+                        )
+                    } catch {
+                        return (account, .failure(error))
+                    }
+                }
+            }
+            for await (account, result) in group {
+                let key = Key(
+                    workerID: worker.id,
+                    kind: account.provider,
+                    accountID: account.accountID
+                )
+                loadingKeys.remove(key)
+                switch result {
+                case .success(let snapshot):
+                    snapshots[key] = snapshot
+                    errors[key] = nil
+                    newSessionSignInRequiredKeys.remove(key)
+                case .failure(let error):
+                    if error as? AccountUsageError == .signInRequired(account.provider) {
+                        snapshots[key] = nil
+                        newSessionSignInRequiredKeys.insert(key)
+                    } else {
+                        newSessionSignInRequiredKeys.remove(key)
+                    }
+                    errors[key] = (error as? LocalizedError)?.errorDescription
+                        ?? AccountUsageError.commandFailed(account.provider).localizedDescription
+                }
+            }
+        }
+    }
+
+    func refresh(
+        worker: ServerProfile,
+        account: ProviderAccountProfile,
+        force: Bool = false
+    ) async {
+        await refresh(worker: worker, accounts: [account], force: force)
     }
 
     func refresh(worker: ServerProfile, force: Bool = false) async {
@@ -279,6 +415,58 @@ final class AccountUsageService: ObservableObject {
         return CodexResetRedemptionResult(
             outcome: outcome,
             limitsRefreshed: limitsRefreshed
+        )
+    }
+
+    func redeemCodexReset(
+        worker: ServerProfile,
+        account: ProviderAccountProfile,
+        creditID: String?
+    ) async throws -> CodexResetRedemptionResult {
+        guard account.provider == .codex else {
+            throw AccountUsageError.resetRedemptionFailed
+        }
+        let usageKey = Key(
+            workerID: worker.id,
+            kind: .codex,
+            accountID: account.accountID
+        )
+        while loadingKeys.contains(usageKey) {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        guard accountResetRedemptionKeys.insert(usageKey).inserted else {
+            throw AccountUsageError.resetRedemptionFailed
+        }
+        defer { accountResetRedemptionKeys.remove(usageKey) }
+        let creditID = creditID?.nilIfEmpty
+        let key = ResetRedemptionKey(
+            workerID: worker.id,
+            accountID: account.accountID,
+            creditID: creditID
+        )
+        let idempotencyKey = resetRedemptionKeys[key] ?? UUID()
+        resetRedemptionKeys[key] = idempotencyKey
+        defer { resetRedemptionKeys[key] = nil }
+
+        let configuration = SSHCommandBuilder.codexResetConfiguration(
+            for: worker,
+            accountID: account.accountID,
+            idempotencyKey: idempotencyKey,
+            creditID: creditID
+        )
+        let result = try await Subprocess.run(
+            executable: URL(fileURLWithPath: configuration.executable),
+            arguments: configuration.arguments
+        )
+        guard result.exitCode == 0 else {
+            throw AccountUsageError.commandFailed(.codex)
+        }
+        try Self.validateAccountRoute(result.standardOutput, expected: account)
+        let outcome = try Self.parseCodexResetConsume(result.standardOutput)
+        await refresh(worker: worker, account: account, force: true)
+        return CodexResetRedemptionResult(
+            outcome: outcome,
+            limitsRefreshed: snapshots[usageKey] != nil
         )
     }
 
@@ -515,6 +703,59 @@ final class AccountUsageService: ObservableObject {
         }
     }
 
+    private static func fetch(
+        account: ProviderAccountProfile,
+        worker: ServerProfile
+    ) async throws -> AccountUsageSnapshot {
+        let configuration = SSHCommandBuilder.providerAccountUsageConfiguration(
+            for: worker,
+            account: account
+        )
+        let result = try await Subprocess.run(
+            executable: URL(fileURLWithPath: configuration.executable),
+            arguments: configuration.arguments
+        )
+        guard result.exitCode == 0 else {
+            throw AccountUsageError.commandFailed(account.provider)
+        }
+        try validateAccountRoute(result.standardOutput, expected: account)
+        switch account.provider {
+        case .codex:
+            return try parseCodex(
+                result.standardOutput,
+                fallbackAccount: account.displayName
+            )
+        case .claude:
+            return try parseClaude(
+                result.standardOutput,
+                fallbackAccount: account.displayName
+            )
+        }
+    }
+
+    static func validateAccountRoute(
+        _ data: Data,
+        expected account: ProviderAccountProfile
+    ) throws {
+        let lines = String(decoding: data, as: UTF8.self)
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+        guard let markerIndex = lines.firstIndex(
+            of: "__TERMINAL_RELAY_ACCOUNT_ROUTE_V1__"
+        ),
+        lines.indices.contains(markerIndex + 1) else {
+            throw AccountUsageError.invalidResponse(account.provider)
+        }
+        let fields = lines[markerIndex + 1]
+            .split(separator: "|", omittingEmptySubsequences: false)
+            .map(String.init)
+        guard fields == [
+            "account", account.provider.rawValue, account.accountID.rawValue,
+        ] else {
+            throw AccountUsageError.invalidResponse(account.provider)
+        }
+    }
+
     private static func consumeCodexReset(
         worker: ServerProfile,
         creditID: String?,
@@ -571,7 +812,18 @@ final class AccountUsageService: ObservableObject {
 
 private struct ResetRedemptionKey: Hashable {
     let workerID: UUID
+    let accountID: ProviderAccountID?
     let creditID: String?
+
+    init(
+        workerID: UUID,
+        accountID: ProviderAccountID? = nil,
+        creditID: String?
+    ) {
+        self.workerID = workerID
+        self.accountID = accountID
+        self.creditID = creditID
+    }
 }
 
 private struct CodexEnvelope: Decodable {

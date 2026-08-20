@@ -1,9 +1,10 @@
-# Terminal Relay chat protocol v1
+# Terminal Relay account-bound chat protocol v2
 
 Terminal Relay chat is a bidirectional NDJSON stream carried inside the same
 authenticated SSH connection as the existing worker commands. It has no TCP
 listener, central service, or transcript database. One worker-local broker owns
-each provider conversation; macOS, iPhone, and iPad attach to that broker.
+each provider conversation. The macOS client supports v2. iPhone and iPad fail
+closed on a multi-account worker until their account-aware client ships.
 
 The provider's local history remains authoritative. The broker holds a bounded
 materialized snapshot and replay window in memory only. Clients hold the
@@ -12,7 +13,8 @@ snapshot after a replay gap or broker restart.
 
 ## Transport
 
-`terminal-relay-session chat-attach-v1` opens an SSH exec channel without a
+`terminal-relay-session chat-attach-v2 <provider> <account-id> <repository> <relay-id>`
+opens an SSH exec channel without a
 PTY. Standard input and standard output carry UTF-8 NDJSON. Standard error is
 reserved for sanitized transport diagnostics and never contains protocol
 payloads or provider content.
@@ -61,6 +63,9 @@ Identifiers are never interchangeable:
 
 - `relayId` is the lowercase UUID of one Terminal Relay broker instance. It is
   the only identifier accepted by exact attach and stop operations.
+- `accountId` is the lowercase worker-issued UUID of one provider profile. It
+  is immutable for the conversation and is required on every v2 command and
+  event.
 - `providerThreadId` is the provider's canonical Codex thread or Claude
   session UUID. History and resume use this value.
 - `turnId` identifies one user turn. Codex supplies it. Claude turns reconcile
@@ -74,8 +79,8 @@ Identifiers are never interchangeable:
 - `snapshotGeneration` is a lowercase UUID that changes whenever the broker
   replaces materialized state from provider history.
 
-Stopping by provider thread ID, repository name, provider kind, timestamp, or
-UI selection is forbidden. A chat-to-terminal transition finishes or
+Stopping by provider thread ID, repository name, provider kind, account alone,
+timestamp, or UI selection is forbidden. A chat-to-terminal transition finishes or
 interrupts the current turn, stops the exact chat relay, verifies that the
 provider thread lock was released, and starts a new terminal relay bound to
 the same provider thread.
@@ -86,11 +91,12 @@ Every client command contains:
 
 ```json
 {
-  "v": 1,
+  "v": 2,
   "type": "turn.start",
   "requestId": "00000000-0000-4000-8000-000000000000",
   "relayId": "00000000-0000-4000-8000-000000000000",
   "provider": "codex",
+  "accountId": "00000000-0000-4000-8000-000000000001",
   "providerThreadId": "00000000-0000-4000-8000-000000000000",
   "sentAt": 0,
   "payload": {}
@@ -101,11 +107,12 @@ Every sequenced server event contains:
 
 ```json
 {
-  "v": 1,
+  "v": 2,
   "type": "message.delta",
   "eventId": "00000000-0000-4000-8000-000000000000",
   "relayId": "00000000-0000-4000-8000-000000000000",
   "provider": "codex",
+  "accountId": "00000000-0000-4000-8000-000000000001",
   "providerThreadId": "00000000-0000-4000-8000-000000000000",
   "snapshotGeneration": "00000000-0000-4000-8000-000000000000",
   "seq": 1,
@@ -157,8 +164,8 @@ The client generates the `turn.start` request UUID before upload and invokes
 one of two fixed, typed SSH helper operations:
 
 ```text
-terminal-relay-session chat-attachment-upload-v1 <codex|claude> <repository> <relay-id> <request-id> <attachment-id> <extension> <byte-count>
-terminal-relay-session chat-attachment-delete-v1 <codex|claude> <repository> <relay-id> <request-id>
+terminal-relay-session chat-attachment-upload-v2 <codex|claude> <account-id> <repository> <relay-id> <request-id> <attachment-id> <extension> <byte-count>
+terminal-relay-session chat-attachment-delete-v2 <codex|claude> <account-id> <repository> <relay-id> <request-id>
 ```
 
 The upload bytes are carried on SSH standard input. The helper creates
@@ -193,7 +200,7 @@ from diagnostics.
 
 ## Server events
 
-The v1 event set is:
+The v2 event set is:
 
 - `session.hello`, `session.state`, `session.heartbeat`,
   `session.terminalFallbackRequired` (unsupported-interaction compatibility
@@ -213,7 +220,7 @@ Message and reasoning deltas append only to the identified incomplete item.
 `*.completed` replaces that item with the provider's authoritative final
 content. A live `tool.updated` may carry optional `payload.outputDelta`; new
 clients append it, while `payload.output` remains an authoritative replacement
-for compatibility with cumulative v1 workers. If both fields are present,
+for compatibility with older cumulative workers. If both fields are present,
 `output` wins. Snapshots and `tool.completed` always contain the bounded
 authoritative `output`, so old clients attached to a delta-producing worker
 still converge at completion or reconnect. Tool completion includes bounded final output, status, duration,
@@ -315,7 +322,7 @@ sanitized error categories only. They never contain prompts, responses,
 reasoning, tool input/output, diffs, file previews, approval details, secret
 answers, account data, provider objects, or raw protocol records.
 
-Workers advertise chat per provider only after the v1 command, broker, and
+Workers advertise account-bound chat per provider only after the v2 command, broker, and
 adapter readiness checks pass. Old clients and old workers retain the existing
 terminal protocol. Active TUI sessions are never converted by parsing ANSI
 screen output.

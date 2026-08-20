@@ -340,7 +340,7 @@ final class WorkerRemoteCommandTests: XCTestCase {
         let instanceID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         let catalog = try WorkerThreadProtocol.parse(
             """
-            \(WorkerThreadProtocol.marker)
+            \(WorkerThreadProtocol.previousMarker)
             {"threads":[{"provider":"claude","threadID":"\(threadID)","title":"Dormant","updatedAt":10,"archived":false,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":null}
             """,
             repositoryName: "terminal-relay"
@@ -470,7 +470,7 @@ final class WorkerRemoteCommandTests: XCTestCase {
         )
         let exactResponse = try WorkerSessionProtocol.parse(
             """
-            \(WorkerSessionProtocol.marker)
+            \(WorkerSessionProtocol.legacyMarker)
             session|codex|terminal-relay|0|\(instanceToken)
             """
         )
@@ -485,7 +485,7 @@ final class WorkerRemoteCommandTests: XCTestCase {
         )
         XCTAssertThrowsError(
             try WorkerSessionProtocol.parse(
-                "\(WorkerSessionProtocol.marker)\nsession|codex|terminal-relay|0"
+                "\(WorkerSessionProtocol.legacyMarker)\nsession|codex|terminal-relay|0"
             )
         ) { error in
             XCTAssertEqual(error as? WorkerSessionProtocolError, .invalidRecord)

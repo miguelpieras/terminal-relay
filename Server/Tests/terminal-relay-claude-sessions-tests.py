@@ -21,6 +21,7 @@ SESSION_ONE = "11111111-1111-4111-8111-111111111111"
 SESSION_TWO = "22222222-2222-4222-8222-222222222222"
 SESSION_THREE = "33333333-3333-4333-8333-333333333333"
 SESSION_FOUR = "44444444-4444-4444-8444-444444444444"
+ACCOUNT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
 
 def load_adapter():
@@ -130,6 +131,7 @@ def run() -> None:
             adapter.list_command,
             [str(project), str(archives), "open"],
             True,
+            ACCOUNT_ID,
         )
         assert [row["threadID"] for row in open_catalog["threads"]] == [
             SESSION_ONE,
@@ -137,6 +139,9 @@ def run() -> None:
         ]
         assert open_catalog["threads"][0]["activityState"] == "inactive"
         assert open_catalog["threads"][0]["capabilities"]["resume"] is True
+        assert all(
+            row["accountID"] == ACCOUNT_ID for row in open_catalog["threads"]
+        )
         assert open_catalog["threads"][1]["activityState"] == "external-active"
         assert open_catalog["threads"][1]["capabilities"]["resume"] is False
         assert all(
@@ -205,6 +210,42 @@ def run() -> None:
         )
         assert len(final_bounded_page["threads"]) == 100
         assert final_bounded_page["nextCursor"] is None
+
+        config_directory = root_path / "claude-account-data"
+        config_directory.mkdir(mode=0o700)
+        runtime_adapter = load_adapter()
+        original_environment = {
+            key: os.environ.get(key)
+            for key in (
+                "TERMINAL_RELAY_PROVIDER",
+                "TERMINAL_RELAY_ACCOUNT_ID",
+                "CLAUDE_CONFIG_DIR",
+            )
+        }
+        original_run = runtime_adapter.subprocess.run
+        captured_environment = None
+
+        def fake_claude_run(*_arguments, **kwargs):
+            nonlocal captured_environment
+            captured_environment = kwargs["env"]
+            return SimpleNamespace(returncode=0, stdout=b"[]")
+
+        try:
+            os.environ["TERMINAL_RELAY_PROVIDER"] = "claude"
+            os.environ["TERMINAL_RELAY_ACCOUNT_ID"] = ACCOUNT_ID
+            os.environ["CLAUDE_CONFIG_DIR"] = str(config_directory)
+            assert runtime_adapter.runtime_account_identity() == ACCOUNT_ID
+            runtime_adapter.subprocess.run = fake_claude_run
+            assert runtime_adapter.provider_active_session_ids(str(project), True) == set()
+            assert captured_environment is not None
+            assert captured_environment["CLAUDE_CONFIG_DIR"] == str(config_directory)
+        finally:
+            runtime_adapter.subprocess.run = original_run
+            for key, value in original_environment.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
         bad_marker = archives / SESSION_ONE
         bad_marker.write_text("corrupt\n", encoding="utf-8")

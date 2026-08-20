@@ -190,10 +190,13 @@ expected = {
 expected_capabilities = [
     "agent-sessions",
     "chat-v1",
+    "chat-v2",
     "file-attachments-v1",
+    "provider-accounts-v1",
     "runtime-updates-v1",
     "threads-v1",
     "threads-v2",
+    "threads-v3",
 ]
 digest = re.compile(r"^[a-f0-9]{64}$")
 
@@ -456,7 +459,7 @@ schedule_app_server_restart() {
             LOGNAME="$runtime_user" \
             SHELL=/bin/bash \
             PATH=/usr/local/bin:/usr/bin:/bin \
-            "$launcher" __schedule-codex-app-server-restart \
+            "$launcher" __schedule-all-codex-app-server-restarts \
         && [[ "$(/usr/bin/stat -c '%U:%G:%a' "$restart_marker")" \
             == "$runtime_user:$runtime_group:600" ]]
 }

@@ -2036,6 +2036,7 @@ final class ConversationStore: ObservableObject {
                     eventID: envelope.eventID,
                     relayID: envelope.relayID,
                     provider: envelope.provider,
+                    accountID: envelope.accountID,
                     providerThreadID: envelope.providerThreadID,
                     snapshotGeneration: envelope.snapshotGeneration,
                     sequence: nil,

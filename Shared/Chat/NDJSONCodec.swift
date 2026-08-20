@@ -109,7 +109,8 @@ struct ChatNDJSONDecoder: Sendable {
             eventID: envelope.eventID,
             sequence: envelope.sequence
         )
-        guard envelope.v == ChatEnvelope.protocolVersion else {
+        guard envelope.v == ChatEnvelope.legacyProtocolVersion
+                || envelope.v == ChatEnvelope.protocolVersion else {
             throw ChatProtocolError.unsupportedVersion(envelope.v, decodedContext)
         }
         guard Self.isValid(envelope) else {
@@ -119,7 +120,16 @@ struct ChatNDJSONDecoder: Sendable {
     }
 
     private static func isValid(_ envelope: ChatEnvelope) -> Bool {
-        guard ChatWireValidation.isCanonicalUUID(envelope.relayID),
+        let hasValidRouteIdentity = switch envelope.v {
+        case ChatEnvelope.legacyProtocolVersion:
+            envelope.accountID == nil
+        case ChatEnvelope.protocolVersion:
+            envelope.accountID != nil
+        default:
+            false
+        }
+        guard hasValidRouteIdentity,
+              ChatWireValidation.isCanonicalUUID(envelope.relayID),
               !envelope.type.isEmpty,
               envelope.type.utf8.count <= 100,
               envelope.type.range(of: #"^[A-Za-z][A-Za-z0-9.]*$"#, options: .regularExpression) != nil,

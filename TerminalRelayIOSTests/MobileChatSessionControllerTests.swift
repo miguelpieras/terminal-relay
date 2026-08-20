@@ -126,6 +126,8 @@ final class MobileChatSessionControllerTests: XCTestCase {
         XCTAssertTrue(recorder.commands[1].contains("chat-start-v1"))
         let envelopes = await recorder.transport.sentEnvelopes()
         XCTAssertEqual(envelopes.first?.type, "session.attach")
+        XCTAssertEqual(envelopes.first?.v, 1)
+        XCTAssertNil(envelopes.first?.accountID)
         XCTAssertEqual(envelopes.first?.relayID, relayID)
     }
 
@@ -321,14 +323,14 @@ final class MobileChatSessionControllerTests: XCTestCase {
         if available {
             return Data(
                 """
-                \(WorkerChatProtocol.marker)
+                \(WorkerChatProtocol.legacyMarker)
                 {"provider":"codex","available":true,"capabilities":{"protocolVersion":1,"features":["streaming"],"supportsHistory":true,"supportsFilePreview":true,"supportsApprovals":true,"supportsQuestions":true,"supportsAttachments":true},"reason":null}
                 """.utf8
             )
         }
         return Data(
             """
-            \(WorkerChatProtocol.marker)
+            \(WorkerChatProtocol.legacyMarker)
             {"provider":"codex","available":false,"capabilities":null,"reason":"not-ready"}
             """.utf8
         )
@@ -337,7 +339,7 @@ final class MobileChatSessionControllerTests: XCTestCase {
     private func startData() -> Data {
         Data(
             """
-            \(WorkerChatProtocol.marker)
+            \(WorkerChatProtocol.legacyMarker)
             {"relayId":"\(relayID)","provider":"codex","providerThreadId":"\(threadID)","capabilities":{"protocolVersion":1,"features":["streaming"],"supportsHistory":true,"supportsFilePreview":true,"supportsApprovals":true,"supportsQuestions":true,"supportsAttachments":true},"launchOptions":{}}
             """.utf8
         )

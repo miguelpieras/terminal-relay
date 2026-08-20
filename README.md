@@ -8,6 +8,10 @@ and Claude Code sessions running on workers you control. Repositories, agent
 credentials, provider history, and agent processes remain on the worker; the
 apps connect directly over SSH.
 
+The macOS client can bind tasks to explicit Codex or Claude account profiles.
+Each task keeps that account for its lifetime, so independently authenticated
+profiles can run concurrently without global account switching.
+
 ## Features
 
 - Shared native streaming chat on macOS, iPhone, and iPad, including Markdown,
@@ -18,8 +22,9 @@ apps connect directly over SSH.
   fail-closed native-chat capability checks.
 - Inactive and archived Codex and Claude conversations can be searched, resumed
   exactly, renamed, archived, and restored from macOS, iPhone, and iPad.
-- Every managed agent session includes a worker-local MCP for safe project and
-  thread operations on that worker.
+- Single-profile managed sessions include a worker-local MCP for safe project
+  and thread operations. MCP is disabled after multi-account activation until
+  its operations can carry an unforgeable task-scoped account route.
 - Handoff between Mac, iPhone, and iPad without stopping the remote agent.
 - GitHub repository creation, deploy-key setup, and worker checkout from macOS.
 - Multiple reusable workers and pinned SSH identities.
@@ -34,6 +39,34 @@ apps connect directly over SSH.
 Terminal Relay starts with no configured workers or GitHub owner. It reads the
 currently authenticated GitHub CLI user on macOS and stores every connection
 profile locally.
+
+## Use multiple Codex and Claude accounts on Mac
+
+Multi-account mode is for one owner using accounts they control on their own
+worker. Add Codex or Claude profiles from the Mac's worker account controls,
+complete the provider-native sign-in for each profile, then choose a profile
+when starting a task. If only one usable profile exists, Terminal Relay shows
+and preselects it; it never chooses an account from quota, model, last use, or
+task title.
+
+The worker assigns each profile an opaque UUID. Codex profiles use separate
+`CODEX_HOME` directories and app-server sockets; Claude profiles use separate
+`CLAUDE_CONFIG_DIR` directories. Credentials stay in those provider-native
+worker directories and are never returned to the Mac. Every task is identified
+by worker, provider, account UUID, and provider thread UUID. Changing a model or
+reasoning setting does not change that route, and an unavailable account fails
+without falling back to another profile.
+
+Activating a second account deliberately disables accountless legacy operations.
+Before that first activation, Terminal Relay asks you to confirm that existing
+provider history remains bound to the imported current profile; stop any
+already-running legacy tasks first. This is the one-time migration assignment,
+and the worker refuses activation while an accountless legacy task is still
+live so the same provider thread cannot be launched twice.
+The current iPhone/iPad client and the worker-local MCP therefore report that an
+upgrade is required on an activated worker; they never reuse whichever provider
+login happens to be current. Account-aware mobile handoff and task-scoped MCP
+routing are follow-up work.
 
 ## Install on macOS
 
@@ -98,11 +131,11 @@ or change the Claude transcript and do not block a direct Claude Code resume.
 Claude's configured retention still determines how long a conversation remains
 resumable.
 
-### Ask an agent to manage worker threads
+### Ask an agent to manage worker threads on a single-profile worker
 
-Every Codex and Claude session opened by Terminal Relay already has the
-worker-local `terminal_relay` MCP. There is nothing to install or configure in
-the agent. For example, ask:
+Before multi-account activation, every Codex and Claude session opened by
+Terminal Relay has the worker-local `terminal_relay` MCP. There is nothing to
+install or configure in the agent. For example, ask:
 
 ```text
 Tell me about my open threads.
@@ -145,13 +178,14 @@ worker-local `terminal-relay-chat` broker owns each live provider conversation,
 listens only on a mode-`0600` Unix socket, and keeps a bounded in-memory replay
 window. It has no TCP listener or transcript database.
 
-The same clients can still display already-running legacy PTY/SwiftTerm
-sessions, but native-chat creation and resumption never fall back to a raw
-terminal. If the worker does not advertise native chat, the request fails
-closed until the worker is updated. The helper supports concurrent Codex and
-Claude agents, permits multiple client attachments, and preserves exact
-restart intent across worker reboots. Closing a client leaves the remote agent
-running.
+Before multi-account activation, the same clients can still display
+already-running legacy PTY/SwiftTerm sessions, but native-chat creation and
+resumption never fall back to a raw terminal. Activation is refused until those
+legacy tasks stop. If the worker does not advertise native chat, the request
+fails closed until the worker is updated. The helper supports concurrent Codex
+and Claude agents, permits multiple client attachments, and preserves exact
+account-bound restart intent across worker reboots. Closing a client leaves the
+remote agent running.
 
 Codex's worker-local app server and the official Claude Agent SDK provide
 paginated catalogs of persisted conversations. The apps keep each provider
@@ -169,13 +203,15 @@ worker. Terminal Relay does not add a transcript store or cross-worker
 migration. Moving to a different worker or replacing its disk requires a
 separate provider-data migration.
 
-Managed Codex and Claude terminals receive
+On a worker that has not activated multi-account routing, managed Codex and
+Claude terminals receive
 `/usr/local/bin/terminal-relay-mcp`, a root-owned stdio MCP server with only
 seven bounded tools: list projects and conversations, start a Codex thread,
 resume Codex or Claude conversations, and rename, archive, or unarchive an
 inactive conversation. It delegates to the same typed worker helper and has no
 listener, shell, transcript reader, terminal input, deletion, or cross-worker
-access.
+access. Multi-account activation disables this ambient MCP path instead of
+letting a model choose or forge an account identifier.
 
 Terminal Relay does not operate a central backend:
 
@@ -183,7 +219,7 @@ Terminal Relay does not operate a central backend:
 macOS app ───────┐
                  ├─ direct SSH ─ worker ─ chat broker ─ Codex / Claude
 iPhone/iPad app ┘              ├ repositories in /workspace
-                               ├ local thread MCP (stdio only)
+                               ├ local thread MCP (before activation)
                                └ existing legacy PTY sessions
 ```
 

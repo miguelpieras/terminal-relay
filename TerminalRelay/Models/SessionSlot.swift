@@ -3,6 +3,17 @@ import Foundation
 struct SessionSlot: Hashable {
     let serverKey: String
     let kind: AgentKind
+    let accountID: ProviderAccountID?
+
+    init(
+        serverKey: String,
+        kind: AgentKind,
+        accountID: ProviderAccountID? = nil
+    ) {
+        self.serverKey = serverKey
+        self.kind = kind
+        self.accountID = accountID
+    }
 }
 
 struct SessionSlotRegistry {

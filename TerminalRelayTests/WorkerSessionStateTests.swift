@@ -2,6 +2,7 @@ import XCTest
 @testable import TerminalRelay
 
 final class WorkerSessionStateTests: XCTestCase {
+    private let accountID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab"
     func testParsesProjectsAndActiveSessionsAfterLoginNoise() throws {
         let response = try WorkerSessionProtocol.parse(
             """
@@ -95,11 +96,12 @@ final class WorkerSessionStateTests: XCTestCase {
         let response = try WorkerSessionProtocol.parse(
             """
             \(WorkerSessionProtocol.marker)
-            session|codex|terminal-relay|2|\(relayID)|123|43686174|1|\(threadID)|chat
-            session|claude|website-api|0|11111111-2222-4333-8444-555555555555
+            session|codex|\(accountID)|terminal-relay|2|\(relayID)|123|43686174|1|\(threadID)|chat
+            session|claude|\(accountID)|website-api|0|11111111-2222-4333-8444-555555555555|0||0||terminal
             """
         )
 
+        XCTAssertEqual(response.sessions[0].accountID?.rawValue, accountID)
         XCTAssertEqual(response.sessions[0].presentation, .chat)
         XCTAssertEqual(response.sessions[0].threadID, threadID)
         XCTAssertEqual(response.sessions[1].presentation, .terminal)
@@ -110,7 +112,7 @@ final class WorkerSessionStateTests: XCTestCase {
             try WorkerSessionProtocol.parse(
                 """
                 \(WorkerSessionProtocol.marker)
-                session|codex|terminal-relay|0|01234567-89ab-4def-8abc-0123456789ab|1||0|aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa|screen
+                session|codex|\(accountID)|terminal-relay|0|01234567-89ab-4def-8abc-0123456789ab|1||0|aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa|screen
                 """
             )
         ) {

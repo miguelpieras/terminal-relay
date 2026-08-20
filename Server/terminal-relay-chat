@@ -36,6 +36,7 @@ from typing import Any, Awaitable, Callable
 
 
 PROTOCOL_VERSION = 1
+ACCOUNT_PROTOCOL_VERSION = 2
 INSTALLED_PATH = "/usr/local/bin/terminal-relay-chat"
 BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
 SAFE_PATH = "/usr/local/bin:/usr/bin:/bin"
@@ -79,6 +80,8 @@ CLAUDE_HISTORY_PAGE_MESSAGES = 100
 SOCKET_NAME = "broker.sock"
 STATE_NAME = "broker.json"
 LOCK_NAME = "broker.lock"
+PROVIDER_ACCOUNTS_DIRECTORY = ".local/share/terminal-relay/provider-accounts-v1"
+PROVIDER_ACCOUNTS_ACTIVATION_CONTENT = b"version|1\n"
 
 UUID_PATTERN = re.compile(
     r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
@@ -235,6 +238,84 @@ def canonical_directory(value: str, label: str) -> str:
     if resolved != value:
         raise ChatError("invalidPath", f"The {label} is invalid.", exit_code=64)
     return value
+
+
+def provider_accounts_root() -> str | None:
+    if (
+        os.path.realpath(__file__) != INSTALLED_PATH
+        and os.environ.get("TERMINAL_RELAY_CHAT_TEST_MODE") == "1"
+        and os.environ.get("TERMINAL_RELAY_TEST_PROVIDER_ACCOUNTS_ROOT")
+    ):
+        return os.environ["TERMINAL_RELAY_TEST_PROVIDER_ACCOUNTS_ROOT"]
+    home = os.environ.get("HOME")
+    if not home or not os.path.isabs(home) or home == "/" or "\n" in home:
+        return None
+    return os.path.join(home, PROVIDER_ACCOUNTS_DIRECTORY)
+
+
+def provider_accounts_activated() -> bool:
+    root = provider_accounts_root()
+    if root is None:
+        return False
+    marker = os.path.join(root, "activated")
+    try:
+        descriptor = os.open(
+            marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise ChatError(
+            "unsafeState", "The provider account activation state is invalid."
+        ) from error
+    try:
+        try:
+            info = os.fstat(descriptor)
+            content = os.read(
+                descriptor, len(PROVIDER_ACCOUNTS_ACTIVATION_CONTENT) + 1
+            )
+        except OSError as error:
+            raise ChatError(
+                "unsafeState", "The provider account activation state is invalid."
+            ) from error
+    finally:
+        os.close(descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or content != PROVIDER_ACCOUNTS_ACTIVATION_CONTENT
+    ):
+        raise ChatError(
+            "unsafeState", "The provider account activation state is invalid."
+        )
+    return True
+
+
+def account_id_for(provider: str, requested: str | None) -> str | None:
+    activated = provider_accounts_activated()
+    environment_provider = os.environ.get("TERMINAL_RELAY_PROVIDER") or None
+    environment_account = os.environ.get("TERMINAL_RELAY_ACCOUNT_ID") or None
+    if environment_provider is not None and environment_provider != provider:
+        raise ChatError(
+            "staleAccount", "The provider account identity is stale.", exit_code=75
+        )
+    account_id = (
+        canonical_uuid(requested, "account ID") if requested is not None else None
+    )
+    if environment_account is not None:
+        environment_account = canonical_uuid(environment_account, "account ID")
+        if account_id is None or environment_account != account_id:
+            raise ChatError(
+                "staleAccount", "The provider account identity is stale.", exit_code=75
+            )
+    if account_id is None and activated:
+        raise ChatError(
+            "upgradeRequired",
+            "An account-aware Terminal Relay client is required.",
+            exit_code=75,
+        )
+    return account_id
 
 
 def attachment_session_directory(runtime_directory: str, relay_id: str) -> str:
@@ -568,6 +649,7 @@ def command_fingerprint(command: dict[str, Any]) -> str:
         "type": command.get("type"),
         "relayId": command.get("relayId"),
         "provider": command.get("provider"),
+        "accountID": command.get("accountID"),
         "providerThreadId": command.get("providerThreadId"),
         "turnId": command.get("turnId"),
         "itemId": command.get("itemId"),
@@ -690,9 +772,13 @@ def validate_launch_arguments(arguments: list[str]) -> dict[str, Any]:
     return accepted
 
 
-def chat_capabilities(provider: str) -> dict[str, Any]:
+def chat_capabilities(
+    provider: str, account_id: str | None = None
+) -> dict[str, Any]:
     common: dict[str, Any] = {
-        "protocolVersion": PROTOCOL_VERSION,
+        "protocolVersion": (
+            ACCOUNT_PROTOCOL_VERSION if account_id is not None else PROTOCOL_VERSION
+        ),
         "features": [
             "streaming",
             "history",
@@ -2650,8 +2736,15 @@ class CodexAdapter(ProviderAdapter):
 class ClaudeAdapter(ProviderAdapter):
     """Official Claude Agent SDK adapter kept behind the worker SDK venv."""
 
-    def __init__(self, *args: Any):
-        super().__init__(*args)
+    def __init__(
+        self,
+        project_directory: str,
+        thread_id: str | None,
+        launch_options: dict[str, Any],
+        claude_config_dir: str | None = None,
+    ):
+        super().__init__(project_directory, thread_id, launch_options)
+        self.claude_config_dir = claude_config_dir
         self.client: Any = None
         self.receive_task: asyncio.Task[None] | None = None
         self.active_turn: str | None = None
@@ -2714,6 +2807,13 @@ class ClaudeAdapter(ProviderAdapter):
 
     async def start(self, emit: Callable[..., Awaitable[dict[str, Any]]]) -> str:
         self.emit = emit
+        if (
+            self.claude_config_dir is not None
+            and os.environ.get("CLAUDE_CONFIG_DIR") != self.claude_config_dir
+        ):
+            raise ChatError(
+                "staleAccount", "The Claude account environment is stale.", exit_code=75
+            )
         self._sdk = await asyncio.to_thread(self._load_sdk)
         new_session = bool(self.launch_options.pop("_newSession", False))
         if self.thread_id and not new_session:
@@ -2731,6 +2831,10 @@ class ClaudeAdapter(ProviderAdapter):
             "include_partial_messages": True,
             "can_use_tool": self._can_use_tool,
         }
+        if self.claude_config_dir is not None:
+            options_kwargs["env"] = {
+                "CLAUDE_CONFIG_DIR": self.claude_config_dir,
+            }
         if new_session:
             options_kwargs["session_id"] = self.thread_id
         else:
@@ -3656,12 +3760,23 @@ class ChatBroker:
         relay_id: str,
         provider: ProviderAdapter,
         launch_options: dict[str, Any],
+        account_id: str | None = None,
     ):
         self.provider_name = provider_name
         self.repository = repository
         self.project_directory = project_directory
         self.runtime_directory = runtime_directory
         self.relay_id = relay_id
+        self.account_id = (
+            canonical_uuid(account_id, "account ID")
+            if account_id is not None
+            else None
+        )
+        self.protocol_version = (
+            ACCOUNT_PROTOCOL_VERSION
+            if self.account_id is not None
+            else PROTOCOL_VERSION
+        )
         self.provider = provider
         provider.request_snapshot_rebuild = self.rebuild_snapshot
         self.launch_options = launch_options
@@ -3728,8 +3843,8 @@ class ChatBroker:
         item_id: str | None = None,
     ) -> dict[str, Any]:
         self.sequence += 1
-        return {
-            "v": PROTOCOL_VERSION,
+        value = {
+            "v": self.protocol_version,
             "type": event_type,
             "eventId": new_uuid(),
             "relayId": self.relay_id,
@@ -3742,13 +3857,16 @@ class ChatBroker:
             "itemId": item_id,
             "payload": payload,
         }
+        if self.account_id is not None:
+            value["accountID"] = self.account_id
+        return value
 
     def control_event(
         self, event_type: str, payload: dict[str, Any]
     ) -> dict[str, Any]:
         """Create an attachment-local pre-sequence control record."""
-        return {
-            "v": PROTOCOL_VERSION,
+        value = {
+            "v": self.protocol_version,
             "type": event_type,
             "eventId": new_uuid(),
             "relayId": self.relay_id,
@@ -3761,6 +3879,9 @@ class ChatBroker:
             "itemId": None,
             "payload": sanitize_json(payload),
         }
+        if self.account_id is not None:
+            value["accountID"] = self.account_id
+        return value
 
     async def emit(
         self,
@@ -4090,7 +4211,7 @@ class ChatBroker:
             "turnState": self.turn_state,
             "activeTurnId": self.active_turn_id,
             "lastErrorMessage": self.last_error_message,
-            "capabilities": chat_capabilities(self.provider_name),
+            "capabilities": chat_capabilities(self.provider_name, self.account_id),
             "usage": self.usage,
             "hasOlderHistory": self.has_older_history,
             "oldestItemId": self.oldest_item_id,
@@ -4171,7 +4292,7 @@ class ChatBroker:
 
     def _write_state(self, status: str) -> None:
         state = {
-            "v": 1,
+            "v": self.protocol_version,
             "status": status,
             "provider": self.provider_name,
             "repository": self.repository,
@@ -4180,10 +4301,12 @@ class ChatBroker:
             "pid": os.getpid(),
             "processStart": process_start_identity(os.getpid()),
             "socket": self.socket_path,
-            "capabilities": chat_capabilities(self.provider_name),
+            "capabilities": chat_capabilities(self.provider_name, self.account_id),
             "launchOptions": public_launch_options(self.launch_options),
             "activityAt": self.activity_at,
         }
+        if self.account_id is not None:
+            state["accountID"] = self.account_id
         temporary = f"{self.state_path}.{os.getpid()}.{new_uuid()}.tmp"
         descriptor = os.open(
             temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
@@ -4210,6 +4333,9 @@ class ChatBroker:
                 prior = json.load(stream)
         except (OSError, ValueError):
             return
+        prior_account_id = prior.get("accountID") if isinstance(prior, dict) else None
+        if prior_account_id != self.account_id:
+            return
         activity = prior.get("activityAt") if isinstance(prior, dict) else None
         if (
             isinstance(activity, int)
@@ -4220,9 +4346,14 @@ class ChatBroker:
 
     def _acquire_provider_lock(self) -> None:
         assert self.provider_thread_id is not None
+        identity = (
+            f"{self.provider_name}-{self.account_id}-{self.provider_thread_id}"
+            if self.account_id is not None
+            else f"{self.provider_name}-{self.provider_thread_id}"
+        )
         path = os.path.join(
             self.runtime_directory,
-            f"provider-{self.provider_name}-{self.provider_thread_id}.lock",
+            f"provider-{identity}.lock",
         )
         if os.path.islink(path):
             raise ChatError("unsafeState", "The provider session lock is invalid.")
@@ -4267,6 +4398,7 @@ class ChatBroker:
             or command.get("type") != "turn.start"
             or command.get("relayId") != self.relay_id
             or command.get("provider") != self.provider_name
+            or command.get("accountID") != self.account_id
         ):
             return
         request_id = command.get("requestId")
@@ -4573,18 +4705,57 @@ class ChatBroker:
             or stat.S_IMODE(info.st_mode) != 0o600
         ):
             return False
+        try:
+            descriptor = os.open(
+                intent_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+            )
+            try:
+                current = os.read(descriptor, MAX_RECORD_BYTES + 1)
+                opened = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+            current_lines = current.decode("utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            return False
+        if (
+            opened.st_ino != info.st_ino
+            or opened.st_dev != info.st_dev
+            or len(current) > MAX_RECORD_BYTES
+        ):
+            return False
+        expected_prefix = [
+            "version|2" if self.account_id is not None else "version|1",
+            f"provider|{self.provider_name}",
+        ]
+        if self.account_id is not None:
+            expected_prefix.append(f"account|{self.account_id}")
+        expected_prefix.extend(
+            [
+                f"repository|{self.repository}",
+                f"relay|{self.relay_id}",
+                f"thread|{self.provider_thread_id}",
+            ]
+        )
+        if current_lines[: len(expected_prefix)] != expected_prefix:
+            return False
         boot_id = current_boot_id()
         if boot_id is None:
             return False
         lines = [
-            "version|1",
+            "version|2" if self.account_id is not None else "version|1",
             f"provider|{self.provider_name}",
-            f"repository|{self.repository}",
-            f"relay|{self.relay_id}",
-            f"thread|{self.provider_thread_id}",
-            f"boot|{boot_id}",
-            f"argc|{len(arguments)}",
         ]
+        if self.account_id is not None:
+            lines.append(f"account|{self.account_id}")
+        lines.extend(
+            [
+                f"repository|{self.repository}",
+                f"relay|{self.relay_id}",
+                f"thread|{self.provider_thread_id}",
+                f"boot|{boot_id}",
+                f"argc|{len(arguments)}",
+            ]
+        )
         lines += [f"arg|{argument.encode('utf-8').hex()}" for argument in arguments]
         temporary = f"{intent_path}.{os.getpid()}.{new_uuid()}.tmp"
         descriptor = os.open(
@@ -4650,7 +4821,7 @@ class ChatBroker:
     def validate_command(
         self, command: dict[str, Any], expected_type: str | None = None
     ) -> tuple[str, str, dict[str, Any]]:
-        if command.get("v") != PROTOCOL_VERSION:
+        if command.get("v") != self.protocol_version:
             raise ChatError("unsupportedVersion", "The chat protocol version is unsupported.", close=True)
         command_type = command.get("type")
         if not isinstance(command_type, str) or (
@@ -4662,6 +4833,12 @@ class ChatBroker:
             raise ChatError("staleRelay", "The chat relay identity is stale.", close=True)
         if command.get("provider") != self.provider_name:
             raise ChatError("staleRelay", "The chat provider identity is stale.", close=True)
+        if command.get("accountID") != self.account_id:
+            raise ChatError(
+                "staleAccount",
+                "The provider account identity is stale.",
+                close=True,
+            )
         provider_thread = command.get("providerThreadId")
         if provider_thread is not None and provider_thread != self.provider_thread_id:
             raise ChatError("staleThread", "The provider conversation identity is stale.", close=True)
@@ -4692,9 +4869,11 @@ class ChatBroker:
             hello = self.control_event(
                 "session.hello",
                 {
-                    "protocolVersion": PROTOCOL_VERSION,
+                    "protocolVersion": self.protocol_version,
                     "connectionState": self.connection_state,
-                    "capabilities": chat_capabilities(self.provider_name),
+                    "capabilities": chat_capabilities(
+                        self.provider_name, self.account_id
+                    ),
                     "replayOldestSeq": self.replay[0][0] if self.replay else self.sequence,
                     "replayNewestSeq": self.sequence,
                 },
@@ -5487,6 +5666,22 @@ def load_state(runtime_directory: str, relay_id: str) -> dict[str, Any]:
         )
     ):
         raise ChatError("unsafeState", "The chat relay state is invalid.")
+    account_id = state_value.get("accountID")
+    if account_id is None:
+        if state_value.get("v") != PROTOCOL_VERSION:
+            raise ChatError("unsafeState", "The chat relay state is invalid.")
+    else:
+        try:
+            canonical_account_id = canonical_uuid(account_id, "account ID")
+        except ChatError as error:
+            raise ChatError(
+                "unsafeState", "The chat relay state is invalid."
+            ) from error
+        if (
+            state_value.get("v") != ACCOUNT_PROTOCOL_VERSION
+            or canonical_account_id != account_id
+        ):
+            raise ChatError("unsafeState", "The chat relay state is invalid.")
     # Brokers from before the activity field wrote no activityAt; 0 means
     # the last-event time is unknown.
     activity = state_value.get("activityAt")
@@ -5534,12 +5729,30 @@ def scan_chat_relays(runtime_directory: str) -> collections.abc.Iterator[dict[st
             continue
 
 
-def emit_chat_bindings(runtime_directory: str, provider: str, repository: str) -> None:
-    """Print 'threadId|relayId|chat|activityAt' for live brokers matching
-    provider+repository; thread catalogs raise relay-active rows' updatedAt
-    to the broker's last-event time."""
+def emit_chat_bindings(
+    runtime_directory: str,
+    provider: str,
+    repository: str,
+    account_id: str | None = None,
+) -> None:
+    """Print account-scoped or legacy bindings for matching live brokers."""
     for state in scan_chat_relays(runtime_directory):
-        if state["provider"] == provider and state["repository"] == repository:
+        if (
+            state["provider"] != provider
+            or state["repository"] != repository
+            or state.get("accountID") != account_id
+        ):
+            continue
+        if account_id is not None:
+            print(
+                "{}|{}|{}|chat|{}".format(
+                    account_id,
+                    state["providerThreadId"],
+                    state["relayId"],
+                    state["activityAt"],
+                )
+            )
+        else:
             print(
                 "{}|{}|chat|{}".format(
                     state["providerThreadId"],
@@ -5549,19 +5762,33 @@ def emit_chat_bindings(runtime_directory: str, provider: str, repository: str) -
             )
 
 
-def emit_chat_status(runtime_directory: str) -> None:
-    """Print 'provider|repository|relayId|threadId|activityAt' for every
-    live broker; the status listing consumes this in one spawn."""
+def emit_chat_status(runtime_directory: str, account_aware: bool = False) -> None:
+    """Print v2 account-scoped or v1 legacy status rows in one scan."""
     for state in scan_chat_relays(runtime_directory):
-        print(
-            "{}|{}|{}|{}|{}".format(
-                state["provider"],
-                state["repository"],
-                state["relayId"],
-                state["providerThreadId"],
-                state["activityAt"],
+        account_id = state.get("accountID")
+        if account_aware:
+            if account_id is None:
+                continue
+            print(
+                "{}|{}|{}|{}|{}|{}".format(
+                    state["provider"],
+                    account_id,
+                    state["repository"],
+                    state["relayId"],
+                    state["providerThreadId"],
+                    state["activityAt"],
+                )
             )
-        )
+        elif account_id is None:
+            print(
+                "{}|{}|{}|{}|{}".format(
+                    state["provider"],
+                    state["repository"],
+                    state["relayId"],
+                    state["providerThreadId"],
+                    state["activityAt"],
+                )
+            )
 
 
 def validate_live_state_process(state: dict[str, Any]) -> None:
@@ -5664,7 +5891,11 @@ async def stop_remote(state: dict[str, Any]) -> int:
     reader, writer = await asyncio.open_unix_connection(state["socket"])
     request_id = new_uuid()
     attach = {
-        "v": 1,
+        "v": (
+            ACCOUNT_PROTOCOL_VERSION
+            if state.get("accountID") is not None
+            else PROTOCOL_VERSION
+        ),
         "type": "session.attach",
         "requestId": request_id,
         "relayId": state["relayId"],
@@ -5673,6 +5904,8 @@ async def stop_remote(state: dict[str, Any]) -> int:
         "sentAt": now_ms(),
         "payload": {"afterSeq": 0},
     }
+    if state.get("accountID") is not None:
+        attach["accountID"] = state["accountID"]
     writer.write(encode_record(attach))
     await writer.drain()
     attached = False
@@ -5682,7 +5915,7 @@ async def stop_remote(state: dict[str, Any]) -> int:
             attached = True
     stop_id = new_uuid()
     stop = {
-        "v": 1,
+        "v": attach["v"],
         "type": "session.stop",
         "requestId": stop_id,
         "relayId": state["relayId"],
@@ -5691,6 +5924,8 @@ async def stop_remote(state: dict[str, Any]) -> int:
         "sentAt": now_ms(),
         "payload": {},
     }
+    if state.get("accountID") is not None:
+        stop["accountID"] = state["accountID"]
     writer.write(encode_record(stop))
     await writer.drain()
     while True:
@@ -5723,10 +5958,16 @@ def provider_for(arguments: argparse.Namespace, options: dict[str, Any]) -> Prov
             arguments.codex_socket,
         )
     if arguments.provider == "claude":
+        claude_config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+        if claude_config_dir is not None:
+            claude_config_dir = canonical_directory(
+                claude_config_dir, "Claude config directory"
+            )
         return ClaudeAdapter(
             arguments.project_directory,
             arguments.thread_id,
             options,
+            claude_config_dir,
         )
     raise ChatError("unsupportedProvider", "The provider is unsupported.", exit_code=64)
 
@@ -5737,11 +5978,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     ready = subparsers.add_parser("ready", add_help=False)
     ready.add_argument("--provider", choices=("codex", "claude"), required=True)
+    ready.add_argument("--account-id")
     ready.add_argument("--codex-socket", default="")
     ready.add_argument("--fake", action="store_true")
 
     serve = subparsers.add_parser("serve", add_help=False)
     serve.add_argument("--provider", choices=("codex", "claude"), required=True)
+    serve.add_argument("--account-id")
     serve.add_argument("--repository", required=True)
     serve.add_argument("--project-directory", required=True)
     serve.add_argument("--runtime-directory", required=True)
@@ -5760,27 +6003,32 @@ def build_parser() -> argparse.ArgumentParser:
     bindings.add_argument("--runtime-directory", required=True)
     bindings.add_argument("--provider", choices=("codex", "claude"), required=True)
     bindings.add_argument("--repository", required=True)
+    bindings.add_argument("--account-id")
 
     chat_status = subparsers.add_parser("inspect-status", add_help=False)
     chat_status.add_argument("--runtime-directory", required=True)
+    chat_status.add_argument("--account-aware", action="store_true")
 
     attach = subparsers.add_parser("attach", add_help=False)
     attach.add_argument("--runtime-directory", required=True)
     attach.add_argument("--relay-id", required=True)
     attach.add_argument("--provider", choices=("codex", "claude"), required=True)
     attach.add_argument("--repository", required=True)
+    attach.add_argument("--account-id")
 
     stop = subparsers.add_parser("stop", add_help=False)
     stop.add_argument("--runtime-directory", required=True)
     stop.add_argument("--relay-id", required=True)
     stop.add_argument("--provider", choices=("codex", "claude"), required=True)
     stop.add_argument("--repository", required=True)
+    stop.add_argument("--account-id")
 
     upload = subparsers.add_parser("upload", add_help=False)
     upload.add_argument("--runtime-directory", required=True)
     upload.add_argument("--relay-id", required=True)
     upload.add_argument("--provider", choices=("codex", "claude"), required=True)
     upload.add_argument("--repository", required=True)
+    upload.add_argument("--account-id")
     upload.add_argument("--request-id", required=True)
     upload.add_argument("--attachment-id", required=True)
     upload.add_argument("--extension", default="")
@@ -5791,11 +6039,15 @@ def build_parser() -> argparse.ArgumentParser:
     discard.add_argument("--relay-id", required=True)
     discard.add_argument("--provider", choices=("codex", "claude"), required=True)
     discard.add_argument("--repository", required=True)
+    discard.add_argument("--account-id")
     discard.add_argument("--request-id", required=True)
 
     cleanup = subparsers.add_parser("cleanup-uploads", add_help=False)
     cleanup.add_argument("--runtime-directory", required=True)
     cleanup.add_argument("--relay-id", required=True)
+    cleanup.add_argument("--provider", choices=("codex", "claude"))
+    cleanup.add_argument("--account-id")
+    cleanup.add_argument("--repository")
 
     return parser
 
@@ -5805,10 +6057,44 @@ async def async_main(arguments: argparse.Namespace) -> int:
         runtime_directory = canonical_directory(
             arguments.runtime_directory, "runtime directory"
         )
+        if arguments.account_id is not None and arguments.provider is None:
+            raise ChatError(
+                "invalidIdentity", "The provider account identity is invalid.", exit_code=64
+            )
+        if arguments.provider is None:
+            if arguments.repository is not None:
+                raise ChatError(
+                    "invalidRepository", "The repository is invalid.", exit_code=64
+                )
+            if provider_accounts_activated():
+                raise ChatError(
+                    "upgradeRequired",
+                    "An account-aware Terminal Relay client is required.",
+                    exit_code=75,
+                )
+        else:
+            account_id = account_id_for(arguments.provider, arguments.account_id)
+            if arguments.repository is None:
+                raise ChatError(
+                    "invalidRepository", "The repository is invalid.", exit_code=64
+                )
+            repository = canonical_repository(arguments.repository)
+            state = load_state(runtime_directory, arguments.relay_id)
+            if (
+                state["provider"] != arguments.provider
+                or state.get("accountID") != account_id
+                or state["repository"] != repository
+            ):
+                raise ChatError(
+                    "staleAccount",
+                    "The provider account identity is stale.",
+                    exit_code=75,
+                )
         clear_relay_attachments(runtime_directory, arguments.relay_id)
         return 0
     if arguments.command == "serve":
         repository = canonical_repository(arguments.repository)
+        account_id = account_id_for(arguments.provider, arguments.account_id)
         relay_id = canonical_uuid(arguments.relay_id, "relay ID")
         project_directory = canonical_directory(
             arguments.project_directory, "project directory"
@@ -5836,6 +6122,7 @@ async def async_main(arguments: argparse.Namespace) -> int:
             relay_id,
             provider,
             options,
+            account_id,
         )
         loop = asyncio.get_running_loop()
         for name in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
@@ -5844,12 +6131,14 @@ async def async_main(arguments: argparse.Namespace) -> int:
         await broker.run()
         return 0
     if arguments.command in {"attach", "stop", "upload", "discard-upload"}:
+        account_id = account_id_for(arguments.provider, arguments.account_id)
         runtime_directory = canonical_directory(
             arguments.runtime_directory, "runtime directory"
         )
         state = load_state(runtime_directory, arguments.relay_id)
         if (
             state["provider"] != arguments.provider
+            or state.get("accountID") != account_id
             or state["repository"] != canonical_repository(arguments.repository)
             or state["status"] != "ready"
         ):
@@ -5902,7 +6191,8 @@ def main() -> int:
                 exit_code=78,
             )
     if arguments.command == "ready":
-        capabilities = chat_capabilities(arguments.provider)
+        account_id = account_id_for(arguments.provider, arguments.account_id)
+        capabilities = chat_capabilities(arguments.provider, account_id)
         if arguments.fake:
             pass
         elif arguments.provider == "codex":
@@ -5930,6 +6220,7 @@ def main() -> int:
         print(json.dumps(state, separators=(",", ":")))
         return 0
     if arguments.command == "inspect-bindings":
+        account_id = account_id_for(arguments.provider, arguments.account_id)
         runtime_directory = canonical_directory(
             arguments.runtime_directory, "runtime directory"
         )
@@ -5937,13 +6228,14 @@ def main() -> int:
             runtime_directory,
             arguments.provider,
             canonical_repository(arguments.repository),
+            account_id,
         )
         return 0
     if arguments.command == "inspect-status":
         runtime_directory = canonical_directory(
             arguments.runtime_directory, "runtime directory"
         )
-        emit_chat_status(runtime_directory)
+        emit_chat_status(runtime_directory, arguments.account_aware)
         return 0
     return asyncio.run(async_main(arguments))
 

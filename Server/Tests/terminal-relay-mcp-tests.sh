@@ -99,6 +99,7 @@ chmod 0755 "$stub_helper"
 TERMINAL_RELAY_MCP_TEST_MODE=1 \
 TERMINAL_RELAY_MCP_TEST_HELPER="$stub_helper" \
 TERMINAL_RELAY_MCP_HELPER_LOG="$helper_log" \
+TERMINAL_RELAY_MCP_TEST_PROVIDER_ACCOUNTS_ROOT="$test_root/provider-accounts-v1" \
 python3 - "$mcp" "$test_root/responses.jsonl" <<'PYTHON_TEST'
 import json
 import os
@@ -360,6 +361,7 @@ grep -Fxq \
 TERMINAL_RELAY_MCP_TEST_MODE=1 \
 TERMINAL_RELAY_MCP_TEST_HELPER="$stub_helper" \
 TERMINAL_RELAY_MCP_HELPER_LOG="$helper_log" \
+TERMINAL_RELAY_MCP_TEST_PROVIDER_ACCOUNTS_ROOT="$test_root/provider-accounts-v1" \
 TERMINAL_RELAY_MCP_TEST_TIMEOUT_SECONDS=0.5 \
 python3 - "$mcp" <<'PYTHON_BOUNDS'
 import json
@@ -422,6 +424,76 @@ large = subprocess.run(
 response = json.loads(large.stdout)
 assert response["error"]["message"] == "Request too large"
 PYTHON_BOUNDS
+
+mkdir -p "$test_root/provider-accounts-v1"
+chmod 0700 "$test_root/provider-accounts-v1"
+printf 'version|1\n' > "$test_root/provider-accounts-v1/activated"
+chmod 0600 "$test_root/provider-accounts-v1/activated"
+helper_calls_before="$(wc -l < "$helper_log" | tr -d '[:space:]')"
+
+TERMINAL_RELAY_MCP_TEST_MODE=1 \
+TERMINAL_RELAY_MCP_TEST_HELPER="$stub_helper" \
+TERMINAL_RELAY_MCP_HELPER_LOG="$helper_log" \
+TERMINAL_RELAY_MCP_TEST_PROVIDER_ACCOUNTS_ROOT="$test_root/provider-accounts-v1" \
+python3 - "$mcp" <<'PYTHON_ACTIVATED'
+import json
+import os
+import subprocess
+import sys
+
+mcp = sys.argv[1]
+requests = [
+    {"jsonrpc": "2.0", "id": 30, "method": "initialize", "params": {}},
+    {"jsonrpc": "2.0", "id": 31, "method": "tools/list", "params": {}},
+    {
+        "jsonrpc": "2.0",
+        "id": 32,
+        "method": "tools/call",
+        "params": {"name": "list_projects", "arguments": {}},
+    },
+]
+process = subprocess.run(
+    [mcp],
+    input="\n".join(json.dumps(request) for request in requests) + "\n",
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+    env=os.environ,
+    timeout=5,
+    check=True,
+)
+responses = [json.loads(line) for line in process.stdout.splitlines()]
+assert "upgradeRequired" in responses[0]["result"]["instructions"]
+assert responses[1]["result"]["tools"] == []
+assert responses[2]["result"]["isError"] is True
+assert responses[2]["result"]["structuredContent"] == {
+    "code": "upgradeRequired"
+}
+
+marker = os.path.join(
+    os.environ["TERMINAL_RELAY_MCP_TEST_PROVIDER_ACCOUNTS_ROOT"], "activated"
+)
+os.chmod(marker, 0o644)
+unsafe = subprocess.run(
+    [mcp],
+    input=json.dumps(requests[2]) + "\n",
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+    env=os.environ,
+    timeout=5,
+    check=True,
+)
+unsafe_response = json.loads(unsafe.stdout)
+assert unsafe_response["result"]["isError"] is True
+assert unsafe_response["result"]["structuredContent"] == {"code": "unsafeState"}
+PYTHON_ACTIVATED
+
+helper_calls_after="$(wc -l < "$helper_log" | tr -d '[:space:]')"
+[[ "$helper_calls_after" == "$helper_calls_before" ]] || {
+    echo "activated MCP invoked the worker helper" >&2
+    exit 1
+}
 
 ! grep -Fq 'private-terminal-output-must-not-escape' "$test_root/responses.jsonl"
 grep -Fq 'INSTALLED_HELPER = "/usr/local/bin/terminal-relay-session"' "$mcp"

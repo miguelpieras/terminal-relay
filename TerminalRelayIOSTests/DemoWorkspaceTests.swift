@@ -82,6 +82,8 @@ final class DemoWorkspaceTests: XCTestCase {
 
     func testChatDemoFixtureExercisesRichRenderingStatesLocally() throws {
         let events = MobileChatDemoFixture.events
+        XCTAssertTrue(events.allSatisfy { $0.v == 1 })
+        XCTAssertTrue(events.allSatisfy { $0.accountID == nil })
         XCTAssertEqual(
             events.map(\.type),
             [
@@ -123,6 +125,8 @@ final class DemoWorkspaceTests: XCTestCase {
 
     func testChatDemoCoordinatorStreamsFixtureThroughTheRealLifecycle() async {
         let coordinator = MobileChatDemoFixture.makeCoordinator()
+
+        XCTAssertNil(MobileChatDemoFixture.identity.accountID)
 
         coordinator.start()
         for _ in 0..<200 {

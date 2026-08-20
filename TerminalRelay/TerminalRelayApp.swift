@@ -71,6 +71,7 @@ final class TerminalRelayApplicationDelegate: NSObject, NSApplicationDelegate,
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        ConversationStateCacheMaintenance.purgeLegacyCache()
         UNUserNotificationCenter.current().delegate = self
         if ApplicationSettings.showTaskCompletionNotifications(in: defaults) {
             TaskCompletionNotificationService.requestAuthorization()
@@ -154,6 +155,7 @@ struct TerminalRelayApp: App {
     @StateObject private var projectStore: ProjectStore
     @StateObject private var sessionManager: SessionManager
     @StateObject private var workerSessionService = WorkerSessionService()
+    @StateObject private var providerAccountService = ProviderAccountService()
     @StateObject private var githubService = GitHubProjectService()
     @StateObject private var accountUsageService: AccountUsageService
     @StateObject private var workerMetricsService = WorkerMetricsService()
@@ -231,6 +233,7 @@ struct TerminalRelayApp: App {
                 .environmentObject(projectStore)
                 .environmentObject(sessionManager)
                 .environmentObject(workerSessionService)
+                .environmentObject(providerAccountService)
                 .environmentObject(githubService)
                 .environmentObject(accountUsageService)
                 .environmentObject(workerMetricsService)

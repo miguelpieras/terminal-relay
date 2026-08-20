@@ -18,7 +18,7 @@ enum TaskCompletionNotificationService {
     static func notifyTaskCompletion(for session: TerminalSession) {
         let content = UNMutableNotificationContent()
         content.title = "\(session.kind.displayName) task finished"
-        content.subtitle = session.projectName
+        content.subtitle = "\(session.projectName) · \(session.kind.displayName) · \(session.accountLabel)"
         content.body = session.displayTitle
         content.sound = .default
 

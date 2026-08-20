@@ -840,7 +840,7 @@ run_as_worker() {
 }
 
 schedule_codex_app_server_restart() {
-    run_as_worker "$launcher_destination" __schedule-codex-app-server-restart \
+    run_as_worker "$launcher_destination" __schedule-all-codex-app-server-restarts \
         || fail "Unable to schedule the shared Codex account service restart."
     [[ "$(/usr/bin/stat -c '%U:%G:%a' "$codex_app_server_restart_marker")" \
         == "$runtime_user:$runtime_group:600" ]] \
@@ -1278,7 +1278,7 @@ verify_readiness() {
         '/^MemTotal:/ { found = 1 } END { exit !found }' /proc/meminfo
     run_as_worker /bin/df -Pk "$workspace_directory" >/dev/null
     run_as_worker "$launcher_destination" runtime-info \
-        | /bin/grep -Eq '^runtime\|[1-9][0-9]*\|1\|2\|agent-sessions,chat-v1,file-attachments-v1,runtime-updates-v1,threads-v1,threads-v2$' \
+        | /bin/grep -Eq '^runtime\|[1-9][0-9]*\|1\|2\|agent-sessions,chat-v1,chat-v2,file-attachments-v1,provider-accounts-v1,runtime-updates-v1,threads-v1,threads-v2,threads-v3$' \
         || fail "The installed worker runtime does not support file attachments."
     run_as_worker "$launcher_destination" runtime-update-status >/dev/null
 

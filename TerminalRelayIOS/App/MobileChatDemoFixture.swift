@@ -315,6 +315,7 @@ enum MobileChatDemoFixture {
         payload: JSONValue = .object([:])
     ) -> ChatEnvelope {
         ChatEnvelope(
+            v: ChatEnvelope.legacyProtocolVersion,
             type: type,
             eventID: String(
                 format: "00000000-0000-4000-8000-%012lld",

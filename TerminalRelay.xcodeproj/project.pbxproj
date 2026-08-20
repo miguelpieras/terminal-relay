@@ -12,6 +12,7 @@
 		034F2FEC41EB660A56480C8C /* TerminalRelayIOSApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A69DA6CF7B2592BF444DB18E /* TerminalRelayIOSApp.swift */; };
 		040CA3D96665635AD86CD343 /* SessionSlotRegistryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7DC204D99814E9F11DA7D053 /* SessionSlotRegistryTests.swift */; };
 		04AAF91C7451D8FD6D15EA28 /* ToolGrouping.swift in Sources */ = {isa = PBXBuildFile; fileRef = D076F925ED184237E527B318 /* ToolGrouping.swift */; };
+		0793A9B77E6709C9E335C9B0 /* ProviderAccountPickerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D6A658E16CFA26FA26D30EC /* ProviderAccountPickerView.swift */; };
 		07CE458918D5CC0869DB4BF4 /* TerminalSessionController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33296AC0DEAC65DE9C252205 /* TerminalSessionController.swift */; };
 		082BC076502E8924C6DE81FF /* ProjectStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C058A6638300575CC7AF0914 /* ProjectStoreTests.swift */; };
 		084B8CA06CDB2012759B2CBB /* AgentBrandIcon.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6B5726E0516AF1EBD1B801ED /* AgentBrandIcon.swift */; };
@@ -236,6 +237,7 @@
 		273C71F1BE8EDFC5433EB578 /* AccountAuthenticationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountAuthenticationService.swift; sourceTree = "<group>"; };
 		2812F2F38DC528ED2610ED2A /* TerminalScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalScreen.swift; sourceTree = "<group>"; };
 		2B8C4489491EF49B7822E03A /* SSHCommandBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SSHCommandBuilder.swift; sourceTree = "<group>"; };
+		2D6A658E16CFA26FA26D30EC /* ProviderAccountPickerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProviderAccountPickerView.swift; sourceTree = "<group>"; };
 		33296AC0DEAC65DE9C252205 /* TerminalSessionController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalSessionController.swift; sourceTree = "<group>"; };
 		35F10890C7A7B20CEA93E345 /* WorkerProfileTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerProfileTests.swift; sourceTree = "<group>"; };
 		38AEF7811F16D7AF0555A73A /* NDJSONCodec.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NDJSONCodec.swift; sourceTree = "<group>"; };
@@ -521,6 +523,7 @@
 				66791B2A1156A33866DB5E75 /* MacTranscriptSelection.swift */,
 				5C2872C5332A2DFC50A26E78 /* MobilePairingView.swift */,
 				D0C0296EE9E83451DA6E5434 /* ProjectEditorView.swift */,
+				2D6A658E16CFA26FA26D30EC /* ProviderAccountPickerView.swift */,
 				BA47F1A31FE07CB12C137C7D /* ServerEditorView.swift */,
 				EFB8C7DD5FBA09DF4BB4A6EF /* ServerWorkspaceView.swift */,
 				E31E6BD2ECBE42BE1EFFDD00 /* TerminalHostView.swift */,
@@ -891,6 +894,7 @@
 				F4A28A72A125021D2239CBA1 /* ProjectGitService.swift in Sources */,
 				5FFF07C89F2D695D5506B7CD /* ProjectProfile.swift in Sources */,
 				8468152A7D1F28988F3C528E /* ProjectStore.swift in Sources */,
+				0793A9B77E6709C9E335C9B0 /* ProviderAccountPickerView.swift in Sources */,
 				D498688D2A8D2DC9B9F89120 /* RichChatRendering.swift in Sources */,
 				0B69126CE70C815298882288 /* SSHCommandBuilder.swift in Sources */,
 				C6DCE64499A8AA5A688018D1 /* SanitizedMarkdownCache.swift in Sources */,

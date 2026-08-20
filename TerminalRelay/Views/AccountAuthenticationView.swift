@@ -4,6 +4,7 @@ import SwiftUI
 struct AccountAuthenticationView: View {
     @EnvironmentObject private var accountAuthenticationService: AccountAuthenticationService
     @EnvironmentObject private var accountUsageService: AccountUsageService
+    @EnvironmentObject private var providerAccountService: ProviderAccountService
 
     let presentation: AccountAuthenticationPresentation
 
@@ -41,7 +42,8 @@ struct AccountAuthenticationView: View {
                 }
             }
 
-            if let currentAccount = presentation.currentAccount {
+            if let currentAccount = presentation.account?.displayName
+                ?? presentation.currentAccount {
                 Label("Currently connected as \(currentAccount)", systemImage: "person.crop.circle")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -99,7 +101,7 @@ struct AccountAuthenticationView: View {
     }
 
     private var accountAction: String {
-        presentation.currentAccount == nil ? "Sign in to" : "Change account for"
+        "Sign in to"
     }
 
     @ViewBuilder
@@ -282,14 +284,31 @@ struct AccountAuthenticationView: View {
         isVerifyingAccount = true
 
         Task {
-            await accountUsageService.refresh(
-                worker: presentation.worker,
-                force: true
-            )
-            let snapshot = accountUsageService.snapshot(
-                for: presentation.worker.id,
-                kind: presentation.kind
-            )
+            let snapshot: AccountUsageSnapshot?
+            if let account = presentation.account,
+               let updatedAccount = try? await providerAccountService.refreshStatus(
+                   worker: presentation.worker,
+                   account: account
+               ) {
+                await accountUsageService.refresh(
+                    worker: presentation.worker,
+                    account: updatedAccount,
+                    force: true
+                )
+                snapshot = accountUsageService.snapshot(
+                    for: presentation.worker.id,
+                    account: updatedAccount
+                )
+            } else {
+                await accountUsageService.refresh(
+                    worker: presentation.worker,
+                    force: true
+                )
+                snapshot = accountUsageService.snapshot(
+                    for: presentation.worker.id,
+                    kind: presentation.kind
+                )
+            }
             verifiedAccount = snapshot?.account
             if snapshot == nil {
                 verificationMessage = "Sign-in completed, but account usage is still unavailable."
@@ -308,7 +327,6 @@ struct AccountAuthenticationView: View {
 
 struct AccountChangeButton: View {
     @EnvironmentObject private var accountAuthenticationService: AccountAuthenticationService
-    @EnvironmentObject private var workerSessionService: WorkerSessionService
 
     let worker: ServerProfile
     let kind: AgentKind
@@ -319,29 +337,21 @@ struct AccountChangeButton: View {
     let controlSize: ControlSize
     let showsIcon: Bool
 
-    @State private var isConfirmingClaudeAccountChange = false
-    @State private var isStoppingClaudeForAccountChange = false
-    @State private var accountChangeError: String?
+    @State private var isManagingAccounts = false
 
     private var productName: String {
         kind == .claude ? "Claude Code" : "Codex"
     }
 
-    private var title: String {
-        currentAccount == nil ? "Sign In" : "Change"
-    }
-
     var body: some View {
-        Button(action: requestAccountChange) {
+        Button { isManagingAccounts = true } label: {
             if showsIcon {
                 Label(
-                    title,
-                    systemImage: currentAccount == nil
-                        ? "person.crop.circle.badge.plus"
-                        : "arrow.triangle.2.circlepath"
+                    "Accounts",
+                    systemImage: "person.2"
                 )
             } else {
-                Text(title)
+                Text("Accounts")
             }
         }
         .buttonStyle(.bordered)
@@ -349,100 +359,10 @@ struct AccountChangeButton: View {
         .disabled(
             isSessionOperationInProgress
                 || accountAuthenticationService.isRunning
-                || isStoppingClaudeForAccountChange
         )
-        .help(accountActionHelp)
-        .confirmationDialog(
-            "Stop Claude Code and change account?",
-            isPresented: $isConfirmingClaudeAccountChange,
-            titleVisibility: .visible
-        ) {
-            Button("Stop & Change Account", role: .destructive) {
-                stopClaudeAndBeginAccountChange()
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text(
-                "Claude conversations are tied to the signed-in account. The active Claude Code agent must stop before the account changes."
-            )
+        .help("Manage \(productName) profiles on \(worker.displayName)")
+        .sheet(isPresented: $isManagingAccounts) {
+            ProviderAccountManagementView(worker: worker, provider: kind)
         }
-        .alert(
-            "Couldn’t stop Claude Code",
-            isPresented: isShowingAccountChangeError
-        ) {
-            Button("OK") {
-                accountChangeError = nil
-            }
-        } message: {
-            Text(accountChangeError ?? "The active Claude Code agent could not be stopped.")
-        }
-    }
-
-    private var accountActionHelp: String {
-        if requiresNewSessionSignIn, hasActiveAgent {
-            return "Sign in once, then restart this active \(productName) terminal to finish its account migration."
-        }
-        if AccountChangePolicy.requiresStoppingActiveAgent(
-            kind: kind,
-            hasActiveAgent: hasActiveAgent
-        ) {
-            return "Change the Claude Code account and stop the active agent."
-        }
-        if kind == .codex, hasActiveAgent {
-            return "Change the shared Codex account without stopping active threads."
-        }
-        if isSessionOperationInProgress {
-            return "Wait for the \(productName) session operation to finish."
-        }
-        return currentAccount == nil
-            ? "Sign in to \(productName) on \(worker.displayName)"
-            : "Change the \(productName) account on \(worker.displayName)"
-    }
-
-    private var isShowingAccountChangeError: Binding<Bool> {
-        Binding(
-            get: { accountChangeError != nil },
-            set: { isPresented in
-                if !isPresented {
-                    accountChangeError = nil
-                }
-            }
-        )
-    }
-
-    private func requestAccountChange() {
-        if AccountChangePolicy.requiresStoppingActiveAgent(
-            kind: kind,
-            hasActiveAgent: hasActiveAgent
-        ) {
-            isConfirmingClaudeAccountChange = true
-        } else {
-            beginAccountChange()
-        }
-    }
-
-    private func stopClaudeAndBeginAccountChange() {
-        isStoppingClaudeForAccountChange = true
-        Task {
-            let stopped = await workerSessionService.stopActiveSessions(
-                kind: .claude,
-                on: worker
-            )
-            isStoppingClaudeForAccountChange = false
-            guard stopped else {
-                accountChangeError = workerSessionService.error(for: worker.id)
-                    ?? "The active Claude Code agent could not be stopped."
-                return
-            }
-            beginAccountChange()
-        }
-    }
-
-    private func beginAccountChange() {
-        accountAuthenticationService.begin(
-            worker: worker,
-            kind: kind,
-            currentAccount: currentAccount
-        )
     }
 }

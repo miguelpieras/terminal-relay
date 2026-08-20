@@ -133,10 +133,13 @@ if (
     != [
         "agent-sessions",
         "chat-v1",
+        "chat-v2",
         "file-attachments-v1",
+        "provider-accounts-v1",
         "runtime-updates-v1",
         "threads-v1",
         "threads-v2",
+        "threads-v3",
     ]
     or not isinstance(manifest.get("releaseVersion"), str)
     or not re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,2}", manifest["releaseVersion"])

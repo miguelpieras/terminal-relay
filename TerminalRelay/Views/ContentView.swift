@@ -110,6 +110,20 @@ private struct LiveThreadArchiveRequest: Identifiable {
     let threadID: String
 }
 
+private struct ProviderAccountSelectionRequest: Identifiable {
+    let id = UUID()
+    let project: ProjectProfile
+    let worker: ServerProfile
+    let provider: AgentKind
+    let accounts: [ProviderAccountProfile]
+}
+
+private struct ProviderAccountCreationRequest: Identifiable {
+    let id = UUID()
+    let worker: ServerProfile
+    let provider: AgentKind
+}
+
 private enum SidebarDragItem: Equatable {
     private static let projectPrefix = "terminal-relay-project:"
     private static let folderPrefix = "terminal-relay-folder:"
@@ -391,6 +405,7 @@ struct ContentView: View {
     @EnvironmentObject private var sessionManager: SessionManager
     @EnvironmentObject private var workerSessionService: WorkerSessionService
     @EnvironmentObject private var accountUsageService: AccountUsageService
+    @EnvironmentObject private var providerAccountService: ProviderAccountService
 
     @StateObject private var accountAuthenticationService = AccountAuthenticationService()
     @StateObject private var sidebarDragCoordinator = SidebarDragCoordinator()
@@ -419,6 +434,8 @@ struct ContentView: View {
     @State private var selectedSessionIDs: Set<UUID> = []
     @State private var sessionArchiveRequest: SessionArchiveRequest?
     @State private var liveThreadArchiveRequest: LiveThreadArchiveRequest?
+    @State private var providerAccountSelectionRequest: ProviderAccountSelectionRequest?
+    @State private var providerAccountCreationRequest: ProviderAccountCreationRequest?
     @State private var didSeedCachedSessionRows = false
     @State private var isNamingSidebarFolder = false
     @State private var newSidebarFolderName = ""
@@ -567,6 +584,53 @@ struct ContentView: View {
                 AccountAuthenticationView(presentation: presentation)
                     .environmentObject(accountAuthenticationService)
                     .environmentObject(accountUsageService)
+                    .environmentObject(providerAccountService)
+            }
+            .sheet(item: $providerAccountSelectionRequest) { request in
+                ProviderAccountPickerView(
+                    workerName: request.worker.displayName,
+                    provider: request.provider,
+                    accounts: request.accounts,
+                    onSelect: { account in
+                        startTask(
+                            account: account,
+                            project: request.project,
+                            worker: request.worker
+                        )
+                    },
+                    onSignIn: { account in
+                        providerAccountSelectionRequest = nil
+                        DispatchQueue.main.async {
+                            accountAuthenticationService.begin(
+                                worker: request.worker,
+                                account: account
+                            )
+                        }
+                    },
+                    onAddAccount: {
+                        providerAccountSelectionRequest = nil
+                        DispatchQueue.main.async {
+                            providerAccountCreationRequest = ProviderAccountCreationRequest(
+                                worker: request.worker,
+                                provider: request.provider
+                            )
+                        }
+                    }
+                )
+            }
+            .sheet(item: $providerAccountCreationRequest) { request in
+                ProviderAccountCreateView(
+                    worker: request.worker,
+                    provider: request.provider
+                ) { account in
+                    providerAccountCreationRequest = nil
+                    DispatchQueue.main.async {
+                        accountAuthenticationService.begin(
+                            worker: request.worker,
+                            account: account
+                        )
+                    }
+                }
             }
     }
 
@@ -1019,6 +1083,7 @@ struct ContentView: View {
                 ProjectThreadRow(
                     thread: thread,
                     projectName: project.displayName,
+                    accountLabel: accountLabel(for: thread, workerID: project.serverID),
                     onResume: {
                         resumeThread(thread, for: project)
                     },
@@ -1027,6 +1092,7 @@ struct ContentView: View {
                         Task {
                             _ = await workerSessionService.setThreadArchived(
                                 kind: thread.kind,
+                                accountID: thread.accountID,
                                 repositoryName: project.displayName,
                                 threadID: thread.threadID,
                                 archived: true,
@@ -1086,12 +1152,18 @@ struct ContentView: View {
             },
             onRefreshThreads: {
                 guard !ScreenshotDemoMode.isEnabled, let worker else { return }
+                var accounts = providerAccountService.accounts(workerID: worker.id)
+                if accounts.isEmpty {
+                    accounts = await providerAccountService.refresh(worker: worker) ?? []
+                }
+                let routedAccounts = accounts
                 // Cached rows are already visible; refresh the active catalog
                 // first and let the archived one follow without blocking.
                 await workerSessionService.loadThreads(
                     repositoryName: project.displayName,
                     archived: false,
                     on: worker,
+                    accounts: routedAccounts,
                     skipIfFresh: true
                 )
                 Task {
@@ -1099,21 +1171,15 @@ struct ContentView: View {
                         repositoryName: project.displayName,
                         archived: true,
                         on: worker,
+                        accounts: routedAccounts,
                         skipIfFresh: true
                     )
                 }
             },
             onCreateThread: {
-                guard let worker else { return }
-                _ = await workerSessionService.createThread(
-                    repositoryName: project.displayName,
-                    on: worker
-                )
-                _ = await workerSessionService.loadThreads(
-                    repositoryName: project.displayName,
-                    archived: false,
-                    on: worker
-                )
+                // A new task must choose its immutable route. Starting Codex
+                // creates the provider thread through the same account picker.
+                openTerminal(.codex, for: project)
             },
             onResumeThread: { thread in
                 await resumeThreadNow(thread, for: project)
@@ -1122,6 +1188,7 @@ struct ContentView: View {
                 guard let worker else { return }
                 _ = await workerSessionService.renameThread(
                     kind: thread.kind,
+                    accountID: thread.accountID,
                     repositoryName: project.displayName,
                     threadID: thread.threadID,
                     name: name,
@@ -1130,13 +1197,15 @@ struct ContentView: View {
                 _ = await workerSessionService.loadThreads(
                     repositoryName: project.displayName,
                     archived: false,
-                    on: worker
+                    on: worker,
+                    accounts: providerAccountService.accounts(workerID: worker.id)
                 )
             },
             onSetThreadArchived: { thread, archived in
                 guard let worker else { return }
                 _ = await workerSessionService.setThreadArchived(
                     kind: thread.kind,
+                    accountID: thread.accountID,
                     repositoryName: project.displayName,
                     threadID: thread.threadID,
                     archived: archived,
@@ -1395,7 +1464,8 @@ struct ContentView: View {
                 project: project,
                 worker: worker,
                 onSelectProject: { navigate(to: .project($0)) },
-                onShowWorkers: { navigate(to: .workers) }
+                onShowWorkers: { navigate(to: .workers) },
+                onStartTask: { openTerminal($0, for: project) }
             )
             .id(project.id)
         } else {
@@ -1482,6 +1552,18 @@ struct ContentView: View {
         navigate(to: .newProject(ProjectProfile(serverID: worker.id)))
     }
 
+    private func accountLabel(
+        for thread: WorkerThreadSnapshot,
+        workerID: UUID
+    ) -> String {
+        guard let accountID = thread.accountID else { return "Legacy" }
+        return providerAccountService.account(
+            workerID: workerID,
+            provider: thread.kind,
+            accountID: accountID
+        )?.displayName ?? String(accountID.rawValue.prefix(8))
+    }
+
     private func openTerminal(_ kind: AgentKind, for project: ProjectProfile) {
         guard let worker = serverStore.server(id: project.serverID) else {
             navigate(to: .editProject(project.id))
@@ -1489,10 +1571,38 @@ struct ContentView: View {
         }
 
         Task {
+            let loaded = await providerAccountService.refresh(
+                worker: worker,
+                provider: kind
+            ) ?? providerAccountService.accounts(
+                workerID: worker.id,
+                provider: kind
+            )
+            let usable = loaded.filter(\.status.isUsable)
+            if usable.count == 1, let account = usable.first {
+                startTask(account: account, project: project, worker: worker)
+            } else {
+                providerAccountSelectionRequest = ProviderAccountSelectionRequest(
+                    project: project,
+                    worker: worker,
+                    provider: kind,
+                    accounts: loaded
+                )
+            }
+        }
+    }
+
+    private func startTask(
+        account: ProviderAccountProfile,
+        project: ProjectProfile,
+        worker: ServerProfile
+    ) {
+        guard account.status.isUsable else { return }
+        Task {
             guard let result = await sessionManager.openNewSession(
                 project: project,
                 on: worker,
-                kind: kind,
+                account: account,
                 launchDefaults: launchDefaults,
                 onPendingSession: { session in
                     handleOpenResult(.opened(session), for: project)
@@ -1511,11 +1621,32 @@ struct ContentView: View {
         _ thread: WorkerThreadSnapshot,
         for project: ProjectProfile
     ) async {
-        guard let worker = serverStore.server(id: project.serverID),
-              let result = await sessionManager.resumeThread(
+        guard let worker = serverStore.server(id: project.serverID) else { return }
+        var account: ProviderAccountProfile?
+        if let accountID = thread.accountID {
+            account = providerAccountService.account(
+                workerID: worker.id,
+                provider: thread.kind,
+                accountID: accountID
+            )
+            if account == nil {
+                _ = await providerAccountService.refresh(
+                    worker: worker,
+                    provider: thread.kind
+                )
+                account = providerAccountService.account(
+                    workerID: worker.id,
+                    provider: thread.kind,
+                    accountID: accountID
+                )
+            }
+            guard account?.status.isUsable == true else { return }
+        }
+        guard let result = await sessionManager.resumeThread(
                   thread,
                   project: project,
                   on: worker,
+                  account: account,
                   launchDefaults: launchDefaults,
                   onPendingSession: { session in
                       handleOpenResult(.opened(session), for: project)
@@ -1601,6 +1732,7 @@ struct ContentView: View {
                 worker: worker,
                 projects: projectStore.projects,
                 response: cached,
+                accounts: providerAccountService.accounts(workerID: worker.id),
                 launchDefaults: launchDefaults
             )
         }
@@ -1610,9 +1742,13 @@ struct ContentView: View {
         guard !ScreenshotDemoMode.isEnabled else { return }
         for worker in serverStore.servers {
             guard !Task.isCancelled else { return }
+            if providerAccountService.accounts(workerID: worker.id).isEmpty {
+                _ = await providerAccountService.refresh(worker: worker)
+            }
             let didRefresh = await sessionManager.refresh(
                 worker: worker,
                 projects: projectStore.projects,
+                accounts: providerAccountService.accounts(workerID: worker.id),
                 launchDefaults: launchDefaults,
                 using: workerSessionService
             )
@@ -1875,6 +2011,7 @@ struct ContentView: View {
             sessionManager.close(sessionID: session.id)
             _ = await workerSessionService.setThreadArchived(
                 kind: session.kind,
+                accountID: session.accountID,
                 repositoryName: project.displayName,
                 threadID: request.threadID,
                 archived: true,
@@ -2098,6 +2235,7 @@ private struct SidebarFolderRow: View {
 
 private struct ProjectSidebarSection: View {
     @EnvironmentObject private var sessionManager: SessionManager
+    @EnvironmentObject private var providerAccountService: ProviderAccountService
 
     let project: ProjectProfile
     let searchQuery: String
@@ -2160,6 +2298,15 @@ private struct ProjectSidebarSection: View {
         if session.isLaunchPending, session.isLoadingExistingConversation { return 1 }
         if session.isLaunchPending || session.isWorking { return 0 }
         return session.status.occupiesSlot ? 1 : 3
+    }
+
+    private func accountLabel(for thread: WorkerThreadSnapshot) -> String {
+        guard let accountID = thread.accountID else { return "Legacy" }
+        return providerAccountService.account(
+            workerID: project.serverID,
+            provider: thread.kind,
+            accountID: accountID
+        )?.displayName ?? String(accountID.rawValue.prefix(8))
     }
 
     private var sessionsWithThreadIDs: [TerminalSession] {
@@ -2493,6 +2640,7 @@ private struct ProjectSidebarSection: View {
                     ForEach(matchingDormantThreads) { thread in
                         ProjectThreadRow(
                             thread: thread,
+                            accountLabel: accountLabel(for: thread),
                             onResume: {
                                 Task { await onResumeThread(thread) }
                             },
@@ -2540,7 +2688,12 @@ private struct ProjectSidebarSection: View {
 
                         if showsArchivedThreads || !searchQuery.isEmpty {
                             ForEach(sortedArchivedThreads) { thread in
-                                ProjectThreadRow(thread: thread, isArchived: true, onResume: {})
+                                ProjectThreadRow(
+                                    thread: thread,
+                                    isArchived: true,
+                                    accountLabel: accountLabel(for: thread),
+                                    onResume: {}
+                                )
                                     .contextMenu {
                                         Button("Unarchive Thread") {
                                             Task { await onSetThreadArchived(thread, false) }
@@ -2665,6 +2818,7 @@ private struct ProjectThreadRow: View {
     let thread: WorkerThreadSnapshot
     var isArchived = false
     var projectName: String? = nil
+    var accountLabel: String? = nil
     let onResume: () -> Void
     var onArchive: (() -> Void)? = nil
 
@@ -2708,6 +2862,12 @@ private struct ProjectThreadRow: View {
                             isInteractive ? SidebarPalette.primary : SidebarPalette.secondary
                         )
                         .lineLimit(1)
+                    if let accountLabel {
+                        Text("\(thread.kind.displayName) · \(accountLabel)")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(SidebarPalette.tertiary)
+                            .lineLimit(1)
+                    }
                     Spacer(minLength: 5)
                     if let projectName {
                         Text(projectName)
@@ -2795,6 +2955,11 @@ private struct ProjectSessionRow: View {
                                 ? SidebarPalette.primary
                                 : SidebarPalette.secondary
                         )
+                        .lineLimit(1)
+
+                    Text("\(session.kind.displayName) · \(session.accountLabel)")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(SidebarPalette.tertiary)
                         .lineLimit(1)
 
                     Spacer(minLength: 5)

@@ -49,10 +49,13 @@ manifest = {
     "capabilities": [
         "agent-sessions",
         "chat-v1",
+        "chat-v2",
         "file-attachments-v1",
+        "provider-accounts-v1",
         "runtime-updates-v1",
         "threads-v1",
         "threads-v2",
+        "threads-v3",
     ],
     "files": files,
 }

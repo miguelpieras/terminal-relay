@@ -3,6 +3,36 @@ import XCTest
 
 @MainActor
 final class ConversationCoordinatorTests: XCTestCase {
+    func testRejectsAnInboundEnvelopeForAnotherProviderAccount() async {
+        let wrongAccount = ProviderAccountID(
+            UUID(uuidString: "ffffffff-ffff-4fff-8fff-ffffffffffff")!
+        )
+        let wrongHello = ChatEnvelope(
+            type: "session.hello",
+            eventID: "00000000-0000-4000-8000-000000000005",
+            relayID: ChatTestFixtures.relayID,
+            provider: .codex,
+            accountID: wrongAccount,
+            providerThreadID: ChatTestFixtures.threadID,
+            snapshotGeneration: ChatTestFixtures.generation,
+            sequence: 1,
+            payload: (try? JSONValue.encoded(ChatCapabilities(features: ["streaming"])))
+                ?? .object([:])
+        )
+        let transport = ChatFixtureTransport(initialEvents: [wrongHello])
+        let store = ConversationStore()
+        let coordinator = makeCoordinator(store: store, transport: transport)
+
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .failed }
+
+        XCTAssertTrue(store.state.items.isEmpty)
+        XCTAssertEqual(
+            store.state.lastErrorMessage,
+            "The worker returned chat data for a different account or task."
+        )
+    }
+
     func testStartAttachesWithCurrentCursorAndDetachLeavesAgentRunning() async throws {
         let transport = makeConnectedTransport()
         let store = ConversationStore()

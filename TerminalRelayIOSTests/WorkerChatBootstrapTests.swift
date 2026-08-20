@@ -10,7 +10,7 @@ final class WorkerChatBootstrapTests: XCTestCase {
             Data(
                 """
                 login banner
-                \(WorkerChatProtocol.marker)
+                \(WorkerChatProtocol.legacyMarker)
                 {"provider":"codex","available":true,"capabilities":{"protocolVersion":1,"features":["streaming","tools"],"supportsHistory":true,"supportsFilePreview":true,"supportsApprovals":true,"supportsQuestions":true,"supportsAttachments":true},"reason":null}
                 """.utf8
             ),
@@ -29,7 +29,7 @@ final class WorkerChatBootstrapTests: XCTestCase {
         let status = try WorkerChatProtocol.parseCapabilities(
             Data(
                 """
-                \(WorkerChatProtocol.marker)
+                \(WorkerChatProtocol.legacyMarker)
                 {"provider":"claude","available":false,"capabilities":null,"reason":"sdk-unavailable"}
                 """.utf8
             ),
@@ -45,7 +45,7 @@ final class WorkerChatBootstrapTests: XCTestCase {
         let status = try WorkerChatProtocol.parseStart(
             Data(
                 """
-                \(WorkerChatProtocol.marker)
+                \(WorkerChatProtocol.legacyMarker)
                 {"relayId":"\(relayID)","provider":"codex","providerThreadId":"\(threadID)","capabilities":{"protocolVersion":1,"features":["streaming"],"supportsHistory":true,"supportsFilePreview":true,"supportsApprovals":true,"supportsQuestions":true,"supportsAttachments":true},"launchOptions":{"model":"gpt","effort":"high","permissionMode":"default","fullAccess":false,"fastMode":false}}
                 """.utf8
             ),
@@ -78,7 +78,7 @@ final class WorkerChatBootstrapTests: XCTestCase {
             try WorkerChatProtocol.parseCapabilities(
                 Data(
                     """
-                    \(WorkerChatProtocol.marker)
+                    \(WorkerChatProtocol.legacyMarker)
                     {"provider":"claude","available":true,"capabilities":{"protocolVersion":1,"features":[],"supportsHistory":true,"supportsFilePreview":true,"supportsApprovals":true,"supportsQuestions":true,"supportsAttachments":false},"reason":null}
                     """.utf8
                 ),
@@ -90,7 +90,7 @@ final class WorkerChatBootstrapTests: XCTestCase {
             try WorkerChatProtocol.parseStart(
                 Data(
                     """
-                    \(WorkerChatProtocol.marker)
+                    \(WorkerChatProtocol.legacyMarker)
                     {"relayId":"\(relayID.uppercased())","provider":"codex","providerThreadId":"\(threadID)","capabilities":{"protocolVersion":1,"features":[],"supportsHistory":true,"supportsFilePreview":true,"supportsApprovals":true,"supportsQuestions":true,"supportsAttachments":true},"launchOptions":{}}
                     """.utf8
                 ),
@@ -104,7 +104,7 @@ final class WorkerChatBootstrapTests: XCTestCase {
             try WorkerChatProtocol.parseCapabilities(
                 Data(
                     """
-                    \(WorkerChatProtocol.marker)
+                    \(WorkerChatProtocol.legacyMarker)
                     {"provider":"codex","available":false,"capabilities":null,"reason":"worker.example.com: secret"}
                     """.utf8
                 ),
@@ -116,7 +116,7 @@ final class WorkerChatBootstrapTests: XCTestCase {
             try WorkerChatProtocol.parseCapabilities(
                 Data(
                     """
-                    \(WorkerChatProtocol.marker)
+                    \(WorkerChatProtocol.legacyMarker)
                     {"provider":"codex","available":false,"capabilities":null,"reason":"not_ready"}
                     {"provider":"codex","available":false,"capabilities":null,"reason":"not_ready"}
                     """.utf8

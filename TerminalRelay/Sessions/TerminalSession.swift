@@ -139,6 +139,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
     let serverKey: String
     let serverName: String
     let kind: AgentKind
+    let accountID: ProviderAccountID?
     let accountLabel: String
     let sequenceNumber: Int
     let startedAt: Date
@@ -180,6 +181,9 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         project: ProjectProfile,
         server: ServerProfile,
         kind: AgentKind,
+        account: ProviderAccountProfile? = nil,
+        accountID: ProviderAccountID? = nil,
+        accountLabel: String? = nil,
         sequenceNumber: Int,
         instanceToken: String,
         id: UUID = UUID(),
@@ -204,7 +208,10 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         self.serverKey = server.concurrencyKey
         self.serverName = server.displayName
         self.kind = kind
-        self.accountLabel = server.accountLabel(for: kind)
+        self.accountID = account?.accountID ?? accountID
+        self.accountLabel = account?.displayName
+            ?? accountLabel
+            ?? server.accountLabel(for: kind)
         self.sequenceNumber = sequenceNumber
         self.startedAt = startedAt
         self.lastActivityAt = lastActivityAt ?? startedAt
@@ -224,6 +231,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
                 for: server,
                 project: project,
                 kind: kind,
+                accountID: account?.accountID ?? accountID,
                 instanceToken: instanceToken
             )
             self.chatCoordinator = nil
@@ -232,6 +240,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
                 configuration: SSHCommandBuilder.workerChatAttachConfiguration(
                     for: server,
                     kind: kind,
+                    accountID: account?.accountID ?? accountID,
                     repositoryName: project.displayName,
                     instanceToken: instanceToken
                 )
@@ -239,6 +248,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
             self.configuration = SSHCommandBuilder.workerChatAttachConfiguration(
                 for: server,
                 kind: kind,
+                accountID: account?.accountID ?? accountID,
                 repositoryName: project.displayName,
                 instanceToken: instanceToken
             )
@@ -252,10 +262,10 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
                 identity: ChatConversationIdentity(
                     relayID: instanceToken,
                     provider: ChatProvider(rawValue: kind.rawValue),
+                    accountID: account?.accountID ?? accountID,
                     providerThreadID: resolvedThreadID
                 ),
-                launchOptions: launchDefaults.chatOptions(for: kind),
-                cache: ConversationStateCache.shared
+                launchOptions: launchDefaults.chatOptions(for: kind)
             )
         }
         self.terminalView = LocalProcessTerminalView(frame: NSRect(x: 0, y: 0, width: 900, height: 600))
@@ -643,6 +653,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
 
     func applyRemoteSnapshot(_ snapshot: WorkerSessionSnapshot) {
         guard snapshot.kind == kind,
+              snapshot.accountID == accountID,
               snapshot.repositoryName == projectName,
               snapshot.instanceToken == instanceToken,
               snapshot.presentation == presentation else {

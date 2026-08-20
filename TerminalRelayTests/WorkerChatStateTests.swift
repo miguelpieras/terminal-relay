@@ -3,23 +3,31 @@ import XCTest
 @testable import TerminalRelay
 
 final class WorkerChatStateTests: XCTestCase {
+    private let accountID = ProviderAccountID(
+        UUID(uuidString: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")!
+    )
     private let capabilities =
-        #"{"protocolVersion":1,"features":["history","streaming"],"supportsHistory":true,"supportsFilePreview":true,"supportsApprovals":true,"supportsQuestions":true,"supportsAttachments":false}"#
+        #"{"protocolVersion":2,"features":["history","streaming"],"supportsHistory":true,"supportsFilePreview":true,"supportsApprovals":true,"supportsQuestions":true,"supportsAttachments":false}"#
 
     func testParsesAvailableCapabilitiesAfterLoginNoise() throws {
         let data = Data(
             """
             login banner
             \(WorkerChatProtocol.marker)
-            {"provider":"codex","available":true,"capabilities":\(capabilities),"reason":null}
+            {"provider":"codex","accountID":"\(accountID.rawValue)","available":true,"capabilities":\(capabilities),"reason":null}
 
             """.utf8
         )
 
-        let response = try WorkerChatProtocol.parseCapabilities(data, expectedKind: .codex)
+        let response = try WorkerChatProtocol.parseCapabilities(
+            data,
+            expectedKind: .codex,
+            expectedAccountID: accountID
+        )
 
         XCTAssertTrue(response.isAvailable)
-        XCTAssertEqual(response.capabilities?.protocolVersion, 1)
+        XCTAssertEqual(response.accountID, accountID)
+        XCTAssertEqual(response.capabilities?.protocolVersion, 2)
         XCTAssertEqual(response.capabilities?.features, ["history", "streaming"])
         XCTAssertNil(response.reason)
     }
@@ -28,12 +36,16 @@ final class WorkerChatStateTests: XCTestCase {
         let data = Data(
             """
             \(WorkerChatProtocol.marker)
-            {"provider":"claude","available":false,"capabilities":null,"reason":"sdk-unavailable"}
+            {"provider":"claude","accountID":"\(accountID.rawValue)","available":false,"capabilities":null,"reason":"sdk-unavailable"}
 
             """.utf8
         )
 
-        let response = try WorkerChatProtocol.parseCapabilities(data, expectedKind: .claude)
+        let response = try WorkerChatProtocol.parseCapabilities(
+            data,
+            expectedKind: .claude,
+            expectedAccountID: accountID
+        )
 
         XCTAssertFalse(response.isAvailable)
         XCTAssertNil(response.capabilities)
@@ -46,14 +58,19 @@ final class WorkerChatStateTests: XCTestCase {
         let data = Data(
             """
             \(WorkerChatProtocol.marker)
-            {"relayId":"\(relayID)","provider":"codex","providerThreadId":"\(threadID)","capabilities":\(capabilities),"launchOptions":{"model":"gpt-example","fullAccess":true}}
+            {"relayId":"\(relayID)","provider":"codex","accountID":"\(accountID.rawValue)","providerThreadId":"\(threadID)","capabilities":\(capabilities),"launchOptions":{"model":"gpt-example","fullAccess":true}}
 
             """.utf8
         )
 
-        let response = try WorkerChatProtocol.parseStart(data, expectedKind: .codex)
+        let response = try WorkerChatProtocol.parseStart(
+            data,
+            expectedKind: .codex,
+            expectedAccountID: accountID
+        )
 
         XCTAssertEqual(response.relayID, relayID)
+        XCTAssertEqual(response.accountID, accountID)
         XCTAssertEqual(response.providerThreadID, threadID)
         XCTAssertEqual(response.launchOptions["model"], .string("gpt-example"))
         XCTAssertEqual(response.launchOptions["fullAccess"], .bool(true))
@@ -63,15 +80,15 @@ final class WorkerChatStateTests: XCTestCase {
         let inputs = [
             """
             \(WorkerChatProtocol.marker)
-            {"provider":"claude","available":true,"capabilities":\(capabilities),"reason":null}
+            {"provider":"claude","accountID":"\(accountID.rawValue)","available":true,"capabilities":\(capabilities),"reason":null}
             """,
             """
             \(WorkerChatProtocol.marker)
-            {"relayId":"NOT-A-UUID","provider":"codex","providerThreadId":"22222222-2222-4222-8222-222222222222","capabilities":\(capabilities),"launchOptions":{}}
+            {"relayId":"NOT-A-UUID","provider":"codex","accountID":"\(accountID.rawValue)","providerThreadId":"22222222-2222-4222-8222-222222222222","capabilities":\(capabilities),"launchOptions":{}}
             """,
             """
             \(WorkerChatProtocol.marker)
-            {"provider":"codex","available":false,"capabilities":null,"reason":"sdk-unavailable"}
+            {"provider":"codex","accountID":"\(accountID.rawValue)","available":false,"capabilities":null,"reason":"sdk-unavailable"}
             {"unexpected":true}
             """,
         ]
@@ -79,19 +96,22 @@ final class WorkerChatStateTests: XCTestCase {
         XCTAssertThrowsError(
             try WorkerChatProtocol.parseCapabilities(
                 Data(inputs[0].utf8),
-                expectedKind: .codex
+                expectedKind: .codex,
+                expectedAccountID: accountID
             )
         )
         XCTAssertThrowsError(
             try WorkerChatProtocol.parseStart(
                 Data(inputs[1].utf8),
-                expectedKind: .codex
+                expectedKind: .codex,
+                expectedAccountID: accountID
             )
         )
         XCTAssertThrowsError(
             try WorkerChatProtocol.parseCapabilities(
                 Data(inputs[2].utf8),
-                expectedKind: .codex
+                expectedKind: .codex,
+                expectedAccountID: accountID
             )
         )
     }

@@ -60,7 +60,7 @@ runtime_control_script="$(render_runtime_control_script)"
     && "$install_script" == *'chmod -R a+rX,u+w,go-w "$claude_sdk_environment"'* \
     && "$install_script" == *'systemctl daemon-reload'* \
     && "$install_script" == *'systemctl enable "$service"'* \
-    && "$install_script" == *'"$helper_target" __schedule-codex-app-server-restart'* \
+    && "$install_script" == *'"$helper_target" __schedule-all-codex-app-server-restarts'* \
     && "$install_script" == *'codex-app-server-restart-required'* ]] \
     || { echo "Install renderer expanded or lost literal remote variables." >&2; exit 1; }
 # shellcheck disable=SC2016
@@ -76,8 +76,8 @@ runtime_control_script="$(render_runtime_control_script)"
     && "$runtime_control_script" == *'"$temporary_directory/runtime-manifest.json"'* \
     && "$runtime_control_script" == *'systemctl enable --now'* ]] \
     || { echo "Runtime-control renderer expanded or lost literal remote variables." >&2; exit 1; }
-[[ "$(< "$installer")" == *"runtime|\$runtime_version|1|2|agent-sessions,chat-v1,file-attachments-v1,runtime-updates-v1,threads-v1,threads-v2"* ]] \
-    || { echo "Helper installer does not verify the file-attachment runtime capability." >&2; exit 1; }
+[[ "$(< "$installer")" == *"runtime|\$runtime_version|1|2|agent-sessions,chat-v1,chat-v2,file-attachments-v1,provider-accounts-v1,runtime-updates-v1,threads-v1,threads-v2,threads-v3"* ]] \
+    || { echo "Helper installer does not verify the multi-account runtime capabilities." >&2; exit 1; }
 /bin/bash -n <<< "$runtime_control_script"
 [[ "$(< "$restore_unit")" == *'ExecStart=/usr/local/bin/terminal-relay-session restore'* \
     && "$(< "$restore_unit")" == *'WantedBy=multi-user.target'* \

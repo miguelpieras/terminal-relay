@@ -88,7 +88,7 @@ validate_remote_rendering() {
                 && "$script" == *'"$service_initial_enabled"'* \
                 && "$script" == *'"$claude_sdk_current/bin/python3"'* \
                 && "$script" == *'"$claude_sessions_target" version'* \
-                && "$script" == *'"$helper_target" __schedule-codex-app-server-restart'* ]] \
+                && "$script" == *'"$helper_target" __schedule-all-codex-app-server-restarts'* ]] \
                 || return 1
             ;;
         rollback)
@@ -805,7 +805,7 @@ if [ "$helper_result" != unchanged ] || [ "$mcp_changed" -eq 1 ] \
             LOGNAME="$application_user" \
             SHELL=/bin/bash \
             PATH=/usr/local/bin:/usr/bin:/bin \
-            "$helper_target" __schedule-codex-app-server-restart
+            "$helper_target" __schedule-all-codex-app-server-restarts
     [ "$(privileged /usr/bin/stat -c "%U:%a" "$restart_marker")" \
         = "$application_user:600" ]
 fi
@@ -1101,7 +1101,7 @@ printf '%s\n' "$runtime_info_output" \
     || { echo "The installed worker runtime marker is invalid." >&2; exit 70; }
 printf '%s\n' "$runtime_info_output" \
     | /usr/bin/grep -Fqx \
-        "runtime|$runtime_version|1|2|agent-sessions,chat-v1,file-attachments-v1,runtime-updates-v1,threads-v1,threads-v2" \
+        "runtime|$runtime_version|1|2|agent-sessions,chat-v1,chat-v2,file-attachments-v1,provider-accounts-v1,runtime-updates-v1,threads-v1,threads-v2,threads-v3" \
     || { echo "The installed worker runtime does not support file attachments." >&2; exit 70; }
 
 echo "Installed helper, restore unit, and automatic runtime update controls."

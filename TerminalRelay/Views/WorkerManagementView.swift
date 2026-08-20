@@ -45,6 +45,7 @@ struct WorkersView: View {
     @EnvironmentObject private var projectStore: ProjectStore
     @EnvironmentObject private var sessionManager: SessionManager
     @EnvironmentObject private var accountUsageService: AccountUsageService
+    @EnvironmentObject private var providerAccountService: ProviderAccountService
     @EnvironmentObject private var workerMetricsService: WorkerMetricsService
 
     let onSelectProject: (UUID) -> Void
@@ -319,21 +320,23 @@ struct WorkersView: View {
             return .offline
         }
 
-        let hasUnavailableAccount = AgentKind.allCases.contains { kind in
-            accountUsageService.error(for: worker.id, kind: kind) != nil
+        let accounts = providerAccountService.accounts(workerID: worker.id)
+        let hasUnavailableAccount = accounts.contains { account in
+            accountUsageService.error(for: worker.id, account: account) != nil
                 && !accountUsageService.requiresNewSessionSignIn(
                     workerID: worker.id,
-                    kind: kind
+                    account: account
                 )
         }
         if hasUnavailableAccount {
             return .offline
         }
 
-        let requiresSignIn = AgentKind.allCases.contains { kind in
-            accountUsageService.requiresNewSessionSignIn(
+        let requiresSignIn = accounts.contains { account in
+            account.status == .authRequired
+                || accountUsageService.requiresNewSessionSignIn(
                 workerID: worker.id,
-                kind: kind
+                account: account
             )
         }
         if requiresSignIn {
@@ -344,8 +347,8 @@ struct WorkersView: View {
             return .online
         }
 
-        let isCheckingAccounts = AgentKind.allCases.contains { kind in
-            accountUsageService.isLoading(workerID: worker.id, kind: kind)
+        let isCheckingAccounts = accounts.contains { account in
+            accountUsageService.isLoading(workerID: worker.id, account: account)
         }
         if workerMetricsService.isLoading(workerID: worker.id) || isCheckingAccounts {
             return .checking
@@ -361,22 +364,24 @@ struct WorkersView: View {
     }
 
     private func isSummaryOnline(_ worker: ServerProfile) -> Bool {
-        workerMetricsService.snapshot(for: worker.id) != nil
+        let accounts = providerAccountService.accounts(workerID: worker.id)
+        return workerMetricsService.snapshot(for: worker.id) != nil
             && workerMetricsService.error(for: worker.id) == nil
-            && !AgentKind.allCases.contains { kind in
+            && !accounts.contains { account in
                 accountUsageService.requiresNewSessionSignIn(
                     workerID: worker.id,
-                    kind: kind
+                    account: account
                 )
             }
     }
 
     private func hasSummaryIssue(_ worker: ServerProfile) -> Bool {
-        workerMetricsService.error(for: worker.id) != nil
-            || AgentKind.allCases.contains { kind in
+        let accounts = providerAccountService.accounts(workerID: worker.id)
+        return workerMetricsService.error(for: worker.id) != nil
+            || accounts.contains { account in
                 accountUsageService.requiresNewSessionSignIn(
                     workerID: worker.id,
-                    kind: kind
+                    account: account
                 )
             }
     }
@@ -394,11 +399,17 @@ struct WorkersView: View {
         isRefreshingAll = true
         defer { isRefreshingAll = false }
 
+        for worker in serverStore.servers {
+            let accounts = await providerAccountService.refresh(worker: worker)
+                ?? providerAccountService.accounts(workerID: worker.id)
+            await accountUsageService.refresh(
+                worker: worker,
+                accounts: accounts,
+                force: force
+            )
+        }
         await withTaskGroup(of: Void.self) { group in
             for worker in serverStore.servers {
-                group.addTask {
-                    await accountUsageService.refresh(worker: worker, force: force)
-                }
                 group.addTask {
                     await workerMetricsService.refresh(worker: worker, force: force)
                 }
@@ -579,6 +590,7 @@ private struct WorkerOverviewCard: View {
     @EnvironmentObject private var accountUsageService: AccountUsageService
     @EnvironmentObject private var workerMetricsService: WorkerMetricsService
     @EnvironmentObject private var workerSessionService: WorkerSessionService
+    @EnvironmentObject private var providerAccountService: ProviderAccountService
 
     let worker: ServerProfile
     let projects: [ProjectProfile]
@@ -597,6 +609,9 @@ private struct WorkerOverviewCard: View {
         VStack(spacing: 0) {
             GeometryReader { proxy in
                 let availableWidth = max(proxy.size.width - 4, 0)
+                let codexAccount = primaryAccount(for: .codex)
+                let claudeAccount = primaryAccount(for: .claude)
+                let issueAccount = primaryIssueAccount
 
                 HStack(spacing: 0) {
                     WorkerIdentityColumn(
@@ -604,21 +619,33 @@ private struct WorkerOverviewCard: View {
                         health: health,
                         issueKind: primaryIssueKind,
                         issueLabel: primaryIssueLabel,
-                        currentAccount: primaryIssueKind.flatMap {
-                            accountUsageService.snapshot(for: worker.id, kind: $0)?.account
+                        currentAccount: issueAccount.flatMap {
+                            accountUsageService.snapshot(for: worker.id, account: $0)?.account
+                                ?? $0.displayName
                         },
-                        hasActiveAgent: primaryIssueKind.map {
-                            sessionManager.occupant(for: worker, kind: $0) != nil
+                        hasActiveAgent: issueAccount.map {
+                            sessionManager.occupant(
+                                for: worker,
+                                kind: $0.provider,
+                                accountID: $0.accountID
+                            ) != nil
                         } ?? false,
-                        requiresNewSessionSignIn: primaryIssueKind.map {
+                        requiresNewSessionSignIn: issueAccount.map {
                             accountUsageService.requiresNewSessionSignIn(
                                 workerID: worker.id,
-                                kind: $0
+                                account: $0
                             )
                         } ?? false,
-                        isSessionOperationInProgress: primaryIssueKind.map {
-                            workerSessionService.isStarting(worker: worker, kind: $0)
-                                || workerSessionService.isStopping(worker: worker, kind: $0)
+                        isSessionOperationInProgress: issueAccount.map {
+                            workerSessionService.isStarting(
+                                worker: worker,
+                                kind: $0.provider,
+                                accountID: $0.accountID
+                            ) || workerSessionService.isStopping(
+                                worker: worker,
+                                kind: $0.provider,
+                                accountID: $0.accountID
+                            )
                         } ?? false
                     )
                     .frame(width: availableWidth * 0.237)
@@ -637,14 +664,25 @@ private struct WorkerOverviewCard: View {
                     WorkerAccountColumn(
                         worker: worker,
                         kind: .codex,
-                        accountFallback: worker.accountLabel(for: .codex),
-                        snapshot: accountUsageService.snapshot(for: worker.id, kind: .codex),
-                        errorMessage: accountUsageService.error(for: worker.id, kind: .codex),
-                        isLoading: accountUsageService.isLoading(workerID: worker.id, kind: .codex),
-                        requiresNewSessionSignIn: accountUsageService.requiresNewSessionSignIn(
-                            workerID: worker.id,
-                            kind: .codex
-                        )
+                        accountID: codexAccount?.accountID,
+                        accountFallback: codexAccount?.displayName
+                            ?? worker.accountLabel(for: .codex),
+                        snapshot: codexAccount.flatMap {
+                            accountUsageService.snapshot(for: worker.id, account: $0)
+                        },
+                        errorMessage: codexAccount.flatMap {
+                            accountUsageService.error(for: worker.id, account: $0)
+                        },
+                        isLoading: codexAccount.map {
+                            accountUsageService.isLoading(workerID: worker.id, account: $0)
+                        } ?? false,
+                        requiresNewSessionSignIn: codexAccount.map {
+                            $0.status == .authRequired
+                                || accountUsageService.requiresNewSessionSignIn(
+                                    workerID: worker.id,
+                                    account: $0
+                                )
+                        } ?? false
                     )
                     .frame(width: availableWidth * 0.185)
 
@@ -653,14 +691,25 @@ private struct WorkerOverviewCard: View {
                     WorkerAccountColumn(
                         worker: worker,
                         kind: .claude,
-                        accountFallback: worker.accountLabel(for: .claude),
-                        snapshot: accountUsageService.snapshot(for: worker.id, kind: .claude),
-                        errorMessage: accountUsageService.error(for: worker.id, kind: .claude),
-                        isLoading: accountUsageService.isLoading(workerID: worker.id, kind: .claude),
-                        requiresNewSessionSignIn: accountUsageService.requiresNewSessionSignIn(
-                            workerID: worker.id,
-                            kind: .claude
-                        )
+                        accountID: claudeAccount?.accountID,
+                        accountFallback: claudeAccount?.displayName
+                            ?? worker.accountLabel(for: .claude),
+                        snapshot: claudeAccount.flatMap {
+                            accountUsageService.snapshot(for: worker.id, account: $0)
+                        },
+                        errorMessage: claudeAccount.flatMap {
+                            accountUsageService.error(for: worker.id, account: $0)
+                        },
+                        isLoading: claudeAccount.map {
+                            accountUsageService.isLoading(workerID: worker.id, account: $0)
+                        } ?? false,
+                        requiresNewSessionSignIn: claudeAccount.map {
+                            $0.status == .authRequired
+                                || accountUsageService.requiresNewSessionSignIn(
+                                    workerID: worker.id,
+                                    account: $0
+                                )
+                        } ?? false
                     )
                     .frame(width: availableWidth * 0.201)
 
@@ -753,21 +802,30 @@ private struct WorkerOverviewCard: View {
             .padding(.vertical, 25)
     }
 
-    private var primaryIssueKind: AgentKind? {
-        AgentKind.allCases.first { kind in
-            accountUsageService.requiresNewSessionSignIn(
-                workerID: worker.id,
-                kind: kind
-            ) || accountUsageService.error(for: worker.id, kind: kind) != nil
+    private func primaryAccount(for kind: AgentKind) -> ProviderAccountProfile? {
+        let accounts = providerAccountService.accounts(workerID: worker.id, provider: kind)
+        return accounts.first(where: { $0.status.isUsable }) ?? accounts.first
+    }
+
+    private var primaryIssueAccount: ProviderAccountProfile? {
+        providerAccountService.accounts(workerID: worker.id).first { account in
+            account.status == .authRequired
+                || accountUsageService.requiresNewSessionSignIn(
+                    workerID: worker.id,
+                    account: account
+                )
+                || accountUsageService.error(for: worker.id, account: account) != nil
         }
     }
 
+    private var primaryIssueKind: AgentKind? { primaryIssueAccount?.provider }
+
     private var primaryIssueLabel: String? {
-        guard let kind = primaryIssueKind else { return nil }
+        guard let account = primaryIssueAccount else { return nil }
         if accountUsageService.requiresNewSessionSignIn(
             workerID: worker.id,
-            kind: kind
-        ) {
+            account: account
+        ) || account.status == .authRequired {
             return "Signed out"
         }
         return "Unavailable"
@@ -986,6 +1044,7 @@ private struct WorkerAccountColumn: View {
 
     let worker: ServerProfile
     let kind: AgentKind
+    let accountID: ProviderAccountID?
     let accountFallback: String
     let snapshot: AccountUsageSnapshot?
     let errorMessage: String?
@@ -1022,12 +1081,19 @@ private struct WorkerAccountColumn: View {
     }
 
     private var hasActiveAgent: Bool {
-        sessionManager.occupant(for: worker, kind: kind) != nil
+        sessionManager.occupant(for: worker, kind: kind, accountID: accountID) != nil
     }
 
     private var isAccountActionDisabled: Bool {
-        workerSessionService.isStarting(worker: worker, kind: kind)
-            || workerSessionService.isStopping(worker: worker, kind: kind)
+        workerSessionService.isStarting(
+            worker: worker,
+            kind: kind,
+            accountID: accountID
+        ) || workerSessionService.isStopping(
+            worker: worker,
+            kind: kind,
+            accountID: accountID
+        )
     }
 
     var body: some View {

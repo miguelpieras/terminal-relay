@@ -4,6 +4,9 @@ import XCTest
 
 final class MacChatTransportTests: XCTestCase {
     private let relayID = "11111111-1111-1111-1111-111111111111"
+    private let accountID = ProviderAccountID(
+        UUID(uuidString: "88888888-8888-4888-8888-888888888888")!
+    )
 
     func testConnectSendDecodeAndCleanDisconnect() async throws {
         let transport = MacChatTransport(
@@ -17,6 +20,7 @@ final class MacChatTransportTests: XCTestCase {
             requestID: "22222222-2222-2222-2222-222222222222",
             relayID: relayID,
             provider: .codex,
+            accountID: accountID,
             sentAt: 1,
             payload: .object([:])
         )
@@ -204,6 +208,7 @@ final class MacChatTransportTests: XCTestCase {
             eventID: eventID,
             relayID: relayID,
             provider: .codex,
+            accountID: accountID,
             snapshotGeneration: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             sequence: sequence,
             occurredAt: sequence,

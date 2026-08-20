@@ -6,6 +6,9 @@ final class SharedChatIOSTests: XCTestCase {
     private let relayID = "00000000-0000-4000-8000-000000000001"
     private let threadID = "00000000-0000-4000-8000-000000000002"
     private let generation = "00000000-0000-4000-8000-000000000003"
+    private let accountID = ProviderAccountID(
+        UUID(uuidString: "00000000-0000-4000-8000-000000000004")!
+    )
 
     func testSharedInteractiveControlsUse44PointIOSPolicyWithCompactVisualPadding() {
         XCTAssertTrue(ChatInteractionTargetLayout.appliesMinimumDimension)
@@ -244,6 +247,7 @@ final class SharedChatIOSTests: XCTestCase {
             ),
             relayID: relayID,
             provider: .codex,
+            accountID: accountID,
             providerThreadID: threadID,
             snapshotGeneration: generation,
             sequence: sequence,

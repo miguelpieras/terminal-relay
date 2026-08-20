@@ -39,37 +39,45 @@ final class ConversationStateCacheTests: XCTestCase {
         return store.state
     }
 
-    func testRoundTripPreservesItemsAndResumeCursor() async throws {
-        let cache = ConversationStateCache(directory: directory)
-        let state = try populatedState()
-        await cache.save(state, for: identity)
-
-        let loaded = await cache.load(for: identity)
-        XCTAssertEqual(loaded?.items, state.items)
-        XCTAssertEqual(
-            loaded?.lastAppliedSequence,
-            1,
-            "The resume cursor must survive the round trip so attach replays only the delta."
+    func testPurgeRemovesOnlyLegacyConversationCache() throws {
+        let relayDirectory = directory.appendingPathComponent(
+            "Terminal Relay",
+            isDirectory: true
         )
+        let cacheDirectory = relayDirectory.appendingPathComponent(
+            "Conversation Cache",
+            isDirectory: true
+        )
+        let sibling = relayDirectory.appendingPathComponent("worker-metadata.json")
+        try FileManager.default.createDirectory(
+            at: cacheDirectory,
+            withIntermediateDirectories: true
+        )
+        try Data("private transcript".utf8).write(
+            to: cacheDirectory.appendingPathComponent("conversation.json")
+        )
+        try Data("keep".utf8).write(to: sibling)
+
+        XCTAssertTrue(
+            ConversationStateCacheMaintenance.purgeLegacyCache(
+                applicationSupportDirectory: directory
+            )
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cacheDirectory.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sibling.path))
     }
 
-    func testLoadRefusesMissingThreadIdentityAndEmptyStates() async throws {
-        let cache = ConversationStateCache(directory: directory)
-        let anonymous = ChatConversationIdentity(
-            relayID: "b265e274-d701-483b-8cf5-42dc41791d65",
-            provider: .codex,
-            providerThreadID: nil
+    func testPurgeIsIdempotentWhenLegacyCacheIsAbsent() {
+        XCTAssertTrue(
+            ConversationStateCacheMaintenance.purgeLegacyCache(
+                applicationSupportDirectory: directory
+            )
         )
-        await cache.save(try populatedState(), for: anonymous)
-        let loadedAnonymous = await cache.load(for: anonymous)
-        XCTAssertNil(
-            loadedAnonymous,
-            "Per-run relay IDs are never written or read; only stable thread IDs key the cache."
+        XCTAssertTrue(
+            ConversationStateCacheMaintenance.purgeLegacyCache(
+                applicationSupportDirectory: directory
+            )
         )
-
-        await cache.save(ConversationState(), for: identity)
-        let loadedEmpty = await cache.load(for: identity)
-        XCTAssertNil(loadedEmpty, "Empty states are not worth persisting.")
     }
 
     func testHydrationPaintsCacheOnceAndNeverClobbersLiveState() throws {

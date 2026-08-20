@@ -102,11 +102,12 @@ final class ChatProtocolTests: XCTestCase {
         }
 
         let unsupported = ChatEnvelope(
-            v: 2,
+            v: 3,
             type: "session.heartbeat",
             eventID: "00000000-0000-4000-8000-000000000004",
             relayID: ChatTestFixtures.relayID,
             provider: .codex,
+            accountID: ChatTestFixtures.accountID,
             providerThreadID: ChatTestFixtures.threadID,
             sequence: 1
         )
@@ -114,7 +115,64 @@ final class ChatProtocolTests: XCTestCase {
         XCTAssertThrowsError(
             try unsupportedDecoder.append(JSONEncoder.chat.encode(unsupported) + Data([0x0A]))
         ) { error in
-            guard case ChatProtocolError.unsupportedVersion(2, _) = error else {
+            guard case ChatProtocolError.unsupportedVersion(3, _) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+    }
+
+    func testVersionTwoRejectsMissingOrNoncanonicalAccountIdentity() throws {
+        let missingAccount = ChatEnvelope(
+            type: "session.heartbeat",
+            eventID: "00000000-0000-4000-8000-000000000004",
+            relayID: ChatTestFixtures.relayID,
+            provider: .codex,
+            providerThreadID: ChatTestFixtures.threadID,
+            sequence: 1
+        )
+        var decoder = ChatNDJSONDecoder()
+        XCTAssertThrowsError(
+            try decoder.append(JSONEncoder.chat.encode(missingAccount) + Data([0x0A]))
+        ) { error in
+            guard case ChatProtocolError.invalidEnvelope = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+
+        XCTAssertNil(
+            ProviderAccountID(rawValue: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA")
+        )
+        let legacyIdentity = ChatConversationIdentity(
+            relayID: ChatTestFixtures.relayID,
+            provider: .codex,
+            providerThreadID: ChatTestFixtures.threadID
+        )
+        let legacyEnvelope = try ChatCommand.ping.envelope(identity: legacyIdentity)
+        XCTAssertEqual(legacyEnvelope.v, ChatEnvelope.legacyProtocolVersion)
+        XCTAssertNil(legacyEnvelope.accountID)
+        var legacyDecoder = ChatNDJSONDecoder()
+        XCTAssertEqual(
+            try legacyDecoder.append(ChatNDJSONEncoder.encode(legacyEnvelope)),
+            [legacyEnvelope]
+        )
+
+        let legacyWithAccount = ChatEnvelope(
+            v: ChatEnvelope.legacyProtocolVersion,
+            type: "session.heartbeat",
+            eventID: "00000000-0000-4000-8000-000000000004",
+            relayID: ChatTestFixtures.relayID,
+            provider: .codex,
+            accountID: ChatTestFixtures.accountID,
+            providerThreadID: ChatTestFixtures.threadID,
+            sequence: 1
+        )
+        var invalidLegacyDecoder = ChatNDJSONDecoder()
+        XCTAssertThrowsError(
+            try invalidLegacyDecoder.append(
+                JSONEncoder.chat.encode(legacyWithAccount) + Data([0x0A])
+            )
+        ) { error in
+            guard case ChatProtocolError.invalidEnvelope = error else {
                 return XCTFail("Unexpected error: \(error)")
             }
         }
@@ -153,6 +211,7 @@ final class ChatProtocolTests: XCTestCase {
             options: ChatLaunchOptions(model: "test-model", reasoningEffort: "high")
         ).envelope(identity: ChatTestFixtures.identity)
         XCTAssertEqual(turn.type, "turn.start")
+        XCTAssertEqual(turn.accountID, ChatTestFixtures.accountID)
         XCTAssertEqual(turn.payload["text"]?.stringValue, "Hello")
         XCTAssertEqual(turn.payload["model"]?.stringValue, "test-model")
         XCTAssertEqual(turn.payload["reasoningEffort"]?.stringValue, "high")

@@ -138,7 +138,7 @@ final class SSHCommandBuilderTests: XCTestCase {
                 "-i", ("~/Keys/agent key" as NSString).expandingTildeInPath,
                 "--",
                 "developer@example.com",
-                "'/usr/local/bin/terminal-relay-session' 'status'"
+                "'/usr/local/bin/terminal-relay-session' 'status-v2'"
             ]
         )
         XCTAssertFalse(configuration.arguments.contains("-tt"))
@@ -388,6 +388,132 @@ final class SSHCommandBuilderTests: XCTestCase {
                     "terminal-relay",
                 ] + AgentLaunchDefaults.standard.chatArguments(for: .claude)
             ).map(SSHCommandBuilder.shellQuote).joined(separator: " ")
+        )
+    }
+
+    func testAccountAwareCommandsUseOnlyExplicitVersionedRoutes() {
+        let server = makeServer()
+        let project = makeProject(server: server)
+        let accountID = ProviderAccountID(
+            UUID(uuidString: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")!
+        )
+
+        let reattach = SSHCommandBuilder.remoteCommand(
+            for: server,
+            project: project,
+            kind: .claude,
+            accountID: accountID,
+            instanceToken: instanceToken
+        )
+        let routedReattach = [
+            WorkerSessionProtocol.helperPath,
+            "reattach-v2",
+            "claude",
+            accountID.rawValue,
+            "terminal-relay",
+            instanceToken,
+        ].map(SSHCommandBuilder.shellQuote).joined(separator: " ")
+        XCTAssertEqual(
+            reattach,
+            "exec \"${SHELL:-/bin/sh}\" -lic "
+                + SSHCommandBuilder.shellQuote("exec \(routedReattach)")
+        )
+        XCTAssertEqual(
+            SSHCommandBuilder.workerChatCapabilitiesConfiguration(
+                for: server,
+                kind: .claude,
+                accountID: accountID,
+                repositoryName: "terminal-relay"
+            ).arguments.last,
+            "'/usr/local/bin/terminal-relay-session' 'chat-capabilities-v2' 'claude' '\(accountID.rawValue)' 'terminal-relay'"
+        )
+        XCTAssertEqual(
+            SSHCommandBuilder.workerChatAttachConfiguration(
+                for: server,
+                kind: .claude,
+                accountID: accountID,
+                repositoryName: "terminal-relay",
+                instanceToken: instanceToken
+            ).arguments.last,
+            "'/usr/local/bin/terminal-relay-session' 'chat-attach-v2' 'claude' '\(accountID.rawValue)' 'terminal-relay' '\(instanceToken)'"
+        )
+        XCTAssertEqual(
+            SSHCommandBuilder.workerThreadListConfiguration(
+                for: server,
+                kind: .claude,
+                accountID: accountID,
+                repositoryName: "terminal-relay",
+                archived: false
+            ).arguments.last,
+            "'/usr/local/bin/terminal-relay-session' 'threads-v3' 'claude' '\(accountID.rawValue)' 'terminal-relay' 'open'"
+        )
+        XCTAssertEqual(
+            SSHCommandBuilder.workerThreadCreateConfiguration(
+                for: server,
+                accountID: accountID,
+                repositoryName: "terminal-relay"
+            ).arguments.last,
+            "'/usr/local/bin/terminal-relay-session' 'thread-create-v2' '\(accountID.rawValue)' 'terminal-relay'"
+        )
+        XCTAssertEqual(
+            SSHCommandBuilder.workerSessionStartConfiguration(
+                for: server,
+                kind: .claude,
+                accountID: accountID,
+                repositoryName: "terminal-relay",
+                launchDefaults: .standard
+            ).arguments.last,
+            ([
+                "/usr/bin/env",
+                "ConEmuANSI=1",
+                WorkerSessionProtocol.helperPath,
+                "start-v2",
+                "claude",
+                accountID.rawValue,
+                "terminal-relay",
+            ] + AgentLaunchDefaults.standard.arguments(for: .claude))
+                .map(SSHCommandBuilder.shellQuote).joined(separator: " ")
+        )
+        XCTAssertEqual(
+            SSHCommandBuilder.workerThreadResumeConfiguration(
+                for: server,
+                kind: .claude,
+                accountID: accountID,
+                repositoryName: "terminal-relay",
+                threadID: instanceToken,
+                launchDefaults: .standard
+            ).arguments.last,
+            ([
+                WorkerSessionProtocol.helperPath,
+                "thread-resume-v3",
+                "claude",
+                accountID.rawValue,
+                "terminal-relay",
+                instanceToken,
+            ] + AgentLaunchDefaults.standard.arguments(for: .claude))
+                .map(SSHCommandBuilder.shellQuote).joined(separator: " ")
+        )
+        XCTAssertEqual(
+            SSHCommandBuilder.workerThreadRenameConfiguration(
+                for: server,
+                kind: .claude,
+                accountID: accountID,
+                repositoryName: "terminal-relay",
+                threadID: instanceToken,
+                name: "Renamed"
+            ).arguments.last,
+            "'/usr/local/bin/terminal-relay-session' 'thread-rename-v3' 'claude' '\(accountID.rawValue)' 'terminal-relay' '\(instanceToken)' 'Renamed'"
+        )
+        XCTAssertEqual(
+            SSHCommandBuilder.workerThreadArchiveConfiguration(
+                for: server,
+                kind: .claude,
+                accountID: accountID,
+                repositoryName: "terminal-relay",
+                threadID: instanceToken,
+                unarchive: false
+            ).arguments.last,
+            "'/usr/local/bin/terminal-relay-session' 'thread-archive-v3' 'claude' '\(accountID.rawValue)' 'terminal-relay' '\(instanceToken)'"
         )
     }
 

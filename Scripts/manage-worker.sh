@@ -864,6 +864,8 @@ claude_sessions="/usr/local/bin/terminal-relay-claude-sessions"
 claude_sdk="/opt/terminal-relay/claude-session-sdk/current"
 codex_restart_marker="/home/terminal-relay/.local/state/terminal-relay/codex-app-server-restart-required"
 codex_app_server_session="terminal-relay-account-server"
+provider_accounts_root="/home/terminal-relay/.local/share/terminal-relay/provider-accounts-v1"
+provider_activation_marker="$provider_accounts_root/activated"
 export PATH="$safe_path"
 
 test "$(id -un)" = terminal-relay
@@ -887,50 +889,84 @@ test "$(command -v bwrap)" = /usr/bin/bwrap
     --ro-bind / / \
     /bin/true
 
-restart_required=0
-if [[ -e "$codex_restart_marker" || -L "$codex_restart_marker" ]]; then
-    restart_required=1
+account_routing_active=0
+if [[ -e "$provider_activation_marker" || -L "$provider_activation_marker" ]]; then
+    test -f "$provider_activation_marker"
+    test ! -L "$provider_activation_marker"
+    test "$(stat -c '%U:%G:%a' "$provider_activation_marker")" \
+        = terminal-relay:terminal-relay:600
+    test "$(< "$provider_activation_marker")" = 'version|1'
+    account_routing_active=1
 fi
-if /usr/bin/tmux -f /dev/null -L terminal-relay \
-    has-session -t "$codex_app_server_session" 2>/dev/null; then
+
+if [[ "$account_routing_active" -eq 1 ]]; then
+    "$session_helper" __schedule-all-codex-app-server-restarts
+    test "$(stat -c '%U:%G:%a' "$codex_restart_marker")" \
+        = terminal-relay:terminal-relay:600
+    codex_profile_count=0
+    shopt -s nullglob
+    for profile in "$provider_accounts_root"/*/profile; do
+        grep -Fxq 'provider|codex' "$profile" || continue
+        account_id="$(basename "$(dirname "$profile")")"
+        [[ "$account_id" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]
+        account_restart_marker="/home/terminal-relay/.local/state/terminal-relay/codex-$account_id-app-server-restart-required"
+        test -f "$account_restart_marker"
+        test ! -L "$account_restart_marker"
+        test "$(stat -c '%U:%G:%a' "$account_restart_marker")" \
+            = terminal-relay:terminal-relay:600
+        codex_profile_count=$((codex_profile_count + 1))
+    done
+    shopt -u nullglob
+    [[ "$codex_profile_count" -ge 1 ]]
+    "$session_helper" status-v2 >/dev/null
+else
+    restart_required=0
+    if [[ -e "$codex_restart_marker" || -L "$codex_restart_marker" ]]; then
+        restart_required=1
+    fi
+    if /usr/bin/tmux -f /dev/null -L terminal-relay \
+        has-session -t "$codex_app_server_session" 2>/dev/null; then
+        app_server_pid="$(/usr/bin/tmux -f /dev/null -L terminal-relay \
+            display-message -p -t "$codex_app_server_session" '#{pane_pid}')"
+        [[ "$app_server_pid" =~ ^[1-9][0-9]*$ ]]
+        app_server_path="$(/usr/bin/tr '\0' '\n' < "/proc/$app_server_pid/environ" \
+            | /usr/bin/sed -n 's/^PATH=//p')"
+        if [[ "$app_server_path" != "$safe_path" ]]; then
+            restart_required=1
+        fi
+    fi
+    if [[ "$restart_required" -eq 1 ]]; then
+        "$session_helper" __schedule-all-codex-app-server-restarts
+    fi
+    "$session_helper" __verify-codex-account >/dev/null
+    if [[ -e "$codex_restart_marker" || -L "$codex_restart_marker" ]]; then
+        test -f "$codex_restart_marker"
+        test ! -L "$codex_restart_marker"
+        test "$(stat -c '%U:%G:%a' "$codex_restart_marker")" \
+            = terminal-relay:terminal-relay:600
+        active_codex_terminals="$("$session_helper" status \
+            | /usr/bin/awk -F'|' '$1 == "session" && $2 == "codex" { count++ } END { print count + 0 }')"
+        [[ "$active_codex_terminals" =~ ^[1-9][0-9]*$ ]]
+    else
+        test ! -L "$codex_restart_marker"
+    fi
+
+    /usr/bin/tmux -f /dev/null -L terminal-relay \
+        has-session -t "$codex_app_server_session" 2>/dev/null
     app_server_pid="$(/usr/bin/tmux -f /dev/null -L terminal-relay \
         display-message -p -t "$codex_app_server_session" '#{pane_pid}')"
     [[ "$app_server_pid" =~ ^[1-9][0-9]*$ ]]
     app_server_path="$(/usr/bin/tr '\0' '\n' < "/proc/$app_server_pid/environ" \
         | /usr/bin/sed -n 's/^PATH=//p')"
-    if [[ "$app_server_path" != "$safe_path" ]]; then
-        restart_required=1
-    fi
+    test "$app_server_path" = "$safe_path"
 fi
-if [[ "$restart_required" -eq 1 ]]; then
-    "$session_helper" __schedule-codex-app-server-restart
-fi
-"$session_helper" __verify-codex-account >/dev/null
-if [[ -e "$codex_restart_marker" || -L "$codex_restart_marker" ]]; then
-    test -f "$codex_restart_marker"
-    test ! -L "$codex_restart_marker"
-    test "$(stat -c '%U:%G:%a' "$codex_restart_marker")" \
-        = terminal-relay:terminal-relay:600
-    active_codex_terminals="$("$session_helper" status \
-        | /usr/bin/awk -F'|' '$1 == "session" && $2 == "codex" { count++ } END { print count + 0 }')"
-    [[ "$active_codex_terminals" =~ ^[1-9][0-9]*$ ]]
-else
-    test ! -L "$codex_restart_marker"
-fi
-
-/usr/bin/tmux -f /dev/null -L terminal-relay \
-    has-session -t "$codex_app_server_session" 2>/dev/null
-app_server_pid="$(/usr/bin/tmux -f /dev/null -L terminal-relay \
-    display-message -p -t "$codex_app_server_session" '#{pane_pid}')"
-[[ "$app_server_pid" =~ ^[1-9][0-9]*$ ]]
-app_server_path="$(/usr/bin/tr '\0' '\n' < "/proc/$app_server_pid/environ" \
-    | /usr/bin/sed -n 's/^PATH=//p')"
-test "$app_server_path" = "$safe_path"
 
 codex --version | grep -Eq '[0-9]+\.[0-9]+\.[0-9]+'
 claude --version | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+'
-claude auth status --json 2>/dev/null \
-    | grep -Eq '"loggedIn"[[:space:]]*:[[:space:]]*true'
+if [[ "$account_routing_active" -eq 0 ]]; then
+    claude auth status --json 2>/dev/null \
+        | grep -Eq '"loggedIn"[[:space:]]*:[[:space:]]*true'
+fi
 systemctl is-enabled --quiet terminal-relay-session-restore@terminal-relay.service
 systemctl is-active --quiet terminal-relay-session-restore@terminal-relay.service
 systemctl is-enabled --quiet terminal-relay-agent-update.timer
@@ -939,14 +975,19 @@ systemctl is-enabled --quiet terminal-relay-runtime-update.timer
 systemctl is-active --quiet terminal-relay-runtime-update.timer
 systemctl is-enabled --quiet terminal-relay-runtime-update.path
 systemctl is-active --quiet terminal-relay-runtime-update.path
-"$session_helper" status >/dev/null
-/usr/bin/python3 "$chat_broker" ready \
-    --provider codex \
-    --codex-socket /home/terminal-relay/.local/state/terminal-relay/codex.sock \
-    >/dev/null
-"$claude_sdk/bin/python3" "$chat_broker" ready --provider claude >/dev/null
+if [[ "$account_routing_active" -eq 1 ]]; then
+    "$session_helper" provider-accounts-v1 >/dev/null
+    "$session_helper" status-v2 >/dev/null
+else
+    "$session_helper" status >/dev/null
+    /usr/bin/python3 "$chat_broker" ready \
+        --provider codex \
+        --codex-socket /home/terminal-relay/.local/state/terminal-relay/codex.sock \
+        >/dev/null
+    "$claude_sdk/bin/python3" "$chat_broker" ready --provider claude >/dev/null
+fi
 "$session_helper" runtime-info \
-    | grep -Eq "^runtime\\|$expected_runtime_version\\|1\\|2\\|agent-sessions,chat-v1,file-attachments-v1,runtime-updates-v1,threads-v1,threads-v2$"
+    | grep -Eq "^runtime\\|$expected_runtime_version\\|1\\|2\\|agent-sessions,chat-v1,chat-v2,file-attachments-v1,provider-accounts-v1,runtime-updates-v1,threads-v1,threads-v2,threads-v3$"
 "$session_helper" runtime-update-status >/dev/null
 printf 'application=ready\n'
 REMOTE

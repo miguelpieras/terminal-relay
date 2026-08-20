@@ -476,7 +476,7 @@ final class WorkerSessionServiceTests: XCTestCase {
                     exitCode: 0,
                     standardOutput: Data(
                         """
-                        \(WorkerSessionProtocol.marker)
+                        \(WorkerSessionProtocol.legacyMarker)
                         session|codex|terminal-relay|0|01234567-89ab-4def-8abc-0123456789ab
                         """.utf8
                     ),
@@ -507,7 +507,7 @@ final class WorkerSessionServiceTests: XCTestCase {
             results: [
                 WorkerSessionCommandResult(
                     exitCode: 0,
-                    standardOutput: Data("\(WorkerSessionProtocol.marker)\n".utf8),
+                    standardOutput: Data("\(WorkerSessionProtocol.legacyMarker)\n".utf8),
                     standardError: Data()
                 ),
                 WorkerSessionCommandResult(
@@ -571,7 +571,7 @@ final class WorkerSessionServiceTests: XCTestCase {
                     exitCode: 0,
                     standardOutput: Data(
                         """
-                        \(WorkerSessionProtocol.marker)
+                        \(WorkerSessionProtocol.legacyMarker)
                         session|codex|terminal-relay|1|\(instanceID)|30|4c697665|1|\(threadID)
                         """.utf8
                     ),
@@ -599,7 +599,7 @@ final class WorkerSessionServiceTests: XCTestCase {
                 ),
                 WorkerSessionCommandResult(
                     exitCode: 0,
-                    standardOutput: Data("\(WorkerSessionProtocol.marker)\n".utf8),
+                    standardOutput: Data("\(WorkerSessionProtocol.legacyMarker)\n".utf8),
                     standardError: Data()
                 ),
                 WorkerSessionCommandResult(
@@ -704,7 +704,7 @@ final class WorkerSessionServiceTests: XCTestCase {
                     exitCode: 0,
                     standardOutput: Data(
                         """
-                        \(WorkerChatProtocol.marker)
+                        \(WorkerChatProtocol.legacyMarker)
                         {"relayId":"\(relayID)","provider":"codex","providerThreadId":"\(threadID)","capabilities":\(capabilities),"launchOptions":{"model":"gpt-example"}}
 
                         """.utf8
@@ -753,7 +753,7 @@ final class WorkerSessionServiceTests: XCTestCase {
                     exitCode: 0,
                     standardOutput: Data(
                         """
-                        \(WorkerChatProtocol.marker)
+                        \(WorkerChatProtocol.legacyMarker)
                         {"relayId":"\(instanceID)","provider":"codex","providerThreadId":"\(threadID)","capabilities":\(capabilities),"launchOptions":{"model":"gpt-example"}}
 
                         """.utf8
@@ -902,7 +902,7 @@ final class WorkerSessionServiceTests: XCTestCase {
                     exitCode: 0,
                     standardOutput: Data(
                         """
-                        \(WorkerSessionProtocol.marker)
+                        \(WorkerSessionProtocol.legacyMarker)
                         session|claude|terminal-relay|1|\(instanceID)|30|4c697665|1|\(threadID)|chat
                         """.utf8
                     ),
@@ -1179,7 +1179,7 @@ final class WorkerSessionServiceTests: XCTestCase {
             #"{"protocolVersion":1,"features":["streaming"],"supportsHistory":true,"supportsFilePreview":true,"supportsApprovals":true,"supportsQuestions":true,"supportsAttachments":false}"#
         let emptyStatus = WorkerSessionCommandResult(
             exitCode: 0,
-            standardOutput: Data("\(WorkerSessionProtocol.marker)\n".utf8),
+            standardOutput: Data("\(WorkerSessionProtocol.legacyMarker)\n".utf8),
             standardError: Data()
         )
         let updateStatus = WorkerSessionCommandResult(
@@ -1193,7 +1193,7 @@ final class WorkerSessionServiceTests: XCTestCase {
                     exitCode: 0,
                     standardOutput: Data(
                         """
-                        \(WorkerChatProtocol.marker)
+                        \(WorkerChatProtocol.legacyMarker)
                         {"relayId":"\(instanceID)","provider":"codex","providerThreadId":"\(threadID)","capabilities":\(capabilities),"launchOptions":{}}
 
                         """.utf8
@@ -1273,7 +1273,7 @@ final class WorkerSessionServiceTests: XCTestCase {
                     exitCode: 0,
                     standardOutput: Data(
                         """
-                        \(WorkerChatProtocol.marker)
+                        \(WorkerChatProtocol.legacyMarker)
                         {"relayId":"\(instanceID)","provider":"codex","providerThreadId":"\(threadID)","capabilities":\(capabilities),"launchOptions":{}}
 
                         """.utf8
@@ -1336,11 +1336,166 @@ final class WorkerSessionServiceTests: XCTestCase {
         )
     }
 
+    func testSameProviderAccountsStartAndRemainDistinctWithSameThreadID() async {
+        let worker = makeWorker()
+        let first = makeAccount(
+            id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            label: "Personal"
+        )
+        let second = makeAccount(
+            id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            label: "Work"
+        )
+        let threadID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        let firstRelay = "11111111-1111-4111-8111-111111111111"
+        let secondRelay = "22222222-2222-4222-8222-222222222222"
+        let capabilities =
+            #"{"protocolVersion":2,"features":["streaming"],"supportsHistory":true,"supportsFilePreview":true,"supportsApprovals":true,"supportsQuestions":true,"supportsAttachments":false}"#
+        func result(account: ProviderAccountProfile, relayID: String) -> WorkerSessionCommandResult {
+            WorkerSessionCommandResult(
+                exitCode: 0,
+                standardOutput: Data(
+                    """
+                    \(WorkerChatProtocol.marker)
+                    {"relayId":"\(relayID)","provider":"codex","accountID":"\(account.accountID.rawValue)","providerThreadId":"\(threadID)","capabilities":\(capabilities),"launchOptions":{}}
+                    """.utf8
+                ),
+                standardError: Data()
+            )
+        }
+        let recorder = WorkerSessionCommandRecorder(
+            results: [
+                result(account: first, relayID: firstRelay),
+                result(account: second, relayID: secondRelay),
+            ]
+        )
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+
+        let firstSnapshot = await service.start(
+            kind: .codex,
+            account: first,
+            repositoryName: "terminal-relay",
+            launchDefaults: .standard,
+            on: worker
+        )
+        let secondSnapshot = await service.start(
+            kind: .codex,
+            account: second,
+            repositoryName: "terminal-relay",
+            launchDefaults: .standard,
+            on: worker
+        )
+
+        XCTAssertEqual(firstSnapshot?.accountID, first.accountID)
+        XCTAssertEqual(secondSnapshot?.accountID, second.accountID)
+        XCTAssertEqual(firstSnapshot?.threadID, secondSnapshot?.threadID)
+        XCTAssertEqual(service.response(for: worker.id)?.sessions.count, 2)
+        XCTAssertTrue(
+            recorder.configurations[0].arguments.last?.contains(first.accountID.rawValue) == true
+        )
+        XCTAssertTrue(
+            recorder.configurations[1].arguments.last?.contains(second.accountID.rawValue) == true
+        )
+    }
+
+    func testAggregateCatalogPreservesSuccessfulAccountWhenAnotherFails() async {
+        let worker = makeWorker()
+        let first = makeAccount(
+            id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            label: "Personal"
+        )
+        let second = makeAccount(
+            id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            label: "Work"
+        )
+        let threadID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        let recorder = WorkerSessionCommandRecorder(
+            results: [
+                WorkerSessionCommandResult(
+                    exitCode: 0,
+                    standardOutput: Data(
+                        """
+                        \(WorkerThreadProtocol.marker)
+                        {"threads":[{"provider":"codex","accountID":"\(first.accountID.rawValue)","threadID":"\(threadID)","title":"Available","updatedAt":1,"archived":false,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":null}
+                        """.utf8
+                    ),
+                    standardError: Data()
+                ),
+                WorkerSessionCommandResult(
+                    exitCode: 1,
+                    standardOutput: Data(),
+                    standardError: Data("auth required".utf8)
+                ),
+            ]
+        )
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+
+        let response = await service.loadThreads(
+            repositoryName: "terminal-relay",
+            archived: false,
+            on: worker,
+            accounts: [first, second]
+        )
+
+        XCTAssertEqual(response?.threads.map(\.accountID), [first.accountID])
+        XCTAssertEqual(
+            service.threads(
+                repositoryName: "terminal-relay",
+                archived: false,
+                on: worker
+            ).map(\.accountID),
+            [first.accountID]
+        )
+        XCTAssertNotNil(service.threadError(workerID: worker.id, account: second))
+        XCTAssertNil(
+            service.error(for: worker.id),
+            "An account-scoped catalog failure must not mask healthy account results."
+        )
+    }
+
+    func testAggregateCatalogSurfacesSignedOutAccountWithoutLaunchingIt() async {
+        let worker = makeWorker()
+        let signedOut = ProviderAccountProfile(
+            accountID: ProviderAccountID(
+                UUID(uuidString: "dddddddd-dddd-4ddd-8ddd-dddddddddddd")!
+            ),
+            provider: .codex,
+            label: "Signed out",
+            storageKind: .isolated,
+            status: .authRequired
+        )
+        let recorder = WorkerSessionCommandRecorder(results: [])
+        let service = WorkerSessionService { configuration in
+            await recorder.run(configuration)
+        }
+
+        let response = await service.loadThreads(
+            repositoryName: "terminal-relay",
+            archived: false,
+            on: worker,
+            accounts: [signedOut]
+        )
+
+        XCTAssertEqual(response, WorkerThreadResponse(threads: [], nextCursor: nil))
+        XCTAssertEqual(
+            service.threadError(workerID: worker.id, account: signedOut),
+            "Sign in to load this account's tasks."
+        )
+        XCTAssertTrue(recorder.configurations.isEmpty)
+
+        service.dismissThreadError(workerID: worker.id, account: signedOut)
+        XCTAssertNil(service.threadError(workerID: worker.id, account: signedOut))
+    }
+
     private func threadResult(_ json: String) -> WorkerSessionCommandResult {
         WorkerSessionCommandResult(
             exitCode: 0,
             standardOutput: Data(
-                "\(WorkerThreadProtocol.marker)\n\(json)\n".utf8
+                "\(WorkerThreadProtocol.previousMarker)\n\(json)\n".utf8
             ),
             standardError: Data()
         )
@@ -1351,6 +1506,16 @@ final class WorkerSessionServiceTests: XCTestCase {
             name: "Worker 1",
             host: "worker.example.com",
             username: "relay"
+        )
+    }
+
+    private func makeAccount(id: String, label: String) -> ProviderAccountProfile {
+        ProviderAccountProfile(
+            accountID: ProviderAccountID(UUID(uuidString: id)!),
+            provider: .codex,
+            label: label,
+            storageKind: .isolated,
+            status: .active
         )
     }
 }
@@ -1456,7 +1621,7 @@ private final class RuntimeInspectionCommandRecorder {
         }
         return WorkerSessionCommandResult(
             exitCode: 0,
-            standardOutput: Data("\(WorkerSessionProtocol.marker)\n".utf8),
+            standardOutput: Data("\(WorkerSessionProtocol.legacyMarker)\n".utf8),
             standardError: Data()
         )
     }

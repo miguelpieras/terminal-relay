@@ -10,6 +10,7 @@ private let sessionOrderLogger = Logger(
 @MainActor
 struct SessionOccupant {
     let kind: AgentKind
+    let accountID: ProviderAccountID?
     let repositoryName: String
     let projectID: UUID?
     let localSession: TerminalSession?
@@ -17,6 +18,7 @@ struct SessionOccupant {
 
     init(session: TerminalSession) {
         kind = session.kind
+        accountID = session.accountID
         repositoryName = session.projectName
         projectID = session.projectID
         localSession = session
@@ -29,6 +31,7 @@ struct SessionOccupant {
         localSession: TerminalSession?
     ) {
         kind = snapshot.kind
+        accountID = snapshot.accountID
         repositoryName = snapshot.repositoryName
         self.projectID = projectID
         self.localSession = localSession
@@ -164,6 +167,9 @@ final class SessionManager: ObservableObject {
                       let threadID = session.threadID else {
                     return nil
                 }
+                if let accountID = session.accountID {
+                    return "\(session.kind.rawValue):\(accountID.rawValue):\(threadID)"
+                }
                 return "\(session.kind.rawValue):\(threadID)"
             }
         )
@@ -187,10 +193,15 @@ final class SessionManager: ObservableObject {
         objectWillChange.send()
     }
 
-    func activeSession(projectID: UUID, kind: AgentKind) -> TerminalSession? {
+    func activeSession(
+        projectID: UUID,
+        kind: AgentKind,
+        accountID: ProviderAccountID? = nil
+    ) -> TerminalSession? {
         sessions.last {
             $0.projectID == projectID
                 && $0.kind == kind
+                && (accountID == nil || $0.accountID == accountID)
                 && $0.status.occupiesSlot
         }
     }
@@ -199,25 +210,41 @@ final class SessionManager: ObservableObject {
         sessions.filter { $0.serverKey == server.concurrencyKey }
     }
 
-    func activeSession(for server: ServerProfile, kind: AgentKind) -> TerminalSession? {
+    func activeSession(
+        for server: ServerProfile,
+        kind: AgentKind,
+        accountID: ProviderAccountID? = nil
+    ) -> TerminalSession? {
         sessions.last {
             $0.serverKey == server.concurrencyKey
                 && $0.kind == kind
+                && (accountID == nil || $0.accountID == accountID)
                 && $0.status.occupiesSlot
         }
     }
 
-    func occupant(for server: ServerProfile, kind: AgentKind) -> SessionOccupant? {
-        if let localSession = activeSession(for: server, kind: kind) {
+    func occupant(
+        for server: ServerProfile,
+        kind: AgentKind,
+        accountID: ProviderAccountID? = nil
+    ) -> SessionOccupant? {
+        if let localSession = activeSession(
+            for: server,
+            kind: kind,
+            accountID: accountID
+        ) {
             return SessionOccupant(session: localSession)
         }
 
         if let snapshot = remoteSessions.first(where: {
-            $0.key.serverKey == server.concurrencyKey && $0.value.kind == kind
+            $0.key.serverKey == server.concurrencyKey
+                && $0.value.kind == kind
+                && (accountID == nil || $0.value.accountID == accountID)
         })?.value {
             let localSession = sessions.last {
                 $0.serverKey == server.concurrencyKey
                     && $0.kind == kind
+                    && $0.accountID == snapshot.accountID
                     && $0.projectName == snapshot.repositoryName
                     && $0.instanceToken == snapshot.instanceToken
                     && $0.status.occupiesSlot
@@ -236,19 +263,48 @@ final class SessionManager: ObservableObject {
     func openNewSession(
         project: ProjectProfile,
         on server: ServerProfile,
-        kind: AgentKind,
+        account: ProviderAccountProfile,
         launchDefaults: AgentLaunchDefaults,
         onPendingSession: ((TerminalSession) -> Void)? = nil,
         using service: WorkerSessionService
     ) async -> SessionOpenResult? {
-        guard project.serverID == server.id else { return nil }
+        await openNewSession(
+            project: project,
+            on: server,
+            kind: account.provider,
+            account: account,
+            launchDefaults: launchDefaults,
+            onPendingSession: onPendingSession,
+            using: service
+        )
+    }
+
+    @discardableResult
+    func openNewSession(
+        project: ProjectProfile,
+        on server: ServerProfile,
+        kind: AgentKind,
+        account: ProviderAccountProfile? = nil,
+        launchDefaults: AgentLaunchDefaults,
+        onPendingSession: ((TerminalSession) -> Void)? = nil,
+        using service: WorkerSessionService
+    ) async -> SessionOpenResult? {
+        guard project.serverID == server.id,
+              account.map({ $0.provider == kind && $0.status.isUsable }) != false else {
+            return nil
+        }
 
         invalidatePendingOpenSelection()
         let pendingSession = TerminalSession(
             project: project,
             server: server,
             kind: kind,
-            sequenceNumber: nextSequenceNumber(projectID: project.id, kind: kind),
+            account: account,
+            sequenceNumber: nextSequenceNumber(
+                projectID: project.id,
+                kind: kind,
+                accountID: account?.accountID
+            ),
             instanceToken: UUID().uuidString.lowercased(),
             presentation: .chat,
             launchState: .starting,
@@ -261,11 +317,13 @@ final class SessionManager: ObservableObject {
 
         guard let snapshot = await service.start(
             kind: kind,
+            account: account,
             repositoryName: project.displayName,
             launchDefaults: launchDefaults,
             on: server
         ),
         snapshot.kind == kind,
+        snapshot.accountID == account?.accountID,
         snapshot.repositoryName == project.displayName else {
             pendingSession.markLaunchFailed(
                 service.error(for: server.id)
@@ -281,6 +339,7 @@ final class SessionManager: ObservableObject {
             project: project,
             on: server,
             snapshot: snapshot,
+            account: account,
             launchDefaults: launchDefaults
         ) else {
             pendingSession.markLaunchFailed("The worker returned an invalid agent session.")
@@ -294,6 +353,7 @@ final class SessionManager: ObservableObject {
         _ thread: WorkerThreadSnapshot,
         project: ProjectProfile,
         on server: ServerProfile,
+        account: ProviderAccountProfile? = nil,
         launchDefaults: AgentLaunchDefaults,
         onPendingSession: ((TerminalSession) -> Void)? = nil,
         using service: WorkerSessionService
@@ -301,7 +361,12 @@ final class SessionManager: ObservableObject {
         guard thread.activityState == .inactive,
               thread.capabilities.resume,
               thread.repositoryName == project.displayName,
-              project.serverID == server.id else {
+              project.serverID == server.id,
+              account.map({
+                  $0.provider == thread.kind
+                      && $0.accountID == thread.accountID
+                      && $0.status.isUsable
+              }) != false else {
             return nil
         }
 
@@ -309,6 +374,7 @@ final class SessionManager: ObservableObject {
             $0.projectID == project.id
                 && $0.serverKey == server.concurrencyKey
                 && $0.kind == thread.kind
+                && $0.accountID == thread.accountID
                 && $0.threadID == thread.threadID
                 && ($0.isLaunchPending || $0.status.occupiesSlot)
         }) {
@@ -324,6 +390,7 @@ final class SessionManager: ObservableObject {
         for leftover in sessions where leftover.projectID == project.id
             && leftover.serverKey == server.concurrencyKey
             && leftover.kind == thread.kind
+            && leftover.accountID == thread.accountID
             && leftover.threadID == thread.threadID
             && leftover.status != .stopping {
             removeSession(id: leftover.id)
@@ -340,7 +407,13 @@ final class SessionManager: ObservableObject {
             project: project,
             server: server,
             kind: thread.kind,
-            sequenceNumber: nextSequenceNumber(projectID: project.id, kind: thread.kind),
+            account: account,
+            accountID: thread.accountID,
+            sequenceNumber: nextSequenceNumber(
+                projectID: project.id,
+                kind: thread.kind,
+                accountID: thread.accountID
+            ),
             instanceToken: UUID().uuidString.lowercased(),
             lastActivityAt: Date(timeIntervalSince1970: TimeInterval(thread.updatedAt)),
             terminalTitle: thread.title,
@@ -356,11 +429,12 @@ final class SessionManager: ObservableObject {
 
         guard let snapshot = await service.resumeThread(
             kind: thread.kind,
+            accountID: thread.accountID,
             repositoryName: project.displayName,
             threadID: thread.threadID,
             launchDefaults: launchDefaults,
             on: server
-        ) else {
+        ), snapshot.accountID == thread.accountID else {
             pendingSession.markLaunchFailed(
                 service.error(for: server.id)
                     ?? "The worker could not load this conversation."
@@ -374,6 +448,7 @@ final class SessionManager: ObservableObject {
             project: project,
             on: server,
             snapshot: snapshot,
+            account: account,
             launchDefaults: launchDefaults
         ) else {
             pendingSession.markLaunchFailed("The worker returned an invalid conversation.")
@@ -396,11 +471,15 @@ final class SessionManager: ObservableObject {
         project: ProjectProfile,
         on server: ServerProfile,
         snapshot: WorkerSessionSnapshot,
+        account: ProviderAccountProfile? = nil,
         selectResult: Bool = true,
         launchDefaults: AgentLaunchDefaults = .standard
     ) -> SessionOpenResult? {
         guard project.serverID == server.id,
               snapshot.repositoryName == project.displayName,
+              account.map({
+                  $0.provider == snapshot.kind && $0.accountID == snapshot.accountID
+              }) != false,
               let instanceID = UUID(uuidString: snapshot.instanceToken),
               instanceID.uuidString.lowercased() == snapshot.instanceToken else {
             return nil
@@ -412,6 +491,7 @@ final class SessionManager: ObservableObject {
                 && ($0.projectID != project.id
                     || $0.projectName != project.displayName
                     || $0.kind != snapshot.kind
+                    || $0.accountID != snapshot.accountID
                     || $0.presentation != snapshot.presentation)
         }) {
             return .occupied(SessionOccupant(session: occupant))
@@ -420,6 +500,8 @@ final class SessionManager: ObservableObject {
         remoteSessions[
             RemoteSessionKey(
                 serverKey: server.concurrencyKey,
+                kind: snapshot.kind,
+                accountID: snapshot.accountID,
                 instanceToken: snapshot.instanceToken
             )
         ] = snapshot
@@ -427,6 +509,7 @@ final class SessionManager: ObservableObject {
             $0.projectID == project.id
                 && $0.serverKey == server.concurrencyKey
                 && $0.kind == snapshot.kind
+                && $0.accountID == snapshot.accountID
                 && $0.instanceToken == snapshot.instanceToken
         }) {
             existing.applyRemoteSnapshot(snapshot)
@@ -451,7 +534,13 @@ final class SessionManager: ObservableObject {
             project: project,
             server: server,
             kind: snapshot.kind,
-            sequenceNumber: nextSequenceNumber(projectID: project.id, kind: snapshot.kind),
+            account: account,
+            accountID: snapshot.accountID,
+            sequenceNumber: nextSequenceNumber(
+                projectID: project.id,
+                kind: snapshot.kind,
+                accountID: snapshot.accountID
+            ),
             instanceToken: snapshot.instanceToken,
             lastActivityAt: snapshot.lastActivityAt.map {
                 Date(timeIntervalSince1970: TimeInterval($0))
@@ -520,6 +609,7 @@ final class SessionManager: ObservableObject {
               existing.projectName == project.displayName,
               existing.status.canReconnect,
               confirmedSnapshot.kind == existing.kind,
+              confirmedSnapshot.accountID == existing.accountID,
               confirmedSnapshot.repositoryName == existing.projectName,
               confirmedSnapshot.instanceToken == existing.instanceToken,
               confirmedSnapshot.presentation == existing.presentation else {
@@ -531,6 +621,8 @@ final class SessionManager: ObservableObject {
             project: project,
             server: server,
             kind: existing.kind,
+            accountID: existing.accountID,
+            accountLabel: existing.accountLabel,
             sequenceNumber: existing.sequenceNumber,
             instanceToken: launchIdentity,
             id: existing.id,
@@ -560,6 +652,7 @@ final class SessionManager: ObservableObject {
         project: ProjectProfile,
         on server: ServerProfile,
         snapshot: WorkerSessionSnapshot,
+        account: ProviderAccountProfile? = nil,
         launchDefaults: AgentLaunchDefaults
     ) -> TerminalSession? {
         guard pendingSession.isLaunchPending,
@@ -567,6 +660,7 @@ final class SessionManager: ObservableObject {
               pendingSession.projectID == project.id,
               pendingSession.serverKey == server.concurrencyKey,
               pendingSession.kind == snapshot.kind,
+              pendingSession.accountID == snapshot.accountID,
               snapshot.repositoryName == project.displayName,
               snapshot.presentation == .chat,
               let instanceID = UUID(uuidString: snapshot.instanceToken),
@@ -574,6 +668,7 @@ final class SessionManager: ObservableObject {
               !sessions.contains(where: {
                   $0 !== pendingSession
                       && $0.serverKey == server.concurrencyKey
+                      && $0.accountID == snapshot.accountID
                       && $0.instanceToken == snapshot.instanceToken
               }),
               let index = sessions.firstIndex(where: { $0 === pendingSession }) else {
@@ -583,6 +678,8 @@ final class SessionManager: ObservableObject {
         remoteSessions[
             RemoteSessionKey(
                 serverKey: server.concurrencyKey,
+                kind: snapshot.kind,
+                accountID: snapshot.accountID,
                 instanceToken: snapshot.instanceToken
             )
         ] = snapshot
@@ -595,6 +692,9 @@ final class SessionManager: ObservableObject {
             project: project,
             server: server,
             kind: snapshot.kind,
+            account: account,
+            accountID: snapshot.accountID,
+            accountLabel: pendingSession.accountLabel,
             sequenceNumber: pendingSession.sequenceNumber,
             instanceToken: snapshot.instanceToken,
             id: pendingSession.id,
@@ -669,6 +769,7 @@ final class SessionManager: ObservableObject {
         worker: ServerProfile,
         projects: [ProjectProfile],
         response: WorkerSessionResponse,
+        accounts: [ProviderAccountProfile] = [],
         launchDefaults: AgentLaunchDefaults
     ) {
         let existingIDs = Set(sessions.map(\.id))
@@ -676,6 +777,7 @@ final class SessionManager: ObservableObject {
             worker: worker,
             projects: projects,
             response: response,
+            accounts: accounts,
             launchDefaults: launchDefaults
         )
         let seededIDs = sessions.map(\.id).filter { !existingIDs.contains($0) }
@@ -689,6 +791,7 @@ final class SessionManager: ObservableObject {
     func refresh(
         worker: ServerProfile,
         projects: [ProjectProfile],
+        accounts: [ProviderAccountProfile] = [],
         launchDefaults: AgentLaunchDefaults,
         using service: WorkerSessionService
     ) async -> Bool {
@@ -699,6 +802,7 @@ final class SessionManager: ObservableObject {
             worker: worker,
             projects: projects,
             response: response,
+            accounts: accounts,
             launchDefaults: launchDefaults
         )
         return true
@@ -708,6 +812,7 @@ final class SessionManager: ObservableObject {
         worker: ServerProfile,
         projects: [ProjectProfile],
         response: WorkerSessionResponse,
+        accounts: [ProviderAccountProfile] = [],
         launchDefaults: AgentLaunchDefaults
     ) {
         remoteSessions = remoteSessions.filter {
@@ -717,6 +822,8 @@ final class SessionManager: ObservableObject {
             remoteSessions[
                 RemoteSessionKey(
                     serverKey: worker.concurrencyKey,
+                    kind: snapshot.kind,
+                    accountID: snapshot.accountID,
                     instanceToken: snapshot.instanceToken
                 )
             ] = snapshot
@@ -727,11 +834,14 @@ final class SessionManager: ObservableObject {
             let remote = remoteSessions[
                 RemoteSessionKey(
                     serverKey: worker.concurrencyKey,
+                    kind: session.kind,
+                    accountID: session.accountID,
                     instanceToken: session.instanceToken
                 )
             ]
             guard session.status.canReconnect,
                   remote?.kind != session.kind
+                    || remote?.accountID != session.accountID
                     || remote?.repositoryName != session.projectName else {
                 continue
             }
@@ -762,10 +872,14 @@ final class SessionManager: ObservableObject {
             let remote = remoteSessions[
                 RemoteSessionKey(
                     serverKey: worker.concurrencyKey,
+                    kind: session.kind,
+                    accountID: session.accountID,
                     instanceToken: session.instanceToken
                 )
             ]
-            if remote?.kind == session.kind, remote?.repositoryName == session.projectName {
+            if remote?.kind == session.kind,
+               remote?.accountID == session.accountID,
+               remote?.repositoryName == session.projectName {
                 unlistedChatSessionIDs.remove(session.id)
             } else {
                 removeSession(id: session.id)
@@ -782,6 +896,7 @@ final class SessionManager: ObservableObject {
                 $0.projectID == project.id
                     && $0.serverKey == worker.concurrencyKey
                     && $0.kind == snapshot.kind
+                    && $0.accountID == snapshot.accountID
                     && $0.instanceToken == snapshot.instanceToken
             }
             if let existing {
@@ -798,6 +913,7 @@ final class SessionManager: ObservableObject {
                        $0.projectID == project.id
                            && $0.serverKey == worker.concurrencyKey
                            && $0.kind == snapshot.kind
+                           && $0.accountID == snapshot.accountID
                            && $0.isLaunchPending
                            && ($0.threadID == nil || $0.threadID == snapshot.threadID)
                    }) {
@@ -813,7 +929,19 @@ final class SessionManager: ObservableObject {
                     project: project,
                     server: worker,
                     kind: snapshot.kind,
-                    sequenceNumber: nextSequenceNumber(projectID: project.id, kind: snapshot.kind),
+                    account: accounts.first {
+                        $0.provider == snapshot.kind
+                            && $0.accountID == snapshot.accountID
+                    },
+                    accountID: snapshot.accountID,
+                    accountLabel: snapshot.accountID.map {
+                        "Account \($0.rawValue.prefix(8))"
+                    },
+                    sequenceNumber: nextSequenceNumber(
+                        projectID: project.id,
+                        kind: snapshot.kind,
+                        accountID: snapshot.accountID
+                    ),
                     instanceToken: snapshot.instanceToken,
                     lastActivityAt: snapshot.lastActivityAt.map {
                         Date(timeIntervalSince1970: TimeInterval($0))
@@ -867,10 +995,13 @@ final class SessionManager: ObservableObject {
 
         let remoteKey = RemoteSessionKey(
             serverKey: worker.concurrencyKey,
+            kind: session.kind,
+            accountID: session.accountID,
             instanceToken: session.instanceToken
         )
         guard let snapshot = remoteSessions[remoteKey],
               snapshot.kind == session.kind,
+              snapshot.accountID == session.accountID,
               snapshot.repositoryName == session.projectName,
               snapshot.instanceToken == session.instanceToken else {
             return false
@@ -881,6 +1012,7 @@ final class SessionManager: ObservableObject {
 
         guard await service.stop(
             kind: session.kind,
+            accountID: session.accountID,
             repositoryName: repositoryName,
             instanceToken: instanceToken,
             presentation: session.presentation,
@@ -971,8 +1103,16 @@ final class SessionManager: ObservableObject {
         }
     }
 
-    private func nextSequenceNumber(projectID: UUID, kind: AgentKind) -> Int {
-        let key = ProjectAgentKey(projectID: projectID, kind: kind)
+    private func nextSequenceNumber(
+        projectID: UUID,
+        kind: AgentKind,
+        accountID: ProviderAccountID? = nil
+    ) -> Int {
+        let key = ProjectAgentKey(
+            projectID: projectID,
+            kind: kind,
+            accountID: accountID
+        )
         let nextNumber = (lastSequenceNumberByProjectAndKind[key] ?? 0) + 1
         lastSequenceNumberByProjectAndKind[key] = nextNumber
         return nextNumber
@@ -993,10 +1133,13 @@ final class SessionManager: ObservableObject {
         let snapshot = remoteSessions[
             RemoteSessionKey(
                 serverKey: server.concurrencyKey,
+                kind: session.kind,
+                accountID: session.accountID,
                 instanceToken: session.instanceToken
             )
         ]
         guard snapshot?.kind == session.kind,
+              snapshot?.accountID == session.accountID,
               snapshot?.repositoryName == session.projectName,
               snapshot?.instanceToken == session.instanceToken else {
             return nil
@@ -1008,9 +1151,12 @@ final class SessionManager: ObservableObject {
 private struct ProjectAgentKey: Hashable {
     let projectID: UUID
     let kind: AgentKind
+    let accountID: ProviderAccountID?
 }
 
 private struct RemoteSessionKey: Hashable {
     let serverKey: String
+    let kind: AgentKind
+    let accountID: ProviderAccountID?
     let instanceToken: String
 }

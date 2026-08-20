@@ -24,6 +24,8 @@ REPOSITORY_ROOT = pathlib.Path(__file__).resolve().parents[2]
 BROKER_PATH = REPOSITORY_ROOT / "Server" / "terminal-relay-chat"
 THREAD_ID = "11111111-1111-4111-8111-111111111111"
 RELAY_ID = "22222222-2222-4222-8222-222222222222"
+ACCOUNT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+OTHER_ACCOUNT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 
 
 def load_broker():
@@ -1787,10 +1789,13 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
     await new_adapter.close()
     assert received.get_nowait() is None
 
+    claude_config = root / "claude-adapter-account"
+    claude_config.mkdir(mode=0o700)
     adapter = module.ClaudeAdapter(
         str(project),
         THREAD_ID,
         {"effort": "high", "permissionMode": "default"},
+        str(claude_config),
     )
     adapter._load_sdk = load_sdk
     events: list[dict] = []
@@ -1805,7 +1810,15 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
         events.append(event)
         return event
 
-    assert await adapter.start(emit) == THREAD_ID
+    prior_claude_config = os.environ.get("CLAUDE_CONFIG_DIR")
+    os.environ["CLAUDE_CONFIG_DIR"] = str(claude_config)
+    try:
+        assert await adapter.start(emit) == THREAD_ID
+    finally:
+        if prior_claude_config is None:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = prior_claude_config
     assert sdk_load_threads and all(
         thread_id != event_loop_thread for thread_id in sdk_load_threads
     )
@@ -1814,6 +1827,9 @@ async def exercise_claude_adapter(module, root: pathlib.Path) -> None:
     )
     assert adapter.client.options.kwargs["include_partial_messages"] is True
     assert adapter.client.options.kwargs["effort"] == "high"
+    assert adapter.client.options.kwargs["env"] == {
+        "CLAUDE_CONFIG_DIR": str(claude_config)
+    }
     assert "replay_user_messages" not in adapter.client.options.kwargs
     history, older = await adapter.history(None, 100)
     assert older is False
@@ -2987,11 +3003,16 @@ def write_intent_file(
     thread_id: str,
     boot_id: str,
     arguments: list[str],
+    account_id: str | None = None,
 ) -> None:
     """Write a restart intent exactly as the session helper does."""
     lines = [
-        "version|1",
+        "version|2" if account_id is not None else "version|1",
         f"provider|{provider}",
+    ]
+    if account_id is not None:
+        lines.append(f"account|{account_id}")
+    lines += [
         f"repository|{repository}",
         f"relay|{relay_id}",
         f"thread|{thread_id}",
@@ -3483,6 +3504,227 @@ def exercise_chat_bindings(module, root: pathlib.Path) -> None:
     assert seeded.activity_at == 1755000000
 
 
+def exercise_account_routing(module, root: pathlib.Path) -> None:
+    import contextlib
+
+    runtime = root / "account-routing-runtime"
+    project = root / "account-routing-project"
+    runtime.mkdir(mode=0o700)
+    project.mkdir()
+    provider = module.FakeProvider(str(project), THREAD_ID, {})
+    broker = module.ChatBroker(
+        "codex",
+        "example-repository",
+        str(project),
+        str(runtime),
+        RELAY_ID,
+        provider,
+        {},
+        ACCOUNT_ID,
+    )
+    assert broker.protocol_version == module.ACCOUNT_PROTOCOL_VERSION
+    event = broker.event("session.state", {"connectionState": "streaming"})
+    control = broker.control_event("session.hello", {})
+    assert event["v"] == 2 and event["accountID"] == ACCOUNT_ID
+    assert control["v"] == 2 and control["accountID"] == ACCOUNT_ID
+    assert broker.snapshot_payload()["capabilities"]["protocolVersion"] == 2
+
+    command = {
+        "v": 2,
+        "type": "ping",
+        "requestId": "abababab-abab-4bab-8bab-abababababab",
+        "relayId": RELAY_ID,
+        "provider": "codex",
+        "accountID": ACCOUNT_ID,
+        "providerThreadId": THREAD_ID,
+        "sentAt": 0,
+        "payload": {},
+    }
+    assert broker.validate_command(command)[0] == "ping"
+    missing_account = dict(command)
+    missing_account.pop("accountID")
+    try:
+        broker.validate_command(missing_account)
+    except module.ChatError as error:
+        assert error.code == "staleAccount"
+    else:
+        raise AssertionError("account-aware broker accepted an accountless command")
+    wrong_account = {**command, "accountID": OTHER_ACCOUNT_ID}
+    try:
+        broker.validate_command(wrong_account)
+    except module.ChatError as error:
+        assert error.code == "staleAccount"
+    else:
+        raise AssertionError("account-aware broker accepted a wrong-account command")
+    assert module.command_fingerprint(command) != module.command_fingerprint(
+        wrong_account
+    )
+
+    module.prepare_session_directory(str(runtime), RELAY_ID)
+    broker._write_state("ready")
+    state = module.load_state(str(runtime), RELAY_ID)
+    assert state["v"] == 2
+    assert state["accountID"] == ACCOUNT_ID
+    state_path = pathlib.Path(broker.state_path)
+    missing_identity = dict(state)
+    missing_identity.pop("accountID")
+    state_path.write_text(json.dumps(missing_identity), encoding="utf-8")
+    state_path.chmod(0o600)
+    try:
+        module.load_state(str(runtime), RELAY_ID)
+    except module.ChatError as error:
+        assert error.code == "unsafeState"
+    else:
+        raise AssertionError("account-aware state accepted a missing account identity")
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    state_path.chmod(0o600)
+
+    original_validate = module.validate_live_state_process
+    module.validate_live_state_process = lambda _state: None
+    try:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            module.emit_chat_bindings(
+                str(runtime), "codex", "example-repository", ACCOUNT_ID
+            )
+        assert output.getvalue().strip() == (
+            f"{ACCOUNT_ID}|{THREAD_ID}|{RELAY_ID}|chat|0"
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            module.emit_chat_status(str(runtime), account_aware=True)
+        assert output.getvalue().strip() == (
+            f"codex|{ACCOUNT_ID}|example-repository|{RELAY_ID}|{THREAD_ID}|0"
+        )
+    finally:
+        module.validate_live_state_process = original_validate
+
+    other = module.ChatBroker(
+        "codex",
+        "example-repository",
+        str(project),
+        str(runtime),
+        "33333333-3333-4333-8333-333333333333",
+        module.FakeProvider(str(project), THREAD_ID, {}),
+        {},
+        OTHER_ACCOUNT_ID,
+    )
+    duplicate = module.ChatBroker(
+        "codex",
+        "example-repository",
+        str(project),
+        str(runtime),
+        "44444444-4444-4444-8444-444444444444",
+        module.FakeProvider(str(project), THREAD_ID, {}),
+        {},
+        ACCOUNT_ID,
+    )
+    broker._acquire_provider_lock()
+    other._acquire_provider_lock()
+    try:
+        try:
+            duplicate._acquire_provider_lock()
+        except module.ChatError as error:
+            assert error.code == "threadActive"
+        else:
+            raise AssertionError("same-account duplicate provider thread acquired a lock")
+    finally:
+        os.close(broker.provider_lock_descriptor)
+        broker.provider_lock_descriptor = None
+        os.close(other.provider_lock_descriptor)
+        other.provider_lock_descriptor = None
+
+    boot_id = "55555555-5555-4555-8555-555555555555"
+    boot_path = root / "account-routing-boot-id"
+    boot_path.write_text(f"{boot_id}\n", encoding="utf-8")
+    intent_path = runtime / f"{RELAY_ID}.chat-intent"
+    arguments = ["--model", "gpt-5"]
+    write_intent_file(
+        intent_path,
+        "codex",
+        "example-repository",
+        RELAY_ID,
+        THREAD_ID,
+        boot_id,
+        arguments,
+        ACCOUNT_ID,
+    )
+    original_boot_path = module.BOOT_ID_PATH
+    module.BOOT_ID_PATH = str(boot_path)
+    try:
+        assert broker._rewrite_intent_file(arguments) is True
+        fields, _ = read_intent_file(intent_path)
+        assert fields["version"] == "2"
+        assert fields["account"] == ACCOUNT_ID
+        write_intent_file(
+            intent_path,
+            "codex",
+            "example-repository",
+            RELAY_ID,
+            THREAD_ID,
+            boot_id,
+            arguments,
+        )
+        legacy_content = intent_path.read_text(encoding="utf-8")
+        assert broker._rewrite_intent_file(arguments) is False
+        assert intent_path.read_text(encoding="utf-8") == legacy_content
+    finally:
+        module.BOOT_ID_PATH = original_boot_path
+
+    claude_config = root / "account-claude-config"
+    claude_config.mkdir(mode=0o700)
+    old_claude_config = os.environ.get("CLAUDE_CONFIG_DIR")
+    try:
+        os.environ["CLAUDE_CONFIG_DIR"] = str(claude_config)
+        claude = module.provider_for(
+            SimpleNamespace(
+                fake=False,
+                provider="claude",
+                project_directory=str(project),
+                thread_id=THREAD_ID,
+                codex_socket="",
+            ),
+            {},
+        )
+        assert claude.claude_config_dir == str(claude_config)
+    finally:
+        if old_claude_config is None:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = old_claude_config
+
+    accounts_root = root / "provider-accounts-v1"
+    accounts_root.mkdir(mode=0o700)
+    marker = accounts_root / "activated"
+    marker.write_text("version|1\n", encoding="utf-8")
+    marker.chmod(0o600)
+    environment_keys = (
+        "TERMINAL_RELAY_CHAT_TEST_MODE",
+        "TERMINAL_RELAY_TEST_PROVIDER_ACCOUNTS_ROOT",
+        "TERMINAL_RELAY_PROVIDER",
+        "TERMINAL_RELAY_ACCOUNT_ID",
+    )
+    original_environment = {key: os.environ.get(key) for key in environment_keys}
+    try:
+        os.environ["TERMINAL_RELAY_CHAT_TEST_MODE"] = "1"
+        os.environ["TERMINAL_RELAY_TEST_PROVIDER_ACCOUNTS_ROOT"] = str(accounts_root)
+        os.environ.pop("TERMINAL_RELAY_PROVIDER", None)
+        os.environ.pop("TERMINAL_RELAY_ACCOUNT_ID", None)
+        try:
+            module.account_id_for("codex", None)
+        except module.ChatError as error:
+            assert error.code == "upgradeRequired"
+        else:
+            raise AssertionError("activated broker accepted an accountless route")
+        assert module.account_id_for("codex", ACCOUNT_ID) == ACCOUNT_ID
+    finally:
+        for key, value in original_environment.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def run() -> None:
     module = load_broker()
     exercise_validation(module)
@@ -3498,6 +3740,7 @@ def run() -> None:
         asyncio.run(exercise_option_adoption(module, root_path))
         exercise_snapshot_trim(module, root_path)
         exercise_chat_bindings(module, root_path)
+        exercise_account_routing(module, root_path)
         asyncio.run(exercise_codex_adapter(module, root_path))
         asyncio.run(exercise_codex_reconnect(module, root_path))
         asyncio.run(exercise_codex_reconcile_failed_turn(module, root_path))

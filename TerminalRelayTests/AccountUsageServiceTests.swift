@@ -217,4 +217,35 @@ final class AccountUsageServiceTests: XCTestCase {
             XCTAssertEqual(error as? AccountUsageError, .invalidResponse(.codex))
         }
     }
+
+    func testValidatesExactProviderAccountUsageRoute() throws {
+        let account = ProviderAccountProfile(
+            accountID: ProviderAccountID(
+                UUID(uuidString: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")!
+            ),
+            provider: .claude,
+            label: "Personal",
+            storageKind: .isolated,
+            status: .active
+        )
+        let matching = Data(
+            """
+            __TERMINAL_RELAY_ACCOUNT_ROUTE_V1__
+            account|claude|\(account.accountID.rawValue)
+            """.utf8
+        )
+        XCTAssertNoThrow(
+            try AccountUsageService.validateAccountRoute(matching, expected: account)
+        )
+
+        let mismatched = Data(
+            """
+            __TERMINAL_RELAY_ACCOUNT_ROUTE_V1__
+            account|codex|\(account.accountID.rawValue)
+            """.utf8
+        )
+        XCTAssertThrowsError(
+            try AccountUsageService.validateAccountRoute(mismatched, expected: account)
+        )
+    }
 }

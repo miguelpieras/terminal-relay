@@ -19,6 +19,7 @@ struct ProjectWorkspaceView: View {
     @EnvironmentObject private var projectStore: ProjectStore
     @EnvironmentObject private var workerSessionService: WorkerSessionService
     @EnvironmentObject private var accountUsageService: AccountUsageService
+    @EnvironmentObject private var providerAccountService: ProviderAccountService
     @EnvironmentObject private var projectGitService: ProjectGitService
 
     @AppStorage(AgentLaunchDefaults.StorageKey.codexModel)
@@ -36,8 +37,8 @@ struct ProjectWorkspaceView: View {
     let worker: ServerProfile
     let onSelectProject: (UUID) -> Void
     let onShowWorkers: () -> Void
+    let onStartTask: (AgentKind) -> Void
 
-    @State private var conflictingOccupant: SessionOccupant?
     @State private var isShowingCodexResets = false
     @State private var isWritingCommitMessage = false
     @State private var commitMessage = ""
@@ -75,6 +76,30 @@ struct ProjectWorkspaceView: View {
         projectSessions.contains { $0.status.occupiesSlot }
     }
 
+    private var soleUsableCodexAccount: ProviderAccountProfile? {
+        let accounts = providerAccountService.accounts(
+            workerID: worker.id,
+            provider: .codex
+        )
+        guard accounts.count == 1, accounts[0].status.isUsable else { return nil }
+        return accounts[0]
+    }
+
+    private var accountThreadWarning: (
+        account: ProviderAccountProfile,
+        message: String
+    )? {
+        for account in providerAccountService.accounts(workerID: worker.id) {
+            if let message = workerSessionService.threadError(
+                workerID: worker.id,
+                account: account
+            ) {
+                return (account, message)
+            }
+        }
+        return nil
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
@@ -84,14 +109,18 @@ struct ProjectWorkspaceView: View {
                     Divider()
                 }
 
-                if selectedSession == nil,
-                   let error = workerSessionService.error(for: worker.id) {
-                    workerSessionErrorBanner(error)
+                if selectedSession == nil, let warning = accountThreadWarning {
+                    accountThreadWarningBanner(
+                        account: warning.account,
+                        message: warning.message
+                    )
                     Divider()
                 }
 
-                if selectedSession == nil, let conflictingOccupant {
-                    conflictBanner(conflictingOccupant)
+                if selectedSession == nil,
+                   accountThreadWarning == nil,
+                   let error = workerSessionService.error(for: worker.id) {
+                    workerSessionErrorBanner(error)
                     Divider()
                 }
 
@@ -130,7 +159,11 @@ struct ProjectWorkspaceView: View {
         .task(id: usageTaskID) {
             guard !ScreenshotDemoMode.isEnabled else { return }
             guard selectedSession == nil else { return }
-            await accountUsageService.refresh(worker: worker)
+            var accounts = providerAccountService.accounts(workerID: worker.id)
+            if accounts.isEmpty {
+                accounts = await providerAccountService.refresh(worker: worker) ?? []
+            }
+            await accountUsageService.refresh(worker: worker, accounts: accounts)
         }
         .task(id: project.id) {
             guard !ScreenshotDemoMode.isEnabled else { return }
@@ -515,41 +548,79 @@ struct ProjectWorkspaceView: View {
             VStack(spacing: 16) {
                 HStack(alignment: .top, spacing: 14) {
                     ForEach(AgentKind.allCases) { kind in
+                        let accounts = providerAccountService.accounts(
+                            workerID: worker.id,
+                            provider: kind
+                        )
+                        let account = accounts.first(where: { $0.status.isUsable })
+                            ?? accounts.first
                         let hasActiveAgent = sessionManager.occupant(
                             for: worker,
-                            kind: kind
+                            kind: kind,
+                            accountID: account?.accountID
                         ) != nil
-                        let requiresNewSessionSignIn = accountUsageService
-                            .requiresNewSessionSignIn(
+                        let requiresNewSessionSignIn = account.map {
+                            accountUsageService.requiresNewSessionSignIn(
                                 workerID: worker.id,
-                                kind: kind
+                                account: $0
                             )
+                        } ?? false
                         AccountUsageCard(
                             worker: worker,
                             kind: kind,
-                            accountFallback: worker.accountLabel(for: kind),
-                            snapshot: accountUsageService.snapshot(for: worker.id, kind: kind),
-                            isLoading: accountUsageService.isLoading(workerID: worker.id, kind: kind),
-                            errorMessage: accountUsageService.error(for: worker.id, kind: kind),
+                            accountFallback: account?.displayName
+                                ?? worker.accountLabel(for: kind),
+                            snapshot: account.flatMap {
+                                accountUsageService.snapshot(for: worker.id, account: $0)
+                            },
+                            isLoading: account.map {
+                                accountUsageService.isLoading(workerID: worker.id, account: $0)
+                            } ?? false,
+                            errorMessage: account.flatMap {
+                                accountUsageService.error(for: worker.id, account: $0)
+                            },
                             hasActiveAgent: hasActiveAgent,
                             requiresNewSessionSignIn: requiresNewSessionSignIn,
                             buttonTitle: launchTitle(for: kind),
                             isButtonDisabled: isGitMutationInProgress
-                                || workerSessionService.isStarting(worker: worker, kind: kind)
-                                || workerSessionService.isStopping(worker: worker, kind: kind)
+                                || accounts.contains {
+                                    workerSessionService.isStarting(
+                                        worker: worker,
+                                        kind: kind,
+                                        accountID: $0.accountID
+                                    )
+                                }
+                                || accounts.contains {
+                                    workerSessionService.isStopping(
+                                        worker: worker,
+                                        kind: kind,
+                                        accountID: $0.accountID
+                                    )
+                                }
                                 || (requiresNewSessionSignIn && !hasActiveAgent),
                             isAccountActionDisabled:
-                                workerSessionService.isStarting(worker: worker, kind: kind)
-                                || workerSessionService.isStopping(worker: worker, kind: kind),
-                            onViewResets: kind == .codex ? { isShowingCodexResets = true } : nil,
-                            action: { open(kind) }
+                                accounts.contains {
+                                    workerSessionService.isStarting(
+                                        worker: worker,
+                                        kind: kind,
+                                        accountID: $0.accountID
+                                    ) || workerSessionService.isStopping(
+                                        worker: worker,
+                                        kind: kind,
+                                        accountID: $0.accountID
+                                    )
+                                },
+                            onViewResets: kind == .codex && soleUsableCodexAccount != nil
+                                ? { isShowingCodexResets = true }
+                                : nil,
+                            action: { onStartTask(kind) }
                         )
                     }
                 }
                 .frame(maxWidth: 820)
 
-                if isShowingCodexResets {
-                    CodexResetCreditsView(worker: worker) {
+                if isShowingCodexResets, let account = soleUsableCodexAccount {
+                    CodexResetCreditsView(worker: worker, account: account) {
                         isShowingCodexResets = false
                     }
                     .frame(maxWidth: 820)
@@ -674,62 +745,17 @@ struct ProjectWorkspaceView: View {
 
     private func launchTitle(for kind: AgentKind) -> String {
         let productName = kind == .claude ? "Claude Code" : kind.displayName
-        if workerSessionService.isStarting(worker: worker, kind: kind) {
+        let accounts = providerAccountService.accounts(workerID: worker.id, provider: kind)
+        if accounts.contains(where: {
+            workerSessionService.isStarting(
+                worker: worker,
+                kind: kind,
+                accountID: $0.accountID
+            )
+        }) {
             return "Starting \(productName)"
         }
         return "Start \(productName)"
-    }
-
-    private func open(_ kind: AgentKind) {
-        guard !isGitMutationInProgress else { return }
-
-        Task {
-            guard let result = await sessionManager.openNewSession(
-                project: project,
-                on: worker,
-                kind: kind,
-                launchDefaults: launchDefaults,
-                using: workerSessionService
-            ) else { return }
-            handleOpenResult(result)
-        }
-    }
-
-    private func handleOpenResult(_ result: SessionOpenResult) {
-        if case .occupied(let occupant) = result {
-            conflictingOccupant = occupant
-        } else {
-            conflictingOccupant = nil
-        }
-    }
-
-    private func conflictBanner(_ occupant: SessionOccupant) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
-
-            Text("\(occupant.kind.displayName) is already running on \(occupant.repositoryName).")
-                .font(.callout)
-
-            Spacer(minLength: 12)
-
-            if let projectID = occupant.projectID, let session = occupant.localSession {
-                Button("Show \(occupant.repositoryName)") {
-                    onSelectProject(projectID)
-                    sessionManager.selectSession(session.id)
-                    conflictingOccupant = nil
-                }
-                .buttonStyle(.borderless)
-            }
-
-            Button("Dismiss") {
-                conflictingOccupant = nil
-            }
-            .buttonStyle(.borderless)
-        }
-        .padding(.horizontal, 14)
-        .frame(minHeight: 38)
-        .background(Color.orange.opacity(0.08))
     }
 
     private func workerSessionErrorBanner(_ message: String) -> some View {
@@ -742,6 +768,33 @@ struct ProjectWorkspaceView: View {
             Spacer(minLength: 12)
             Button {
                 workerSessionService.dismissError(for: worker.id)
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss")
+        }
+        .padding(.horizontal, 14)
+        .frame(minHeight: 34)
+        .background(Color.orange.opacity(0.08))
+    }
+
+    private func accountThreadWarningBanner(
+        account: ProviderAccountProfile,
+        message: String
+    ) -> some View {
+        HStack(spacing: 9) {
+            Image(systemName: "person.crop.circle.badge.exclamationmark")
+                .foregroundStyle(.orange)
+            Text("\(account.provider.displayName) · \(account.displayName): \(message)")
+                .font(.caption)
+                .lineLimit(2)
+            Spacer(minLength: 12)
+            Button {
+                workerSessionService.dismissThreadError(
+                    workerID: worker.id,
+                    account: account
+                )
             } label: {
                 Image(systemName: "xmark")
             }
@@ -992,6 +1045,7 @@ private struct CodexResetCreditsView: View {
     @EnvironmentObject private var accountUsageService: AccountUsageService
 
     let worker: ServerProfile
+    let account: ProviderAccountProfile
     let onClose: () -> Void
 
     @State private var selectedReset: ResetSelection?
@@ -999,7 +1053,7 @@ private struct CodexResetCreditsView: View {
     @State private var notice: ResetNotice?
 
     private var snapshot: AccountUsageSnapshot? {
-        accountUsageService.snapshot(for: worker.id, kind: .codex)
+        accountUsageService.snapshot(for: worker.id, account: account)
     }
 
     private var summary: CodexRateLimitResetCredits? {
@@ -1022,7 +1076,7 @@ private struct CodexResetCreditsView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Codex rate-limit resets")
                         .font(.headline)
-                    Text(snapshot?.account ?? worker.accountLabel(for: .codex))
+                    Text(snapshot?.account ?? account.displayName)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -1230,6 +1284,7 @@ private struct CodexResetCreditsView: View {
             do {
                 let result = try await accountUsageService.redeemCodexReset(
                     worker: worker,
+                    account: account,
                     creditID: selection.creditID
                 )
                 notice = ResetNotice(result: result)
@@ -1332,9 +1387,11 @@ private struct TerminalPane: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if !session.usesNativeChat {
-                HStack(spacing: 9) {
-                    Label(session.accountLabel, systemImage: "person.crop.circle")
+            HStack(spacing: 9) {
+                    Label(
+                        "\(session.kind.displayName) · \(session.accountLabel)",
+                        systemImage: "person.crop.circle"
+                    )
                     Text("·")
                         .foregroundStyle(.tertiary)
                     Text(session.status.label)
@@ -1373,7 +1430,6 @@ private struct TerminalPane: View {
                 .padding(.horizontal, 12)
                 .frame(height: 34)
                 .background(Color(nsColor: .controlBackgroundColor))
-            }
 
             if session.isLaunchPending {
                 if session.isLoadingExistingConversation,

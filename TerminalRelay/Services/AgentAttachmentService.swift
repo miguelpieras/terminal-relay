@@ -29,9 +29,13 @@ enum AgentAttachmentService {
             throw AgentAttachmentUploadError.tooLarge
         }
         if session.usesNativeChat {
+            guard let accountID = session.accountID else {
+                throw AgentAttachmentUploadError.failed
+            }
             let configuration = SSHCommandBuilder.workerChatAttachmentUploadConfiguration(
                 for: worker,
                 kind: session.kind,
+                accountID: accountID,
                 repositoryName: session.projectName,
                 relayID: session.instanceToken,
                 requestID: requestID,
@@ -70,9 +74,11 @@ enum AgentAttachmentService {
         guard session.usesNativeChat else {
             return
         }
+        guard let accountID = session.accountID else { return }
         let configuration = SSHCommandBuilder.workerChatAttachmentDeleteConfiguration(
             for: worker,
             kind: session.kind,
+            accountID: accountID,
             repositoryName: session.projectName,
             relayID: session.instanceToken,
             requestID: requestID

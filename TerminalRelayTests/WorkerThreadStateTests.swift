@@ -3,6 +3,9 @@ import XCTest
 
 final class WorkerThreadStateTests: XCTestCase {
     private let threadID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    private let accountID = ProviderAccountID(
+        UUID(uuidString: "11111111-1111-4111-8111-111111111111")!
+    )
     private let instanceToken =
         "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 
@@ -11,9 +14,10 @@ final class WorkerThreadStateTests: XCTestCase {
             """
             login banner
             \(WorkerThreadProtocol.marker)
-            {"threads":[{"provider":"codex","threadID":"\(threadID)","title":"Fix pagination","updatedAt":1700000000,"archived":false,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":"page-2"}
+            {"threads":[{"provider":"codex","accountID":"\(accountID.rawValue)","threadID":"\(threadID)","title":"Fix pagination","updatedAt":1700000000,"archived":false,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}}],"nextCursor":"page-2"}
             """,
-            repositoryName: "terminal-relay"
+            repositoryName: "terminal-relay",
+            expectedAccountID: accountID
         )
 
         XCTAssertEqual(
@@ -22,6 +26,7 @@ final class WorkerThreadStateTests: XCTestCase {
                 threads: [
                     WorkerThreadSnapshot(
                         kind: .codex,
+                        accountID: accountID,
                         repositoryName: "terminal-relay",
                         threadID: threadID,
                         title: "Fix pagination",
@@ -40,6 +45,7 @@ final class WorkerThreadStateTests: XCTestCase {
     func testLiveSessionsReplaceDormantRowsWithoutConflatingThreadAndInstanceIDs() {
         let dormant = WorkerThreadSnapshot(
             kind: .codex,
+            accountID: accountID,
             repositoryName: "terminal-relay",
             threadID: threadID,
             title: "Dormant title",
@@ -51,6 +57,7 @@ final class WorkerThreadStateTests: XCTestCase {
         )
         let live = WorkerSessionSnapshot(
             kind: .codex,
+            accountID: accountID,
             repositoryName: "terminal-relay",
             attachedClientCount: 2,
             instanceToken: instanceToken,
@@ -74,19 +81,54 @@ final class WorkerThreadStateTests: XCTestCase {
         XCTAssertEqual(merged.threads[0].capabilities, WorkerThreadCapabilities.active)
     }
 
+    func testIdenticalProviderThreadIDsRemainDistinctAcrossAccounts() {
+        let secondAccountID = ProviderAccountID(
+            UUID(uuidString: "22222222-2222-4222-8222-222222222222")!
+        )
+        let first = WorkerThreadSnapshot(
+            kind: .codex,
+            accountID: accountID,
+            repositoryName: "terminal-relay",
+            threadID: threadID,
+            title: "First",
+            updatedAt: 1,
+            isArchived: false,
+            activeInstanceToken: nil,
+            reportedWorking: nil,
+            capabilities: .dormant
+        )
+        let second = WorkerThreadSnapshot(
+            kind: .codex,
+            accountID: secondAccountID,
+            repositoryName: "terminal-relay",
+            threadID: threadID,
+            title: "Second",
+            updatedAt: 2,
+            isArchived: false,
+            activeInstanceToken: nil,
+            reportedWorking: nil,
+            capabilities: .dormant
+        )
+
+        XCTAssertNotEqual(first.id, second.id)
+        XCTAssertEqual(Set([first.id, second.id]).count, 2)
+    }
+
     func testCatalogRejectsUnsafeOrAmbiguousRecordsAndLegacyWorkersRemainDetectable() {
         XCTAssertThrowsError(
             try WorkerThreadProtocol.parse(
                 "\(WorkerThreadProtocol.marker)\n{\"threads\":[],\"nextCursor\":\"line\\nbreak\"}",
-                repositoryName: "terminal-relay"
+                repositoryName: "terminal-relay",
+                expectedAccountID: accountID
             )
         ) { error in
             XCTAssertEqual(error as? WorkerThreadProtocolError, .invalidResponse)
         }
         XCTAssertThrowsError(
             try WorkerThreadProtocol.parse(
-                "\(WorkerThreadProtocol.marker)\n{\"threads\":[{\"provider\":\"codex\",\"threadID\":\"\(threadID)\",\"title\":null,\"updatedAt\":1,\"archived\":false,\"activityState\":\"inactive\",\"activeInstanceToken\":null,\"isWorking\":null,\"capabilities\":{\"resume\":true,\"rename\":true,\"archive\":true,\"unarchive\":true}},{\"provider\":\"codex\",\"threadID\":\"\(threadID)\",\"title\":null,\"updatedAt\":1,\"archived\":false,\"activityState\":\"inactive\",\"activeInstanceToken\":null,\"isWorking\":null,\"capabilities\":{\"resume\":true,\"rename\":true,\"archive\":true,\"unarchive\":true}}],\"nextCursor\":null}",
-                repositoryName: "terminal-relay"
+                "\(WorkerThreadProtocol.marker)\n{\"threads\":[{\"provider\":\"codex\",\"accountID\":\"\(accountID.rawValue)\",\"threadID\":\"\(threadID)\",\"title\":null,\"updatedAt\":1,\"archived\":false,\"activityState\":\"inactive\",\"activeInstanceToken\":null,\"isWorking\":null,\"capabilities\":{\"resume\":true,\"rename\":true,\"archive\":true,\"unarchive\":true}},{\"provider\":\"codex\",\"accountID\":\"\(accountID.rawValue)\",\"threadID\":\"\(threadID)\",\"title\":null,\"updatedAt\":1,\"archived\":false,\"activityState\":\"inactive\",\"activeInstanceToken\":null,\"isWorking\":null,\"capabilities\":{\"resume\":true,\"rename\":true,\"archive\":true,\"unarchive\":true}}],\"nextCursor\":null}",
+                repositoryName: "terminal-relay",
+                expectedAccountID: accountID
             )
         ) { error in
             XCTAssertEqual(error as? WorkerThreadProtocolError, .invalidResponse)
@@ -107,9 +149,10 @@ final class WorkerThreadStateTests: XCTestCase {
         let response = try WorkerThreadProtocol.parse(
             """
             \(WorkerThreadProtocol.marker)
-            {"threads":[{"provider":"claude","threadID":"\(threadID)","title":"Inactive","updatedAt":3,"archived":false,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}},{"provider":"claude","threadID":"\(externalID)","title":"External","updatedAt":2,"archived":false,"activityState":"external-active","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":false,"rename":false,"archive":false,"unarchive":false}},{"provider":"claude","threadID":"\(unknownID)","title":"Unknown archived","updatedAt":1,"archived":true,"activityState":"unknown","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":false,"rename":false,"archive":false,"unarchive":false}}],"nextCursor":null}
+            {"threads":[{"provider":"claude","accountID":"\(accountID.rawValue)","threadID":"\(threadID)","title":"Inactive","updatedAt":3,"archived":false,"activityState":"inactive","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":true,"rename":true,"archive":true,"unarchive":false}},{"provider":"claude","accountID":"\(accountID.rawValue)","threadID":"\(externalID)","title":"External","updatedAt":2,"archived":false,"activityState":"external-active","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":false,"rename":false,"archive":false,"unarchive":false}},{"provider":"claude","accountID":"\(accountID.rawValue)","threadID":"\(unknownID)","title":"Unknown archived","updatedAt":1,"archived":true,"activityState":"unknown","activeInstanceToken":null,"isWorking":null,"capabilities":{"resume":false,"rename":false,"archive":false,"unarchive":false}}],"nextCursor":null}
             """,
-            repositoryName: "terminal-relay"
+            repositoryName: "terminal-relay",
+            expectedAccountID: accountID
         )
 
         XCTAssertEqual(response.threads.map(\.kind), [.claude, .claude, .claude])

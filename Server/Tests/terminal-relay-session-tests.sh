@@ -15,8 +15,10 @@ temporary_parent="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
 test_root="$(mktemp -d "$temporary_parent/terminal-relay-session-tests.XXXXXX")"
 workspace_root="$test_root/workspace"
 runtime_root="$test_root/runtime"
+provider_socket_root="/tmp/terminal-relay-sockets-$$"
 test_home="$test_root/home"
 agent_log="$test_root/agent.log"
+account_auth_log="$test_root/account-auth.log"
 signal_log="$test_root/signal.log"
 codex_app_server_log="$test_root/codex-app-server.log"
 codex_app_server_control="$test_root/codex-app-server.control"
@@ -44,6 +46,9 @@ cleanup() {
     "$tmux_path" -f /dev/null -L "$harness_socket" kill-server 2>/dev/null || true
     "$tmux_path" -f /dev/null -L "$tmux_socket" kill-server 2>/dev/null || true
     /bin/rm -f -- "$rotation_codex_socket"
+    if [[ "${provider_socket_root:-}" == /tmp/terminal-relay-sockets-[0-9]* ]]; then
+        /bin/rm -rf -- "$provider_socket_root"
+    fi
 
     if [[ -f "$agent_log" ]]; then
         while IFS= read -r pid; do
@@ -369,7 +374,15 @@ cat > "$stub_agent" <<'STUB_AGENT'
 set -euo pipefail
 
 if [[ "${1:-}" == "auth" && "${2:-}" == "status" && "${3:-}" == "--json" ]]; then
+    if [[ "${TERMINAL_RELAY_TEST_ACCOUNT_AUTH_REQUIRED:-0}" == "1" ]]; then
+        exit 77
+    fi
     printf '%s\n' '{"loggedIn":true}'
+    exit 0
+fi
+
+if [[ "${1:-}" == "auth" && "${2:-}" == "login" ]]; then
+    printf '%s\n' "$*" >> "$TERMINAL_RELAY_TEST_ACCOUNT_AUTH_LOG"
     exit 0
 fi
 
@@ -381,6 +394,18 @@ fi
 
 printf 'start|pid=%s|cwd=%s|path=%s' "$$" "$PWD" "$PATH" \
     >> "$TERMINAL_RELAY_TEST_AGENT_LOG"
+if [[ -n "${TERMINAL_RELAY_ACCOUNT_ID:-}" ]]; then
+    printf '|provider=%s|account=%s' \
+        "${TERMINAL_RELAY_PROVIDER:-}" "$TERMINAL_RELAY_ACCOUNT_ID" \
+        >> "$TERMINAL_RELAY_TEST_AGENT_LOG"
+fi
+if [[ -n "${CODEX_HOME:-}" ]]; then
+    printf '|CODEX_HOME=%s' "$CODEX_HOME" >> "$TERMINAL_RELAY_TEST_AGENT_LOG"
+fi
+if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+    printf '|CLAUDE_CONFIG_DIR=%s' "$CLAUDE_CONFIG_DIR" \
+        >> "$TERMINAL_RELAY_TEST_AGENT_LOG"
+fi
 if [[ -n "${ConEmuANSI:-}" ]]; then
     printf '|ConEmuANSI=%s' "$ConEmuANSI" >> "$TERMINAL_RELAY_TEST_AGENT_LOG"
 fi
@@ -903,6 +928,7 @@ export TERMINAL_RELAY_TEST_TMUX_PATH="$tmux_path"
 export TERMINAL_RELAY_TEST_TMUX_SOCKET="$tmux_socket"
 export TERMINAL_RELAY_TEST_WORKSPACE_ROOT="$workspace_root"
 export TERMINAL_RELAY_TEST_RUNTIME_ROOT="$runtime_root"
+export TERMINAL_RELAY_TEST_PROVIDER_SOCKET_ROOT="$provider_socket_root"
 export TERMINAL_RELAY_TEST_CODEX_PATH="$stub_agent"
 export TERMINAL_RELAY_TEST_CLAUDE_PATH="$stub_agent"
 export TERMINAL_RELAY_TEST_CLAUDE_SESSIONS_PYTHON_PATH="$python_path"
@@ -910,6 +936,7 @@ export TERMINAL_RELAY_TEST_CLAUDE_SESSIONS_ADAPTER_PATH="$stub_claude_sessions"
 export TERMINAL_RELAY_TEST_CLAUDE_SESSIONS_STATE="$claude_sessions_state"
 export TERMINAL_RELAY_TEST_FLOCK_PATH="$flock_adapter"
 export TERMINAL_RELAY_TEST_AGENT_LOG="$agent_log"
+export TERMINAL_RELAY_TEST_ACCOUNT_AUTH_LOG="$account_auth_log"
 export TERMINAL_RELAY_TEST_SIGNAL_PATH="$signal_adapter"
 export TERMINAL_RELAY_TEST_SIGNAL_LOG="$signal_log"
 export TERMINAL_RELAY_TEST_SIGNAL_TARGET_PATH="$stub_agent"
@@ -958,11 +985,11 @@ assert_equal "70" "$malformed_update_status" "malformed agent update status"
 assert_contains "$malformed_update_output" "malformed" "malformed agent update diagnostic"
 /bin/rm -f -- "$agent_update_status_file"
 printf '%s\n' \
-    '{"runtimeVersion":2000000000,"protocol":{"minimum":1,"maximum":2},"capabilities":["agent-sessions","chat-v1","file-attachments-v1","runtime-updates-v1","threads-v1","threads-v2"]}' \
+    '{"runtimeVersion":2000000000,"protocol":{"minimum":1,"maximum":2},"capabilities":["agent-sessions","chat-v1","chat-v2","file-attachments-v1","provider-accounts-v1","runtime-updates-v1","threads-v1","threads-v2","threads-v3"]}' \
     > "$runtime_manifest_file"
 /bin/chmod 644 "$runtime_manifest_file"
 assert_equal \
-    $'__TERMINAL_RELAY_RUNTIME_INFO_V1__\nruntime|2000000000|1|2|agent-sessions,chat-v1,file-attachments-v1,runtime-updates-v1,threads-v1,threads-v2' \
+    $'__TERMINAL_RELAY_RUNTIME_INFO_V1__\nruntime|2000000000|1|2|agent-sessions,chat-v1,chat-v2,file-attachments-v1,provider-accounts-v1,runtime-updates-v1,threads-v1,threads-v2,threads-v3' \
     "$(/bin/bash "$helper" runtime-info)" \
     "worker runtime information"
 assert_equal \
@@ -1907,5 +1934,278 @@ TERMINAL_RELAY_TEST_CODEX_SHARED_ACCOUNT=1 \
     || fail "runtime replacement restart marker remained after attached terminals drained"
 
 helper="$current_runtime_helper"
+
+echo "Provider profiles activate only on a same-provider second account and route concurrent launches"
+provider_accounts_root="$test_home/.local/share/terminal-relay/provider-accounts-v1"
+initial_accounts_output="$(/bin/bash "$helper" provider-accounts-v1)"
+assert_contains "$initial_accounts_output" \
+    "__TERMINAL_RELAY_PROVIDER_ACCOUNTS_V1__" \
+    "provider account protocol marker"
+read -r legacy_codex_account legacy_claude_account < <(
+    printf '%s\n' "$initial_accounts_output" | "$python_path" -c '
+import json
+import sys
+lines = sys.stdin.read().splitlines()
+value = json.loads(lines[1])
+by_provider = {row["provider"]: row for row in value["accounts"]}
+assert set(by_provider) == {"codex", "claude"}
+assert all(row["storageKind"] == "legacyDefault" for row in by_provider.values())
+print(by_provider["codex"]["accountID"], by_provider["claude"]["accountID"])
+'
+)
+[[ ! -e "$provider_accounts_root/activated" ]] \
+    || fail "importing one legacy profile per provider activated account routing"
+assert_equal "700" "$(path_mode "$provider_accounts_root")" \
+    "provider account root mode"
+assert_equal "600" \
+    "$(path_mode "$provider_accounts_root/$legacy_codex_account/profile")" \
+    "legacy Codex profile mode"
+
+legacy_activation_start="$(/bin/bash "$helper" start \
+    codex alpha --activation-guard)"
+legacy_activation_instance="$(printf '%s\n' "$legacy_activation_start" \
+    | /usr/bin/awk -F'|' '$1 == "session" { print $5; exit }')"
+wait_for_log_lines "$(( $(/usr/bin/awk 'END { print NR + 0 }' "$agent_log") ))"
+set +e
+blocked_account_output="$(/bin/bash "$helper" \
+    provider-account-create-v1 codex "Blocked Codex" 2>&1)"
+blocked_account_result=$?
+set -e
+assert_equal "75" "$blocked_account_result" \
+    "second account while legacy task is live"
+assert_contains "$blocked_account_output" "Stop every legacy codex task" \
+    "legacy activation guard diagnostic"
+[[ ! -e "$provider_accounts_root/activated" ]] \
+    || fail "blocked account creation wrote the activation marker"
+codex_profile_count="$(/usr/bin/grep -l '^provider|codex$' \
+    "$provider_accounts_root"/*/profile | /usr/bin/wc -l \
+    | /usr/bin/tr -d '[:space:]')"
+assert_equal "1" "$codex_profile_count" \
+    "blocked account creation left an isolated profile"
+/bin/bash "$helper" stop codex alpha "$legacy_activation_instance"
+
+isolated_codex_output="$(/bin/bash "$helper" \
+    provider-account-create-v1 codex "Second Codex")"
+isolated_codex_account="$(printf '%s\n' "$isolated_codex_output" \
+    | "$python_path" -c '
+import json
+import sys
+lines = sys.stdin.read().splitlines()
+value = json.loads(lines[1])
+assert len(value["accounts"]) == 1
+row = value["accounts"][0]
+assert row["provider"] == "codex"
+assert row["status"] == "authRequired"
+assert row["storageKind"] == "isolated"
+print(row["accountID"])
+')"
+assert_equal "600" "$(path_mode "$provider_accounts_root/activated")" \
+    "provider account activation marker mode"
+assert_equal "version|1" "$(< "$provider_accounts_root/activated")" \
+    "provider account activation marker"
+assert_equal "700" \
+    "$(path_mode "$provider_accounts_root/$isolated_codex_account/data")" \
+    "isolated Codex data mode"
+set +e
+legacy_status_error="$(/bin/bash "$helper" status 2>&1)"
+legacy_status_result=$?
+set -e
+assert_equal "76" "$legacy_status_result" \
+    "legacy status after account activation"
+assert_contains "$legacy_status_error" "choose an account" \
+    "legacy status activation diagnostic"
+
+/bin/bash "$helper" provider-account-rename-v1 \
+    codex "$isolated_codex_account" "Work Codex" >/dev/null
+for account_id in "$isolated_codex_account"; do
+    profile="$provider_accounts_root/$account_id/profile"
+    /usr/bin/sed 's/^status|authRequired$/status|active/' "$profile" \
+        > "$profile.next"
+    /bin/chmod 600 "$profile.next"
+    /bin/mv -f "$profile.next" "$profile"
+done
+
+isolated_claude_output="$(/bin/bash "$helper" \
+    provider-account-create-v1 claude "Second Claude")"
+isolated_claude_account="$(printf '%s\n' "$isolated_claude_output" \
+    | "$python_path" -c '
+import json
+import sys
+lines = sys.stdin.read().splitlines()
+value = json.loads(lines[1])
+row = value["accounts"][0]
+assert row["provider"] == "claude"
+assert row["storageKind"] == "isolated"
+print(row["accountID"])
+')"
+profile="$provider_accounts_root/$isolated_claude_account/profile"
+claude_login_output="$(/bin/bash "$helper" provider-account-login-v1 \
+    claude "$isolated_claude_account")"
+assert_contains "$claude_login_output" "account|claude|$isolated_claude_account" \
+    "Claude login account route"
+assert_equal "auth login --claudeai" "$(< "$account_auth_log")" \
+    "Claude personal account login mode"
+set +e
+claude_auth_required_status="$(TERMINAL_RELAY_TEST_ACCOUNT_AUTH_REQUIRED=1 \
+    /bin/bash "$helper" provider-account-status-v1 \
+        claude "$isolated_claude_account")"
+claude_auth_required_result=$?
+set -e
+assert_equal "0" "$claude_auth_required_result" \
+    "auth-required account status response"
+printf '%s\n' "$claude_auth_required_status" | "$python_path" -c '
+import json
+import sys
+lines = sys.stdin.read().splitlines()
+assert len(lines) == 2
+value = json.loads(lines[1])
+assert value["accounts"][0]["status"] == "authRequired"
+'
+claude_profile_status="$(/bin/bash "$helper" provider-account-status-v1 \
+    claude "$isolated_claude_account")"
+assert_contains "$claude_profile_status" \
+    "__TERMINAL_RELAY_PROVIDER_ACCOUNTS_V1__" \
+    "provider account status marker"
+printf '%s\n' "$claude_profile_status" | "$python_path" -c '
+import json
+import sys
+lines = sys.stdin.read().splitlines()
+assert len(lines) == 2
+value = json.loads(lines[1])
+assert len(value["accounts"]) == 1
+assert value["accounts"][0]["status"] == "active"
+'
+
+export TERMINAL_RELAY_TEST_CODEX_PATH="$stub_codex"
+export TERMINAL_RELAY_TEST_CODEX_SHARED_ACCOUNT=1
+account_log_before="$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")"
+legacy_account_start="$(/bin/bash "$helper" start-v2 \
+    codex "$legacy_codex_account" alpha --account-one)"
+isolated_account_start="$(/bin/bash "$helper" start-v2 \
+    codex "$isolated_codex_account" beta --account-two)"
+claude_account_start="$(/bin/bash "$helper" start-v2 \
+    claude "$isolated_claude_account" beta --account-claude)"
+legacy_account_instance="$(printf '%s\n' "$legacy_account_start" \
+    | /usr/bin/awk -F'|' '$1 == "session" { print $6; exit }')"
+isolated_account_instance="$(printf '%s\n' "$isolated_account_start" \
+    | /usr/bin/awk -F'|' '$1 == "session" { print $6; exit }')"
+claude_account_instance="$(printf '%s\n' "$claude_account_start" \
+    | /usr/bin/awk -F'|' '$1 == "session" { print $6; exit }')"
+assert_contains "$legacy_account_start" "__TERMINAL_RELAY_SESSION_V2__" \
+    "legacy profile account-aware start marker"
+assert_contains "$isolated_account_start" "$isolated_codex_account" \
+    "isolated Codex start account"
+assert_contains "$claude_account_start" "$isolated_claude_account" \
+    "isolated Claude start account"
+wait_for_log_lines "$((account_log_before + 3))"
+account_logs="$(/usr/bin/tail -n 3 "$agent_log")"
+assert_contains "$account_logs" \
+    "account=$isolated_codex_account" "isolated Codex process account"
+assert_contains "$account_logs" \
+    "CODEX_HOME=$provider_accounts_root/$isolated_codex_account/data" \
+    "isolated Codex home"
+assert_contains "$account_logs" \
+    "account=$isolated_claude_account" "isolated Claude process account"
+assert_contains "$account_logs" \
+    "CLAUDE_CONFIG_DIR=$provider_accounts_root/$isolated_claude_account/data" \
+    "isolated Claude config directory"
+[[ -f "$provider_accounts_root/$isolated_claude_account/data/.claude.json" ]] \
+    || fail "isolated Claude onboarding state was not account-scoped"
+
+account_status_output="$(/bin/bash "$helper" status-v2)"
+assert_contains "$account_status_output" "__TERMINAL_RELAY_SESSION_V2__" \
+    "account-aware status marker"
+assert_contains "$account_status_output" \
+    "session|codex|$legacy_codex_account|alpha" \
+    "legacy Codex profile in account-aware status"
+assert_contains "$account_status_output" \
+    "session|codex|$isolated_codex_account|beta" \
+    "isolated Codex profile in account-aware status"
+assert_contains "$account_status_output" \
+    "session|claude|$isolated_claude_account|beta" \
+    "isolated Claude profile in account-aware status"
+[[ -S "$provider_socket_root/codex-$legacy_codex_account.sock" \
+    && -S "$provider_socket_root/codex-$isolated_codex_account.sock" ]] \
+    || fail "Codex profiles did not receive independent app-server sockets"
+assert_contains "$(< "$runtime_root/$isolated_account_instance.intent")" \
+    $'version|3\n' "account-aware terminal intent version"
+assert_contains "$(< "$runtime_root/$isolated_account_instance.intent")" \
+    "account|$isolated_codex_account" "account-aware terminal intent route"
+assert_contains "$(< "$runtime_root/$claude_account_instance.session")" \
+    "account|$isolated_claude_account" "account-aware terminal metadata route"
+
+account_restore_log_before="$(/usr/bin/awk 'END { print NR + 0 }' "$agent_log")"
+"$tmux_path" -f /dev/null -L "$tmux_socket" kill-server
+wait_for_agent_lock_free "$legacy_account_instance"
+wait_for_agent_lock_free "$isolated_account_instance"
+wait_for_agent_lock_free "$claude_account_instance"
+printf '%s\n' '12121212-1212-4121-8121-121212121212' > "$boot_id_file"
+/bin/bash "$helper" restore >/dev/null
+expected_account_restore_logs=$((account_restore_log_before + 3))
+wait_for_log_lines "$expected_account_restore_logs"
+account_status_output="$(/bin/bash "$helper" status-v2)"
+assert_contains "$account_status_output" \
+    "session|codex|$legacy_codex_account|alpha|0|$legacy_account_instance" \
+    "legacy Codex profile after account-aware restore"
+assert_contains "$account_status_output" \
+    "session|codex|$isolated_codex_account|beta|0|$isolated_account_instance" \
+    "isolated Codex profile after account-aware restore"
+assert_contains "$account_status_output" \
+    "session|claude|$isolated_claude_account|beta|0|$claude_account_instance" \
+    "isolated Claude profile after account-aware restore"
+
+legacy_codex_profile="$provider_accounts_root/$legacy_codex_account/profile"
+/usr/bin/sed 's/^status|active$/status|authRequired/' \
+    "$legacy_codex_profile" > "$legacy_codex_profile.next"
+/bin/chmod 600 "$legacy_codex_profile.next"
+/bin/mv -f "$legacy_codex_profile.next" "$legacy_codex_profile"
+isolated_status_output="$(/bin/bash "$helper" status-v2 \
+    2> "$test_root/status-v2-isolation.err")"
+assert_contains "$isolated_status_output" \
+    "session|codex|$isolated_codex_account|beta" \
+    "healthy Codex profile survives status isolation"
+assert_contains "$isolated_status_output" \
+    "session|claude|$isolated_claude_account|beta" \
+    "healthy Claude profile survives status isolation"
+[[ "$isolated_status_output" != *"session|codex|$legacy_codex_account|alpha"* ]] \
+    || fail "auth-required terminal profile leaked into account-aware status"
+assert_contains "$(< "$test_root/status-v2-isolation.err")" \
+    "provider account '$legacy_codex_account' is unavailable" \
+    "account-aware status isolation diagnostic"
+/usr/bin/sed 's/^status|authRequired$/status|active/' \
+    "$legacy_codex_profile" > "$legacy_codex_profile.next"
+/bin/chmod 600 "$legacy_codex_profile.next"
+/bin/mv -f "$legacy_codex_profile.next" "$legacy_codex_profile"
+
+legacy_account_server_pid="$("$tmux_path" -f /dev/null -L "$tmux_socket" \
+    display-message -p -t "terminal-relay-account-$legacy_codex_account" '#{pane_pid}')"
+isolated_account_server_pid="$("$tmux_path" -f /dev/null -L "$tmux_socket" \
+    display-message -p -t "terminal-relay-account-$isolated_codex_account" '#{pane_pid}')"
+/bin/bash "$helper" __schedule-all-codex-app-server-restarts
+[[ -f "$codex_restart_marker" \
+    && -f "$runtime_root/codex-$legacy_codex_account-app-server-restart-required" \
+    && -f "$runtime_root/codex-$isolated_codex_account-app-server-restart-required" ]] \
+    || fail "update scheduling omitted an account-scoped Codex restart marker"
+
+/bin/bash "$helper" stop-v2 codex "$legacy_codex_account" \
+    alpha "$legacy_account_instance"
+/bin/bash "$helper" stop-v2 codex "$isolated_codex_account" \
+    beta "$isolated_account_instance"
+/bin/bash "$helper" stop-v2 claude "$isolated_claude_account" \
+    beta "$claude_account_instance"
+/bin/bash "$helper" codex-account-v2 "$legacy_codex_account" >/dev/null
+/bin/bash "$helper" codex-account-v2 "$isolated_codex_account" >/dev/null
+[[ ! -e "$runtime_root/codex-$legacy_codex_account-app-server-restart-required" \
+    && ! -e "$runtime_root/codex-$isolated_codex_account-app-server-restart-required" ]] \
+    || fail "account-scoped Codex restart markers remained after profile rotation"
+[[ "$legacy_account_server_pid" != \
+    "$("$tmux_path" -f /dev/null -L "$tmux_socket" display-message -p \
+        -t "terminal-relay-account-$legacy_codex_account" '#{pane_pid}')" ]] \
+    || fail "legacy Codex profile app-server did not rotate"
+[[ "$isolated_account_server_pid" != \
+    "$("$tmux_path" -f /dev/null -L "$tmux_socket" display-message -p \
+        -t "terminal-relay-account-$isolated_codex_account" '#{pane_pid}')" ]] \
+    || fail "isolated Codex profile app-server did not rotate"
+unset TERMINAL_RELAY_TEST_CODEX_SHARED_ACCOUNT
 
 echo "PASS: terminal-relay-session integration tests"

@@ -30,7 +30,7 @@ run_as_worker() {
 }
 
 schedule_codex_app_server_restart() {
-    run_as_worker "$launcher_path" __schedule-codex-app-server-restart \
+    run_as_worker "$launcher_path" __schedule-all-codex-app-server-restarts \
         || return 1
     [[ "$(/usr/bin/stat -c '%U:%G:%a' "$codex_app_server_restart_marker")" \
         == "$runtime_user:$runtime_group:600" ]]

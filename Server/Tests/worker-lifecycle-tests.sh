@@ -246,7 +246,7 @@ for marker_source in "$application_installer" "$session_helper" "$agent_updater"
 done
 grep -Fq 'codex-app-server-restart-required' "$lifecycle" \
     || fail "fleet verification does not inspect a pending Codex app-server restart"
-grep -Fq '"$session_helper" __schedule-codex-app-server-restart' "$lifecycle" \
+grep -Fq '"$session_helper" __schedule-all-codex-app-server-restarts' "$lifecycle" \
     || fail "fleet verification does not schedule an unsafe Codex app-server rotation"
 grep -Fq '"$session_helper" __verify-codex-account >/dev/null' "$lifecycle" \
     || fail "fleet verification does not require the shared Codex account after rotation"
@@ -277,9 +277,9 @@ grep -Fq 'local -a numbers=()' "$lifecycle" \
     || fail "fleet-wide lifecycle actions do not snapshot every configured worker number"
 grep -Fq 'for number in "${numbers[@]}"' "$lifecycle" \
     || fail "fleet-wide lifecycle actions can let SSH consume undispatched workers"
-grep -Fq '__schedule-codex-app-server-restart' "$application_installer" \
+grep -Fq '__schedule-all-codex-app-server-restarts' "$application_installer" \
     || fail "application reconciliation does not schedule a Codex app-server restart"
-grep -Fq '__schedule-codex-app-server-restart' "$agent_updater" \
+grep -Fq '__schedule-all-codex-app-server-restarts' "$agent_updater" \
     || fail "Codex updater does not schedule through the worker helper"
 [[ "$(grep -Fc 'codex-app-server.lock' "$session_helper")" == "1" ]] \
     || fail "Codex restart scheduling and rotation do not use one worker lock path"

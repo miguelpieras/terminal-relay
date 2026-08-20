@@ -59,6 +59,7 @@ final class WorkerSessionService: ObservableObject {
     @Published private(set) var startingSlots: Set<SessionSlot> = []
     @Published private(set) var stoppingSlots: Set<SessionSlot> = []
     @Published private(set) var threadCatalogs: [WorkerThreadCatalogKey: WorkerThreadResponse] = [:]
+    @Published private(set) var threadErrors: [ProviderAccountKey: String] = [:]
 
     private let runCommand: CommandRunner
     private let inspectsRuntimeOnRefresh: Bool
@@ -84,8 +85,10 @@ final class WorkerSessionService: ObservableObject {
     private static let startedSessionGuardLifetime: TimeInterval = 60
     private var threadLoadTasks: [WorkerThreadCatalogKey: Task<WorkerThreadResponse?, Never>] = [:]
 
-    private static let threadCatalogStorageKey = "workerThreadCatalogs.v1"
-    private static let sessionResponseStorageKey = "workerSessionResponses.v1"
+    // Accountless v1 caches cannot be attributed safely. New keys make the
+    // migration an invalidation instead of guessing an owner.
+    private static let threadCatalogStorageKey = "workerThreadCatalogs.v2"
+    private static let sessionResponseStorageKey = "workerSessionResponses.v2"
     private static let threadCatalogFreshness: TimeInterval = 30
 
     convenience init() {
@@ -182,6 +185,7 @@ final class WorkerSessionService: ObservableObject {
                 sessions: entry.response.sessions.map {
                     WorkerSessionSnapshot(
                         kind: $0.kind,
+                        accountID: $0.accountID,
                         repositoryName: $0.repositoryName,
                         attachedClientCount: 0,
                         instanceToken: $0.instanceToken,
@@ -220,15 +224,60 @@ final class WorkerSessionService: ObservableObject {
     func threads(
         repositoryName: String,
         archived: Bool,
-        on worker: ServerProfile
+        on worker: ServerProfile,
+        account: ProviderAccountProfile? = nil
     ) -> [WorkerThreadSnapshot] {
-        threadCatalogs[
-            WorkerThreadCatalogKey(
-                workerID: worker.id,
-                repositoryName: repositoryName,
-                archived: archived
+        if let account {
+            return threadCatalogs[
+                WorkerThreadCatalogKey(
+                    workerID: worker.id,
+                    provider: account.provider,
+                    accountID: account.accountID,
+                    repositoryName: repositoryName,
+                    archived: archived
+                )
+            ]?.threads ?? []
+        }
+        let matching = threadCatalogs.filter {
+            $0.key.workerID == worker.id
+                && $0.key.repositoryName == repositoryName
+                && $0.key.archived == archived
+        }
+        var byID: [String: WorkerThreadSnapshot] = [:]
+        for response in matching.values {
+            for thread in response.threads { byID[thread.id] = thread }
+        }
+        return byID.values.sorted {
+            if $0.isActive != $1.isActive { return $0.isActive }
+            if $0.updatedAt != $1.updatedAt { return $0.updatedAt > $1.updatedAt }
+            return $0.id < $1.id
+        }
+    }
+
+    func threadError(
+        workerID: UUID,
+        account: ProviderAccountProfile
+    ) -> String? {
+        threadErrors[
+            ProviderAccountKey(
+                workerID: workerID,
+                provider: account.provider,
+                accountID: account.accountID
             )
-        ]?.threads ?? []
+        ]
+    }
+
+    func dismissThreadError(
+        workerID: UUID,
+        account: ProviderAccountProfile
+    ) {
+        threadErrors[
+            ProviderAccountKey(
+                workerID: workerID,
+                provider: account.provider,
+                accountID: account.accountID
+            )
+        ] = nil
     }
 
     func updateWarning(for workerID: UUID) -> String? {
@@ -242,12 +291,32 @@ final class WorkerSessionService: ObservableObject {
         updateWarnings[workerID] = nil
     }
 
-    func isStopping(worker: ServerProfile, kind: AgentKind) -> Bool {
-        stoppingSlots.contains(SessionSlot(serverKey: worker.concurrencyKey, kind: kind))
+    func isStopping(
+        worker: ServerProfile,
+        kind: AgentKind,
+        accountID: ProviderAccountID? = nil
+    ) -> Bool {
+        stoppingSlots.contains(
+            SessionSlot(
+                serverKey: worker.concurrencyKey,
+                kind: kind,
+                accountID: accountID
+            )
+        )
     }
 
-    func isStarting(worker: ServerProfile, kind: AgentKind) -> Bool {
-        startingSlots.contains(SessionSlot(serverKey: worker.concurrencyKey, kind: kind))
+    func isStarting(
+        worker: ServerProfile,
+        kind: AgentKind,
+        accountID: ProviderAccountID? = nil
+    ) -> Bool {
+        startingSlots.contains(
+            SessionSlot(
+                serverKey: worker.concurrencyKey,
+                kind: kind,
+                accountID: accountID
+            )
+        )
     }
 
     @discardableResult
@@ -456,17 +525,26 @@ final class WorkerSessionService: ObservableObject {
 
     func start(
         kind: AgentKind,
+        account: ProviderAccountProfile? = nil,
         repositoryName: String,
         launchDefaults: AgentLaunchDefaults,
         on worker: ServerProfile
     ) async -> WorkerSessionSnapshot? {
         guard requireCapability("agent-sessions", worker: worker) else { return nil }
+        guard account.map({ $0.provider == kind && $0.status.isUsable }) != false else {
+            errors[worker.id] = WorkerSessionServiceError.startFailed.localizedDescription
+            return nil
+        }
         guard WorkerSessionProtocol.isValidRepositoryName(repositoryName) else {
             errors[worker.id] = WorkerSessionServiceError.startFailed.localizedDescription
             return nil
         }
 
-        let slot = SessionSlot(serverKey: worker.concurrencyKey, kind: kind)
+        let slot = SessionSlot(
+            serverKey: worker.concurrencyKey,
+            kind: kind,
+            accountID: account?.accountID
+        )
         guard !startingSlots.contains(slot), !stoppingSlots.contains(slot) else { return nil }
         startingSlots.insert(slot)
         defer { startingSlots.remove(slot) }
@@ -479,6 +557,7 @@ final class WorkerSessionService: ObservableObject {
                 SSHCommandBuilder.workerChatStartConfiguration(
                     for: worker,
                     kind: kind,
+                    accountID: account?.accountID,
                     repositoryName: repositoryName,
                     threadID: nil,
                     launchDefaults: launchDefaults
@@ -496,10 +575,12 @@ final class WorkerSessionService: ObservableObject {
 
             let chat = try WorkerChatProtocol.parseStart(
                 result.standardOutput,
-                expectedKind: kind
+                expectedKind: kind,
+                expectedAccountID: account?.accountID
             )
             let snapshot = WorkerSessionSnapshot(
                 kind: kind,
+                accountID: account?.accountID,
                 repositoryName: repositoryName,
                 attachedClientCount: 0,
                 instanceToken: chat.relayID,
@@ -551,6 +632,7 @@ final class WorkerSessionService: ObservableObject {
     @discardableResult
     func stop(
         kind: AgentKind,
+        accountID: ProviderAccountID? = nil,
         repositoryName: String,
         instanceToken: String,
         presentation: WorkerSessionPresentation = .terminal,
@@ -564,7 +646,11 @@ final class WorkerSessionService: ObservableObject {
             return false
         }
 
-        let slot = SessionSlot(serverKey: worker.concurrencyKey, kind: kind)
+        let slot = SessionSlot(
+            serverKey: worker.concurrencyKey,
+            kind: kind,
+            accountID: accountID
+        )
         guard !stoppingSlots.contains(slot), !startingSlots.contains(slot) else { return false }
         stoppingSlots.insert(slot)
         defer { stoppingSlots.remove(slot) }
@@ -579,6 +665,7 @@ final class WorkerSessionService: ObservableObject {
                 configuration = SSHCommandBuilder.workerSessionStopConfiguration(
                     for: worker,
                     kind: kind,
+                    accountID: accountID,
                     repositoryName: repositoryName,
                     instanceToken: instanceToken
                 )
@@ -586,6 +673,7 @@ final class WorkerSessionService: ObservableObject {
                 configuration = SSHCommandBuilder.workerChatStopConfiguration(
                     for: worker,
                     kind: kind,
+                    accountID: accountID,
                     repositoryName: repositoryName,
                     instanceToken: instanceToken
                 )
@@ -605,6 +693,7 @@ final class WorkerSessionService: ObservableObject {
                     projects: response.projects,
                     sessions: response.sessions.filter {
                         $0.kind != kind
+                            || $0.accountID != accountID
                             || $0.repositoryName != repositoryName
                             || $0.instanceToken != instanceToken
                     }
@@ -639,14 +728,44 @@ final class WorkerSessionService: ObservableObject {
 
     @discardableResult
     func stopActiveSessions(
-        kind: AgentKind,
+        account: ProviderAccountProfile,
         on worker: ServerProfile
     ) async -> Bool {
         guard let response = await refreshCoalescing(worker: worker) else {
             return false
         }
 
-        for snapshot in response.sessions where snapshot.kind == kind {
+        for snapshot in response.sessions
+        where snapshot.kind == account.provider
+            && snapshot.accountID == account.accountID {
+            guard await stop(
+                kind: account.provider,
+                accountID: account.accountID,
+                repositoryName: snapshot.repositoryName,
+                instanceToken: snapshot.instanceToken,
+                presentation: snapshot.presentation,
+                on: worker
+            ) else {
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Pre-activation compatibility only. Account-management UI must never
+    /// call this because replacing one provider login is no longer a global
+    /// operation.
+    @available(*, deprecated, message: "Stop one explicit provider account instead.")
+    @discardableResult
+    func stopActiveSessions(
+        kind: AgentKind,
+        on worker: ServerProfile
+    ) async -> Bool {
+        guard let response = await refreshCoalescing(worker: worker) else {
+            return false
+        }
+        for snapshot in response.sessions
+        where snapshot.kind == kind && snapshot.accountID == nil {
             guard await stop(
                 kind: kind,
                 repositoryName: snapshot.repositoryName,
@@ -665,10 +784,13 @@ final class WorkerSessionService: ObservableObject {
         repositoryName: String,
         archived: Bool,
         on worker: ServerProfile,
+        account: ProviderAccountProfile? = nil,
         skipIfFresh: Bool = false
     ) async -> WorkerThreadResponse? {
         let catalogKey = WorkerThreadCatalogKey(
             workerID: worker.id,
+            provider: account?.provider,
+            accountID: account?.accountID,
             repositoryName: repositoryName,
             archived: archived
         )
@@ -678,7 +800,21 @@ final class WorkerSessionService: ObservableObject {
            let cached = threadCatalogs[catalogKey] {
             return cached
         }
-        guard requireCapability("threads-v2", worker: worker) else { return nil }
+        guard requireCapability(account == nil ? "threads-v2" : "provider-accounts-v1", worker: worker) else {
+            return nil
+        }
+        guard account.map({ $0.status.isUsable }) != false else {
+            if let account {
+                threadErrors[
+                    ProviderAccountKey(
+                        workerID: worker.id,
+                        provider: account.provider,
+                        accountID: account.accountID
+                    )
+                ] = WorkerSessionServiceError.threadFailed.localizedDescription
+            }
+            return nil
+        }
         guard WorkerSessionProtocol.isValidRepositoryName(repositoryName) else {
             errors[worker.id] = WorkerSessionServiceError.threadFailed.localizedDescription
             return nil
@@ -701,6 +837,7 @@ final class WorkerSessionService: ObservableObject {
                 catalogKey: catalogKey,
                 repositoryName: repositoryName,
                 archived: archived,
+                route: account.map { ($0.provider, $0.accountID) },
                 on: worker
             )
         }
@@ -708,10 +845,66 @@ final class WorkerSessionService: ObservableObject {
         return await task.value
     }
 
+    /// Loads every selected route independently. Successful account catalogs
+    /// remain visible when another account is signed out or unavailable.
+    @discardableResult
+    func loadThreads(
+        repositoryName: String,
+        archived: Bool,
+        on worker: ServerProfile,
+        accounts: [ProviderAccountProfile],
+        skipIfFresh: Bool = false
+    ) async -> WorkerThreadResponse? {
+        var seenRoutes: Set<String> = []
+        for account in accounts where !account.status.isUsable {
+            threadErrors[
+                ProviderAccountKey(
+                    workerID: worker.id,
+                    provider: account.provider,
+                    accountID: account.accountID
+                )
+            ] = account.status == .authRequired
+                ? "Sign in to load this account's tasks."
+                : "This account is unavailable."
+        }
+        let usable = accounts.filter {
+            $0.status.isUsable && seenRoutes.insert($0.routeKey).inserted
+        }
+        guard !usable.isEmpty else {
+            return WorkerThreadResponse(threads: [], nextCursor: nil)
+        }
+        var successes: [WorkerThreadResponse] = []
+        for account in usable {
+            if let response = await loadThreads(
+                repositoryName: repositoryName,
+                archived: archived,
+                on: worker,
+                account: account,
+                skipIfFresh: skipIfFresh
+            ) {
+                successes.append(response)
+            }
+        }
+        guard !successes.isEmpty else { return nil }
+        var byID: [String: WorkerThreadSnapshot] = [:]
+        for response in successes {
+            for thread in response.threads { byID[thread.id] = thread }
+        }
+        return WorkerThreadResponse(
+            threads: byID.values.sorted {
+                if $0.isActive != $1.isActive { return $0.isActive }
+                if $0.updatedAt != $1.updatedAt { return $0.updatedAt > $1.updatedAt }
+                return $0.id < $1.id
+            },
+            nextCursor: successes.compactMap(\.nextCursor).first
+        )
+    }
+
     private func fetchThreads(
         catalogKey: WorkerThreadCatalogKey,
         repositoryName: String,
         archived: Bool,
+        route: (kind: AgentKind, accountID: ProviderAccountID)?,
         on worker: ServerProfile
     ) async -> WorkerThreadResponse? {
         // The listing's content is as-of the fetch start; the archive
@@ -721,14 +914,18 @@ final class WorkerSessionService: ObservableObject {
         do {
             var remainingCursor: String?
             var threads: [WorkerThreadSnapshot] = []
-            for kind in AgentKind.allCases {
+            let routes: [(kind: AgentKind, accountID: ProviderAccountID?)] = route.map {
+                [($0.kind, $0.accountID)]
+            } ?? AgentKind.allCases.map { ($0, nil) }
+            for route in routes {
                 var cursor: String?
                 var pages = 0
                 repeat {
                     let result = try await runCommand(
                         SSHCommandBuilder.workerThreadListConfiguration(
                             for: worker,
-                            kind: kind,
+                            kind: route.kind,
+                            accountID: route.accountID,
                             repositoryName: repositoryName,
                             archived: archived,
                             cursor: cursor
@@ -739,9 +936,12 @@ final class WorkerSessionService: ObservableObject {
                     }
                     let page = try WorkerThreadProtocol.parse(
                         result.standardOutput,
-                        repositoryName: repositoryName
+                        repositoryName: repositoryName,
+                        expectedAccountID: route.accountID
                     )
-                    guard page.threads.allSatisfy({ $0.kind == kind }) else {
+                    guard page.threads.allSatisfy({
+                        $0.kind == route.kind && $0.accountID == route.accountID
+                    }) else {
                         throw WorkerSessionServiceError.threadFailed
                     }
                     threads.append(contentsOf: page.threads)
@@ -768,6 +968,8 @@ final class WorkerSessionService: ObservableObject {
                 response = response.merging(
                     liveSessions: responses[worker.id]?.sessions.filter {
                         $0.repositoryName == repositoryName
+                            && $0.accountID == route?.accountID
+                            && (route == nil || $0.kind == route?.kind)
                     } ?? []
                 )
                 response = withoutRecentlyArchived(
@@ -779,37 +981,70 @@ final class WorkerSessionService: ObservableObject {
             threadCatalogs[catalogKey] = response
             threadCatalogFetchTimes[catalogKey] = fetchStartedAt
             persistThreadCatalogs()
-            errors[worker.id] = nil
+            if let route {
+                threadErrors[
+                    ProviderAccountKey(
+                        workerID: worker.id,
+                        provider: route.kind,
+                        accountID: route.accountID
+                    )
+                ] = nil
+            } else {
+                errors[worker.id] = nil
+            }
             return response
         } catch {
-            errors[worker.id] = WorkerSessionServiceError.threadFailed.localizedDescription
+            let message = WorkerSessionServiceError.threadFailed.localizedDescription
+            if let route {
+                threadErrors[
+                    ProviderAccountKey(
+                        workerID: worker.id,
+                        provider: route.kind,
+                        accountID: route.accountID
+                    )
+                ] = message
+            } else {
+                errors[worker.id] = message
+            }
             return nil
         }
     }
 
     func createThread(
         repositoryName: String,
-        on worker: ServerProfile
+        on worker: ServerProfile,
+        account: ProviderAccountProfile? = nil
     ) async -> WorkerThreadSnapshot? {
-        guard requireCapability("threads-v2", worker: worker) else { return nil }
+        guard requireCapability(account == nil ? "threads-v2" : "provider-accounts-v1", worker: worker) else {
+            return nil
+        }
+        guard account.map({ $0.provider == .codex && $0.status.isUsable }) != false else {
+            errors[worker.id] = WorkerSessionServiceError.threadFailed.localizedDescription
+            return nil
+        }
         return await mutateThreadCatalog(
             configuration: SSHCommandBuilder.workerThreadCreateConfiguration(
                 for: worker,
+                accountID: account?.accountID,
                 repositoryName: repositoryName
             ),
             repositoryName: repositoryName,
+            expectedAccountID: account?.accountID,
             on: worker
         )
     }
 
     func resumeThread(
         kind: AgentKind,
+        accountID: ProviderAccountID? = nil,
         repositoryName: String,
         threadID: String,
         launchDefaults: AgentLaunchDefaults,
         on worker: ServerProfile
     ) async -> WorkerSessionSnapshot? {
-        guard requireCapability("threads-v2", worker: worker) else { return nil }
+        guard requireCapability(accountID == nil ? "threads-v2" : "provider-accounts-v1", worker: worker) else {
+            return nil
+        }
         guard Self.isCanonicalUUID(threadID) else {
             errors[worker.id] = WorkerSessionServiceError.threadFailed.localizedDescription
             return nil
@@ -819,6 +1054,7 @@ final class WorkerSessionService: ObservableObject {
                 SSHCommandBuilder.workerChatStartConfiguration(
                     for: worker,
                     kind: kind,
+                    accountID: accountID,
                     repositoryName: repositoryName,
                     threadID: threadID,
                     launchDefaults: launchDefaults
@@ -832,13 +1068,15 @@ final class WorkerSessionService: ObservableObject {
             }
             let chat = try WorkerChatProtocol.parseStart(
                 result.standardOutput,
-                expectedKind: kind
+                expectedKind: kind,
+                expectedAccountID: accountID
             )
             guard chat.providerThreadID == threadID else {
                 throw WorkerSessionServiceError.threadFailed
             }
             let snapshot = WorkerSessionSnapshot(
                 kind: kind,
+                accountID: accountID,
                 repositoryName: repositoryName,
                 attachedClientCount: 0,
                 instanceToken: chat.relayID,
@@ -879,15 +1117,33 @@ final class WorkerSessionService: ObservableObject {
         }
     }
 
+    func resumeThread(
+        _ thread: WorkerThreadSnapshot,
+        launchDefaults: AgentLaunchDefaults,
+        on worker: ServerProfile
+    ) async -> WorkerSessionSnapshot? {
+        await resumeThread(
+            kind: thread.kind,
+            accountID: thread.accountID,
+            repositoryName: thread.repositoryName,
+            threadID: thread.threadID,
+            launchDefaults: launchDefaults,
+            on: worker
+        )
+    }
+
     @discardableResult
     func renameThread(
         kind: AgentKind,
+        accountID: ProviderAccountID? = nil,
         repositoryName: String,
         threadID: String,
         name: String,
         on worker: ServerProfile
     ) async -> Bool {
-        guard requireCapability("threads-v2", worker: worker) else { return false }
+        guard requireCapability(accountID == nil ? "threads-v2" : "provider-accounts-v1", worker: worker) else {
+            return false
+        }
         let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard Self.isCanonicalUUID(threadID), !normalized.isEmpty,
               !normalized.contains("\n"), normalized.utf8.count <= 200 else {
@@ -898,24 +1154,45 @@ final class WorkerSessionService: ObservableObject {
             configuration: SSHCommandBuilder.workerThreadRenameConfiguration(
                 for: worker,
                 kind: kind,
+                accountID: accountID,
                 repositoryName: repositoryName,
                 threadID: threadID,
                 name: normalized
             ),
             repositoryName: repositoryName,
+            expectedAccountID: accountID,
             on: worker
         ) != nil
     }
 
     @discardableResult
+    func renameThread(
+        _ thread: WorkerThreadSnapshot,
+        name: String,
+        on worker: ServerProfile
+    ) async -> Bool {
+        await renameThread(
+            kind: thread.kind,
+            accountID: thread.accountID,
+            repositoryName: thread.repositoryName,
+            threadID: thread.threadID,
+            name: name,
+            on: worker
+        )
+    }
+
+    @discardableResult
     func setThreadArchived(
         kind: AgentKind,
+        accountID: ProviderAccountID? = nil,
         repositoryName: String,
         threadID: String,
         archived: Bool,
         on worker: ServerProfile
     ) async -> Bool {
-        guard requireCapability("threads-v2", worker: worker) else { return false }
+        guard requireCapability(accountID == nil ? "threads-v2" : "provider-accounts-v1", worker: worker) else {
+            return false
+        }
         guard Self.isCanonicalUUID(threadID) else {
             errors[worker.id] = WorkerSessionServiceError.threadFailed.localizedDescription
             return false
@@ -924,11 +1201,13 @@ final class WorkerSessionService: ObservableObject {
             configuration: SSHCommandBuilder.workerThreadArchiveConfiguration(
                 for: worker,
                 kind: kind,
+                accountID: accountID,
                 repositoryName: repositoryName,
                 threadID: threadID,
                 unarchive: !archived
             ),
             repositoryName: repositoryName,
+            expectedAccountID: accountID,
             on: worker
         ) != nil else {
             return false
@@ -936,6 +1215,7 @@ final class WorkerSessionService: ObservableObject {
         let tombstoneKey = Self.threadTombstoneKey(
             workerID: worker.id,
             kind: kind,
+            accountID: accountID,
             threadID: threadID
         )
         if archived {
@@ -943,14 +1223,50 @@ final class WorkerSessionService: ObservableObject {
         } else {
             archivedThreadTombstones.removeValue(forKey: tombstoneKey)
         }
-        _ = await loadThreads(repositoryName: repositoryName, archived: false, on: worker)
-        _ = await loadThreads(repositoryName: repositoryName, archived: true, on: worker)
+        if let accountID {
+            // Catalog keys already retain the route. Refresh the exact key
+            // directly without manufacturing mutable account metadata.
+            _ = await reloadThreadCatalog(
+                worker: worker,
+                kind: kind,
+                accountID: accountID,
+                repositoryName: repositoryName,
+                archived: false
+            )
+            _ = await reloadThreadCatalog(
+                worker: worker,
+                kind: kind,
+                accountID: accountID,
+                repositoryName: repositoryName,
+                archived: true
+            )
+        } else {
+            _ = await loadThreads(repositoryName: repositoryName, archived: false, on: worker)
+            _ = await loadThreads(repositoryName: repositoryName, archived: true, on: worker)
+        }
         return true
+    }
+
+    @discardableResult
+    func setThreadArchived(
+        _ thread: WorkerThreadSnapshot,
+        archived: Bool,
+        on worker: ServerProfile
+    ) async -> Bool {
+        await setThreadArchived(
+            kind: thread.kind,
+            accountID: thread.accountID,
+            repositoryName: thread.repositoryName,
+            threadID: thread.threadID,
+            archived: archived,
+            on: worker
+        )
     }
 
     private func mutateThreadCatalog(
         configuration: SSHLaunchConfiguration,
         repositoryName: String,
+        expectedAccountID: ProviderAccountID? = nil,
         on worker: ServerProfile
     ) async -> WorkerThreadSnapshot? {
         do {
@@ -960,7 +1276,8 @@ final class WorkerSessionService: ObservableObject {
             }
             let response = try WorkerThreadProtocol.parse(
                 result.standardOutput,
-                repositoryName: repositoryName
+                repositoryName: repositoryName,
+                expectedAccountID: expectedAccountID
             )
             guard response.threads.count == 1, let thread = response.threads.first else {
                 throw WorkerSessionServiceError.threadFailed
@@ -971,6 +1288,38 @@ final class WorkerSessionService: ObservableObject {
             errors[worker.id] = WorkerSessionServiceError.threadFailed.localizedDescription
             return nil
         }
+    }
+
+    private func reloadThreadCatalog(
+        worker: ServerProfile,
+        kind: AgentKind,
+        accountID: ProviderAccountID,
+        repositoryName: String,
+        archived: Bool
+    ) async -> WorkerThreadResponse? {
+        let key = WorkerThreadCatalogKey(
+            workerID: worker.id,
+            provider: kind,
+            accountID: accountID,
+            repositoryName: repositoryName,
+            archived: archived
+        )
+        if let inFlight = threadLoadTasks[key] {
+            _ = await inFlight.value
+        }
+        let task = Task { [weak self] () -> WorkerThreadResponse? in
+            guard let self else { return nil }
+            defer { self.threadLoadTasks[key] = nil }
+            return await self.fetchThreads(
+                catalogKey: key,
+                repositoryName: repositoryName,
+                archived: archived,
+                route: (kind, accountID),
+                on: worker
+            )
+        }
+        threadLoadTasks[key] = task
+        return await task.value
     }
 
     private static func isCanonicalUUID(_ value: String) -> Bool {
@@ -990,6 +1339,7 @@ final class WorkerSessionService: ObservableObject {
                 catalog.merging(
                     liveSessions: sessions.filter {
                         $0.repositoryName == key.repositoryName
+                            && $0.accountID == key.accountID
                     }
                 ),
                 workerID: workerID,
@@ -1007,9 +1357,10 @@ final class WorkerSessionService: ObservableObject {
     private static func threadTombstoneKey(
         workerID: UUID,
         kind: AgentKind,
+        accountID: ProviderAccountID?,
         threadID: String
     ) -> String {
-        "\(workerID.uuidString):\(kind.rawValue):\(threadID)"
+        "\(workerID.uuidString):\(kind.rawValue):\(accountID?.rawValue ?? "legacy"):\(threadID)"
     }
 
     private func pruneTombstones() {
@@ -1079,6 +1430,7 @@ final class WorkerSessionService: ObservableObject {
                     Self.threadTombstoneKey(
                         workerID: workerID,
                         kind: thread.kind,
+                        accountID: thread.accountID,
                         threadID: thread.threadID
                     )
                 ] else { return true }

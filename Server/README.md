@@ -184,9 +184,9 @@ per-file digest before installation. It prepares the pinned SDK without
 switching the live link, takes the deployment and agent-update locks, installs
 through atomic renames, and rolls back files, the installed manifest, and SDK
 link on failure. It does not read or write `/workspace`, provider credentials
-or histories, relay metadata, restart intents, or tmux processes. A shared
-Codex app-server restart is recorded and deferred until active Codex terminals
-drain.
+or histories, relay metadata, restart intents, or tmux processes. Restart
+markers are recorded for every registered Codex profile, then each profile's
+lazy app-server rotates after its active Codex tasks drain.
 
 The unprivileged helper exposes only:
 
@@ -211,26 +211,57 @@ bootstrap command). Future stable runtime changes then arrive unattended. App
 binaries remain separate: Sparkle updates macOS and the App Store updates
 iPhone/iPad.
 
+## Provider account profiles
+
+The account-aware Mac client uses the worker-owned registry below
+`~/.local/share/terminal-relay/provider-accounts-v1`. A profile contains only a
+worker-issued UUID, provider, label, status, and storage kind. Credentials stay
+in provider-native storage. The worker derives every path; clients cannot
+provide `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, socket, or credential paths.
+
+The registry imports the existing default Codex and Claude profiles in place.
+An isolated Codex profile receives its own `CODEX_HOME`, stable app-server Unix
+socket, and lazy tmux process. An isolated Claude profile receives its own
+`CLAUDE_CONFIG_DIR`, which is passed to login, status, history, Agent SDK, live
+broker, and restore operations. Adding a second profile for either provider
+writes the permanent `activated` marker only after the Mac confirms that
+existing history belongs to the imported current profile. Activation is
+refused while an accountless legacy terminal or chat relay is live. After
+activation, accountless legacy commands return `upgradeRequired` before
+provider access.
+
+```text
+terminal-relay-session provider-accounts-v1 [codex|claude]
+terminal-relay-session provider-account-create-v1 <codex|claude> <label>
+terminal-relay-session provider-account-login-v1 <codex|claude> <account-id>
+terminal-relay-session provider-account-status-v1 <codex|claude> <account-id>
+terminal-relay-session provider-account-rename-v1 <codex|claude> <account-id> <label>
+```
+
+Profiles are a deterministic routing boundary for a single trusted owner. They
+are not hostile-tenant isolation from code with full access as the same worker
+Unix user.
+
 ## Native structured chat
 
 Supported clients negotiate native chat before starting or resuming an agent.
 The worker exposes these fixed helper operations:
 
 ```text
-terminal-relay-session chat-capabilities-v1 <codex|claude> <repository>
-terminal-relay-session chat-start-v1 <codex|claude> <repository> [provider-thread-id] [agent arguments...]
-terminal-relay-session chat-attach-v1 <codex|claude> <repository> <relay-id>
-terminal-relay-session chat-stop-v1 <codex|claude> <repository> <relay-id>
-terminal-relay-session chat-attachment-upload-v1 <codex|claude> <repository> <relay-id> <request-id> <attachment-id> <extension> <byte-count>
-terminal-relay-session chat-attachment-delete-v1 <codex|claude> <repository> <relay-id> <request-id>
+terminal-relay-session chat-capabilities-v2 <codex|claude> <account-id> <repository>
+terminal-relay-session chat-start-v2 <codex|claude> <account-id> <repository> [provider-thread-id] [agent arguments...]
+terminal-relay-session chat-attach-v2 <codex|claude> <account-id> <repository> <relay-id>
+terminal-relay-session chat-stop-v2 <codex|claude> <account-id> <repository> <relay-id>
+terminal-relay-session chat-attachment-upload-v2 <codex|claude> <account-id> <repository> <relay-id> <request-id> <attachment-id> <extension> <byte-count>
+terminal-relay-session chat-attachment-delete-v2 <codex|claude> <account-id> <repository> <relay-id> <request-id>
 ```
 
-`chat-start-v1` launches one `terminal-relay-chat` broker under the existing
-worker-user supervision and provider-thread lock. The broker owns the provider
-connection and listens only on a mode-`0600` Unix socket. `chat-attach-v1`
+`chat-start-v2` launches one `terminal-relay-chat` broker under the selected
+account route and provider-thread lock. The broker owns the provider connection
+and listens only on a mode-`0600` Unix socket. `chat-attach-v2`
 opens a non-PTY, bidirectional NDJSON stream over the authenticated SSH
 connection. Disconnecting that stream leaves the broker and provider running;
-`chat-stop-v1` accepts only the exact relay UUID and ends that instance for all
+`chat-stop-v2` accepts only the exact account and relay UUID and ends that instance for all
 attached clients.
 
 Workers advertising `file-attachments-v1` accept attachment bytes only on the
@@ -243,8 +274,9 @@ client cleanup, broker startup or shutdown, and through a bounded orphan
 sweep. Attachment contents and paths are not logged or persisted in the
 conversation snapshot or replay window.
 
-Codex chat uses the shared worker-local app-server and its v2 history and turn
-methods. Claude chat uses the pinned official Agent SDK environment. Provider
+Codex chat uses the selected profile's worker-local app-server and its v2
+history and turn methods. Claude chat uses the selected profile's pinned
+official Agent SDK environment. Provider
 history remains authoritative. The broker retains only a bounded in-memory
 snapshot, replay window, and unresolved live interactions; it has no TCP
 listener or transcript database. See
@@ -283,8 +315,8 @@ host copies. If an operator explicitly requests `--retain-backups`, differing
 helper and unit files are retained as timestamped backups and the installer
 prints a guarded rollback command. The MCP and Claude adapter are always staged,
 atomically renamed, and verified in place. Replacing the helper or MCP also
-schedules the shared Codex app-server to restart after active Codex terminals
-drain. Both the full worker installer and this helper-only installer require the
+schedules every registered Codex profile's app-server to restart after its
+active tasks drain. Both the full worker installer and this helper-only installer require the
 installed runtime to advertise `file-attachments-v1` before succeeding.
 
 Run the isolated local helper coverage before installation:
@@ -339,17 +371,28 @@ terminal-relay-session thread-resume-v2 <codex|claude> <repository> <thread-uuid
 terminal-relay-session thread-rename-v2 <codex|claude> <repository> <thread-uuid> <name>
 terminal-relay-session thread-archive-v2 <codex|claude> <repository> <thread-uuid>
 terminal-relay-session thread-unarchive-v2 <codex|claude> <repository> <thread-uuid>
+terminal-relay-session status-v2
+terminal-relay-session start-v2 <codex|claude> <account-id> <repository> [agent arguments...]
+terminal-relay-session reattach-v2 <codex|claude> <account-id> <repository> <instance-uuid>
+terminal-relay-session stop-v2 <codex|claude> <account-id> <repository> <instance-uuid>
+terminal-relay-session threads-v3 <codex|claude> <account-id> <repository> <open|archived> [cursor]
+terminal-relay-session thread-create-v2 <account-id> <repository>
+terminal-relay-session thread-read-v3 <codex|claude> <account-id> <repository> <thread-uuid>
+terminal-relay-session thread-resume-v3 <codex|claude> <account-id> <repository> <thread-uuid> [agent arguments...]
+terminal-relay-session thread-rename-v3 <codex|claude> <account-id> <repository> <thread-uuid> <name>
+terminal-relay-session thread-archive-v3 <codex|claude> <account-id> <repository> <thread-uuid>
+terminal-relay-session thread-unarchive-v3 <codex|claude> <account-id> <repository> <thread-uuid>
 ```
 
 `list-projects` emits sorted `project|<repository>` records. Names must match
 `^[A-Za-z0-9._-]+$`, contain at most 100 characters, and name real immediate
 directories (not symlinks) below `/workspace`.
 
-The V1 parser contract retains the original five-field record for older clients.
-Current workers emit one extended record for each active agent:
+The V1 parser contract remains available only before account activation. The
+account-aware status marker is `__TERMINAL_RELAY_SESSION_V2__`; each live row is:
 
 ```text
-session|<codex|claude>|<repository>|<attached-client-count>|<instance-uuid>|<activity-epoch>|<hex-UTF-8-title>|<0|1|empty-working>|<provider-thread-uuid>|<terminal|chat>
+session|<codex|claude>|<account-id>|<repository>|<attached-client-count>|<instance-uuid>|<activity-epoch>|<hex-UTF-8-title>|<0|1|empty-working>|<provider-thread-uuid>|<terminal|chat>
 ```
 
 The activity epoch is seconds since the Unix epoch, with 0 meaning unknown.
@@ -471,14 +514,15 @@ There is intentionally no detach RPC: closing SSH, Terminal Relay, or an
 individual terminal only disconnects that tmux client.
 
 Each successful initial launch writes a mode-`0600` restart intent below the
-runtime user's mode-`0700` `~/.local/state/terminal-relay` directory. The record
-contains data only: repository, Terminal Relay UUID, provider thread UUID, boot
-ID, and the resume-safe argument array. `restore` holds the same instance and
-provider-session locks and acts only on a valid intent from an earlier boot. It
+runtime user's mode-`0700` `~/.local/state/terminal-relay` directory. The
+account-aware record contains data only: provider, account UUID, repository,
+Terminal Relay UUID, provider thread UUID, boot ID, and the resume-safe
+argument array. `restore` holds the same instance and
+provider-account-thread locks and acts only on a valid intent from an earlier boot. It
 recreates the same UUID-named tmux session, starts Claude with
 `--resume <provider-thread-uuid>`, or starts Codex with
-`resume <provider-thread-uuid>` from the recorded repository. A legacy
-intent with no Codex provider ID retains the old `resume --last` fallback.
+`resume <provider-thread-uuid>` from the recorded repository. Accountless
+legacy intents are not promoted after activation.
 Caller-supplied lifecycle flags are rejected. A normal CLI exit, failed initial
 launch, or exact `stop` removes only its matching intent; shutdown retains it.
 The enabled
@@ -517,8 +561,8 @@ multiple Codex and Claude processes can run concurrently without weakening
 exact-instance stop or stale-attach checks. Legacy create-capable attachment
 keeps its provider-scoped lock.
 
-The shared Codex app server adds the built-in `terminal_relay` MCP without
-changing Codex's existing configuration policy for other servers. Managed
+Before multi-account activation, the shared Codex app server adds the built-in
+`terminal_relay` MCP without changing Codex's existing configuration policy for other servers. Managed
 Claude launches receive the same fixed
 `/usr/local/bin/terminal-relay-mcp` through strict MCP configuration. The MCP is
 a dependency-free Python stdio server and exposes exactly `list_projects`,
@@ -530,6 +574,11 @@ inputs plus 30-second and 1 MiB bounds, redacts helper stderr, and has no
 listener, shell, transcript access, terminal input, permanent deletion, or
 cross-worker capability. Claude's strict launch policy prevents unrequested
 servers.
+
+After activation, the ambient MCP advertises no tools and returns
+`upgradeRequired` without invoking the session helper. A public account UUID or
+model-controlled environment variable is not accepted as authorization; a
+future account-aware MCP requires a host-created task-scoped capability.
 
 For the isolated integration test only, a helper invoked from a path other than
 `/usr/local/bin/terminal-relay-session` accepts these settings:

@@ -10,6 +10,7 @@ enum SSHCommandBuilder {
         for server: ServerProfile,
         project: ProjectProfile,
         kind: AgentKind,
+        accountID: ProviderAccountID? = nil,
         instanceToken: String
     ) -> SSHLaunchConfiguration {
         var arguments = [
@@ -34,6 +35,7 @@ enum SSHCommandBuilder {
                 for: server,
                 project: project,
                 kind: kind,
+                accountID: accountID,
                 instanceToken: instanceToken
             )
         )
@@ -45,15 +47,27 @@ enum SSHCommandBuilder {
         for _: ServerProfile,
         project: ProjectProfile,
         kind: AgentKind,
+        accountID: ProviderAccountID? = nil,
         instanceToken: String
     ) -> String {
-        let sessionCommand = [
-            WorkerSessionProtocol.helperPath,
-            "reattach",
-            kind.rawValue,
-            project.displayName,
-            instanceToken
-        ]
+        let routeArguments: [String]
+        if let accountID {
+            routeArguments = [
+                "reattach-v2",
+                kind.rawValue,
+                accountID.rawValue,
+                project.displayName,
+                instanceToken,
+            ]
+        } else {
+            routeArguments = [
+                "reattach",
+                kind.rawValue,
+                project.displayName,
+                instanceToken,
+            ]
+        }
+        let sessionCommand = ([WorkerSessionProtocol.helperPath] + routeArguments)
             .map(shellQuote)
             .joined(separator: " ")
         let payload = "exec \(sessionCommand)"
@@ -66,7 +80,69 @@ enum SSHCommandBuilder {
     ) -> SSHLaunchConfiguration {
         workerSessionConfiguration(
             for: server,
-            arguments: ["status"]
+            arguments: ["status-v2"]
+        )
+    }
+
+    static func providerAccountListConfiguration(
+        for server: ServerProfile,
+        provider: AgentKind? = nil
+    ) -> SSHLaunchConfiguration {
+        workerSessionConfiguration(
+            for: server,
+            arguments: ["provider-accounts-v1"] + (provider.map { [$0.rawValue] } ?? [])
+        )
+    }
+
+    static func providerAccountCreateConfiguration(
+        for server: ServerProfile,
+        provider: AgentKind,
+        label: String
+    ) -> SSHLaunchConfiguration {
+        workerSessionConfiguration(
+            for: server,
+            arguments: ["provider-account-create-v1", provider.rawValue, label]
+        )
+    }
+
+    static func providerAccountImportDefaultConfiguration(
+        for server: ServerProfile,
+        provider: AgentKind,
+        label: String
+    ) -> SSHLaunchConfiguration {
+        workerSessionConfiguration(
+            for: server,
+            arguments: ["provider-account-import-default-v1", provider.rawValue, label]
+        )
+    }
+
+    static func providerAccountRenameConfiguration(
+        for server: ServerProfile,
+        account: ProviderAccountProfile,
+        label: String
+    ) -> SSHLaunchConfiguration {
+        workerSessionConfiguration(
+            for: server,
+            arguments: [
+                "provider-account-rename-v1",
+                account.provider.rawValue,
+                account.accountID.rawValue,
+                label,
+            ]
+        )
+    }
+
+    static func providerAccountStatusConfiguration(
+        for server: ServerProfile,
+        account: ProviderAccountProfile
+    ) -> SSHLaunchConfiguration {
+        workerSessionConfiguration(
+            for: server,
+            arguments: [
+                "provider-account-status-v1",
+                account.provider.rawValue,
+                account.accountID.rawValue,
+            ]
         )
     }
 
@@ -100,14 +176,16 @@ enum SSHCommandBuilder {
     static func workerSessionStartConfiguration(
         for server: ServerProfile,
         kind: AgentKind,
+        accountID: ProviderAccountID? = nil,
         repositoryName: String,
         launchDefaults: AgentLaunchDefaults
     ) -> SSHLaunchConfiguration {
-        let arguments = ["start", kind.rawValue, repositoryName]
-            + launchDefaults.arguments(for: kind)
+        let routeArguments = accountID.map {
+            ["start-v2", kind.rawValue, $0.rawValue, repositoryName]
+        } ?? ["start", kind.rawValue, repositoryName]
         return workerSessionConfiguration(
             for: server,
-            arguments: arguments,
+            arguments: routeArguments + launchDefaults.arguments(for: kind),
             environment: kind == .claude ? ["ConEmuANSI=1"] : []
         )
     }
@@ -115,34 +193,43 @@ enum SSHCommandBuilder {
     static func workerSessionStopConfiguration(
         for server: ServerProfile,
         kind: AgentKind,
+        accountID: ProviderAccountID? = nil,
         repositoryName: String,
         instanceToken: String
     ) -> SSHLaunchConfiguration {
         workerSessionConfiguration(
             for: server,
-            arguments: ["stop", kind.rawValue, repositoryName, instanceToken]
+            arguments: accountID.map {
+                ["stop-v2", kind.rawValue, $0.rawValue, repositoryName, instanceToken]
+            } ?? ["stop", kind.rawValue, repositoryName, instanceToken]
         )
     }
 
     static func workerChatCapabilitiesConfiguration(
         for server: ServerProfile,
         kind: AgentKind,
+        accountID: ProviderAccountID? = nil,
         repositoryName: String
     ) -> SSHLaunchConfiguration {
         workerSessionConfiguration(
             for: server,
-            arguments: ["chat-capabilities-v1", kind.rawValue, repositoryName]
+            arguments: accountID.map {
+                ["chat-capabilities-v2", kind.rawValue, $0.rawValue, repositoryName]
+            } ?? ["chat-capabilities-v1", kind.rawValue, repositoryName]
         )
     }
 
     static func workerChatStartConfiguration(
         for server: ServerProfile,
         kind: AgentKind,
+        accountID: ProviderAccountID? = nil,
         repositoryName: String,
         threadID: String?,
         launchDefaults: AgentLaunchDefaults
     ) -> SSHLaunchConfiguration {
-        var arguments = ["chat-start-v1", kind.rawValue, repositoryName]
+        var arguments = accountID.map {
+            ["chat-start-v2", kind.rawValue, $0.rawValue, repositoryName]
+        } ?? ["chat-start-v1", kind.rawValue, repositoryName]
         if let threadID {
             arguments.append(threadID)
         }
@@ -153,16 +240,22 @@ enum SSHCommandBuilder {
     static func workerChatAttachConfiguration(
         for server: ServerProfile,
         kind: AgentKind,
+        accountID: ProviderAccountID? = nil,
         repositoryName: String,
         instanceToken: String
     ) -> SSHLaunchConfiguration {
         workerSessionStreamConfiguration(
             for: server,
-            arguments: [
-                "chat-attach-v1",
-                kind.rawValue,
-                repositoryName,
-                instanceToken,
+            arguments: accountID.map {
+                [
+                    "chat-attach-v2",
+                    kind.rawValue,
+                    $0.rawValue,
+                    repositoryName,
+                    instanceToken,
+                ]
+            } ?? [
+                "chat-attach-v1", kind.rawValue, repositoryName, instanceToken,
             ]
         )
     }
@@ -170,26 +263,36 @@ enum SSHCommandBuilder {
     static func workerChatStopConfiguration(
         for server: ServerProfile,
         kind: AgentKind,
+        accountID: ProviderAccountID? = nil,
         repositoryName: String,
         instanceToken: String
     ) -> SSHLaunchConfiguration {
         workerSessionConfiguration(
             for: server,
-            arguments: ["chat-stop-v1", kind.rawValue, repositoryName, instanceToken]
+            arguments: accountID.map {
+                ["chat-stop-v2", kind.rawValue, $0.rawValue, repositoryName, instanceToken]
+            } ?? ["chat-stop-v1", kind.rawValue, repositoryName, instanceToken]
         )
     }
 
     static func workerThreadListConfiguration(
         for server: ServerProfile,
         kind: AgentKind,
+        accountID: ProviderAccountID? = nil,
         repositoryName: String,
         archived: Bool,
         cursor: String? = nil
     ) -> SSHLaunchConfiguration {
-        var arguments = [
-            "threads-v2",
-            kind.rawValue,
-            repositoryName,
+        var arguments = accountID.map {
+            [
+                "threads-v3",
+                kind.rawValue,
+                $0.rawValue,
+                repositoryName,
+                archived ? "archived" : "open",
+            ]
+        } ?? [
+            "threads-v2", kind.rawValue, repositoryName,
             archived ? "archived" : "open",
         ]
         if let cursor {
@@ -200,43 +303,51 @@ enum SSHCommandBuilder {
 
     static func workerThreadCreateConfiguration(
         for server: ServerProfile,
+        accountID: ProviderAccountID? = nil,
         repositoryName: String
     ) -> SSHLaunchConfiguration {
         workerSessionConfiguration(
             for: server,
-            arguments: ["thread-create", repositoryName]
+            arguments: accountID.map {
+                ["thread-create-v2", $0.rawValue, repositoryName]
+            } ?? ["thread-create", repositoryName]
         )
     }
 
     static func workerThreadResumeConfiguration(
         for server: ServerProfile,
         kind: AgentKind,
+        accountID: ProviderAccountID? = nil,
         repositoryName: String,
         threadID: String,
         launchDefaults: AgentLaunchDefaults
     ) -> SSHLaunchConfiguration {
-        workerSessionConfiguration(
+        let routeArguments = accountID.map {
+            ["thread-resume-v3", kind.rawValue, $0.rawValue, repositoryName, threadID]
+        } ?? ["thread-resume-v2", kind.rawValue, repositoryName, threadID]
+        return workerSessionConfiguration(
             for: server,
-            arguments: ["thread-resume-v2", kind.rawValue, repositoryName, threadID]
-                + launchDefaults.arguments(for: kind)
+            arguments: routeArguments + launchDefaults.arguments(for: kind)
         )
     }
 
     static func workerThreadRenameConfiguration(
         for server: ServerProfile,
         kind: AgentKind,
+        accountID: ProviderAccountID? = nil,
         repositoryName: String,
         threadID: String,
         name: String
     ) -> SSHLaunchConfiguration {
         workerSessionConfiguration(
             for: server,
-            arguments: [
-                "thread-rename-v2",
-                kind.rawValue,
-                repositoryName,
-                threadID,
-                name,
+            arguments: accountID.map {
+                [
+                    "thread-rename-v3", kind.rawValue, $0.rawValue,
+                    repositoryName, threadID, name,
+                ]
+            } ?? [
+                "thread-rename-v2", kind.rawValue, repositoryName, threadID, name,
             ]
         )
     }
@@ -244,17 +355,21 @@ enum SSHCommandBuilder {
     static func workerThreadArchiveConfiguration(
         for server: ServerProfile,
         kind: AgentKind,
+        accountID: ProviderAccountID? = nil,
         repositoryName: String,
         threadID: String,
         unarchive: Bool
     ) -> SSHLaunchConfiguration {
         workerSessionConfiguration(
             for: server,
-            arguments: [
+            arguments: accountID.map {
+                [
+                    unarchive ? "thread-unarchive-v3" : "thread-archive-v3",
+                    kind.rawValue, $0.rawValue, repositoryName, threadID,
+                ]
+            } ?? [
                 unarchive ? "thread-unarchive-v2" : "thread-archive-v2",
-                kind.rawValue,
-                repositoryName,
-                threadID,
+                kind.rawValue, repositoryName, threadID,
             ]
         )
     }
@@ -282,6 +397,7 @@ enum SSHCommandBuilder {
     static func workerChatAttachmentUploadConfiguration(
         for server: ServerProfile,
         kind: AgentKind,
+        accountID: ProviderAccountID? = nil,
         repositoryName: String,
         relayID: String,
         requestID: String,
@@ -291,15 +407,15 @@ enum SSHCommandBuilder {
     ) -> SSHLaunchConfiguration {
         workerSessionStreamConfiguration(
             for: server,
-            arguments: [
-                "chat-attachment-upload-v1",
-                kind.rawValue,
-                repositoryName,
-                relayID,
-                requestID,
-                attachmentID,
-                fileExtension,
-                String(byteCount),
+            arguments: accountID.map {
+                [
+                    "chat-attachment-upload-v2", kind.rawValue, $0.rawValue,
+                    repositoryName, relayID, requestID, attachmentID,
+                    fileExtension, String(byteCount),
+                ]
+            } ?? [
+                "chat-attachment-upload-v1", kind.rawValue, repositoryName,
+                relayID, requestID, attachmentID, fileExtension, String(byteCount),
             ]
         )
     }
@@ -307,20 +423,50 @@ enum SSHCommandBuilder {
     static func workerChatAttachmentDeleteConfiguration(
         for server: ServerProfile,
         kind: AgentKind,
+        accountID: ProviderAccountID? = nil,
         repositoryName: String,
         relayID: String,
         requestID: String
     ) -> SSHLaunchConfiguration {
         workerSessionConfiguration(
             for: server,
-            arguments: [
-                "chat-attachment-delete-v1",
-                kind.rawValue,
-                repositoryName,
-                relayID,
-                requestID,
+            arguments: accountID.map {
+                [
+                    "chat-attachment-delete-v2", kind.rawValue, $0.rawValue,
+                    repositoryName, relayID, requestID,
+                ]
+            } ?? [
+                "chat-attachment-delete-v1", kind.rawValue, repositoryName,
+                relayID, requestID,
             ]
         )
+    }
+
+    static func providerAccountUsageConfiguration(
+        for server: ServerProfile,
+        account: ProviderAccountProfile
+    ) -> SSHLaunchConfiguration {
+        workerSessionConfiguration(
+            for: server,
+            arguments: [
+                account.provider == .codex ? "codex-account-v2" : "claude-account-v2",
+                account.accountID.rawValue,
+            ]
+        )
+    }
+
+    static func codexResetConfiguration(
+        for server: ServerProfile,
+        accountID: ProviderAccountID,
+        idempotencyKey: UUID,
+        creditID: String?
+    ) -> SSHLaunchConfiguration {
+        var arguments = [
+            "codex-reset-v2", accountID.rawValue,
+            idempotencyKey.uuidString.lowercased(),
+        ]
+        if let creditID { arguments.append(creditID) }
+        return workerSessionConfiguration(for: server, arguments: arguments)
     }
 
     static func shellQuote(_ value: String) -> String {

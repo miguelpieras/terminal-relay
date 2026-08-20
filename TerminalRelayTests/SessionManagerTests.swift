@@ -77,6 +77,91 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(manager.sessions.count, 3)
     }
 
+    func testSameProviderAccountsCanOccupyTheSameProjectAndThreadConcurrently() {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let manager = SessionManager()
+        let firstAccount = ProviderAccountProfile(
+            accountID: ProviderAccountID(
+                UUID(uuidString: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")!
+            ),
+            provider: .codex,
+            label: "Personal",
+            storageKind: .isolated,
+            status: .active
+        )
+        let secondAccount = ProviderAccountProfile(
+            accountID: ProviderAccountID(
+                UUID(uuidString: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")!
+            ),
+            provider: .codex,
+            label: "Work",
+            storageKind: .isolated,
+            status: .active
+        )
+        let threadID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        let firstInstanceID = UUID(
+            uuidString: "11111111-1111-4111-8111-111111111111"
+        )!.uuidString.lowercased()
+        let secondInstanceID = UUID(
+            uuidString: "22222222-2222-4222-8222-222222222222"
+        )!.uuidString.lowercased()
+        let firstSnapshot = WorkerSessionSnapshot(
+            kind: .codex,
+            accountID: firstAccount.accountID,
+            repositoryName: project.displayName,
+            attachedClientCount: 0,
+            instanceToken: firstInstanceID,
+            threadID: threadID,
+            presentation: .chat
+        )
+        let secondSnapshot = WorkerSessionSnapshot(
+            kind: .codex,
+            accountID: secondAccount.accountID,
+            repositoryName: project.displayName,
+            attachedClientCount: 0,
+            instanceToken: secondInstanceID,
+            threadID: threadID,
+            presentation: .chat
+        )
+
+        guard let firstResult = manager.openConfirmedRemote(
+            project: project,
+            on: server,
+            snapshot: firstSnapshot,
+            account: firstAccount
+        ), let secondResult = manager.openConfirmedRemote(
+            project: project,
+            on: server,
+            snapshot: secondSnapshot,
+            account: secondAccount
+        ), case .opened(let first) = firstResult,
+           case .opened(let second) = secondResult else {
+            return XCTFail("Both account-scoped sessions should open")
+        }
+
+        XCTAssertEqual(manager.sessions.count, 2)
+        XCTAssertEqual(first.accountID, firstAccount.accountID)
+        XCTAssertEqual(second.accountID, secondAccount.accountID)
+        XCTAssertTrue(
+            manager.activeSession(
+                projectID: project.id,
+                kind: .codex,
+                accountID: firstAccount.accountID
+            ) === first
+        )
+        XCTAssertEqual(
+            manager.occupiedThreadKeys(
+                forProjectID: project.id,
+                serverKey: server.concurrencyKey
+            ),
+            [
+                "codex:\(firstAccount.accountID.rawValue):\(threadID)",
+                "codex:\(secondAccount.accountID.rawValue):\(threadID)",
+            ]
+        )
+    }
+
     func testProjectSessionQueriesAndIdentityUseProjectValues() {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let project = makeProject(name: "terminal-relay", server: server)
@@ -2580,7 +2665,7 @@ private func sessionManagerTestChatCapabilitiesResult(
         exitCode: 0,
         standardOutput: Data(
             """
-            \(WorkerChatProtocol.marker)
+            \(WorkerChatProtocol.legacyMarker)
             {"provider":"\(kind.rawValue)","available":true,"capabilities":\(capabilities),"reason":null}
 
             """.utf8
@@ -2605,7 +2690,7 @@ private func sessionManagerTestChatStartResult(
         exitCode: 0,
         standardOutput: Data(
             """
-            \(WorkerChatProtocol.marker)
+            \(WorkerChatProtocol.legacyMarker)
             {"relayId":"\(snapshot.instanceToken)","provider":"\(snapshot.kind.rawValue)","providerThreadId":"\(threadID)","capabilities":\(capabilities),"launchOptions":{}}
 
             """.utf8

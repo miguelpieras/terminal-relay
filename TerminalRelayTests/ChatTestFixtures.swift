@@ -5,11 +5,15 @@ enum ChatTestFixtures {
     static let relayID = "00000000-0000-4000-8000-000000000001"
     static let threadID = "00000000-0000-4000-8000-000000000002"
     static let generation = "00000000-0000-4000-8000-000000000003"
+    static let accountID = ProviderAccountID(
+        UUID(uuidString: "00000000-0000-4000-8000-000000000004")!
+    )
 
     static var identity: ChatConversationIdentity {
         ChatConversationIdentity(
             relayID: relayID,
             provider: .codex,
+            accountID: accountID,
             providerThreadID: threadID
         )
     }
@@ -31,6 +35,7 @@ enum ChatTestFixtures {
             ),
             relayID: relayID,
             provider: .codex,
+            accountID: accountID,
             providerThreadID: threadID,
             snapshotGeneration: snapshotGeneration,
             sequence: sequence,

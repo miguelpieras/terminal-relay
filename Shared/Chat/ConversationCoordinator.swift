@@ -872,6 +872,18 @@ final class ConversationCoordinator {
         lifecycleEpoch epoch: UInt64
     ) async -> Bool {
         guard canContinueLifecycle(epoch) else { return true }
+        // Route identity is immutable. Reject a wrong relay/provider/account/
+        // thread before detached projection work or any reducer state change.
+        guard identity.matches(envelope) else {
+            store.setConnectionState(
+                .failed,
+                message: "The worker returned chat data for a different account or task."
+            )
+            shouldStayConnected = false
+            isAttached = false
+            await transport.disconnect()
+            return true
+        }
         let kind = ChatEventKind(rawValue: envelope.type)
         let projectionPreparation: Task<PreparedConversationApplication, Never>?
         let requiresProjectionPreparation: Bool

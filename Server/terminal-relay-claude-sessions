@@ -73,6 +73,18 @@ def canonical_session_id(value: Any) -> str:
     return canonical
 
 
+def canonical_account_id(value: Any) -> str:
+    if not isinstance(value, str):
+        raise AdapterError("The provider account identity is invalid.", 64)
+    try:
+        canonical = str(uuid.UUID(value))
+    except ValueError as error:
+        raise AdapterError("The provider account identity is invalid.", 64) from error
+    if canonical != value:
+        raise AdapterError("The provider account identity is invalid.", 64)
+    return canonical
+
+
 def canonical_directory(value: str, label: str, must_exist: bool = True) -> str:
     if not os.path.isabs(value) or value == "/" or "\n" in value:
         raise AdapterError(f"The {label} is invalid.", 64)
@@ -83,6 +95,21 @@ def canonical_directory(value: str, label: str, must_exist: bool = True) -> str:
     if resolved != value:
         raise AdapterError(f"The {label} is invalid.", 64)
     return value
+
+
+def runtime_account_identity() -> str | None:
+    provider = os.environ.get("TERMINAL_RELAY_PROVIDER") or None
+    raw_account_id = os.environ.get("TERMINAL_RELAY_ACCOUNT_ID") or None
+    if raw_account_id is None and provider in {None, "claude"}:
+        account_id = None
+    elif provider != "claude" or raw_account_id is None:
+        raise AdapterError("The provider account identity is stale.", 75)
+    else:
+        account_id = canonical_account_id(raw_account_id)
+    config_directory = os.environ.get("CLAUDE_CONFIG_DIR")
+    if config_directory is not None:
+        canonical_directory(config_directory, "Claude config directory")
+    return account_id
 
 
 def parse_cursor(value: str | None) -> int:
@@ -288,7 +315,10 @@ def row_for_session(
     project_directory: str,
     archive_directory: str,
     active_ids: set[str] | None,
+    account_id: str | None = None,
 ) -> dict[str, Any]:
+    if account_id is not None:
+        account_id = canonical_account_id(account_id)
     session_id, title, updated_at = validate_session_info(info, project_directory)
     archived = session_is_archived(archive_directory, session_id)
     if active_ids is None:
@@ -298,7 +328,7 @@ def row_for_session(
     else:
         activity = "inactive"
     mutable = activity == "inactive"
-    return {
+    row = {
         "provider": "claude",
         "threadID": session_id,
         "title": title,
@@ -314,6 +344,9 @@ def row_for_session(
             "unarchive": mutable and archived,
         },
     }
+    if account_id is not None:
+        row["accountID"] = account_id
+    return row
 
 
 def print_catalog(rows: list[dict[str, Any]], next_cursor: str | None = None) -> None:
@@ -324,7 +357,11 @@ def print_catalog(rows: list[dict[str, Any]], next_cursor: str | None = None) ->
     print(encoded)
 
 
-def list_command(arguments: list[str], test_mode: bool) -> None:
+def list_command(
+    arguments: list[str], test_mode: bool, account_id: str | None = None
+) -> None:
+    if account_id is not None:
+        account_id = canonical_account_id(account_id)
     if len(arguments) not in (3, 4):
         raise AdapterError("Invalid Claude session list request.", 64)
     project_directory = canonical_directory(arguments[0], "project directory")
@@ -359,6 +396,7 @@ def list_command(arguments: list[str], test_mode: bool) -> None:
                 project_directory,
                 archive_directory,
                 active_ids,
+                account_id,
             )
         except AdapterError:
             continue
@@ -387,7 +425,11 @@ def read_info(project_directory: str, session_id: str):
     return info
 
 
-def read_command(arguments: list[str], test_mode: bool) -> None:
+def read_command(
+    arguments: list[str], test_mode: bool, account_id: str | None = None
+) -> None:
+    if account_id is not None:
+        account_id = canonical_account_id(account_id)
     if len(arguments) != 3:
         raise AdapterError("Invalid Claude session read request.", 64)
     project_directory = canonical_directory(arguments[0], "project directory")
@@ -400,7 +442,15 @@ def read_command(arguments: list[str], test_mode: bool) -> None:
     info = read_info(project_directory, session_id)
     active_ids = provider_active_session_ids(project_directory, test_mode)
     print_catalog(
-        [row_for_session(info, project_directory, archive_directory, active_ids)]
+        [
+            row_for_session(
+                info,
+                project_directory,
+                archive_directory,
+                active_ids,
+                account_id,
+            )
+        ]
     )
 
 
@@ -427,7 +477,11 @@ def activity_command(arguments: list[str], test_mode: bool) -> None:
         raise AdapterError("The requested Claude session is already active.", 75)
 
 
-def rename_command(arguments: list[str], test_mode: bool) -> None:
+def rename_command(
+    arguments: list[str], test_mode: bool, account_id: str | None = None
+) -> None:
+    if account_id is not None:
+        account_id = canonical_account_id(account_id)
     if len(arguments) != 4:
         raise AdapterError("Invalid Claude session rename request.", 64)
     project_directory = canonical_directory(arguments[0], "project directory")
@@ -460,27 +514,36 @@ def rename_command(arguments: list[str], test_mode: bool) -> None:
     if updated_title != title:
         raise AdapterError("The Claude session rename could not be verified.")
     print_catalog(
-        [row_for_session(updated, project_directory, archive_directory, active_ids)]
+        [
+            row_for_session(
+                updated,
+                project_directory,
+                archive_directory,
+                active_ids,
+                account_id,
+            )
+        ]
     )
 
 
 def main() -> None:
     test_mode = test_mode_enabled()
+    account_id = runtime_account_identity()
     if len(sys.argv) < 2:
         raise AdapterError("A Claude session operation is required.", 64)
     operation, *arguments = sys.argv[1:]
     if operation == "version":
         version_command(arguments)
     elif operation == "list":
-        list_command(arguments, test_mode)
+        list_command(arguments, test_mode, account_id)
     elif operation == "read":
-        read_command(arguments, test_mode)
+        read_command(arguments, test_mode, account_id)
     elif operation == "title":
         title_command(arguments)
     elif operation == "activity":
         activity_command(arguments, test_mode)
     elif operation == "rename":
-        rename_command(arguments, test_mode)
+        rename_command(arguments, test_mode, account_id)
     else:
         raise AdapterError("The Claude session operation is unsupported.", 64)
 

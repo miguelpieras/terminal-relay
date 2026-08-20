@@ -37,6 +37,7 @@ enum WorkerThreadActivityState: String, Codable, Equatable {
 
 struct WorkerThreadSnapshot: Codable, Equatable, Identifiable {
     let kind: AgentKind
+    let accountID: ProviderAccountID?
     let repositoryName: String
     let threadID: String
     let title: String?
@@ -49,6 +50,7 @@ struct WorkerThreadSnapshot: Codable, Equatable, Identifiable {
 
     init(
         kind: AgentKind,
+        accountID: ProviderAccountID? = nil,
         repositoryName: String,
         threadID: String,
         title: String?,
@@ -60,6 +62,7 @@ struct WorkerThreadSnapshot: Codable, Equatable, Identifiable {
         capabilities: WorkerThreadCapabilities
     ) {
         self.kind = kind
+        self.accountID = accountID
         self.repositoryName = repositoryName
         self.threadID = threadID
         self.title = title
@@ -71,7 +74,9 @@ struct WorkerThreadSnapshot: Codable, Equatable, Identifiable {
         self.capabilities = capabilities
     }
 
-    var id: String { "\(kind.rawValue):\(threadID)" }
+    var id: String {
+        "\(kind.rawValue):\(accountID?.rawValue ?? "legacy"):\(threadID)"
+    }
     var isActive: Bool {
         activityState == .relayActive || activityState == .externalActive
     }
@@ -90,6 +95,7 @@ struct WorkerThreadResponse: Codable, Equatable {
             if thread.activityState == .relayActive {
                 merged[thread.id] = WorkerThreadSnapshot(
                     kind: thread.kind,
+                    accountID: thread.accountID,
                     repositoryName: thread.repositoryName,
                     threadID: thread.threadID,
                     title: thread.title,
@@ -106,9 +112,10 @@ struct WorkerThreadResponse: Codable, Equatable {
         }
         for session in liveSessions {
             guard let threadID = session.threadID else { continue }
-            let id = "\(session.kind.rawValue):\(threadID)"
+            let id = "\(session.kind.rawValue):\(session.accountID?.rawValue ?? "legacy"):\(threadID)"
             merged[id] = WorkerThreadSnapshot(
                 kind: session.kind,
+                accountID: session.accountID,
                 repositoryName: session.repositoryName,
                 threadID: threadID,
                 title: session.title ?? merged[id]?.title,
@@ -133,8 +140,24 @@ struct WorkerThreadResponse: Codable, Equatable {
 
 struct WorkerThreadCatalogKey: Codable, Hashable {
     let workerID: UUID
+    let provider: AgentKind?
+    let accountID: ProviderAccountID?
     let repositoryName: String
     let archived: Bool
+
+    init(
+        workerID: UUID,
+        provider: AgentKind? = nil,
+        accountID: ProviderAccountID? = nil,
+        repositoryName: String,
+        archived: Bool
+    ) {
+        self.workerID = workerID
+        self.provider = provider
+        self.accountID = accountID
+        self.repositoryName = repositoryName
+        self.archived = archived
+    }
 }
 
 enum WorkerThreadProtocolError: LocalizedError, Equatable {
@@ -152,7 +175,8 @@ enum WorkerThreadProtocolError: LocalizedError, Equatable {
 }
 
 enum WorkerThreadProtocol {
-    static let marker = "__TERMINAL_RELAY_THREADS_V2__"
+    static let marker = "__TERMINAL_RELAY_THREADS_V3__"
+    static let previousMarker = "__TERMINAL_RELAY_THREADS_V2__"
     static let legacyMarker = "__TERMINAL_RELAY_THREADS_V1__"
 
     private struct WireResponse: Decodable {
@@ -162,6 +186,7 @@ enum WorkerThreadProtocol {
 
     private struct WireThread: Decodable {
         let provider: String
+        let accountID: ProviderAccountID?
         let threadID: String
         let title: String?
         let updatedAt: Int
@@ -174,26 +199,38 @@ enum WorkerThreadProtocol {
 
     static func parse(
         _ data: Data,
-        repositoryName: String
+        repositoryName: String,
+        expectedAccountID: ProviderAccountID? = nil
     ) throws -> WorkerThreadResponse {
-        try parse(String(decoding: data, as: UTF8.self), repositoryName: repositoryName)
+        try parse(
+            String(decoding: data, as: UTF8.self),
+            repositoryName: repositoryName,
+            expectedAccountID: expectedAccountID
+        )
     }
 
     static func parse(
         _ output: String,
-        repositoryName: String
+        repositoryName: String,
+        expectedAccountID: ProviderAccountID? = nil
     ) throws -> WorkerThreadResponse {
         guard WorkerSessionProtocol.isValidRepositoryName(repositoryName) else {
             throw WorkerThreadProtocolError.invalidResponse
         }
         let lines = output.split(whereSeparator: \.isNewline).map(String.init)
-        let isV2 = lines.contains(marker)
-        guard let markerIndex = lines.firstIndex(of: isV2 ? marker : legacyMarker) else {
+        let isV3 = lines.contains(marker)
+        let selectedMarker = isV3 ? marker : (
+            lines.contains(previousMarker) ? previousMarker : legacyMarker
+        )
+        guard expectedAccountID == nil || isV3,
+              let markerIndex = lines.firstIndex(of: selectedMarker) else {
             throw WorkerThreadProtocolError.missingMarker
         }
-        guard lines.indices.contains(markerIndex + 1),
+        guard lines.count == markerIndex + 2,
               let data = lines[markerIndex + 1].data(using: .utf8),
+              data.count <= ChatNDJSONDecoder.maximumRecordBytes,
               let value = try? JSONDecoder().decode(WireResponse.self, from: data),
+              value.threads.count <= 1_000,
               value.nextCursor.map({ $0.utf8.count <= 2_048 && !$0.contains("\n") }) != false else {
             throw WorkerThreadProtocolError.invalidResponse
         }
@@ -201,6 +238,8 @@ enum WorkerThreadProtocol {
         var seenIDs: Set<String> = []
         let threads = try value.threads.map { thread -> WorkerThreadSnapshot in
             guard let kind = AgentKind(rawValue: thread.provider),
+                  (!isV3 || thread.accountID != nil),
+                  (expectedAccountID == nil || thread.accountID == expectedAccountID),
                   let parsedThreadID = UUID(uuidString: thread.threadID),
                   parsedThreadID.uuidString.lowercased() == thread.threadID,
                   thread.updatedAt >= 0,
@@ -208,11 +247,11 @@ enum WorkerThreadProtocol {
                   thread.activeInstanceToken.map({
                       UUID(uuidString: $0)?.uuidString.lowercased() == $0
                   }) != false,
-                  seenIDs.insert("\(kind.rawValue):\(thread.threadID)").inserted else {
+                  seenIDs.insert("\(kind.rawValue):\(thread.accountID?.rawValue ?? "legacy"):\(thread.threadID)").inserted else {
                 throw WorkerThreadProtocolError.invalidResponse
             }
             let activityState: WorkerThreadActivityState
-            if isV2 {
+            if isV3 || selectedMarker == previousMarker {
                 guard let reportedActivity = thread.activityState else {
                     throw WorkerThreadProtocolError.invalidResponse
                 }
@@ -235,6 +274,7 @@ enum WorkerThreadProtocol {
             }
             return WorkerThreadSnapshot(
                 kind: kind,
+                accountID: thread.accountID,
                 repositoryName: repositoryName,
                 threadID: thread.threadID,
                 title: thread.title,

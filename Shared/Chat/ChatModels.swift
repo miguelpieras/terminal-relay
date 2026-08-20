@@ -7,14 +7,62 @@ struct ChatProvider: RawRepresentable, Codable, Equatable, Hashable, Sendable {
     static let claude = ChatProvider(rawValue: "claude")
 }
 
+/// Stable, worker-issued routing identity for one provider login.
+///
+/// The wire spelling is deliberately stricter than Foundation's UUID parser:
+/// only lowercase canonical UUID text is accepted. This keeps every cache,
+/// lock, and route key byte-for-byte identical across the Mac and worker.
+struct ProviderAccountID: RawRepresentable, Codable, Equatable, Hashable, Sendable,
+    CustomStringConvertible
+{
+    let rawValue: String
+
+    init?(rawValue: String) {
+        guard UUID(uuidString: rawValue)?.uuidString.lowercased() == rawValue else {
+            return nil
+        }
+        self.rawValue = rawValue
+    }
+
+    init(_ uuid: UUID) {
+        rawValue = uuid.uuidString.lowercased()
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let value = try container.decode(String.self)
+        guard let accountID = ProviderAccountID(rawValue: value) else {
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "Provider account ID must be a canonical lowercase UUID."
+            )
+        }
+        self = accountID
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    var description: String { rawValue }
+}
+
 struct ChatConversationIdentity: Codable, Equatable, Sendable {
     let relayID: String
     let provider: ChatProvider
+    let accountID: ProviderAccountID?
     let providerThreadID: String?
 
-    init(relayID: String, provider: ChatProvider, providerThreadID: String? = nil) {
+    init(
+        relayID: String,
+        provider: ChatProvider,
+        accountID: ProviderAccountID? = nil,
+        providerThreadID: String? = nil
+    ) {
         self.relayID = relayID
         self.provider = provider
+        self.accountID = accountID
         self.providerThreadID = providerThreadID
     }
 }

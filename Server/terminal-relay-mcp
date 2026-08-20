@@ -4,6 +4,7 @@
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import uuid
@@ -15,6 +16,8 @@ SESSION_MARKER = "__TERMINAL_RELAY_SESSION_V1__"
 THREAD_MARKER = "__TERMINAL_RELAY_THREADS_V1__"
 THREAD_MARKER_V2 = "__TERMINAL_RELAY_THREADS_V2__"
 MAXIMUM_MESSAGE_BYTES = 1024 * 1024
+PROVIDER_ACCOUNTS_DIRECTORY = ".local/share/terminal-relay/provider-accounts-v1"
+PROVIDER_ACCOUNTS_ACTIVATION_CONTENT = b"version|1\n"
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 PROVIDERS = ("codex", "claude")
 CLAUDE_RESUME_ARGUMENTS = (
@@ -25,6 +28,65 @@ CLAUDE_RESUME_ARGUMENTS = (
     "--strict-mcp-config",
     "--dangerously-skip-permissions",
 )
+
+
+def provider_accounts_root():
+    if (
+        os.path.realpath(__file__) != INSTALLED_PATH
+        and os.environ.get("TERMINAL_RELAY_MCP_TEST_MODE") == "1"
+        and os.environ.get("TERMINAL_RELAY_MCP_TEST_PROVIDER_ACCOUNTS_ROOT")
+    ):
+        return os.environ["TERMINAL_RELAY_MCP_TEST_PROVIDER_ACCOUNTS_ROOT"]
+    home = os.environ.get("HOME")
+    if not home or not os.path.isabs(home) or home == "/" or "\n" in home:
+        return None
+    return os.path.join(home, PROVIDER_ACCOUNTS_DIRECTORY)
+
+
+def account_activation_error():
+    root = provider_accounts_root()
+    if root is None:
+        return None
+    marker = os.path.join(root, "activated")
+    try:
+        descriptor = os.open(
+            marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return "unsafeState"
+    try:
+        try:
+            info = os.fstat(descriptor)
+            content = os.read(
+                descriptor, len(PROVIDER_ACCOUNTS_ACTIVATION_CONTENT) + 1
+            )
+        except OSError:
+            return "unsafeState"
+    finally:
+        os.close(descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or content != PROVIDER_ACCOUNTS_ACTIVATION_CONTENT
+    ):
+        return "unsafeState"
+    return "upgradeRequired"
+
+
+def account_activation_tool_error(code):
+    message = (
+        "upgradeRequired: MCP tools are unavailable after multi-account activation."
+        if code == "upgradeRequired"
+        else "unsafeState: the provider account activation state is invalid."
+    )
+    return {
+        "content": [{"type": "text", "text": message}],
+        "structuredContent": {"code": code},
+        "isError": True,
+    }
 
 
 def helper_path():
@@ -89,6 +151,9 @@ def require_name(value):
 
 
 def run_helper(*arguments):
+    activation_error = account_activation_error()
+    if activation_error is not None:
+        raise RuntimeError(activation_error)
     environment = {"PATH": "/usr/local/bin:/usr/bin:/bin"}
     if (
         os.path.realpath(__file__) != INSTALLED_PATH
@@ -619,20 +684,32 @@ def handle(message):
     if request_id is None:
         return
     if method == "initialize":
+        activation_error = account_activation_error()
         response(
             request_id,
             {
                 "protocolVersion": "2025-03-26",
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": "terminal-relay", "version": "1.0.0"},
-                "instructions": SERVER_INSTRUCTIONS,
+                "instructions": (
+                    SERVER_INSTRUCTIONS
+                    if activation_error is None
+                    else account_activation_tool_error(activation_error)["content"][0]["text"]
+                ),
             },
         )
     elif method == "ping":
         response(request_id, {})
     elif method == "tools/list":
-        response(request_id, {"tools": TOOLS})
+        response(
+            request_id,
+            {"tools": [] if account_activation_error() is not None else TOOLS},
+        )
     elif method == "tools/call":
+        activation_error = account_activation_error()
+        if activation_error is not None:
+            response(request_id, account_activation_tool_error(activation_error))
+            return
         params = message.get("params")
         if not isinstance(params, dict) or not isinstance(params.get("name"), str):
             raise ValueError("invalid tool call")

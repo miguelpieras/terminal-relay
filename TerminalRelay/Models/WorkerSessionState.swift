@@ -7,6 +7,7 @@ enum WorkerSessionPresentation: String, Codable, Equatable {
 
 struct WorkerSessionSnapshot: Codable, Equatable, Identifiable {
     let kind: AgentKind
+    let accountID: ProviderAccountID?
     let repositoryName: String
     let attachedClientCount: Int
     let instanceToken: String
@@ -20,6 +21,7 @@ struct WorkerSessionSnapshot: Codable, Equatable, Identifiable {
 
     init(
         kind: AgentKind,
+        accountID: ProviderAccountID? = nil,
         repositoryName: String,
         attachedClientCount: Int,
         instanceToken: String,
@@ -30,6 +32,7 @@ struct WorkerSessionSnapshot: Codable, Equatable, Identifiable {
         presentation: WorkerSessionPresentation = .terminal
     ) {
         self.kind = kind
+        self.accountID = accountID
         self.repositoryName = repositoryName
         self.attachedClientCount = attachedClientCount
         self.instanceToken = instanceToken
@@ -69,7 +72,8 @@ enum WorkerSessionProtocolError: LocalizedError, Equatable {
 }
 
 enum WorkerSessionProtocol {
-    static let marker = "__TERMINAL_RELAY_SESSION_V1__"
+    static let marker = "__TERMINAL_RELAY_SESSION_V2__"
+    static let legacyMarker = "__TERMINAL_RELAY_SESSION_V1__"
     static let helperPath = "/usr/local/bin/terminal-relay-session"
 
     static func parse(_ data: Data) throws -> WorkerSessionResponse {
@@ -81,7 +85,8 @@ enum WorkerSessionProtocol {
             .split(whereSeparator: \Character.isNewline)
             .map(String.init)
 
-        guard let markerIndex = lines.firstIndex(of: marker) else {
+        let isV2 = lines.contains(marker)
+        guard let markerIndex = lines.firstIndex(of: isV2 ? marker : legacyMarker) else {
             throw WorkerSessionProtocolError.missingMarker
         }
 
@@ -102,14 +107,17 @@ enum WorkerSessionProtocol {
                 }
                 projects.append(fields[1])
             case "session":
-                guard fields.count == 5 || fields.count == 7
-                        || fields.count == 8 || fields.count == 9
-                        || fields.count == 10,
+                let allowedCounts: Set<Int> = isV2
+                    ? [11]
+                    : [5, 7, 8, 9, 10]
+                let offset = isV2 ? 1 : 0
+                guard allowedCounts.contains(fields.count),
                       let kind = AgentKind(rawValue: fields[1]),
-                      isValidRepositoryName(fields[2]),
-                      let attachedClientCount = Int(fields[3]),
+                      (!isV2 || ProviderAccountID(rawValue: fields[2]) != nil),
+                      isValidRepositoryName(fields[2 + offset]),
+                      let attachedClientCount = Int(fields[3 + offset]),
                       attachedClientCount >= 0,
-                      let instanceToken = UUID(uuidString: fields[4]) else {
+                      let instanceToken = UUID(uuidString: fields[4 + offset]) else {
                     throw WorkerSessionProtocolError.invalidRecord
                 }
                 let canonicalInstanceID = instanceToken.uuidString.lowercased()
@@ -121,9 +129,9 @@ enum WorkerSessionProtocol {
                 let reportedWorking: Bool?
                 let threadID: String?
                 let presentation: WorkerSessionPresentation
-                if fields.count >= 7 {
-                    guard let activity = Int(fields[5]), activity >= 0,
-                          let decodedTitle = decodeHexUTF8(fields[6]),
+                if fields.count >= 7 + offset {
+                    guard let activity = Int(fields[5 + offset]), activity >= 0,
+                          let decodedTitle = decodeHexUTF8(fields[6 + offset]),
                           decodedTitle.count <= 200 else {
                         throw WorkerSessionProtocolError.invalidRecord
                     }
@@ -132,19 +140,19 @@ enum WorkerSessionProtocol {
                     // as a real timestamp in recency sorts.
                     lastActivityAt = activity == 0 ? nil : activity
                     title = decodedTitle.isEmpty ? nil : decodedTitle
-                    if fields.count >= 8 {
-                        guard fields[7].isEmpty || fields[7] == "0" || fields[7] == "1" else {
+                    if fields.count >= 8 + offset {
+                        guard fields[7 + offset].isEmpty || fields[7 + offset] == "0" || fields[7 + offset] == "1" else {
                             throw WorkerSessionProtocolError.invalidRecord
                         }
-                        reportedWorking = fields[7].isEmpty ? nil : fields[7] == "1"
+                        reportedWorking = fields[7 + offset].isEmpty ? nil : fields[7 + offset] == "1"
                     } else {
                         reportedWorking = nil
                     }
-                    if fields.count >= 9 {
-                        if fields[8].isEmpty {
+                    if fields.count >= 9 + offset {
+                        if fields[8 + offset].isEmpty {
                             threadID = nil
                         } else {
-                            guard let parsedThreadID = UUID(uuidString: fields[8]) else {
+                            guard let parsedThreadID = UUID(uuidString: fields[8 + offset]) else {
                                 throw WorkerSessionProtocolError.invalidRecord
                             }
                             threadID = parsedThreadID.uuidString.lowercased()
@@ -152,9 +160,9 @@ enum WorkerSessionProtocol {
                     } else {
                         threadID = nil
                     }
-                    if fields.count == 10 {
+                    if fields.count == 10 + offset {
                         guard let parsedPresentation = WorkerSessionPresentation(
-                            rawValue: fields[9]
+                            rawValue: fields[9 + offset]
                         ) else {
                             throw WorkerSessionProtocolError.invalidRecord
                         }
@@ -172,7 +180,8 @@ enum WorkerSessionProtocol {
                 sessions.append(
                     WorkerSessionSnapshot(
                         kind: kind,
-                        repositoryName: fields[2],
+                        accountID: isV2 ? ProviderAccountID(rawValue: fields[2]) : nil,
+                        repositoryName: fields[2 + offset],
                         attachedClientCount: attachedClientCount,
                         instanceToken: canonicalInstanceID,
                         title: title,

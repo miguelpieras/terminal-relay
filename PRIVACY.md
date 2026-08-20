@@ -6,10 +6,11 @@ developer-operated data service.
 ## Data stored on your devices
 
 The apps store worker connection settings, project references, display
-preferences, account labels, last-known thread catalog metadata, and read state
-locally. Thread catalog metadata is limited to the configured worker, project
-name, provider thread identifier, relay instance identifier, title, activity
-time, archive/run state, and supported actions. The universal iPhone and iPad
+preferences, opaque provider-account UUIDs and labels, last-known thread
+catalog metadata, and read state locally. Thread catalog metadata is limited to
+the configured worker, project name, provider and account identifiers, provider
+thread identifier, relay instance identifier, title, activity time, archive/run
+state, and supported actions. The universal iPhone and iPad
 app creates an SSH private key in the device Keychain. Terminal Relay does not
 upload that private key. Conversation titles can be provider-generated from
 prompt content and may therefore contain sensitive text; the apps cache the
@@ -19,6 +20,12 @@ Native-chat messages, reasoning, tool activity, diffs, approvals, questions,
 usage, and bounded file previews are held only in app memory while their
 conversation is open. The apps do not write that structured content to
 `UserDefaults`, files, analytics, or a Terminal Relay service.
+
+Older Mac builds briefly wrote reduced conversation state below
+`Application Support/Terminal Relay/Conversation Cache`. Current builds do not
+use that cache and remove that exact legacy directory at launch. They do not
+remove provider-native Codex or Claude history or any sibling Application
+Support data.
 
 Files selected for a native chat message are read into app memory and sent
 directly over the authenticated SSH connection only when you send that
@@ -43,14 +50,20 @@ Terminal Relay project and its maintainers do not receive it. Those configured
 services process data under their own terms and privacy policies.
 
 Thread catalog and mutation requests travel over the same direct SSH
-connection. The built-in worker MCP runs only as stdio inside Codex or Claude
-on that worker and invokes the root-owned session helper locally. Its tools
+connection. Before multi-account activation, the built-in worker MCP runs only
+as stdio inside Codex or Claude on that worker and invokes the root-owned
+session helper locally. Its tools
 return project names and thread metadata, not prompts, transcript items,
 terminal contents, credentials, or account data. It has no network listener and
 cannot access another worker. Codex cataloging reads only IDs, project paths,
 titles, activity times, archive flags, and source kinds from Codex's local
 metadata index when a new preview-empty thread is not yet returned by the app
 server; message and preview content are not selected.
+
+After multi-account activation, the ambient worker MCP is disabled because an
+account UUID supplied by a model or environment variable would not be an
+authorization boundary. Accountless clients and helpers fail before a provider
+process is launched.
 
 Claude cataloging uses a pinned official Claude Agent SDK environment on the
 worker. The SDK derives session ID, working directory, provider display title
@@ -70,8 +83,10 @@ identifier-only recovery metadata. It does not parse Claude JSONL, install a
 transcript database, or send history to another worker or maintainer-operated
 service.
 
-Claude Code keeps its own conversation history in plaintext local provider
-storage on the worker under its own retention and cleanup policy. Terminal
+Codex and Claude account profiles keep separate provider-native configuration,
+credentials, and history roots on the worker. Claude Code keeps its own
+conversation history in plaintext local provider storage under its retention
+and cleanup policy. Terminal
 Relay does not change that retention and does not install a transcript
 `SessionStore`. Exact resume and reboot recovery work only while the provider
 history remains on the same worker. Multi-device handoff sends the current

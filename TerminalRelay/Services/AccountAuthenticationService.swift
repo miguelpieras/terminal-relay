@@ -12,17 +12,20 @@ struct AccountAuthenticationPresentation: Identifiable, Equatable {
     let id: UUID
     let worker: ServerProfile
     let kind: AgentKind
+    let account: ProviderAccountProfile?
     let currentAccount: String?
 
     init(
         id: UUID = UUID(),
         worker: ServerProfile,
         kind: AgentKind,
+        account: ProviderAccountProfile? = nil,
         currentAccount: String?
     ) {
         self.id = id
         self.worker = worker
         self.kind = kind
+        self.account = account
         self.currentAccount = currentAccount
     }
 }
@@ -46,7 +49,7 @@ enum AccountChangePolicy {
         kind: AgentKind,
         hasActiveAgent: Bool
     ) -> Bool {
-        kind == .claude && hasActiveAgent
+        false
     }
 }
 
@@ -117,7 +120,8 @@ enum AccountAuthenticationOutputParser {
 enum AccountAuthenticationCommand {
     static func configuration(
         for worker: ServerProfile,
-        kind: AgentKind
+        kind: AgentKind,
+        accountID: ProviderAccountID? = nil
     ) -> SSHLaunchConfiguration {
         var arguments = [
             "-tt",
@@ -138,11 +142,23 @@ enum AccountAuthenticationCommand {
             arguments += ["-i", (identityFile as NSString).expandingTildeInPath]
         }
 
-        let loginCommand = switch kind {
-        case .codex:
-            "\(WorkerSessionProtocol.helperPath) codex-login"
-        case .claude:
-            "claude auth login --claudeai"
+        let loginCommand: String
+        if let accountID {
+            loginCommand = [
+                WorkerSessionProtocol.helperPath,
+                "provider-account-login-v1",
+                kind.rawValue,
+                accountID.rawValue,
+            ]
+                .map(SSHCommandBuilder.shellQuote)
+                .joined(separator: " ")
+        } else {
+            loginCommand = switch kind {
+            case .codex:
+                "\(WorkerSessionProtocol.helperPath) codex-login"
+            case .claude:
+                "claude auth login --claudeai"
+            }
         }
         let script = "stty -echo 2>/dev/null || true; exec \(loginCommand)"
         let remoteCommand = "exec \"${SHELL:-/bin/sh}\" -lic \(SSHCommandBuilder.shellQuote(script))"
@@ -194,6 +210,21 @@ final class AccountAuthenticationService: ObservableObject {
         start()
     }
 
+    func begin(worker: ServerProfile, account: ProviderAccountProfile) {
+        accountAuthenticationLogger.notice(
+            "Beginning \(account.provider.rawValue, privacy: .public) sign-in for account \(account.accountID.rawValue, privacy: .public) on \(worker.destination, privacy: .public)"
+        )
+        cancelCurrentRun()
+        presentation = AccountAuthenticationPresentation(
+            worker: worker,
+            kind: account.provider,
+            account: account,
+            currentAccount: account.displayName
+        )
+        resetTransientState()
+        start()
+    }
+
     func retry() {
         guard let presentation else { return }
         accountAuthenticationLogger.notice(
@@ -239,7 +270,8 @@ final class AccountAuthenticationService: ObservableObject {
         guard let presentation else { return }
         let configuration = AccountAuthenticationCommand.configuration(
             for: presentation.worker,
-            kind: presentation.kind
+            kind: presentation.kind,
+            accountID: presentation.account?.accountID
         )
         let process = Process()
         let inputPipe = Pipe()
@@ -393,5 +425,284 @@ final class AccountAuthenticationService: ObservableObject {
         inputPipe = nil
         outputPipe = nil
         errorPipe = nil
+    }
+}
+
+enum ProviderAccountServiceError: LocalizedError, Equatable {
+    case invalidLabel
+    case legacyTasksRunning(AgentKind)
+    case commandFailed
+    case invalidResponse
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidLabel:
+            "Enter an account name between 1 and 100 bytes."
+        case .legacyTasksRunning(let provider):
+            "Stop every existing \(provider.displayName) task on this worker, then add the account again."
+        case .commandFailed:
+            "The worker could not complete that account action."
+        case .invalidResponse:
+            "The worker returned unexpected account metadata."
+        }
+    }
+}
+
+/// Account catalog used by all Mac task-creation and account-management UI.
+/// Only public routing metadata is retained; provider credentials stay on the
+/// worker in the profile selected by `accountID`.
+@MainActor
+final class ProviderAccountService: ObservableObject {
+    typealias CommandRunner = (SSHLaunchConfiguration) async throws -> WorkerSessionCommandResult
+
+    @Published private(set) var profilesByWorker: [UUID: [ProviderAccountProfile]] = [:]
+    @Published private(set) var errors: [UUID: String] = [:]
+    @Published private(set) var loadingWorkerIDs: Set<UUID> = []
+    @Published private(set) var mutatingAccounts: Set<ProviderAccountKey> = []
+
+    private let runCommand: CommandRunner
+
+    convenience init() {
+        self.init { configuration in
+            let result = try await Subprocess.run(
+                executable: URL(fileURLWithPath: configuration.executable),
+                arguments: configuration.arguments
+            )
+            return WorkerSessionCommandResult(
+                exitCode: result.exitCode,
+                standardOutput: result.standardOutput,
+                standardError: result.standardError
+            )
+        }
+    }
+
+    init(runCommand: @escaping CommandRunner) {
+        self.runCommand = runCommand
+    }
+
+    func accounts(
+        workerID: UUID,
+        provider: AgentKind? = nil
+    ) -> [ProviderAccountProfile] {
+        let accounts = profilesByWorker[workerID] ?? []
+        guard let provider else { return accounts }
+        return accounts.filter { $0.provider == provider }
+    }
+
+    func account(
+        workerID: UUID,
+        provider: AgentKind,
+        accountID: ProviderAccountID
+    ) -> ProviderAccountProfile? {
+        accounts(workerID: workerID, provider: provider).first {
+            $0.accountID == accountID
+        }
+    }
+
+    @discardableResult
+    func refresh(
+        worker: ServerProfile,
+        provider: AgentKind? = nil
+    ) async -> [ProviderAccountProfile]? {
+        guard loadingWorkerIDs.insert(worker.id).inserted else {
+            return provider.map { accounts(workerID: worker.id, provider: $0) }
+                ?? accounts(workerID: worker.id)
+        }
+        defer { loadingWorkerIDs.remove(worker.id) }
+        do {
+            let result = try await runCommand(
+                SSHCommandBuilder.providerAccountListConfiguration(
+                    for: worker,
+                    provider: provider
+                )
+            )
+            guard result.exitCode == 0 else {
+                throw ProviderAccountServiceError.commandFailed
+            }
+            let loaded = try ProviderAccountProtocol.parse(
+                result.standardOutput,
+                expectedProvider: provider
+            )
+            if let provider {
+                replaceProfiles(loaded, provider: provider, workerID: worker.id)
+            } else {
+                profilesByWorker[worker.id] = loaded
+            }
+            errors[worker.id] = nil
+            return loaded
+        } catch {
+            errors[worker.id] = message(for: error)
+            return nil
+        }
+    }
+
+    func create(
+        worker: ServerProfile,
+        provider: AgentKind,
+        label: String
+    ) async throws -> ProviderAccountProfile {
+        let label = try validatedLabel(label)
+        let result = try await runCommand(
+            SSHCommandBuilder.providerAccountCreateConfiguration(
+                for: worker,
+                provider: provider,
+                label: label
+            )
+        )
+        guard result.exitCode == 0 else {
+            if String(decoding: result.standardError, as: UTF8.self)
+                .contains("Stop every legacy \(provider.rawValue) task") {
+                throw ProviderAccountServiceError.legacyTasksRunning(provider)
+            }
+            throw ProviderAccountServiceError.commandFailed
+        }
+        let accounts = try ProviderAccountProtocol.parse(
+            result.standardOutput,
+            expectedProvider: provider
+        )
+        guard accounts.count == 1, let account = accounts.first else {
+            throw ProviderAccountServiceError.invalidResponse
+        }
+        upsert(account, workerID: worker.id)
+        errors[worker.id] = nil
+        return account
+    }
+
+    func importDefault(
+        worker: ServerProfile,
+        provider: AgentKind,
+        label: String
+    ) async throws -> ProviderAccountProfile {
+        let label = try validatedLabel(label)
+        let result = try await runCommand(
+            SSHCommandBuilder.providerAccountImportDefaultConfiguration(
+                for: worker,
+                provider: provider,
+                label: label
+            )
+        )
+        guard result.exitCode == 0 else {
+            throw ProviderAccountServiceError.commandFailed
+        }
+        let accounts = try ProviderAccountProtocol.parse(
+            result.standardOutput,
+            expectedProvider: provider
+        )
+        guard accounts.count == 1, let account = accounts.first else {
+            throw ProviderAccountServiceError.invalidResponse
+        }
+        upsert(account, workerID: worker.id)
+        errors[worker.id] = nil
+        return account
+    }
+
+    @discardableResult
+    func rename(
+        worker: ServerProfile,
+        account: ProviderAccountProfile,
+        label: String
+    ) async throws -> ProviderAccountProfile {
+        let label = try validatedLabel(label)
+        return try await mutate(
+            worker: worker,
+            account: account,
+            configuration: SSHCommandBuilder.providerAccountRenameConfiguration(
+                for: worker,
+                account: account,
+                label: label
+            )
+        )
+    }
+
+    @discardableResult
+    func refreshStatus(
+        worker: ServerProfile,
+        account: ProviderAccountProfile
+    ) async throws -> ProviderAccountProfile {
+        try await mutate(
+            worker: worker,
+            account: account,
+            configuration: SSHCommandBuilder.providerAccountStatusConfiguration(
+                for: worker,
+                account: account
+            )
+        )
+    }
+
+    private func mutate(
+        worker: ServerProfile,
+        account: ProviderAccountProfile,
+        configuration: SSHLaunchConfiguration
+    ) async throws -> ProviderAccountProfile {
+        let key = ProviderAccountKey(
+            workerID: worker.id,
+            provider: account.provider,
+            accountID: account.accountID
+        )
+        guard mutatingAccounts.insert(key).inserted else {
+            throw ProviderAccountServiceError.commandFailed
+        }
+        defer { mutatingAccounts.remove(key) }
+        let result = try await runCommand(configuration)
+        guard result.exitCode == 0 else {
+            throw ProviderAccountServiceError.commandFailed
+        }
+        let accounts = try ProviderAccountProtocol.parse(
+            result.standardOutput,
+            expectedProvider: account.provider,
+            expectedAccountID: account.accountID
+        )
+        guard accounts.count == 1, let updated = accounts.first else {
+            throw ProviderAccountServiceError.invalidResponse
+        }
+        upsert(updated, workerID: worker.id)
+        errors[worker.id] = nil
+        return updated
+    }
+
+    private func validatedLabel(_ value: String) throws -> String {
+        let label = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !label.isEmpty, label.utf8.count <= 100,
+              !label.unicodeScalars.contains(where: {
+                  CharacterSet.controlCharacters.contains($0)
+              }) else {
+            throw ProviderAccountServiceError.invalidLabel
+        }
+        return label
+    }
+
+    private func upsert(_ account: ProviderAccountProfile, workerID: UUID) {
+        var profiles = profilesByWorker[workerID] ?? []
+        profiles.removeAll { $0.routeKey == account.routeKey }
+        profiles.append(account)
+        profilesByWorker[workerID] = profiles.sorted(by: profileSort)
+    }
+
+    private func replaceProfiles(
+        _ accounts: [ProviderAccountProfile],
+        provider: AgentKind,
+        workerID: UUID
+    ) {
+        let retained = (profilesByWorker[workerID] ?? []).filter {
+            $0.provider != provider
+        }
+        profilesByWorker[workerID] = (retained + accounts).sorted(by: profileSort)
+    }
+
+    private func profileSort(
+        _ lhs: ProviderAccountProfile,
+        _ rhs: ProviderAccountProfile
+    ) -> Bool {
+        if lhs.provider != rhs.provider {
+            return lhs.provider.rawValue < rhs.provider.rawValue
+        }
+        let labelOrder = lhs.label.localizedStandardCompare(rhs.label)
+        if labelOrder != .orderedSame { return labelOrder == .orderedAscending }
+        return lhs.accountID.rawValue < rhs.accountID.rawValue
+    }
+
+    private func message(for error: Error) -> String {
+        (error as? LocalizedError)?.errorDescription
+            ?? ProviderAccountServiceError.commandFailed.localizedDescription
     }
 }

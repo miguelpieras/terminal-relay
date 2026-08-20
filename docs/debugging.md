@@ -151,12 +151,12 @@ history:
 
 ```bash
 ssh terminal-relay-worker-N \
-  '/usr/local/bin/terminal-relay-session chat-capabilities-v1 codex example-repository'
+  '/usr/local/bin/terminal-relay-session chat-capabilities-v2 codex ACCOUNT-UUID example-repository'
 ssh terminal-relay-worker-N \
-  '/usr/local/bin/terminal-relay-session chat-capabilities-v1 claude example-repository'
+  '/usr/local/bin/terminal-relay-session chat-capabilities-v2 claude ACCOUNT-UUID example-repository'
 ```
 
-A ready adapter returns `__TERMINAL_RELAY_CHAT_V1__` followed by one bounded
+A ready adapter returns `__TERMINAL_RELAY_CHAT_V2__` followed by one bounded
 capability object. A missing marker means the worker predates structured chat.
 An unavailable result means the selected provider adapter failed its readiness
 check; existing terminal sessions remain usable.
@@ -187,8 +187,8 @@ failure or provider lock.
 
 ## A chat attachment fails or remains on the worker
 
-First confirm `chat-capabilities-v1` for the conversation's provider (`codex`
-or `claude`) reports `file-attachments-v1`. That feature is required by the
+First confirm `chat-capabilities-v2` for the conversation's provider and exact
+account reports `file-attachments-v1`. That feature is required by the
 supported worker runtime, so reconcile a worker that does not report it before
 retrying. The app
 retains selected bytes in memory after a failed upload, so use the attachment's
@@ -257,67 +257,51 @@ Expected tools are `list_projects`, `list_threads`, `start_thread`,
 The process exits at end-of-input. Do not add an HTTP wrapper or paste
 unredacted app-server, agent, or terminal output into an issue.
 
-Codex receives the MCP through the shared app-server configuration. If the
-binary changed while Codex terminals were live, reconciliation records a
-pending app-server restart and completes it after those terminals drain.
+Before activation, Codex receives the MCP through its app-server
+configuration. If the binary changed while Codex tasks were live,
+reconciliation records pending restart markers for all registered profile
+servers and completes each rotation after that profile's tasks drain.
 Claude receives the same fixed executable through its strict per-launch MCP
 configuration.
 
-## Codex account and terminal disagree
+## Provider account and task disagree
 
-Terminal Relay uses one persistent Codex app-server per worker as the account
-authority. Account reads, device login, rate-limit reads, reset redemption, and
-every Codex terminal all connect to that same process. A new Codex terminal is
-refused when that shared process is signed out.
-
-Check the shared account response without printing or copying it into an issue:
+Account-aware tasks are pinned to one worker-issued UUID. Codex uses one
+`CODEX_HOME` and app-server socket per profile; Claude uses one
+`CLAUDE_CONFIG_DIR` per profile. First list safe profile metadata:
 
 ```bash
 ssh terminal-relay-worker-N \
-  '/usr/local/bin/terminal-relay-session codex-account'
+  '/usr/local/bin/terminal-relay-session provider-accounts-v1'
 ```
 
-The response can include the account email and reset-credit identifiers. It
-must never include OAuth tokens or API keys.
+Then inspect the exact provider/profile route shown by the Mac:
 
-Workers with a Codex terminal started by an older helper need a one-time
-migration: use **Sign In** in Terminal Relay, then stop and restart the old
-terminal. New terminals and all later account reads then use the shared
-app-server automatically.
+```bash
+ssh terminal-relay-worker-N \
+  '/usr/local/bin/terminal-relay-session provider-account-status-v1 codex ACCOUNT-UUID'
+```
+
+Never substitute a different account to make a task start. `accountMismatch`,
+`authRequired`, and `upgradeRequired` are fail-closed route errors. Once the
+registry is activated, an old Mac/iPhone/iPad or accountless helper command is
+expected to fail before provider launch; update the client or use the
+account-aware Mac.
 
 ## Claude reports signed in but opens login
 
-Check Claude's own authentication result without printing its credentials:
+Check the selected Claude profile through the helper, not ambient `claude`
+state:
 
 ```bash
 ssh terminal-relay-worker-N \
-  "/usr/bin/claude auth status --json | /usr/bin/python3 -c \
-  'import json,sys; print(json.load(sys.stdin).get(\"loggedIn\"))'"
+  '/usr/local/bin/terminal-relay-session provider-account-status-v1 claude ACCOUNT-UUID'
 ```
 
-Check only the interactive onboarding marker:
-
-```bash
-ssh terminal-relay-worker-N \
-  "/usr/bin/python3 -c \
-  'import json,pathlib; p=pathlib.Path.home()/\".claude.json\"; \
-  d=json.loads(p.read_text()) if p.exists() else {}; \
-  print(d.get(\"hasCompletedOnboarding\"))'"
-```
-
-Claude Code can leave valid OAuth credentials while omitting
-`hasCompletedOnboarding`, which makes its interactive terminal enter the
-first-run login flow. Before every Claude start or boot restoration,
-`terminal-relay-session` now:
-
-1. Leaves an already-completed configuration unchanged.
-2. Verifies `claude auth status --json` reports `loggedIn: true`.
-3. Atomically sets only `hasCompletedOnboarding` while preserving the rest of
-   `~/.claude.json`.
-4. Returns an explicit sign-in error when Claude is not authenticated.
-
-The helper refuses symlinked, non-regular, invalid, or wrong-owner configuration
-files instead of overwriting them.
+Use **Accounts → Sign In** for that profile. The helper applies its exact
+`CLAUDE_CONFIG_DIR` to auth, onboarding, history, Agent SDK, broker, and restore
+operations. It refuses malformed/unsafe profile state and never searches a
+sibling profile.
 
 Never print or copy `~/.claude/.credentials.json`, authorization codes, full
 authorization URLs, or unredacted terminal captures into logs or issues.

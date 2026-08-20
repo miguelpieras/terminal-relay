@@ -110,6 +110,9 @@ final class SSHTransportTests: XCTestCase {
             eventID: eventID,
             relayID: relayID,
             provider: .codex,
+            accountID: ProviderAccountID(
+                UUID(uuidString: "cccccccc-cccc-4ccc-8ccc-cccccccccccc")!
+            ),
             sequence: 1
         )
         let line = try ChatNDJSONEncoder.encode(envelope)
@@ -184,6 +187,9 @@ final class SSHTransportTests: XCTestCase {
             eventID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
             relayID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             provider: .codex,
+            accountID: ProviderAccountID(
+                UUID(uuidString: "cccccccc-cccc-4ccc-8ccc-cccccccccccc")!
+            ),
             sequence: 1
         )
         let pump = IOSSSHChatOrderedCallbackPump()

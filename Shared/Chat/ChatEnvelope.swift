@@ -80,7 +80,8 @@ enum JSONValue: Codable, Equatable, Sendable {
 }
 
 struct ChatEnvelope: Codable, Equatable, Identifiable, Sendable {
-    static let protocolVersion = 1
+    static let legacyProtocolVersion = 1
+    static let protocolVersion = 2
 
     let v: Int
     let type: String
@@ -88,6 +89,7 @@ struct ChatEnvelope: Codable, Equatable, Identifiable, Sendable {
     let eventID: String?
     let relayID: String
     let provider: ChatProvider
+    let accountID: ProviderAccountID?
     let providerThreadID: String?
     let snapshotGeneration: String?
     let sequence: Int64?
@@ -108,6 +110,7 @@ struct ChatEnvelope: Codable, Equatable, Identifiable, Sendable {
         case eventID = "eventId"
         case relayID = "relayId"
         case provider
+        case accountID
         case providerThreadID = "providerThreadId"
         case snapshotGeneration
         case sequence = "seq"
@@ -125,6 +128,7 @@ struct ChatEnvelope: Codable, Equatable, Identifiable, Sendable {
         eventID: String? = nil,
         relayID: String,
         provider: ChatProvider,
+        accountID: ProviderAccountID? = nil,
         providerThreadID: String? = nil,
         snapshotGeneration: String? = nil,
         sequence: Int64? = nil,
@@ -140,6 +144,7 @@ struct ChatEnvelope: Codable, Equatable, Identifiable, Sendable {
         self.eventID = eventID
         self.relayID = relayID
         self.provider = provider
+        self.accountID = accountID
         self.providerThreadID = providerThreadID
         self.snapshotGeneration = snapshotGeneration
         self.sequence = sequence
@@ -197,6 +202,9 @@ enum ChatCommand: Equatable, Sendable {
         requestID: String = UUID().uuidString.lowercased(),
         sentAt: Int64 = Int64(Date().timeIntervalSince1970 * 1_000)
     ) throws -> ChatEnvelope {
+        guard identity.isValid else {
+            throw ConversationCoordinatorError.invalidIdentity
+        }
         let payload: JSONValue
         var turnID: String?
 
@@ -255,10 +263,12 @@ enum ChatCommand: Equatable, Sendable {
         }
 
         return ChatEnvelope(
+            v: identity.protocolVersion,
             type: type,
             requestID: requestID,
             relayID: identity.relayID,
             provider: identity.provider,
+            accountID: identity.accountID,
             providerThreadID: identity.providerThreadID,
             sentAt: sentAt,
             turnID: turnID,
@@ -345,10 +355,24 @@ extension JSONDecoder {
 }
 
 extension ChatConversationIdentity {
+    var protocolVersion: Int {
+        accountID == nil
+            ? ChatEnvelope.legacyProtocolVersion
+            : ChatEnvelope.protocolVersion
+    }
+
     var isValid: Bool {
         ChatWireValidation.isCanonicalUUID(relayID)
             && providerThreadID.map(ChatWireValidation.isCanonicalUUID) != false
             && !provider.rawValue.isEmpty
+    }
+
+    func matches(_ envelope: ChatEnvelope) -> Bool {
+        protocolVersion == envelope.v
+            && relayID == envelope.relayID
+            && provider == envelope.provider
+            && accountID == envelope.accountID
+            && providerThreadID == envelope.providerThreadID
     }
 }
 

@@ -25,6 +25,14 @@ Terminal Relay is a client for infrastructure controlled by its user:
 
 - SSH private keys remain in the macOS filesystem or iOS Keychain.
 - Agent credentials and repositories remain on user-configured workers.
+- Multi-account tasks bind to the composite identity of worker, provider,
+  account UUID, and provider thread UUID. The worker resolves the UUID to a
+  provider-native profile path; clients cannot supply credential paths. Missing
+  or mismatched accounts fail before provider traffic and never fall back.
+- Codex profiles use separate `CODEX_HOME` roots and app-server sockets. Claude
+  profiles use separate `CLAUDE_CONFIG_DIR` roots. This guarantees deterministic
+  routing for one trusted owner; directories owned by the same Unix user are not
+  a hostile-tenant boundary against a deliberately malicious full-access task.
 - Worker host keys are verified or explicitly pinned.
 - The project does not operate a shared Terminal Relay backend.
 - Provider thread IDs and relay instance UUIDs are separate identities. Resume
@@ -52,10 +60,14 @@ Terminal Relay is a client for infrastructure controlled by its user:
   accept only validated credential-free `http` and `https` URLs; repository
   previews reject directories, binaries, symlink escapes, and paths outside
   the selected repository.
-- The built-in MCP is a root-owned, worker-local stdio process. It delegates
+- Before multi-account activation, the built-in MCP is a root-owned,
+  worker-local stdio process. It delegates
   seven typed project/thread operations to the fixed helper path, validates
   project and UUID inputs, bounds runtime and output, and exposes no shell,
   terminal input, transcript access, deletion, listener, or cross-worker route.
+- Multi-account activation disables ambient MCP and rejects accountless legacy
+  clients before provider launch. Task-scoped MCP and account-aware iPhone/iPad
+  support must use the same immutable route before they can be enabled.
 - Worker runtime releases are described by an Ed25519-signed manifest with an
   exact file allowlist, destinations, modes, and SHA-256 digests. The root
   updater has one compiled-in HTTPS feed, accepts no arguments, rejects

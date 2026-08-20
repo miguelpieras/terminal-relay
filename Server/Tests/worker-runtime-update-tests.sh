@@ -61,10 +61,13 @@ assert manifest["protocol"] == {"minimum": 1, "maximum": 2}
 assert manifest["capabilities"] == [
     "agent-sessions",
     "chat-v1",
+    "chat-v2",
     "file-attachments-v1",
+    "provider-accounts-v1",
     "runtime-updates-v1",
     "threads-v1",
     "threads-v2",
+    "threads-v3",
 ]
 assert hashlib.sha256(archive_path.read_bytes()).hexdigest() == manifest["archiveSHA256"]
 expected = {item["source"]: item for item in manifest["files"]}
