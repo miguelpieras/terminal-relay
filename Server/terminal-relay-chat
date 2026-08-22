@@ -2725,12 +2725,16 @@ class CodexAdapter(ProviderAdapter):
                 await self.request(
                     "thread/unsubscribe", {"threadId": self.thread_id}, timeout=1
                 )
+        # Shut the socket down before joining the reader: the reader's
+        # blocking recv only wakes on the socket shutdown, and a stranded
+        # executor thread keeps the interpreter (and the app-server's
+        # thread-writer registration) alive after run() returns.
+        await asyncio.to_thread(self.websocket.close)
         if self.reader_task:
             self.reader_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.reader_task
         await self._expire_interactions()
-        await asyncio.to_thread(self.websocket.close)
 
 
 class ClaudeAdapter(ProviderAdapter):
@@ -3738,8 +3742,10 @@ class ClaudeAdapter(ProviderAdapter):
             with contextlib.suppress(asyncio.CancelledError):
                 await self.receive_task
         if self.client:
-            with contextlib.suppress(Exception):
-                await self.client.disconnect()
+            # Bound the SDK disconnect: an unresponsive transport subprocess
+            # must not stall the broker's shutdown indefinitely.
+            with contextlib.suppress(Exception, asyncio.TimeoutError):
+                await asyncio.wait_for(self.client.disconnect(), timeout=5)
 
 
 class ChatBroker:
@@ -4588,8 +4594,14 @@ class ChatBroker:
                 "session.state",
                 {"connectionState": "streaming", "reason": "providerReady"},
             )
-            async with self.server:
-                await self.stop_event.wait()
+            # Not `async with self.server`: on Python 3.12.1+ the context
+            # manager's exit awaits wait_closed(), which now waits for every
+            # per-connection handler task — but attached viewers only exit
+            # after this teardown closes them below, so the old order
+            # deadlocked with the listener already gone and the state file
+            # still saying "ready".
+            await self.stop_event.wait()
+            self.server.close()
         await self.emit(
             "session.ended",
             {"reason": "stopped", "connectionState": "stopped"},
@@ -4600,7 +4612,6 @@ class ChatBroker:
             with contextlib.suppress(asyncio.CancelledError):
                 await self.heartbeat_task
         self._clear_all_attachments()
-        await self.provider.close()
         for client in tuple(self.clients):
             await client.close()
         self.clients.clear()
@@ -4609,9 +4620,19 @@ class ChatBroker:
             await self.server.wait_closed()
         with contextlib.suppress(FileNotFoundError):
             os.unlink(self.socket_path)
+        # Record "stopped" before any provider I/O: a provider that stalls
+        # its close must not leave the state file claiming "ready", and the
+        # activity refresher only rewrites a "ready" state.
         self._write_state("stopped")
         if self.explicit_stop:
             self._remove_intent_file()
+        close = asyncio.create_task(self.provider.close())
+        finished, _ = await asyncio.wait({close}, timeout=5)
+        if not finished:
+            close.cancel()
+        for task in finished:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                task.result()
         if self.provider_lock_descriptor is not None:
             os.close(self.provider_lock_descriptor)
             self.provider_lock_descriptor = None
