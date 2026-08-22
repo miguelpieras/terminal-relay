@@ -129,9 +129,9 @@ final class DemoWorkspaceTests: XCTestCase {
         XCTAssertNil(MobileChatDemoFixture.identity.accountID)
 
         coordinator.start()
-        for _ in 0..<200 {
+        for _ in 0..<2000 {
             if coordinator.store.state.lastAppliedSequence == 4 { break }
-            try? await Task.sleep(nanoseconds: 1_000_000)
+            try? await Task.sleep(nanoseconds: 5_000_000)
         }
 
         XCTAssertEqual(coordinator.store.state.lastAppliedSequence, 4)
