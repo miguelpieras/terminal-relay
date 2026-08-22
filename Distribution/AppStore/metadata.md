@@ -3,10 +3,12 @@
 ## App record
 
 - Platform: iOS universal app for iPhone and iPad
-- Name: Terminal Relay
+- Name: Terminal Relay: AI Coding
 - Subtitle: Private AI coding sessions
 - Primary language: English (U.S.)
 - SKU: `terminal-relay-ios`
+- Apple ID: `6804198744`
+- App Store Connect status: Prepare for Submission
 - Version: 1.0
 - Next upload build: 6
 - Copyright: 2026 AMURA VENTURES SL
@@ -106,7 +108,7 @@ privacy policy and are not a developer-operated collection service.
 
 - Contact name: Miguel Pieras
 - Contact email: `hey@miguelpieras.com`
-- Contact phone: `[ADD APP REVIEW PHONE]`
+- Contact phone: Set privately in App Store Connect; never commit it here.
 - Sign-in required: No. The reviewer uses the private pairing credential in
   the review notes; dedicated agent accounts remain on the isolated worker.
 
@@ -156,11 +158,9 @@ documentation key.
 
 ## EU Digital Services Act
 
-The App Store Connect account is an organization account. The Account Holder
-must confirm whether the app is distributed by a trader. If trader status is
-selected, Apple requires verified business contact details and displays them
-on EU product pages. Recommended status: trader, subject to the Account
-Holder's legal confirmation.
+The App Store Connect account is an organization account and identifies the
+developer as a trader for this app. Apple uses the account's verified business
+contact details on EU product pages.
 
 ## Captured screenshots
 
@@ -183,9 +183,9 @@ account, SSH-key, and pairing values and never connect to a real worker.
 
 ## Remaining submission actions
 
-- Create the App Store Connect record using the values above.
-- Add the App Review phone number.
-- Confirm the account's EU trader status and public business contact details.
+- Save the prepared content-rights, 4+ age-rating, privacy, pricing, and
+  availability declarations in App Store Connect.
+- Upload the captured iPhone and iPad screenshots.
 - Complete Apple's encryption questionnaire and attach documentation if
   requested.
 - Provision and authenticate the isolated App Review worker, create its
