@@ -181,11 +181,20 @@ All images are direct captures of the native apps running with Debug-only
 screenshot fixtures. The fixtures use example worker, repository, session,
 account, SSH-key, and pairing values and never connect to a real worker.
 
+## App Store Connect preparation status
+
+- Product metadata and App Review contact saved.
+- Content rights saved: the app has the necessary rights to display the
+  user-authorized third-party content it accesses.
+- Age rating saved: 4+ globally, with Apple's regional equivalents.
+- App privacy published: Data Not Collected; no tracking.
+- Pricing and availability saved: free, public, and available in all 175
+  current countries or regions plus future App Store regions.
+- Four iPhone 6.9-inch and four iPad 13-inch screenshots uploaded in the order
+  listed above.
+
 ## Remaining submission actions
 
-- Save the prepared content-rights, 4+ age-rating, privacy, pricing, and
-  availability declarations in App Store Connect.
-- Upload the captured iPhone and iPad screenshots.
 - Complete Apple's encryption questionnaire and attach documentation if
   requested.
 - Provision and authenticate the isolated App Review worker, create its
