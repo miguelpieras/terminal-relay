@@ -10,7 +10,7 @@
 - Apple ID: `6804198744`
 - App Store Connect status: Prepare for Submission
 - Version: 1.0
-- Next upload build: 6
+- Current upload build: 6
 - Copyright: 2026 AMURA VENTURES SL
 - Primary category: Developer Tools
 - Secondary category: Utilities
@@ -148,13 +148,14 @@ the normal ten-minute, single-use Mac QR code.
   Swift Crypto.
 - It relies only on encryption built into Apple's operating system: No.
 - It implements proprietary or non-standard cryptography: No.
-- Exemption or documentation outcome: Complete Apple's App Encryption
-  Documentation questionnaire in App Store Connect. Apple evaluates the
-  result case by case.
+- App Store Connect classification: Non-exempt encryption. The app implements
+  industry-standard encryption outside Apple's operating system and will be
+  distributed in France.
+- Required documentation: French encryption declaration approval form.
 
-Do not add `ITSAppUsesNonExemptEncryption` until the App Store Connect
-questionnaire confirms whether the build is exempt or supplies an approved
-documentation key.
+`ITSAppUsesNonExemptEncryption` is set to `YES`. Add the
+`ITSEncryptionExportComplianceCode` supplied by Apple only after Apple approves
+the French declaration.
 
 ## EU Digital Services Act
 
@@ -195,10 +196,10 @@ account, SSH-key, and pairing values and never connect to a real worker.
 
 ## Remaining submission actions
 
-- Complete Apple's encryption questionnaire and attach documentation if
-  requested.
+- Obtain the French encryption declaration approval from ANSSI, upload it to
+  App Store Connect, and add Apple's resulting compliance code to the app.
 - Provision and authenticate the isolated App Review worker, create its
   invitation, and paste the pairing code and expiration date into Review
   Notes.
-- Increment `CURRENT_PROJECT_VERSION` to 6, upload the signed universal IPA,
-  attach it to version 1.0, and submit it for review.
+- Upload signed universal build 6, attach it to version 1.0, and submit it for
+  review.
