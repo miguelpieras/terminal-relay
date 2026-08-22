@@ -1,17 +1,44 @@
 # App Store metadata
 
-## Identity
+## App record
 
+- Platform: iOS universal app for iPhone and iPad
 - Name: Terminal Relay
-- Subtitle: Remote AI coding sessions
+- Subtitle: Private AI coding sessions
+- Primary language: English (U.S.)
+- SKU: `terminal-relay-ios`
+- Version: 1.0
+- Next upload build: 6
+- Copyright: 2026 AMURA VENTURES SL
 - Primary category: Developer Tools
+- Secondary category: Utilities
 - Bundle ID: `com.mpieras.TerminalRelay.iOS`
+- User access: Full Access
+- License agreement: Apple's standard EULA
 - Privacy policy:
   `https://miguelpieras.com/terminal-relay/privacy`
 - Support:
   `https://miguelpieras.com/terminal-relay/support`
 - Marketing:
   `https://miguelpieras.com/terminal-relay`
+
+## Pricing and availability
+
+- Price: Free
+- Tax category: App Store software
+- Distribution method: Public
+- Availability: All current and future App Store countries or regions
+- Pre-order: No
+- Version release: Manual release after approval
+- Phased release: Not applicable to the first version
+- Education and business distribution: Available without a reduced price
+
+## Content rights
+
+Terminal Relay accesses repositories, terminal output and agent responses that
+users make available on workers they control. It does not bundle or operate a
+catalog of third-party content. The app is permitted to display the
+user-authorized content and services it connects to.
 
 ## Promotional text
 
@@ -36,11 +63,52 @@ Terminal Relay does not provide hosted workers or agent accounts. You bring
 your own SSH-accessible worker, Tailscale network, repositories, and Codex or
 Claude account.
 
+Terminal Relay is open source under the Apache License 2.0. Review the client
+and worker code, follow development, or contribute on GitHub.
+
 The app contains no advertising, analytics, or tracking.
 
 ## Keywords
 
-terminal,ssh,coding,developer,codex,claude,remote,tailscale
+terminal,ssh,coding,developer,remote,agent,worker,devtools,repository,private
+
+## Age rating questionnaire
+
+- Parental controls: No
+- Age assurance: No
+- Unrestricted web access: No
+- User-generated content: No. The app does not distribute user content to
+  other users.
+- Social media: No
+- Messaging and chat: No. Agent conversations are not person-to-person
+  messaging.
+- Advertising: None
+- Violence, sexual content, profanity, drugs, gambling, contests, horror,
+  medical content and loot boxes: None
+- Made for Kids: No
+- Override to a higher rating: No
+- Expected Apple global rating: 4+. App Store Connect remains authoritative.
+
+## App privacy
+
+- Privacy policy URL:
+  `https://miguelpieras.com/terminal-relay/privacy`
+- Data collection answer: No, the developer and included third-party code do
+  not collect data from this app.
+- Tracking: No
+- Privacy choices URL: Not applicable
+
+Terminal Relay sends requests directly to the SSH workers and agent services
+the user configures. Those user-directed connections are described in the
+privacy policy and are not a developer-operated collection service.
+
+## App Review contact
+
+- Contact name: Miguel Pieras
+- Contact email: `hey@miguelpieras.com`
+- Contact phone: `[ADD APP REVIEW PHONE]`
+- Sign-in required: No. The reviewer uses the private pairing credential in
+  the review notes; dedicated agent accounts remain on the isolated worker.
 
 ## Review notes
 
@@ -71,9 +139,28 @@ and cannot request a general SSH shell or forwarding. The worker will remain
 online throughout review. Real users pair with their own private workers using
 the normal ten-minute, single-use Mac QR code.
 
-Also answer App Store Connect's export-compliance questionnaire for the bundled
-SSH and Swift Crypto implementation. Do not add
-`ITSAppUsesNonExemptEncryption` until that classification is confirmed.
+## Export compliance facts
+
+- The app contains and uses encryption: Yes.
+- It implements standard published encryption: Yes, through SSH, NIOSSH and
+  Swift Crypto.
+- It relies only on encryption built into Apple's operating system: No.
+- It implements proprietary or non-standard cryptography: No.
+- Exemption or documentation outcome: Complete Apple's App Encryption
+  Documentation questionnaire in App Store Connect. Apple evaluates the
+  result case by case.
+
+Do not add `ITSAppUsesNonExemptEncryption` until the App Store Connect
+questionnaire confirms whether the build is exempt or supplies an approved
+documentation key.
+
+## EU Digital Services Act
+
+The App Store Connect account is an organization account. The Account Holder
+must confirm whether the app is distributed by a trader. If trader status is
+selected, Apple requires verified business contact details and displays them
+on EU product pages. Recommended status: trader, subject to the Account
+Holder's legal confirmation.
 
 ## Captured screenshots
 
@@ -94,8 +181,15 @@ All images are direct captures of the native apps running with Debug-only
 screenshot fixtures. The fixtures use example worker, repository, session,
 account, SSH-key, and pairing values and never connect to a real worker.
 
-## Remaining assets and decisions
+## Remaining submission actions
 
-- App Review contact information.
-- Age rating, territories, price, and release method.
-- Export-compliance answers and any requested documentation.
+- Create the App Store Connect record using the values above.
+- Add the App Review phone number.
+- Confirm the account's EU trader status and public business contact details.
+- Complete Apple's encryption questionnaire and attach documentation if
+  requested.
+- Provision and authenticate the isolated App Review worker, create its
+  invitation, and paste the pairing code and expiration date into Review
+  Notes.
+- Increment `CURRENT_PROJECT_VERSION` to 6, upload the signed universal IPA,
+  attach it to version 1.0, and submit it for review.
