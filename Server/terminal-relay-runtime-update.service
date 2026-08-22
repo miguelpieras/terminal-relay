@@ -7,6 +7,11 @@ Wants=network-online.target
 Type=oneshot
 User=root
 Group=root
+# The "+" prefix runs this outside the sandbox with full privileges: a
+# ReadWritePaths entry whose directory is missing at service start is silently
+# dropped by systemd, so both home-directory state roots must exist before the
+# sandboxed updater launches or the restart hook fails EROFS on every retry.
+ExecStartPre=+/usr/bin/install -d -o terminal-relay -g terminal-relay -m 0700 /home/terminal-relay/.local/share/terminal-relay /home/terminal-relay/.local/state/terminal-relay
 ExecStart=/usr/local/sbin/terminal-relay-runtime-update
 Nice=10
 IOSchedulingClass=idle
@@ -15,4 +20,4 @@ ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=true
 NoNewPrivileges=true
-ReadWritePaths=/etc/terminal-relay /home/terminal-relay/.local/state/terminal-relay /opt/terminal-relay/claude-session-sdk /usr/local/bin /usr/local/libexec /usr/local/sbin /etc/systemd/system /var/lib/terminal-relay /run/lock
+ReadWritePaths=/etc/terminal-relay /home/terminal-relay/.local/share/terminal-relay /home/terminal-relay/.local/state/terminal-relay /opt/terminal-relay/claude-session-sdk /usr/local/bin /usr/local/libexec /usr/local/sbin /etc/systemd/system /var/lib/terminal-relay /run/lock

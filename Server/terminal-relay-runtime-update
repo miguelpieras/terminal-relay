@@ -13,7 +13,6 @@ readonly runtime_user="terminal-relay"
 readonly runtime_group="terminal-relay"
 readonly sdk_root="/opt/terminal-relay/claude-session-sdk"
 readonly sdk_current="$sdk_root/current"
-readonly sdk_version="0.2.125"
 readonly deployment_lock="/run/lock/terminal-relay-session-helper.lock"
 readonly update_lock="/run/lock/terminal-relay-runtime-update.lock"
 readonly launcher="/usr/local/bin/terminal-relay-session"
@@ -126,85 +125,20 @@ download() {
 validate_manifest() {
     /usr/bin/python3 - "$1" "$2" "$installed_version" "$feed_root" <<'PYTHON'
 import json
+import posixpath
 import re
 import sys
 
 manifest_path, output_path, installed_text, feed_root = sys.argv[1:]
-expected = {
-    "terminal-relay-session": ("/usr/local/bin/terminal-relay-session", "0755"),
-    "terminal-relay-mcp": ("/usr/local/bin/terminal-relay-mcp", "0755"),
-    "terminal-relay-chat": ("/usr/local/bin/terminal-relay-chat", "0755"),
-    "terminal-relay-claude-sessions": (
-        "/usr/local/bin/terminal-relay-claude-sessions",
-        "0755",
-    ),
-    "claude-agent-sdk-requirements.txt": (
-        "/opt/terminal-relay/claude-session-sdk/runtime-requirements.txt",
-        "0644",
-    ),
-    "terminal-relay-session-restore@.service": (
-        "/etc/systemd/system/terminal-relay-session-restore@.service",
-        "0644",
-    ),
-    "terminal-relay-agent-update": (
-        "/usr/local/sbin/terminal-relay-agent-update",
-        "0755",
-    ),
-    "terminal-relay-agent-update.service": (
-        "/etc/systemd/system/terminal-relay-agent-update.service",
-        "0644",
-    ),
-    "terminal-relay-agent-update.timer": (
-        "/etc/systemd/system/terminal-relay-agent-update.timer",
-        "0644",
-    ),
-    "terminal-relay-runtime-update": (
-        "/usr/local/sbin/terminal-relay-runtime-update",
-        "0755",
-    ),
-    "terminal-relay-runtime-update.service": (
-        "/etc/systemd/system/terminal-relay-runtime-update.service",
-        "0644",
-    ),
-    "terminal-relay-runtime-update.timer": (
-        "/etc/systemd/system/terminal-relay-runtime-update.timer",
-        "0644",
-    ),
-    "terminal-relay-runtime-update.path": (
-        "/etc/systemd/system/terminal-relay-runtime-update.path",
-        "0644",
-    ),
-    "terminal-relay-runtime-update.pub": (
-        "/etc/terminal-relay/runtime-update-public.pem",
-        "0644",
-    ),
-    "terminal-relay-review-gateway": (
-        "/usr/local/libexec/terminal-relay-command-gateway",
-        "0755",
-    ),
-    "terminal-relay-mobile-gateway": (
-        "/usr/local/bin/terminal-relay-mobile-gateway",
-        "0755",
-    ),
-}
-expected_capabilities = [
-    "agent-sessions",
-    "chat-v1",
-    "chat-v2",
-    "file-attachments-v1",
-    "provider-accounts-v1",
-    "runtime-updates-v1",
-    "threads-v1",
-    "threads-v2",
-    "threads-v3",
-]
-digest = re.compile(r"^[a-f0-9]{64}$")
-
-try:
-    manifest = json.load(open(manifest_path, encoding="utf-8"))
-except (OSError, ValueError):
-    raise SystemExit(1)
-if set(manifest) != {
+# The manifest's Ed25519 signature is verified against the pinned public key
+# before this validation runs, so every field here is already authenticated.
+# These checks therefore enforce compatibility shape and, for file rows, bound
+# where a signed manifest may write — they must accept manifests from FUTURE
+# releases, because the updater judging a new manifest is always one release
+# old. Never pin an exact capability list, file inventory, key set, or
+# protocol range here: that bricks every deployed updater the release it
+# changes.
+required_keys = {
     "schemaVersion",
     "channel",
     "runtimeVersion",
@@ -214,51 +148,102 @@ if set(manifest) != {
     "archiveURL",
     "archiveSHA256",
     "files",
-}:
+}
+required_sources = {
+    "terminal-relay-runtime-update",
+    "claude-agent-sdk-requirements.txt",
+}
+# Every prefix here must stay writable under the .service unit's
+# ReadWritePaths, or a signed manifest can validate and then hit EROFS at
+# install time on every retry; the test suite cross-checks the two lists.
+destination_prefixes = (
+    "/usr/local/bin/",
+    "/usr/local/sbin/",
+    "/usr/local/libexec/",
+    "/etc/systemd/system/",
+    "/etc/terminal-relay/",
+    "/opt/terminal-relay/claude-session-sdk/",
+)
+digest = re.compile(r"^[a-f0-9]{64}$")
+capability_token = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+source_token = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$")
+destination_chars = re.compile(r"^[A-Za-z0-9._@/-]{1,255}$")
+release_token = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,31}$")
+
+try:
+    manifest = json.load(open(manifest_path, encoding="utf-8"))
+except (OSError, ValueError):
+    raise SystemExit(1)
+if not isinstance(manifest, dict) or not required_keys <= set(manifest):
     raise SystemExit(1)
 version = manifest["runtimeVersion"]
+protocol = manifest["protocol"]
+capabilities = manifest["capabilities"]
 if (
     manifest["schemaVersion"] != 1
     or manifest["channel"] != "stable"
     or not isinstance(version, int)
+    or isinstance(version, bool)
     or version <= 0
     or version > 9_223_372_036_854_775_807
     or not isinstance(manifest["releaseVersion"], str)
-    or not re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,2}", manifest["releaseVersion"])
-    or manifest["protocol"] != {"minimum": 1, "maximum": 2}
-    or manifest["capabilities"] != expected_capabilities
+    or not release_token.fullmatch(manifest["releaseVersion"])
+    or not isinstance(protocol, dict)
+    or not {"minimum", "maximum"} <= set(protocol)
+    or not isinstance(protocol["minimum"], int)
+    or not isinstance(protocol["maximum"], int)
+    or isinstance(protocol["minimum"], bool)
+    or isinstance(protocol["maximum"], bool)
+    or not 1 <= protocol["minimum"] <= protocol["maximum"]
+    or not isinstance(capabilities, list)
+    or not capabilities
+    or len(capabilities) > 64
+    or not all(
+        isinstance(item, str) and capability_token.fullmatch(item)
+        for item in capabilities
+    )
+    or len(set(capabilities)) != len(capabilities)
+    or capabilities != sorted(capabilities)
     or manifest["archiveURL"] != f"{feed_root}/{version}/runtime.tar.gz"
     or not isinstance(manifest["archiveSHA256"], str)
     or not digest.fullmatch(manifest["archiveSHA256"])
     or not isinstance(manifest["files"], list)
-    or len(manifest["files"]) != len(expected)
+    or not manifest["files"]
+    or len(manifest["files"]) > 256
 ):
     raise SystemExit(1)
 
-seen = set()
+seen_sources = set()
+seen_destinations = set()
 rows = []
 for item in manifest["files"]:
-    if not isinstance(item, dict) or set(item) != {
+    if not isinstance(item, dict) or not {
         "source",
         "destination",
         "mode",
         "sha256",
-    }:
+    } <= set(item):
         raise SystemExit(1)
     source = item["source"]
-    if source not in expected or source in seen:
-        raise SystemExit(1)
-    destination, mode = expected[source]
+    destination = item["destination"]
     if (
-        item["destination"] != destination
-        or item["mode"] != mode
+        not isinstance(source, str)
+        or not source_token.fullmatch(source)
+        or source in seen_sources
+        or not isinstance(destination, str)
+        or not destination_chars.fullmatch(destination)
+        or not destination.startswith(destination_prefixes)
+        or posixpath.normpath(destination) != destination
+        or destination in seen_destinations
+        or item["mode"] not in {"0600", "0644", "0755"}
         or not isinstance(item["sha256"], str)
         or not digest.fullmatch(item["sha256"])
     ):
         raise SystemExit(1)
-    seen.add(source)
-    rows.append((source, destination, mode, item["sha256"]))
-if seen != set(expected):
+    seen_sources.add(source)
+    seen_destinations.add(destination)
+    rows.append((source, destination, item["mode"], item["sha256"]))
+if not required_sources <= seen_sources:
     raise SystemExit(1)
 
 with open(output_path, "w", encoding="utf-8") as output:
@@ -318,9 +303,21 @@ with tarfile.open(archive_path, mode="r:gz") as archive:
 PYTHON
 }
 
+# The expected claude-agent-sdk version comes from the signed requirements
+# file itself, never from a constant in this script: this updater is always
+# one release old relative to the manifest it installs, so a baked-in version
+# would reject every SDK bump.
+sdk_version_from_requirements() {
+    local pinned
+    pinned="$(/usr/bin/grep -m1 -oE '^claude-agent-sdk==[0-9]+(\.[0-9]+){0,3}$' "$1")" \
+        || return 1
+    printf '%s\n' "${pinned#claude-agent-sdk==}"
+}
+
 install_sdk() {
     local requirements="$1"
     local requirements_digest
+    local sdk_version
     local environment_name
     local environment_directory
     local staging_directory
@@ -328,6 +325,7 @@ install_sdk() {
     requirements_digest="$(/usr/bin/sha256sum "$requirements" | /usr/bin/awk '{ print $1 }')" \
         || return 1
     [[ "$requirements_digest" =~ ^[a-f0-9]{64}$ ]] || return 1
+    sdk_version="$(sdk_version_from_requirements "$requirements")" || return 1
     environment_name="sdk-$sdk_version-${requirements_digest:0:16}"
     environment_directory="$sdk_root/$environment_name"
     /usr/bin/install -d -o root -g root -m 0755 "$sdk_root" || return 1
