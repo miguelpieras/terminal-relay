@@ -24,6 +24,8 @@ target_version=0
 prepared_sdk_environment_name=""
 previous_sdk_current_target=""
 sdk_current_changed=false
+verify_unit_paths=()
+enable_unit_names=()
 
 log() {
     printf '[terminal-relay-runtime-update] %s\n' "$*"
@@ -449,6 +451,46 @@ rollback_runtime() {
     fi
 }
 
+# The updater running this step is always one release old relative to the
+# manifest it installs, so the systemd inventories must come from the
+# validated manifest rows, never a pinned list: a hard-coded list skips units
+# a future signed manifest adds and rollback-loops on a worker missing a unit
+# file the manifest no longer ships. Every installed unit file is verified;
+# timer/path units and template instances (instantiated for the runtime user)
+# are enabled, while plain services stay timer- and path-activated.
+collect_systemd_units() {
+    local validated="$1"
+    local destination
+    local unit
+
+    verify_unit_paths=()
+    enable_unit_names=()
+    while IFS=$'\t' read -r _source destination _mode _digest; do
+        [[ "$destination" == /etc/systemd/system/* ]] || continue
+        verify_unit_paths+=("$destination")
+        unit="${destination##*/}"
+        case "$unit" in
+            *.timer|*.path)
+                enable_unit_names+=("$unit")
+                ;;
+            *@.service)
+                enable_unit_names+=("${unit%@.service}@$runtime_user.service")
+                ;;
+        esac
+    done < <(/usr/bin/tail -n +2 "$validated")
+}
+
+refresh_systemd_units() {
+    collect_systemd_units "$1"
+    /usr/bin/systemctl daemon-reload || return 1
+    if ((${#verify_unit_paths[@]} > 0)); then
+        /usr/bin/systemd-analyze verify "${verify_unit_paths[@]}" || return 1
+    fi
+    if ((${#enable_unit_names[@]} > 0)); then
+        /usr/bin/systemctl enable --now "${enable_unit_names[@]}" || return 1
+    fi
+}
+
 schedule_app_server_restart() {
     /usr/sbin/runuser -u "$runtime_user" -- \
         /usr/bin/env \
@@ -542,19 +584,7 @@ main() {
         rollback_runtime
         fail_update install-failed
     fi
-    if ! /usr/bin/systemctl daemon-reload \
-        || ! /usr/bin/systemd-analyze verify \
-            /etc/systemd/system/terminal-relay-session-restore@.service \
-            /etc/systemd/system/terminal-relay-agent-update.service \
-            /etc/systemd/system/terminal-relay-agent-update.timer \
-            /etc/systemd/system/terminal-relay-runtime-update.service \
-            /etc/systemd/system/terminal-relay-runtime-update.timer \
-            /etc/systemd/system/terminal-relay-runtime-update.path \
-        || ! /usr/bin/systemctl enable --now \
-            terminal-relay-session-restore@terminal-relay.service \
-            terminal-relay-agent-update.timer \
-            terminal-relay-runtime-update.timer \
-            terminal-relay-runtime-update.path; then
+    if ! refresh_systemd_units "$validated"; then
         rollback_runtime
         /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
         fail_update systemd-failed

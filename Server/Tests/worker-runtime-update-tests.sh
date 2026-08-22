@@ -182,6 +182,11 @@ case("added-root-only-config", "accept",
      lambda m: m["files"].append(dict(
          new_file, destination="/etc/terminal-relay/future-policy.json",
          mode="0600")))
+case("added-unit-file", "accept",
+     lambda m: m["files"].append(dict(
+         new_file, source="terminal-relay-future-sync.timer",
+         destination="/etc/systemd/system/terminal-relay-future-sync.timer",
+         mode="0644")))
 case("removed-file", "accept",
      lambda m: m["files"].remove(next(
          f for f in m["files"] if f["source"] == "terminal-relay-mobile-gateway")))
@@ -233,6 +238,47 @@ while IFS=$'\t' read -r case_name expected_verdict; do
         exit 1
     fi
 done < "$test_directory/forward-compat-cases.tsv"
+
+# The systemd verify/enable inventories must come from the validated manifest
+# rows: the deployed updater is always one release old, so a unit file a
+# future signed manifest adds has to be verified and enabled without a script
+# change, and plain services must stay timer/path-activated.
+run_collect_systemd_units() {
+    (
+        set +e
+        main() { :; }
+        readonly -f main
+        source "$repository_root/Server/terminal-relay-runtime-update" 2>/dev/null
+        collect_systemd_units "$1" || exit 1
+        printf 'verify\t%s\n' "${verify_unit_paths[@]}"
+        printf 'enable\t%s\n' "${enable_unit_names[@]}"
+    )
+}
+
+unit_plan="$(run_collect_systemd_units \
+    "$test_directory/validated-added-unit-file.tsv")" || {
+    echo "Deriving systemd units from the validated manifest failed." >&2
+    exit 1
+}
+for expected_line in \
+    $'verify\t/etc/systemd/system/terminal-relay-future-sync.timer' \
+    $'enable\tterminal-relay-future-sync.timer' \
+    $'verify\t/etc/systemd/system/terminal-relay-session-restore@.service' \
+    $'enable\tterminal-relay-session-restore@terminal-relay.service' \
+    $'verify\t/etc/systemd/system/terminal-relay-runtime-update.service' \
+    $'enable\tterminal-relay-agent-update.timer' \
+    $'enable\tterminal-relay-runtime-update.timer' \
+    $'enable\tterminal-relay-runtime-update.path'; do
+    if ! /usr/bin/grep -qxF "$expected_line" <<< "$unit_plan"; then
+        echo "Derived systemd unit plan is missing: $expected_line" >&2
+        exit 1
+    fi
+done
+if /usr/bin/grep -qxF $'enable\tterminal-relay-runtime-update.service' \
+    <<< "$unit_plan"; then
+    echo "Plain services must stay timer/path-activated, never enabled." >&2
+    exit 1
+fi
 
 # The SDK version pin must come from the signed requirements file, and the
 # derivation must work on the requirements file the runtime actually ships.
