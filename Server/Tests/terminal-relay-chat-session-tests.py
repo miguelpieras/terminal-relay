@@ -540,6 +540,135 @@ except BlockingIOError:
             assert stale.returncode == 0, stale.stderr
             assert not leaked_intent.exists()
             assert not leaked_upload.parent.parent.exists()
+
+            # A worker updated to account-pinned routing still runs brokers
+            # started before the update. Account-aware status must not list
+            # them, and it must schedule the migration that stops them with
+            # chat-stop-v1 semantics and retires the clientless legacy shared
+            # Codex app-server so its thread-writer locks release.
+            def tmux_has_session(name: str) -> bool:
+                return (
+                    subprocess.run(
+                        [
+                            tmux,
+                            "-f",
+                            "/dev/null",
+                            "-L",
+                            socket_label,
+                            "has-session",
+                            "-t",
+                            name,
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                    ).returncode
+                    == 0
+                )
+
+            def tmux_new_session(name: str) -> None:
+                subprocess.run(
+                    [
+                        tmux,
+                        "-f",
+                        "/dev/null",
+                        "-L",
+                        socket_label,
+                        "new-session",
+                        "-d",
+                        "-s",
+                        name,
+                        "/bin/sleep 60",
+                    ],
+                    check=True,
+                )
+
+            legacy_start = helper(
+                "chat-start-v1",
+                "codex",
+                "example-repository",
+                "--model",
+                "gpt-5.6-sol",
+            )
+            legacy_value = json.loads(legacy_start.stdout.splitlines()[1])
+            legacy_relay = legacy_value["relayId"]
+            legacy_thread = legacy_value["providerThreadId"]
+            legacy_session = f"terminal-relay-chat-codex-{legacy_relay}"
+            legacy_state_path = runtime / f"chat-{legacy_relay}" / "broker.json"
+            legacy_intent = runtime / f"{legacy_relay}.chat-intent"
+            assert legacy_intent.exists()
+
+            # Stand-ins for the legacy shared Codex app-server and the
+            # restart marker a runtime update schedules for it.
+            tmux_new_session("terminal-relay-account-server")
+            restart_marker = runtime / "codex-app-server-restart-required"
+            restart_marker.write_text("", encoding="utf-8")
+            restart_marker.chmod(0o600)
+
+            # A live legacy Codex terminal still uses the shared server, so
+            # the migration must stop the broker but leave the server alone.
+            guard_instance = str(uuid.uuid4())
+            guard_metadata = runtime / f"{guard_instance}.session"
+            guard_metadata.write_text(
+                "tool|codex\n"
+                "repository|example-repository\n"
+                f"instance|{guard_instance}\n"
+                "pid|0\n"
+                "start|pending\n"
+                "thread|\n",
+                encoding="utf-8",
+            )
+            guard_metadata.chmod(0o600)
+            tmux_new_session(f"terminal-relay-codex-{guard_instance}")
+
+            status_v2 = helper("status-v2")
+            status_v2_lines = status_v2.stdout.splitlines()
+            assert status_v2_lines[0] == "__TERMINAL_RELAY_SESSION_V2__"
+            assert all(legacy_relay not in line for line in status_v2_lines)
+            for _ in range(500):
+                if not tmux_has_session(legacy_session):
+                    try:
+                        broker_state = json.loads(
+                            legacy_state_path.read_text(encoding="utf-8")
+                        )
+                    except (OSError, ValueError):
+                        broker_state = {}
+                    if broker_state.get("status") == "stopped":
+                        break
+                time.sleep(0.02)
+            else:
+                raise AssertionError("legacy broker survived the migration")
+            assert not legacy_intent.exists()
+            # The conversation survives as a resumable thread.
+            assert broker_state["providerThreadId"] == legacy_thread
+            for _ in range(500):
+                if not tmux_has_session("terminal-relay-legacy-chat-migration"):
+                    break
+                time.sleep(0.02)
+            else:
+                raise AssertionError("legacy chat migration did not finish")
+            assert tmux_has_session("terminal-relay-account-server")
+            assert restart_marker.exists()
+
+            # Once the last legacy client is gone, the migration retires the
+            # clientless shared server and its restart marker.
+            subprocess.run(
+                [
+                    tmux,
+                    "-f",
+                    "/dev/null",
+                    "-L",
+                    socket_label,
+                    "kill-session",
+                    "-t",
+                    f"terminal-relay-codex-{guard_instance}",
+                ],
+                check=True,
+            )
+            guard_metadata.unlink()
+            helper("__migrate-legacy-chats")
+            assert not tmux_has_session("terminal-relay-account-server")
+            assert not restart_marker.exists()
         finally:
             subprocess.run(
                 [tmux, "-f", "/dev/null", "-L", socket_label, "kill-server"],

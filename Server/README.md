@@ -402,6 +402,16 @@ file on a 30-second throttle and re-seeds across restarts. The status
 listing gathers every live broker's identity and activity in a single
 `terminal-relay-chat inspect-status` invocation.
 
+Account-aware status also migrates pre-account leftovers instead of listing
+them. When the scan finds a live accountless legacy chat broker, or the legacy
+shared Codex app-server still runs with a pending restart marker, `status-v2`
+schedules a detached one-shot migration that stops each legacy broker with
+`chat-stop-v1` semantics (the broker exits, its restart intent is removed, the
+conversation stays resumable as a thread) and then — only once no accountless
+Codex terminal or chat relay is live — retires the legacy shared Codex
+app-server and its restart marker, releasing the thread-writer locks that
+otherwise block account-pinned resumes of threads that server had opened.
+
 The relay instance UUID is a new immutable terminal identity on every launch.
 The provider thread UUID is the persisted conversation identity. Current app
 starts and V2 resumes deliberately keep them separate for both providers: a

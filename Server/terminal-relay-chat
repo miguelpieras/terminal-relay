@@ -5789,6 +5789,18 @@ def emit_chat_status(runtime_directory: str, account_aware: bool = False) -> Non
         account_id = state.get("accountID")
         if account_aware:
             if account_id is None:
+                # Pre-account brokers are unreachable through account routing;
+                # a "legacy" row lets the caller migrate (stop) them instead
+                # of leaving them running invisibly.
+                print(
+                    "legacy|{}|{}|{}|{}|{}".format(
+                        state["provider"],
+                        state["repository"],
+                        state["relayId"],
+                        state["providerThreadId"],
+                        state["activityAt"],
+                    )
+                )
                 continue
             print(
                 "{}|{}|{}|{}|{}|{}".format(

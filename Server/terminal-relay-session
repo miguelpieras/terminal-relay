@@ -2850,6 +2850,56 @@ chat_stop_v2() {
     chat_stop_v1 "$provider" "$repository" "$relay_id"
 }
 
+schedule_legacy_chat_migration() {
+    local launch_command
+
+    if tmux_command has-session -t terminal-relay-legacy-chat-migration \
+        2>/dev/null; then
+        return 0
+    fi
+    printf -v launch_command 'exec %q __migrate-legacy-chats' "$helper_path"
+    tmux_command new-session -d -s terminal-relay-legacy-chat-migration \
+        -c "${runtime_home:-${HOME:-/}}" "$launch_command" >/dev/null 2>&1 || true
+}
+
+migrate_legacy_chats() {
+    local provider repository relay_id thread_id activity extra
+    local migrate_status=0
+
+    # Stop every live pre-account broker with chat-stop-v1 semantics: the
+    # broker exits, its restart intent is removed, and the conversation stays
+    # resumable as a thread through account-pinned routing.
+    if [[ -f "$chat_path" && ! -L "$chat_path" && -x "$default_python_path" ]]; then
+        while IFS='|' read -r provider repository relay_id thread_id \
+            activity extra; do
+            [[ -z "${extra:-}" ]] || continue
+            [[ "$provider" == "codex" || "$provider" == "claude" ]] || continue
+            is_valid_repository_name "$repository" || continue
+            is_valid_instance "$relay_id" || continue
+            is_valid_instance "$thread_id" || continue
+            select_legacy_provider_route "$provider"
+            chat_stop_v1 "$provider" "$repository" "$relay_id" \
+                || migrate_status=$?
+        done < <("$default_python_path" "$chat_path" inspect-status \
+            --runtime-directory "$runtime_directory" 2>/dev/null || true)
+    fi
+
+    # The legacy shared Codex app-server keeps a thread-writer lock for every
+    # thread it ever opened until the process exits, which makes
+    # account-pinned resumes of those threads fail with a writer conflict.
+    # Once nothing legacy is left to serve, retire the server and its pending
+    # restart marker; a surviving legacy client would relaunch it on demand.
+    select_legacy_provider_route codex
+    lock_codex_app_server || return $?
+    if ! legacy_provider_runtime_is_live codex; then
+        tmux_command kill-session -t "$codex_app_server_session" \
+            2>/dev/null || true
+        /bin/rm -f -- "$codex_app_server_restart_marker"
+    fi
+    unlock_codex_app_server
+    return "$migrate_status"
+}
+
 chat_attachment_upload_v1() {
     local provider="$1"
     local repository="$2"
@@ -4922,6 +4972,7 @@ status_sessions() {
     local bound_thread_id
     local bound_account_id
     local needs_active_title_generation=0
+    local legacy_chat_present=0
     local -a records=()
     local -a title_generation_thread_ids=()
 
@@ -5043,6 +5094,12 @@ status_sessions() {
     if [[ ${#chat_directories[@]} -gt 0 && "$status_protocol_v2" == "1" ]]; then
         while IFS='|' read -r tool bound_account_id repository instance \
             bound_thread_id chat_activity; do
+            if [[ "$tool" == "legacy" ]]; then
+                # A pre-account broker is still running but unreachable
+                # through account routing; migrate it instead of listing it.
+                legacy_chat_present=1
+                continue
+            fi
             [[ "$tool" == "codex" || "$tool" == "claude" ]] || continue
             is_valid_instance "$bound_account_id" || continue
             [[ "$repository" =~ ^[A-Za-z0-9._-]{1,100}$ ]] || continue
@@ -5070,6 +5127,20 @@ status_sessions() {
             --runtime-directory "$runtime_directory" 2>/dev/null || true)
     fi
     shopt -u nullglob
+
+    # Account-aware status is the first thing an updated client runs, so it
+    # doubles as the migration point for pre-account leftovers: live legacy
+    # brokers, and a legacy shared Codex app-server whose scheduled restart
+    # nothing legacy will ever honor (its thread-writer locks release only
+    # when the process exits).
+    if [[ "$status_protocol_v2" == "1" ]]; then
+        if [[ $legacy_chat_present -eq 1 ]] \
+            || { [[ -f "$runtime_directory/codex-app-server-restart-required" ]] \
+                && tmux_command has-session -t terminal-relay-account-server \
+                    2>/dev/null; }; then
+            schedule_legacy_chat_migration
+        fi
+    fi
 
     if [[ "$status_protocol_v2" == "1" ]]; then
         printf '%s\n' "$session_protocol_marker_v2"
@@ -7327,6 +7398,10 @@ case "$command_name" in
     __generate-codex-titles)
         [[ $# -ge 1 ]] || fail_usage "Invalid internal Codex title request."
         generate_codex_titles "$@"
+        ;;
+    __migrate-legacy-chats)
+        [[ $# -eq 0 ]] || fail_usage "Invalid internal legacy chat migration request."
+        migrate_legacy_chats
         ;;
     *) fail_usage "Unknown command: $command_name" ;;
 esac

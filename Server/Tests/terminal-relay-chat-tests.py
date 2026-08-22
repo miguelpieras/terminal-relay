@@ -3506,6 +3506,7 @@ def exercise_chat_bindings(module, root: pathlib.Path) -> None:
 
 def exercise_account_routing(module, root: pathlib.Path) -> None:
     import contextlib
+    import shutil
 
     runtime = root / "account-routing-runtime"
     project = root / "account-routing-project"
@@ -3579,6 +3580,28 @@ def exercise_account_routing(module, root: pathlib.Path) -> None:
     state_path.write_text(json.dumps(state), encoding="utf-8")
     state_path.chmod(0o600)
 
+    legacy_relay = "99999999-9999-4999-8999-999999999999"
+    legacy_directory = runtime / f"chat-{legacy_relay}"
+    legacy_directory.mkdir(mode=0o700)
+    legacy_state_path = legacy_directory / "broker.json"
+    legacy_state_path.write_text(
+        json.dumps(
+            {
+                "v": 1,
+                "status": "ready",
+                "provider": "codex",
+                "repository": "example-repository",
+                "relayId": legacy_relay,
+                "providerThreadId": THREAD_ID,
+                "pid": os.getpid(),
+                "processStart": "proc_1",
+                "socket": str(legacy_directory / "broker.sock"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    legacy_state_path.chmod(0o600)
+
     original_validate = module.validate_live_state_process
     module.validate_live_state_process = lambda _state: None
     try:
@@ -3590,14 +3613,19 @@ def exercise_account_routing(module, root: pathlib.Path) -> None:
         assert output.getvalue().strip() == (
             f"{ACCOUNT_ID}|{THREAD_ID}|{RELAY_ID}|chat|0"
         )
+        # Account-aware status reports a pre-account broker as a "legacy" row
+        # so the caller can migrate it instead of leaving it running invisibly.
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             module.emit_chat_status(str(runtime), account_aware=True)
-        assert output.getvalue().strip() == (
-            f"codex|{ACCOUNT_ID}|example-repository|{RELAY_ID}|{THREAD_ID}|0"
-        )
+        lines = [line for line in output.getvalue().splitlines() if line]
+        assert lines == [
+            f"codex|{ACCOUNT_ID}|example-repository|{RELAY_ID}|{THREAD_ID}|0",
+            f"legacy|codex|example-repository|{legacy_relay}|{THREAD_ID}|0",
+        ]
     finally:
         module.validate_live_state_process = original_validate
+    shutil.rmtree(legacy_directory)
 
     other = module.ChatBroker(
         "codex",
