@@ -116,7 +116,8 @@ delete, retain, move, or modify the provider transcript and cannot prevent a
 direct provider resume outside Terminal Relay.
 
 Maintainer-signed macOS builds check a public GitHub Pages appcast once per day
-and download accepted updates from GitHub Releases. Sparkle system profiling is
+and download accepted updates from that same GitHub Pages feed; release
+archives are also published on GitHub Releases. Sparkle system profiling is
 disabled, and Terminal Relay does not attach worker, account, project, or device
 details to update requests. You can disable automatic checks, downloads, or
 installation in the app and can always initiate a manual check. iPhone and iPad

@@ -41,11 +41,16 @@ This repository is Apache-2.0 open source and must remain safe to publish.
 
 ## Delivery
 
-After every user-requested change to this repository, run
-`./Scripts/build-and-install.sh` before reporting completion. The command must
-regenerate the Xcode project, pass all tests, build the Release app, install it
-at `/Applications/Terminal Relay.app`, and relaunch it.
+This section applies only on the maintainer's own workstation. On any other
+checkout — contributor machines included — do not install to `/Applications`,
+modify the Dock, or relaunch applications; verify changes with
+`xcodegen generate`, the relevant Xcode scheme tests, and the server test
+scripts instead.
 
+On the maintainer's workstation, after every user-requested change to this
+repository, run `./Scripts/build-and-install.sh` before reporting completion.
+The command must regenerate the Xcode project, pass all tests, build the
+Release app, install it at `/Applications/Terminal Relay.app`, and relaunch it.
 Do not report a requested change as complete when this command fails. Keep the
 installed application path stable so its Dock item always opens the newest
 successful build.

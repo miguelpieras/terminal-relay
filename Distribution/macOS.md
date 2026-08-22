@@ -42,8 +42,11 @@ gh workflow run publish-worker-runtime.yml --ref main
 
 `Publish Worker Runtime` uses the same `macos-release` signing key and canonical
 payload builder, preserves the currently published Sparkle appcast and client
-archive, deploys only the new stable worker manifest/signature/archive, and
-verifies the public signature and archive digest over HTTPS. It does not create
+archives by re-downloading them from the live feed on top of the tracked
+`docs/` snapshot (which alone seeds the client feed only when no appcast has
+been published yet), deploys only the new stable worker
+manifest/signature/archive, and verifies the public signature and archive
+digest over HTTPS. It does not create
 a tag, GitHub Release, Sparkle client update, or App Store upload. Normal client
 releases continue to publish their matching runtime first through
 `release-macos.yml`.

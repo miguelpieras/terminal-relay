@@ -3,6 +3,8 @@ DerivedData/
 build/
 *.xcuserstate
 xcuserdata/
+__pycache__/
+*.pyc
 
 # Local credentials and private keys
 .env

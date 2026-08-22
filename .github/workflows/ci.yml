@@ -1,6 +1,27 @@
 name: CI
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - "TerminalRelay/**"
+      - "TerminalRelayIOS/**"
+      - "TerminalRelayTests/**"
+      - "TerminalRelayIOSTests/**"
+      - "TerminalRelayIOSUITests/**"
+      - "Shared/**"
+      - "project.yml"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    paths:
+      - "TerminalRelay/**"
+      - "TerminalRelayIOS/**"
+      - "TerminalRelayTests/**"
+      - "TerminalRelayIOSTests/**"
+      - "TerminalRelayIOSUITests/**"
+      - "Shared/**"
+      - "project.yml"
+      - ".github/workflows/ci.yml"
   workflow_dispatch:
 
 permissions:

@@ -22,7 +22,7 @@ done
 while IFS= read -r private_path; do
     [[ ! -e "$repository_root/$private_path" ]] \
         || fail "private planning file is tracked: $private_path"
-done < <(git -C "$repository_root" ls-files | grep -E '^(\\.private|dev-tasklists)/' || true)
+done < <(git -C "$repository_root" ls-files | grep -E '^(\.private|dev-tasklists)/' || true)
 
 secret_pattern='(AKIA|ASIA)[A-Z0-9]{16}|github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|sk-(proj-)?[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|tskey-[A-Za-z0-9-]{10,}|-----BEGIN ([A-Z ]+ )?PRIVATE KEY-----'
 public_files=()

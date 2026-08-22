@@ -107,6 +107,83 @@ jobs:
           runtime_directory="$GITHUB_WORKSPACE/build/worker-runtime"
           mkdir -p "$pages_directory/worker-runtime/$RUNTIME_VERSION"
           cp -R docs/. "$pages_directory/"
+          feed_root="https://miguelpieras.github.io/terminal-relay"
+          live_appcast="$RUNNER_TEMP/live-appcast.xml"
+          if ! live_status="$(curl \
+            --proto '=https' \
+            --tlsv1.2 \
+            --location \
+            --silent \
+            --show-error \
+            --retry 6 \
+            --retry-all-errors \
+            --retry-delay 5 \
+            --max-time 15 \
+            --write-out '%{http_code}' \
+            --output "$live_appcast" \
+            "$feed_root/appcast.xml")"; then
+            echo "could not read the published Sparkle appcast" >&2
+            exit 1
+          fi
+          if [[ "$live_status" != "200" && "$live_status" != "404" ]]; then
+            echo "could not read the published Sparkle appcast (HTTP $live_status)" >&2
+            exit 1
+          fi
+          if [[ "$live_status" == "200" ]]; then
+            cp "$live_appcast" "$pages_directory/appcast.xml"
+            /usr/bin/python3 - "$live_appcast" > "$RUNNER_TEMP/live-archives.txt" <<'PYTHON'
+          import re
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(sys.argv[1]).getroot()
+          prefix = "https://miguelpieras.github.io/terminal-relay/"
+          names = []
+          for item in root.iter():
+              if not item.tag.endswith("enclosure"):
+                  continue
+              url = item.attrib.get("url", "")
+              if not url.startswith(prefix):
+                  raise SystemExit("published Sparkle archive URL is invalid")
+              name = url.removeprefix(prefix)
+              if not re.fullmatch(r"Terminal-Relay-[0-9]+(?:\.[0-9]+){1,2}\.zip", name):
+                  raise SystemExit("published Sparkle archive name is invalid")
+              names.append(name)
+          if not names:
+              raise SystemExit("published Sparkle appcast has no enclosures")
+          print("\n".join(names))
+          PYTHON
+            while IFS= read -r archive_name; do
+              [[ -n "$archive_name" ]] || continue
+              if ! archive_status="$(curl \
+                --proto '=https' \
+                --tlsv1.2 \
+                --location \
+                --silent \
+                --show-error \
+                --retry 6 \
+                --retry-all-errors \
+                --retry-delay 5 \
+                --max-time 60 \
+                --write-out '%{http_code}' \
+                --output "$pages_directory/$archive_name.download" \
+                "$feed_root/$archive_name")"; then
+                echo "could not download published archive $archive_name" >&2
+                exit 1
+              fi
+              if [[ "$archive_status" == "200" ]]; then
+                mv "$pages_directory/$archive_name.download" \
+                  "$pages_directory/$archive_name"
+              elif [[ "$archive_status" == "404" ]]; then
+                rm -f "$pages_directory/$archive_name.download"
+                echo "warning: live feed lists $archive_name but does not host it;" \
+                  "keeping any tracked copy" >&2
+              else
+                echo "could not download published archive $archive_name (HTTP $archive_status)" >&2
+                exit 1
+              fi
+            done < "$RUNNER_TEMP/live-archives.txt"
+          fi
           cp "$runtime_directory/manifest.json" \
             "$pages_directory/worker-runtime/manifest.json"
           cp "$runtime_directory/manifest.sig" \
@@ -135,12 +212,18 @@ jobs:
           expected_prefix = "https://miguelpieras.github.io/terminal-relay/"
           if not urls or any(not url.startswith(expected_prefix) for url in urls):
               raise SystemExit("published Sparkle archive URL is invalid")
-          for url in urls:
-              name = url.removeprefix(expected_prefix)
+          names = [url.removeprefix(expected_prefix) for url in urls]
+          for name in names:
               if not re.fullmatch(r"Terminal-Relay-[0-9]+(?:\.[0-9]+){1,2}\.zip", name):
                   raise SystemExit("published Sparkle archive name is invalid")
+          if not any((pages / name).is_file() for name in names):
+              raise SystemExit("no published Sparkle archive is staged")
+          for name in names:
               if not (pages / name).is_file():
-                  raise SystemExit("published Sparkle archive is missing")
+                  print(
+                      f"warning: staged feed lists {name} but no archive is staged",
+                      file=sys.stderr,
+                  )
           manifest_path = pages / "worker-runtime" / "manifest.json"
           archive_path = pages / "worker-runtime" / str(version) / "runtime.tar.gz"
           manifest = json.loads(manifest_path.read_text(encoding="utf-8"))

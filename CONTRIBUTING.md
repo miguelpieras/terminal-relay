@@ -15,7 +15,7 @@ Thanks for helping improve Terminal Relay.
 
 ## Development setup
 
-Terminal Relay requires macOS 14 or later, Xcode 26 or later, XcodeGen 2.46.0
+Terminal Relay requires macOS 15 or later, Xcode 26 or later, XcodeGen 2.46.0
 or later, and Apple's Metal toolchain component:
 
 ```bash
@@ -24,6 +24,18 @@ xcodebuild -downloadComponent MetalToolchain
 xcodegen generate
 open TerminalRelay.xcodeproj
 ```
+
+Enable the repository's shared git hooks so the secret guard scans every
+commit and push in your checkout:
+
+```bash
+git config core.hooksPath .githooks
+git config terminalRelay.allowedCommitterEmail "your-github-noreply@users.noreply.github.com"
+```
+
+The guard requires commits to use the configured committer email (use your
+GitHub noreply address) and blocks staged or pushed content that matches
+credential patterns or sensitive filenames.
 
 The macOS target uses the local SSH client and therefore intentionally runs
 outside App Sandbox. iOS signing is needed only for physical-device builds;

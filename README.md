@@ -70,7 +70,12 @@ routing are follow-up work.
 
 ## Install on macOS
 
-There is no prebuilt release yet. Install the current version from source:
+Download the latest notarized build from
+[GitHub Releases](https://github.com/miguelpieras/terminal-relay/releases/latest),
+unzip it, and move **Terminal Relay.app** into `/Applications`. The app is
+Developer ID signed and offers signed in-app updates through its Sparkle feed.
+
+To build and install from source instead:
 
 ```bash
 git clone https://github.com/miguelpieras/terminal-relay.git
@@ -225,7 +230,7 @@ iPhone/iPad app ┘              ├ repositories in /workspace
 
 ## Requirements
 
-- macOS 14 or later
+- macOS 15 or later
 - Xcode 26 or later
 - [XcodeGen 2.46.0 or later](https://github.com/yonaskolb/XcodeGen)
 - Apple's Metal toolchain component
@@ -335,8 +340,9 @@ Source availability and binary distribution are independent:
   team and bundle identifiers.
 - The maintained universal iPhone and iPad binary can be distributed through
   App Store Connect under the configured Terminal Relay application identifier.
-- Maintainer-signed macOS binaries are Developer ID signed, notarized, and
-  delivered from GitHub Releases through a signed Sparkle feed on GitHub Pages.
+- Maintainer-signed macOS binaries are Developer ID signed, notarized,
+  published on GitHub Releases, and downloaded through the signed Sparkle feed
+  on GitHub Pages.
 - Every user still connects to their own private workers and accounts.
 
 A macOS release is cut by pushing a version tag that matches
@@ -398,3 +404,6 @@ dependency licenses and attributions are listed in
 ## Credits
 
 Created and maintained by [Miguel Pieras (@mpieras)](https://x.com/mpieras).
+
+Copyright 2025-2026 Miguel Pieras. Licensed under the
+[Apache License 2.0](LICENSE).
