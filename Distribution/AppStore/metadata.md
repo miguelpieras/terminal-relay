@@ -10,7 +10,7 @@
 - Apple ID: `6804198744`
 - App Store Connect status: Prepare for Submission
 - Version: 1.0
-- Current upload build: 6
+- Current upload build: 7
 - Copyright: 2026 AMURA VENTURES SL
 - Primary category: Developer Tools
 - Secondary category: Utilities
@@ -29,7 +29,8 @@
 - Price: Free
 - Tax category: App Store software
 - Distribution method: Public
-- Availability: All current and future App Store countries or regions
+- Availability: All current and future App Store countries or regions except
+  France
 - Pre-order: No
 - Version release: Manual release after approval
 - Phased release: Not applicable to the first version
@@ -149,13 +150,13 @@ the normal ten-minute, single-use Mac QR code.
 - It relies only on encryption built into Apple's operating system: No.
 - It implements proprietary or non-standard cryptography: No.
 - App Store Connect classification: Non-exempt encryption. The app implements
-  industry-standard encryption outside Apple's operating system and will be
+  industry-standard encryption outside Apple's operating system and is not
   distributed in France.
-- Required documentation: French encryption declaration approval form.
+- Required documentation: None for the selected availability.
 
-`ITSAppUsesNonExemptEncryption` is set to `YES`. Add the
-`ITSEncryptionExportComplianceCode` supplied by Apple only after Apple approves
-the French declaration.
+`ITSAppUsesNonExemptEncryption` is set to `YES`. No
+`ITSEncryptionExportComplianceCode` is included because no documentation is
+required for the selected availability.
 
 ## EU Digital Services Act
 
@@ -189,17 +190,15 @@ account, SSH-key, and pairing values and never connect to a real worker.
   user-authorized third-party content it accesses.
 - Age rating saved: 4+ globally, with Apple's regional equivalents.
 - App privacy published: Data Not Collected; no tracking.
-- Pricing and availability saved: free, public, and available in all 175
-  current countries or regions plus future App Store regions.
+- Pricing and availability saved: free, public, and available in all current
+  countries or regions plus future App Store regions, except France.
 - Four iPhone 6.9-inch and four iPad 13-inch screenshots uploaded in the order
   listed above.
 
 ## Remaining submission actions
 
-- Obtain the French encryption declaration approval from ANSSI, upload it to
-  App Store Connect, and add Apple's resulting compliance code to the app.
 - Provision and authenticate the isolated App Review worker, create its
   invitation, and paste the pairing code and expiration date into Review
   Notes.
-- Upload signed universal build 6, attach it to version 1.0, and submit it for
+- Upload signed universal build 7, attach it to version 1.0, and submit it for
   review.
