@@ -122,6 +122,23 @@ final class WorkerSessionModel: ObservableObject {
         }
     }
 
+    func enterDemoMode() {
+        refreshToken = UUID()
+        isLoading = false
+        isDemoMode = true
+        profiles = [DemoWorkspace.worker]
+        profile = DemoWorkspace.worker
+        projects = DemoWorkspace.projects
+        sessions = DemoWorkspace.sessions
+        threadCatalogs = [:]
+        workerOverviews = [DemoWorkspace.worker.id: DemoWorkspace.overview]
+        workerLoadingIDs = []
+        projectLoadingIDs = []
+        terminalRoute = nil
+        errorMessage = nil
+        loadDemoThreads()
+    }
+
     @discardableResult
     func pair(with code: String) async -> Bool {
         guard !isPairing else { return false }

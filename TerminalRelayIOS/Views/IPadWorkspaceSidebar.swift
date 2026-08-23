@@ -109,6 +109,12 @@ struct IPadWorkspaceSidebar: View {
                     Button(action: onAddWorker) {
                         Label("Scan Mac Pairing Code", systemImage: "qrcode.viewfinder")
                     }
+
+                    Button {
+                        model.enterDemoMode()
+                    } label: {
+                        Label("Explore Demo", systemImage: "sparkles")
+                    }
                 }
             } else if projects.isEmpty {
                 if !model.projectLoadingIDs.isEmpty {

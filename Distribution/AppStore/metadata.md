@@ -58,6 +58,7 @@ Use it to:
 - Start or reconnect to Codex and Claude terminal sessions.
 - Move between Mac, iPhone, and iPad without stopping the remote agent.
 - Monitor worker availability and resource usage.
+- Explore a complete built-in demo before pairing a worker.
 - Pair securely with the Mac app by scanning a short-lived QR code.
 - Keep a dedicated SSH identity in the device Keychain.
 - Pin every worker's SSH host key.
@@ -110,8 +111,8 @@ privacy policy and are not a developer-operated collection service.
 - Contact name: Miguel Pieras
 - Contact email: `hey@miguelpieras.com`
 - Contact phone: Set privately in App Store Connect; never commit it here.
-- Sign-in required: No. The reviewer uses the private pairing credential in
-  the review notes; dedicated agent accounts remain on the isolated worker.
+- Sign-in required: No. The built-in offline demo provides the complete review
+  path without an account or pairing credential.
 
 ## Review notes
 
@@ -121,26 +122,20 @@ by the Mac app; the code contains a short-lived SSH key restricted to
 authorizing that device key and cannot open a shell. Camera frames are
 processed only on the device.
 
-For App Review, we provide an isolated worker containing only synthetic
-repositories and dedicated, limited agent accounts. It is not connected to our
-private workers or Tailscale network. The private review pairing code is:
-
-`[PASTE CURRENT CODE FROM MAINTAINER KEYCHAIN BEFORE SUBMISSION]`
+The review path is built into the submitted app and makes no network requests:
 
 1. Launch Terminal Relay on iPhone or iPad.
-2. On the Projects screen, choose **Scan Mac Pairing Code**.
-3. Choose **Paste Pairing Code** and paste the code above.
-4. Open `atlas` and start Codex or Claude. This uses the same interactive
-   terminal, SSH/session flow, and interface as every user-owned worker.
-5. Switch between `atlas`, `launchpad`, and `northstar`, reconnect to the active
-   terminal, stop it, and open **Workers** to inspect account and resource
-   status.
+2. On the empty Projects screen, choose **Explore Demo**.
+3. Open `atlas`, then open **Build adaptive iPad workspace** to inspect the
+   complete native agent conversation, tools, diff, approval, and error states.
+4. Return to Projects and switch among `atlas`, `launchpad`, and `northstar`.
+5. Open **Workers** to inspect the synthetic worker, agent accounts, capacity,
+   and resource status.
 
-The invitation is valid through `[REVIEW EXPIRATION DATE]` for up to eight
-review devices. Review device keys can run only Terminal Relay worker commands
-and cannot request a general SSH shell or forwarding. The worker will remain
-online throughout review. Real users pair with their own private workers using
-the normal ten-minute, single-use Mac QR code.
+The demo uses only bundled synthetic data (`worker.example.com`, example
+repositories, and example accounts). Nothing is persisted as a real worker.
+Real users pair with their own private workers using the normal ten-minute,
+single-use Mac QR code.
 
 ## Export compliance facts
 
@@ -197,8 +192,5 @@ account, SSH-key, and pairing values and never connect to a real worker.
 
 ## Remaining submission actions
 
-- Provision and authenticate the isolated App Review worker, create its
-  invitation, and paste the pairing code and expiration date into Review
-  Notes.
 - Upload signed universal build 7, attach it to version 1.0, and submit it for
   review.

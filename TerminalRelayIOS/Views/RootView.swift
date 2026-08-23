@@ -313,6 +313,11 @@ struct RootView: View {
                             showsProjectsAfterSave: true
                         )
                     }
+
+                    Button("Explore Demo") {
+                        model.enterDemoMode()
+                        selectedTab = .projects
+                    }
                 }
             } else {
                 Group {
