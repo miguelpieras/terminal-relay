@@ -1083,7 +1083,6 @@ struct ContentView: View {
                 ProjectThreadRow(
                     thread: thread,
                     projectName: project.displayName,
-                    accountLabel: accountLabel(for: thread, workerID: project.serverID),
                     onResume: {
                         resumeThread(thread, for: project)
                     },
@@ -1550,18 +1549,6 @@ struct ContentView: View {
         }
 
         navigate(to: .newProject(ProjectProfile(serverID: worker.id)))
-    }
-
-    private func accountLabel(
-        for thread: WorkerThreadSnapshot,
-        workerID: UUID
-    ) -> String {
-        guard let accountID = thread.accountID else { return "Legacy" }
-        return providerAccountService.account(
-            workerID: workerID,
-            provider: thread.kind,
-            accountID: accountID
-        )?.displayName ?? String(accountID.rawValue.prefix(8))
     }
 
     private func openTerminal(_ kind: AgentKind, for project: ProjectProfile) {
@@ -2300,15 +2287,6 @@ private struct ProjectSidebarSection: View {
         return session.status.occupiesSlot ? 1 : 3
     }
 
-    private func accountLabel(for thread: WorkerThreadSnapshot) -> String {
-        guard let accountID = thread.accountID else { return "Legacy" }
-        return providerAccountService.account(
-            workerID: project.serverID,
-            provider: thread.kind,
-            accountID: accountID
-        )?.displayName ?? String(accountID.rawValue.prefix(8))
-    }
-
     private var sessionsWithThreadIDs: [TerminalSession] {
         allSessions.filter { $0.threadID != nil }
     }
@@ -2640,7 +2618,6 @@ private struct ProjectSidebarSection: View {
                     ForEach(matchingDormantThreads) { thread in
                         ProjectThreadRow(
                             thread: thread,
-                            accountLabel: accountLabel(for: thread),
                             onResume: {
                                 Task { await onResumeThread(thread) }
                             },
@@ -2691,7 +2668,6 @@ private struct ProjectSidebarSection: View {
                                 ProjectThreadRow(
                                     thread: thread,
                                     isArchived: true,
-                                    accountLabel: accountLabel(for: thread),
                                     onResume: {}
                                 )
                                     .contextMenu {
@@ -2818,7 +2794,6 @@ private struct ProjectThreadRow: View {
     let thread: WorkerThreadSnapshot
     var isArchived = false
     var projectName: String? = nil
-    var accountLabel: String? = nil
     let onResume: () -> Void
     var onArchive: (() -> Void)? = nil
 
@@ -2862,12 +2837,6 @@ private struct ProjectThreadRow: View {
                             isInteractive ? SidebarPalette.primary : SidebarPalette.secondary
                         )
                         .lineLimit(1)
-                    if let accountLabel {
-                        Text("\(thread.kind.displayName) · \(accountLabel)")
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundStyle(SidebarPalette.tertiary)
-                            .lineLimit(1)
-                    }
                     Spacer(minLength: 5)
                     if let projectName {
                         Text(projectName)
@@ -2955,11 +2924,6 @@ private struct ProjectSessionRow: View {
                                 ? SidebarPalette.primary
                                 : SidebarPalette.secondary
                         )
-                        .lineLimit(1)
-
-                    Text("\(session.kind.displayName) · \(session.accountLabel)")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundStyle(SidebarPalette.tertiary)
                         .lineLimit(1)
 
                     Spacer(minLength: 5)

@@ -1388,24 +1388,18 @@ private struct TerminalPane: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 9) {
-                    Label(
-                        "\(session.kind.displayName) · \(session.accountLabel)",
-                        systemImage: "person.crop.circle"
-                    )
+                    AgentBrandIcon(kind: session.kind, size: 13)
+                    Text(session.accountLabel)
+                        .lineLimit(1)
+                        .accessibilityLabel(
+                            "\(session.kind.displayName) · \(session.accountLabel)"
+                        )
                     Text("·")
                         .foregroundStyle(.tertiary)
                     Text(session.status.label)
                         .foregroundStyle(.secondary)
 
-                    if let terminalTitle = session.terminalTitle, !terminalTitle.isEmpty {
-                        Text("·")
-                            .foregroundStyle(.tertiary)
-                        Text(terminalTitle)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-
-                    if let clientCount = session.remoteAttachedClientCount {
+                    if let clientCount = session.remoteAttachedClientCount, clientCount > 0 {
                         Text("·")
                             .foregroundStyle(.tertiary)
                         Text("\(clientCount) \(clientCount == 1 ? "client" : "clients")")
