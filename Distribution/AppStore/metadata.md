@@ -10,7 +10,7 @@
 - Apple ID: `6804198744`
 - App Store Connect status: Prepare for Submission
 - Version: 1.0
-- Current upload build: 7
+- Current upload build: 8
 - Copyright: 2026 AMURA VENTURES SL
 - Primary category: Developer Tools
 - Secondary category: Utilities
@@ -144,12 +144,14 @@ single-use Mac QR code.
   Swift Crypto.
 - It relies only on encryption built into Apple's operating system: No.
 - It implements proprietary or non-standard cryptography: No.
-- App Store Connect classification: Non-exempt encryption. The app implements
-  industry-standard encryption outside Apple's operating system and is not
-  distributed in France.
+- App Store Connect classification: Exempt from export documentation. The app
+  implements industry-standard encryption outside Apple's operating system and
+  is not distributed in France.
 - Required documentation: None for the selected availability.
 
-`ITSAppUsesNonExemptEncryption` is set to `YES`. No
+`ITSAppUsesNonExemptEncryption` is set to `NO` because Apple's classification
+determined that the app's encryption use is exempt from documentation for the
+selected availability. No
 `ITSEncryptionExportComplianceCode` is included because no documentation is
 required for the selected availability.
 
@@ -192,5 +194,5 @@ account, SSH-key, and pairing values and never connect to a real worker.
 
 ## Remaining submission actions
 
-- Upload signed universal build 7, attach it to version 1.0, and submit it for
+- Upload signed universal build 8, attach it to version 1.0, and submit it for
   review.
