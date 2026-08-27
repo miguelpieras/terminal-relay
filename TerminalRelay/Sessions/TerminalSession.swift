@@ -198,7 +198,9 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
         presentation: WorkerSessionPresentation = .terminal,
         launchState: TerminalSessionLaunchState = .ready,
         launchDefaults: AgentLaunchDefaults = .standard,
-        initialChatState: ConversationState? = nil
+        initialChatState: ConversationState? = nil,
+        chatTransport: (any ChatTransport)? = nil,
+        chatRetryPolicy: ChatRetryPolicy = .standard
     ) {
         self.id = id
         self.terminalViewIdentity = terminalViewIdentity
@@ -236,7 +238,7 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
             )
             self.chatCoordinator = nil
         case .chat:
-            let transport = MacChatTransport(
+            let transport = chatTransport ?? MacChatTransport(
                 configuration: SSHCommandBuilder.workerChatAttachConfiguration(
                     for: server,
                     kind: kind,
@@ -265,7 +267,8 @@ final class TerminalSession: NSObject, ObservableObject, Identifiable {
                     accountID: account?.accountID ?? accountID,
                     providerThreadID: resolvedThreadID
                 ),
-                launchOptions: launchDefaults.chatOptions(for: kind)
+                launchOptions: launchDefaults.chatOptions(for: kind),
+                retryPolicy: chatRetryPolicy
             )
         }
         self.terminalView = LocalProcessTerminalView(frame: NSRect(x: 0, y: 0, width: 900, height: 600))

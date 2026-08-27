@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 @testable import TerminalRelay
 
@@ -58,6 +59,13 @@ final class ConversationCoordinatorTests: XCTestCase {
         await coordinator.detach()
         let commands = await transport.sentEnvelopes()
         XCTAssertEqual(commands.last?.type, "session.detach")
+        XCTAssertEqual(store.state.connectionState, .offlineAgentRunning)
+        XCTAssertNil(store.state.lastErrorMessage)
+        // The detach park is deliberate: no reconnect attempt may follow it.
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        let attaches = await transport.sentEnvelopes()
+            .filter { $0.type == "session.attach" }
+        XCTAssertEqual(attaches.count, 1)
         XCTAssertEqual(store.state.connectionState, .offlineAgentRunning)
     }
 
@@ -1070,7 +1078,8 @@ final class ConversationCoordinatorTests: XCTestCase {
                 initialDelayNanoseconds: 0,
                 maximumDelayNanoseconds: 0,
                 attachResponseGraceNanoseconds: 10_000_000,
-                connectingGraceNanoseconds: 200_000_000
+                connectingGraceNanoseconds: 200_000_000,
+                slowRetryIntervalNanoseconds: 5_000_000
             )
         )
         coordinator.start()
@@ -1083,6 +1092,13 @@ final class ConversationCoordinatorTests: XCTestCase {
         XCTAssertNil(store.state.lastErrorMessage)
         await waitUntil { store.state.connectionState == .failed }
         XCTAssertNotNil(store.state.lastErrorMessage)
+        // The wedged-broker verdict is terminal: even with a slow-lane
+        // interval configured, no reconnect attempt may follow it.
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        let attaches = await transport.sentEnvelopes()
+            .filter { $0.type == "session.attach" }
+        XCTAssertEqual(attaches.count, 1)
+        XCTAssertEqual(store.state.connectionState, .failed)
         await coordinator.detach()
     }
 
@@ -1118,11 +1134,14 @@ final class ConversationCoordinatorTests: XCTestCase {
         await coordinator.detach()
     }
 
-    func testAttachesThatDeliverNothingExhaustTheRetryBudget() async {
-        // Undelivered attaches must consume the retry budget — the send
-        // "succeeding" into a local pipe must not refresh it — so a truly
-        // unreachable worker still ends in an honest retryable failure
-        // instead of reconnecting forever.
+    func testAttachesThatDeliverNothingEnterTheSlowLaneAndKeepAttaching() async {
+        // Undelivered attaches must consume the fast budget — the send
+        // "succeeding" into a local pipe must not refresh it — but a truly
+        // unreachable worker now escalates into the slow lane under the
+        // reconnect notice and keeps attaching at the slow cadence (the
+        // watchdog must keep tearing down undelivered attaches even though
+        // the lane never publishes .connecting). Detach mid-lane stays
+        // detached.
         let transport = ChatFixtureTransport()
         let store = ConversationStore()
         let coordinator = ConversationCoordinator(
@@ -1134,14 +1153,258 @@ final class ConversationCoordinatorTests: XCTestCase {
                 initialDelayNanoseconds: 1_000_000,
                 maximumDelayNanoseconds: 1_000_000,
                 attachResponseGraceNanoseconds: 20_000_000,
-                connectingGraceNanoseconds: 10_000_000_000
+                connectingGraceNanoseconds: 10_000_000_000,
+                slowRetryIntervalNanoseconds: 10_000_000
             )
         )
         coordinator.start()
-        await waitUntil { store.state.connectionState == .offlineAgentRunning }
-        XCTAssertNotNil(store.state.lastErrorMessage)
+        await waitUntil {
+            store.state.connectionState == .offlineAgentRunning
+                && store.state.lastErrorMessage == Self.slowLaneNotice
+        }
+        let attachesAtNotice = await transport.sentEnvelopes()
+            .filter { $0.type == "session.attach" }.count
+        XCTAssertGreaterThanOrEqual(attachesAtNotice, 2)
+        await waitUntil(timeoutNanoseconds: 3_000_000_000) {
+            await transport.sentEnvelopes()
+                .filter { $0.type == "session.attach" }.count >= attachesAtNotice + 2
+        }
+        XCTAssertEqual(store.state.connectionState, .offlineAgentRunning)
+        XCTAssertEqual(store.state.lastErrorMessage, Self.slowLaneNotice)
+
+        await coordinator.detach()
+        let attachesAfterDetach = await transport.sentEnvelopes()
+            .filter { $0.type == "session.attach" }.count
+        try? await Task.sleep(nanoseconds: 60_000_000)
+        let attachesAfterWaiting = await transport.sentEnvelopes()
+            .filter { $0.type == "session.attach" }.count
+        XCTAssertEqual(attachesAfterWaiting, attachesAfterDetach)
+        XCTAssertEqual(store.state.connectionState, .offlineAgentRunning)
+    }
+
+    func testConnectFailuresEscalateToTheSlowLaneAndKeepRetrying() async {
+        // Exhausting the fast budget must not park the conversation. With a
+        // slow-lane interval configured, the loop escalates to an honest
+        // reconnecting notice and keeps attempting at the slow cadence for
+        // as long as the conversation stays open; detach mid-sleep still
+        // stops it cold.
+        let transport = SlowLaneScriptedTransport(failuresBeforeSuccess: .max)
+        let store = ConversationStore()
+        let coordinator = ConversationCoordinator(
+            store: store,
+            transport: transport,
+            identity: ChatTestFixtures.identity,
+            retryPolicy: ChatRetryPolicy(
+                maximumAutomaticRetries: 1,
+                initialDelayNanoseconds: 1_000_000,
+                maximumDelayNanoseconds: 1_000_000,
+                slowRetryIntervalNanoseconds: 10_000_000
+            )
+        )
+        coordinator.start()
+        await waitUntil {
+            store.state.connectionState == .offlineAgentRunning
+                && store.state.lastErrorMessage == Self.slowLaneNotice
+        }
+        let attemptsAtNotice = await transport.connectAttemptCount()
+        await waitUntil(timeoutNanoseconds: 3_000_000_000) {
+            await transport.connectAttemptCount() >= attemptsAtNotice + 2
+        }
+        XCTAssertEqual(store.state.connectionState, .offlineAgentRunning)
+        XCTAssertEqual(store.state.lastErrorMessage, Self.slowLaneNotice)
+
+        await coordinator.detach()
+        let attemptsAfterDetach = await transport.connectAttemptCount()
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        let attemptsAfterWaiting = await transport.connectAttemptCount()
+        XCTAssertEqual(attemptsAfterWaiting, attemptsAfterDetach)
+    }
+
+    func testSlowLaneNoticeHoldsSteadyAndOneEnvelopeClearsIt() async {
+        // Across consecutive failed slow-lane attempts the published state
+        // must hold at .offlineAgentRunning with the notice — the loop's
+        // bare .connecting publications would wipe the message and flicker
+        // the UI. The first delivered envelope clears the notice and
+        // restores the fast retry budget.
+        let hellos = (1...8).map { Self.hello(sequence: Int64($0)) }
+        let transport = SlowLaneScriptedTransport(
+            failuresBeforeSuccess: 5,
+            attachResponse: { attach in
+                attach <= hellos.count ? hellos[attach - 1] : nil
+            }
+        )
+        let store = ConversationStore()
+        let coordinator = ConversationCoordinator(
+            store: store,
+            transport: transport,
+            identity: ChatTestFixtures.identity,
+            retryPolicy: ChatRetryPolicy(
+                maximumAutomaticRetries: 1,
+                initialDelayNanoseconds: 1_000_000,
+                maximumDelayNanoseconds: 1_000_000,
+                slowRetryIntervalNanoseconds: 10_000_000
+            )
+        )
+        var published: [(ChatConnectionState, String?)] = []
+        let subscription = store.$state.sink { state in
+            published.append((state.connectionState, state.lastErrorMessage))
+        }
+        defer { subscription.cancel() }
+
+        coordinator.start()
+        await waitUntil(timeoutNanoseconds: 3_000_000_000) {
+            store.state.connectionState == .streaming
+        }
+        XCTAssertNil(store.state.lastErrorMessage)
+        let attemptsToRecover = await transport.connectAttemptCount()
+        XCTAssertEqual(attemptsToRecover, 6)
+
+        let recorded = published
+        guard let noticeStart = recorded.firstIndex(where: {
+            $0.0 == .offlineAgentRunning && $0.1 == Self.slowLaneNotice
+        }), let clearIndex = recorded[noticeStart...].firstIndex(where: {
+            $0.0 == .streaming
+        }) else {
+            XCTFail("The slow-lane notice or the clearing envelope never published")
+            await coordinator.detach()
+            return
+        }
+        for entry in recorded[noticeStart..<clearIndex] {
+            XCTAssertEqual(entry.0, .offlineAgentRunning)
+            XCTAssertEqual(entry.1, Self.slowLaneNotice)
+        }
+
+        // A fresh recoverable disconnect must take the fast lane again —
+        // proof the delivered envelope reset the budget rather than leaving
+        // the loop suppressed in slow-lane mode.
+        await transport.emitRemoteDisconnect(
+            ChatTransportFailure(
+                category: "network",
+                message: "Connection was interrupted.",
+                isRecoverable: true
+            )
+        )
+        await waitUntil {
+            published[recorded.count...].contains { $0.0 == .connecting && $0.1 == nil }
+        }
+        await waitUntil { store.state.connectionState == .streaming }
         await coordinator.detach()
     }
+
+    func testFailedSendExpeditesTheSlowLaneReconnect() async {
+        // A user actively sending must not wait out the slow-lane interval:
+        // the failed send restores the draft and cuts the pending sleep
+        // short so the next connect attempt starts immediately.
+        let transport = SlowLaneScriptedTransport(failuresBeforeSuccess: .max)
+        let store = ConversationStore()
+        let coordinator = ConversationCoordinator(
+            store: store,
+            transport: transport,
+            identity: ChatTestFixtures.identity,
+            retryPolicy: ChatRetryPolicy(
+                maximumAutomaticRetries: 1,
+                initialDelayNanoseconds: 1_000_000,
+                maximumDelayNanoseconds: 1_000_000,
+                slowRetryIntervalNanoseconds: 60_000_000_000
+            )
+        )
+        coordinator.start()
+        await waitUntil {
+            store.state.connectionState == .offlineAgentRunning
+                && store.state.lastErrorMessage == Self.slowLaneNotice
+        }
+        let attemptsBeforeSend = await transport.connectAttemptCount()
+
+        store.draft = "Send while offline"
+        await coordinator.sendDraft()
+
+        await waitUntil {
+            await transport.connectAttemptCount() > attemptsBeforeSend
+        }
+        XCTAssertEqual(store.draft, "Send while offline")
+        await coordinator.detach()
+    }
+
+    func testNonRecoverableConnectFailureGoesTerminalOnFirstAttempt() async {
+        // Host-key and authentication failures surface as throws from
+        // connect(). They must fail fast into .failed with their own
+        // actionable message — never burn the retry budget or loop forever
+        // in the slow lane behind a generic reconnect notice.
+        let transport = SlowLaneScriptedTransport(
+            failuresBeforeSuccess: .max,
+            connectFailure: ChatTransportFailure(
+                category: "host_key",
+                message: "The worker's host key changed. Pair it again.",
+                isRecoverable: false
+            )
+        )
+        let store = ConversationStore()
+        let coordinator = ConversationCoordinator(
+            store: store,
+            transport: transport,
+            identity: ChatTestFixtures.identity,
+            retryPolicy: ChatRetryPolicy(
+                maximumAutomaticRetries: 3,
+                initialDelayNanoseconds: 1_000_000,
+                maximumDelayNanoseconds: 1_000_000,
+                slowRetryIntervalNanoseconds: 5_000_000
+            )
+        )
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .failed }
+        XCTAssertEqual(
+            store.state.lastErrorMessage,
+            "The worker's host key changed. Pair it again."
+        )
+        let attemptsAtFailure = await transport.connectAttemptCount()
+        XCTAssertEqual(attemptsAtFailure, 1)
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        let attemptsAfterWaiting = await transport.connectAttemptCount()
+        XCTAssertEqual(attemptsAfterWaiting, 1)
+        await coordinator.detach()
+    }
+
+    func testStartAfterTerminalParkRunsAFreshLoopWithAFullBudget() async {
+        // With a 0-interval policy, exhaustion still parks terminally. A
+        // later start() — the iOS foreground path — must run a fresh loop
+        // with the full fast budget, not resume a spent one: two more
+        // attempts fit before the transport recovers on the fourth.
+        let hellos = (1...4).map { Self.hello(sequence: Int64($0)) }
+        let transport = SlowLaneScriptedTransport(
+            failuresBeforeSuccess: 3,
+            attachResponse: { attach in
+                attach <= hellos.count ? hellos[attach - 1] : nil
+            }
+        )
+        let store = ConversationStore()
+        let coordinator = ConversationCoordinator(
+            store: store,
+            transport: transport,
+            identity: ChatTestFixtures.identity,
+            retryPolicy: ChatRetryPolicy(
+                maximumAutomaticRetries: 1,
+                initialDelayNanoseconds: 1_000_000,
+                maximumDelayNanoseconds: 1_000_000
+            )
+        )
+        coordinator.start()
+        await waitUntil {
+            store.state.connectionState == .offlineAgentRunning
+                && store.state.lastErrorMessage != nil
+        }
+        let attemptsAtPark = await transport.connectAttemptCount()
+        XCTAssertEqual(attemptsAtPark, 2)
+
+        coordinator.start()
+        await waitUntil { store.state.connectionState == .streaming }
+        XCTAssertNil(store.state.lastErrorMessage)
+        let attemptsAtRecovery = await transport.connectAttemptCount()
+        XCTAssertEqual(attemptsAtRecovery, 4)
+        await coordinator.detach()
+    }
+
+    private static let slowLaneNotice =
+        "Offline. Reconnecting automatically — Retry to try now."
 
     func testConnectingWatchdogStaysQuietOnceTheConversationProgresses() async {
         let transport = makeConnectedTransport()
@@ -1229,10 +1492,21 @@ final class ConversationCoordinatorTests: XCTestCase {
 
         await coordinator.stop()
         XCTAssertEqual(store.state.connectionState, .offlineAgentRunning)
+        XCTAssertEqual(
+            store.state.lastErrorMessage,
+            "Stop was sent, but the worker did not confirm it. Retry before trying again."
+        )
         await coordinator.stop()
         let stops = await transport.sentEnvelopes().filter { $0.type == "session.stop" }
         XCTAssertEqual(stops.count, 2)
         XCTAssertEqual(stops.first?.requestID, stops.last?.requestID)
+        // The unconfirmed-stop park keeps its actionable message and stays
+        // parked: no reconnect attempt may follow it.
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        let attaches = await transport.sentEnvelopes()
+            .filter { $0.type == "session.attach" }
+        XCTAssertEqual(attaches.count, 1)
+        XCTAssertEqual(store.state.connectionState, .offlineAgentRunning)
     }
 
     func testDetachDisconnectsBeforeAwaitingASuspendedConnect() async {

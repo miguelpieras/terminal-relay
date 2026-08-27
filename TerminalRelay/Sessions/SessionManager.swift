@@ -1060,7 +1060,7 @@ final class SessionManager: ObservableObject {
         return await stopAgent(sessionID: sessionID, on: worker, using: service)
     }
 
-    private func append(_ session: TerminalSession) {
+    func append(_ session: TerminalSession) {
         sessions.append(session)
         observe(session)
     }

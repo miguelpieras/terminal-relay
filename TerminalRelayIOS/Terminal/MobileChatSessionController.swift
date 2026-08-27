@@ -139,7 +139,12 @@ final class MobileChatSessionController: ObservableObject {
             start()
         case .chat:
             coordinator?.start()
-        case .terminal, .failed:
+        case .failed:
+            // A cold open during an outage dies in prepare() one layer above
+            // the coordinator's retry lanes; foregrounding is the natural
+            // moment the network is likely back.
+            retryPreparation()
+        case .terminal:
             break
         }
     }

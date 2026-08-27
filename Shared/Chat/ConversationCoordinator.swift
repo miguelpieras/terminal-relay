@@ -18,11 +18,16 @@ struct ChatRetryPolicy: Equatable, Sendable {
     // reports a terminal session.ended, so this fires only when the broker is
     // wedged past its own deadline — the one case Retry cannot fix.
     var connectingGraceNanoseconds: UInt64 = 150_000_000_000
+    // Cadence of the slow lane entered once the fast retry budget is spent.
+    // Zero keeps exhaustion terminal — the offline demo and tests rely on
+    // that to avoid a zero-delay busy loop.
+    var slowRetryIntervalNanoseconds: UInt64 = 0
 
     static let standard = ChatRetryPolicy(
         maximumAutomaticRetries: 5,
         initialDelayNanoseconds: 500_000_000,
-        maximumDelayNanoseconds: 8_000_000_000
+        maximumDelayNanoseconds: 8_000_000_000,
+        slowRetryIntervalNanoseconds: 30_000_000_000
     )
 
     static let immediate = ChatRetryPolicy(
@@ -121,6 +126,11 @@ final class ConversationCoordinator {
     private var retryTask: Task<Void, Never>?
     private var retrySleepTask: Task<Void, Never>?
     private var retrySleepToken: UUID?
+    // True while the connection loop is past its fast budget and holding
+    // the .offlineAgentRunning reconnect notice. The attach watchdog needs
+    // this: its "attach hasn't progressed" checks read .connecting, which
+    // the slow lane deliberately never publishes.
+    private var slowLaneActive = false
     private var connectingWatchdogTask: Task<Void, Never>?
     private var attachGeneration: UInt64 = 0
     private var shouldStayConnected = false
@@ -459,6 +469,9 @@ final class ConversationCoordinator {
                         attachments: failedTurn.attachments
                     )
                 }
+                // A user actively sending should not wait out a pending
+                // reconnect backoff — especially the slow-lane interval.
+                expediteReconnectIfWaiting()
                 throw error
             }
             return true
@@ -689,8 +702,10 @@ final class ConversationCoordinator {
 
     private func runConnectionLoop(lifecycleEpoch epoch: UInt64) async {
         var retryCount = 0
+        slowLaneActive = false
         defer {
             if lifecycleEpoch == epoch {
+                slowLaneActive = false
                 lifecycleTask = nil
             }
         }
@@ -720,6 +735,7 @@ final class ConversationCoordinator {
                         // reset the budget, a transport that spawns but never
                         // delivers would be reconnected forever.
                         retryCount = 0
+                        slowLaneActive = false
                         hasReceivedEnvelopeSinceAttach = true
                         if await apply(envelope, lifecycleEpoch: epoch) {
                             break eventLoop
@@ -730,7 +746,11 @@ final class ConversationCoordinator {
                         if let failure, !failure.isRecoverable {
                             shouldStayConnected = false
                             store.setConnectionState(.failed, message: failure.message)
-                        } else {
+                        } else if !slowLaneActive {
+                            // In the slow lane the state holds at
+                            // .offlineAgentRunning with its notice — a bare
+                            // .connecting would wipe the message and flicker
+                            // the UI on every failed attempt.
                             store.setConnectionState(.connecting)
                         }
                         break eventLoop
@@ -746,24 +766,54 @@ final class ConversationCoordinator {
                 resetReconnectScopedState()
                 await transport.disconnect()
                 guard canContinueLifecycle(epoch) else { return }
-                store.setConnectionState(.connecting)
+                // Host-key and authentication failures surface as throws from
+                // connect(); retrying cannot fix them, so they must go
+                // terminal with their own actionable message — never into
+                // the retry lanes behind a generic reconnect notice.
+                if let failure = error as? ChatTransportFailure,
+                   !failure.isRecoverable {
+                    shouldStayConnected = false
+                    store.setConnectionState(.failed, message: failure.message)
+                    return
+                }
+                if !slowLaneActive {
+                    store.setConnectionState(.connecting)
+                }
             }
 
             guard canContinueLifecycle(epoch) else { return }
             retryCount += 1
-            guard retryCount <= retryPolicy.maximumAutomaticRetries else {
+            if retryCount > retryPolicy.maximumAutomaticRetries {
+                guard retryPolicy.slowRetryIntervalNanoseconds > 0 else {
+                    store.setConnectionState(
+                        .offlineAgentRunning,
+                        message: "Lost the connection to this conversation. Tap Retry to reconnect."
+                    )
+                    shouldStayConnected = false
+                    return
+                }
+                // Slow lane: exhaustion is not terminal for recoverable
+                // failures. Keep attempting at a calm cadence for as long as
+                // the conversation stays open; only received traffic (which
+                // resets retryCount) leaves the lane. .offlineAgentRunning
+                // carries the notice — .connecting would latch composers and
+                // placeholder UI that must stay usable while offline.
+                slowLaneActive = true
                 store.setConnectionState(
                     .offlineAgentRunning,
-                    message: "Lost the connection to this conversation. Tap Retry to reconnect."
+                    message: "Offline. Reconnecting automatically — Retry to try now."
                 )
-                shouldStayConnected = false
-                return
             }
-            let multiplier = UInt64(1 << min(retryCount - 1, 10))
-            let delay = min(
-                retryPolicy.initialDelayNanoseconds * multiplier,
-                retryPolicy.maximumDelayNanoseconds
-            )
+            let delay: UInt64
+            if retryCount > retryPolicy.maximumAutomaticRetries {
+                delay = retryPolicy.slowRetryIntervalNanoseconds
+            } else {
+                let multiplier = UInt64(1 << min(retryCount - 1, 10))
+                delay = min(
+                    retryPolicy.initialDelayNanoseconds * multiplier,
+                    retryPolicy.maximumDelayNanoseconds
+                )
+            }
             if delay > 0 {
                 // A cancellable child so opening the conversation can cut the
                 // backoff short without tearing down the connection loop.
@@ -777,7 +827,7 @@ final class ConversationCoordinator {
                     retrySleepToken = nil
                 }
             }
-            if canContinueLifecycle(epoch) {
+            if canContinueLifecycle(epoch), !slowLaneActive {
                 store.setConnectionState(.connecting)
             }
         }
@@ -832,7 +882,7 @@ final class ConversationCoordinator {
         guard canContinueLifecycle(epoch),
               attachGeneration == generation,
               isAttached,
-              store.workingConnectionState == .connecting else {
+              connectionStateAwaitsAttachProgress else {
             return false
         }
         guard !hasReceivedEnvelopeSinceAttach else { return true }
@@ -846,6 +896,18 @@ final class ConversationCoordinator {
         return false
     }
 
+    // The watchdog's "attach hasn't progressed" reading. During normal
+    // attempts that is the published .connecting; during the slow lane the
+    // loop deliberately holds .offlineAgentRunning with the reconnect
+    // notice instead, and an undelivered attach must still be torn down —
+    // otherwise the lane would wedge on a transport that spawns but never
+    // delivers.
+    private var connectionStateAwaitsAttachProgress: Bool {
+        store.workingConnectionState == .connecting
+            || (slowLaneActive
+                && store.workingConnectionState == .offlineAgentRunning)
+    }
+
     private func handleConnectingWatchdogExpiry(
         lifecycleEpoch epoch: UInt64,
         attachGeneration generation: UInt64
@@ -853,7 +915,7 @@ final class ConversationCoordinator {
         guard canContinueLifecycle(epoch),
               attachGeneration == generation,
               isAttached,
-              store.workingConnectionState == .connecting else {
+              connectionStateAwaitsAttachProgress else {
             return
         }
         shouldStayConnected = false

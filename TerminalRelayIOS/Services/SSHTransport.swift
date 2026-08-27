@@ -340,6 +340,10 @@ private final class SSHExecOperation {
         let userAuth = PrivateKeyAuthenticationDelegate(username: profile.username, privateKey: privateKey)
         let serverAuth = PinnedHostKeyDelegate(expectedFingerprint: profile.expectedHostKeyFingerprint)
         let bootstrap = ClientBootstrap(group: group)
+            // Under NIO's default 10s the connect failure lands exactly on
+            // the coordinator's 10s attach grace; 8s keeps a dead tunnel
+            // attributed to the connect, not the watchdog.
+            .connectTimeout(.seconds(8))
             .channelInitializer { [weak self] channel in
                 channel.eventLoop.makeCompletedFuture {
                     let sshHandler = NIOSSHHandler(
@@ -638,6 +642,7 @@ final class SSHStreamingExecConnection {
             expectedFingerprint: profile.expectedHostKeyFingerprint
         )
         let bootstrap = ClientBootstrap(group: group)
+            .connectTimeout(.seconds(8))
             .channelInitializer { [weak self] channel in
                 channel.eventLoop.makeCompletedFuture {
                     let sshHandler = NIOSSHHandler(
@@ -1010,6 +1015,7 @@ final class SSHTerminalConnection {
         let userAuth = PrivateKeyAuthenticationDelegate(username: profile.username, privateKey: privateKey)
         let serverAuth = PinnedHostKeyDelegate(expectedFingerprint: profile.expectedHostKeyFingerprint)
         let bootstrap = ClientBootstrap(group: group)
+            .connectTimeout(.seconds(8))
             .channelInitializer { [weak self] channel in
                 channel.eventLoop.makeCompletedFuture {
                     let sshHandler = NIOSSHHandler(

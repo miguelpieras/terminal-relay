@@ -739,6 +739,119 @@ final class SessionManagerTests: XCTestCase {
         )
     }
 
+    func testWorkerListingOmissionStopsASlowLaneChatLoop() async {
+        // Mac coordinators live inside persistent sessions and the slow lane
+        // retries indefinitely, so the status-derived reconcile guards are
+        // what end a loop whose conversation died while unreachable:
+        // .offlineAgentRunning maps to .remoteRunning (canReconnect), the
+        // omitted listing reaches markRemoteExited, and the detach must
+        // leave no further transport connects.
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let manager = SessionManager()
+        let transport = SlowLaneScriptedTransport(failuresBeforeSuccess: .max)
+        let session = await makeSlowLaneChatSession(
+            server: server,
+            project: project,
+            transport: transport
+        )
+        manager.append(session)
+        let attemptsInLane = await transport.connectAttemptCount()
+        for _ in 0..<400 {
+            if await transport.connectAttemptCount() > attemptsInLane { break }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let attemptsStillGrowing = await transport.connectAttemptCount()
+        XCTAssertGreaterThan(attemptsStillGrowing, attemptsInLane)
+
+        manager.reconcile(
+            worker: server,
+            projects: [project],
+            response: WorkerSessionResponse(
+                projects: [project.displayName],
+                sessions: []
+            ),
+            launchDefaults: .standard
+        )
+
+        XCTAssertEqual(session.status, .exited(nil))
+        await assertSlowLaneLoopStopped(transport: transport)
+    }
+
+    func testRemoteReplacementStopsASlowLaneChatLoop() async {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let transport = SlowLaneScriptedTransport(failuresBeforeSuccess: .max)
+        let session = await makeSlowLaneChatSession(
+            server: server,
+            project: project,
+            transport: transport
+        )
+
+        session.markRemoteReplaced()
+
+        XCTAssertEqual(session.status, .exited(nil))
+        await assertSlowLaneLoopStopped(transport: transport)
+    }
+
+    func testCompletedRemoteStopStopsASlowLaneChatLoop() async {
+        let server = makeServer(name: "Worker 1", host: "worker-1")
+        let project = makeProject(name: "Terminal Relay", server: server)
+        let transport = SlowLaneScriptedTransport(failuresBeforeSuccess: .max)
+        let session = await makeSlowLaneChatSession(
+            server: server,
+            project: project,
+            transport: transport
+        )
+
+        session.beginRemoteStop()
+        session.completeRemoteStop()
+
+        XCTAssertEqual(session.status, .exited(nil))
+        await assertSlowLaneLoopStopped(transport: transport)
+    }
+
+    private func makeSlowLaneChatSession(
+        server: ServerProfile,
+        project: ProjectProfile,
+        transport: SlowLaneScriptedTransport
+    ) async -> TerminalSession {
+        let session = TerminalSession(
+            project: project,
+            server: server,
+            kind: .claude,
+            sequenceNumber: 1,
+            instanceToken: "01234567-89ab-" + "4def-8abc-0123456789ab",
+            presentation: .chat,
+            chatTransport: transport,
+            chatRetryPolicy: ChatRetryPolicy(
+                maximumAutomaticRetries: 1,
+                initialDelayNanoseconds: 1_000_000,
+                maximumDelayNanoseconds: 1_000_000,
+                slowRetryIntervalNanoseconds: 10_000_000
+            )
+        )
+        session.startIfNeeded()
+        for _ in 0..<400 {
+            if session.status == .remoteRunning { break }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(session.status, .remoteRunning)
+        return session
+    }
+
+    private func assertSlowLaneLoopStopped(
+        transport: SlowLaneScriptedTransport
+    ) async {
+        // Let the async detach land, then require several slow-lane
+        // intervals to pass without a single new connect attempt.
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        let attemptsAfterStop = await transport.connectAttemptCount()
+        try? await Task.sleep(nanoseconds: 60_000_000)
+        let attemptsAfterWaiting = await transport.connectAttemptCount()
+        XCTAssertEqual(attemptsAfterWaiting, attemptsAfterStop)
+    }
+
     func testWorkerConfirmedTerminalRowKeepsTheExitedTreatmentWhenItVanishes() {
         let server = makeServer(name: "Worker 1", host: "worker-1")
         let project = makeProject(name: "Terminal Relay", server: server)

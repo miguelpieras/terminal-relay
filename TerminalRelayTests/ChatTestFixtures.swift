@@ -123,3 +123,86 @@ enum ChatTestFixtures {
         )
     }
 }
+
+/// Fails `connect()` a scripted number of times before succeeding, so tests
+/// can drive a coordinator through the fast retry budget into the slow
+/// lane and, optionally, back out via a delivered attach response.
+actor SlowLaneScriptedTransport: ChatTransport {
+    private let failuresBeforeSuccess: Int
+    private let connectFailure: ChatTransportFailure
+    private let attachResponse: @Sendable (Int) -> ChatEnvelope?
+    private var connectAttempts = 0
+    private var attachCount = 0
+    private var isConnected = false
+    private var stream: AsyncStream<ChatTransportEvent>
+    private var continuation: AsyncStream<ChatTransportEvent>.Continuation
+
+    init(
+        failuresBeforeSuccess: Int,
+        connectFailure: ChatTransportFailure = ChatTransportFailure(
+            category: "network",
+            message: "Connection refused.",
+            isRecoverable: true
+        ),
+        attachResponse: @escaping @Sendable (Int) -> ChatEnvelope? = { _ in nil }
+    ) {
+        self.failuresBeforeSuccess = failuresBeforeSuccess
+        self.connectFailure = connectFailure
+        self.attachResponse = attachResponse
+        let pair = AsyncStream.makeStream(of: ChatTransportEvent.self)
+        stream = pair.stream
+        continuation = pair.continuation
+    }
+
+    func connect() async throws {
+        connectAttempts += 1
+        guard connectAttempts > failuresBeforeSuccess else {
+            throw connectFailure
+        }
+        isConnected = true
+    }
+
+    func send(_ envelope: ChatEnvelope) async throws {
+        guard isConnected else {
+            throw ChatTransportFailure(
+                category: "not_connected",
+                message: "The chat transport is not connected.",
+                isRecoverable: true
+            )
+        }
+        if envelope.type == "session.attach" {
+            attachCount += 1
+            if let response = attachResponse(attachCount) {
+                continuation.yield(.envelope(response))
+            }
+        }
+    }
+
+    func disconnect(sendingBestEffort envelope: ChatEnvelope?) async {
+        guard isConnected else { return }
+        isConnected = false
+        continuation.finish()
+        let pair = AsyncStream.makeStream(of: ChatTransportEvent.self)
+        stream = pair.stream
+        continuation = pair.continuation
+    }
+
+    func events() async -> AsyncStream<ChatTransportEvent> {
+        stream
+    }
+
+    /// Mirrors a real remote failure: the transport emits `.disconnected`,
+    /// finishes its stream, and serves a fresh one on the next connect.
+    func emitRemoteDisconnect(_ failure: ChatTransportFailure?) {
+        continuation.yield(.disconnected(failure))
+        continuation.finish()
+        isConnected = false
+        let pair = AsyncStream.makeStream(of: ChatTransportEvent.self)
+        stream = pair.stream
+        continuation = pair.continuation
+    }
+
+    func connectAttemptCount() -> Int {
+        connectAttempts
+    }
+}

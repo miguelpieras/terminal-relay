@@ -291,6 +291,27 @@ final class MobileChatSessionControllerTests: XCTestCase {
         await waitForPhase(.chat, controller: controller)
     }
 
+    func testForegroundRetriesAFailedPreparation() async {
+        // A cold open during an outage dies in prepare(), one layer above
+        // the coordinator's retry lanes. Foregrounding the app must retry
+        // the preparation instead of leaving the dead-end failure phase.
+        let recorder = CommandRecorder(
+            capabilityData: capabilityData(available: true),
+            startData: startData(),
+            failuresRemaining: 1
+        )
+        let controller = makeNewController(recorder: recorder)
+
+        controller.start()
+        await waitForSettledPhase(controller)
+        guard case .failed = controller.phase else {
+            return XCTFail("Expected the outage cold open to fail")
+        }
+
+        controller.reconnectAfterForeground()
+        await waitForPhase(.chat, controller: controller)
+    }
+
     private func makeNewController(
         recorder: CommandRecorder
     ) -> MobileChatSessionController {
