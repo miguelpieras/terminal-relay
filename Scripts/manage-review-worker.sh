@@ -32,6 +32,7 @@ usage() {
     cat <<'EOF'
 Usage:
   ./Scripts/manage-review-worker.sh provision [--yes]
+  ./Scripts/manage-review-worker.sh repurpose <server-name> [--yes]
   ./Scripts/manage-review-worker.sh authenticate
   ./Scripts/manage-review-worker.sh invite [--days N] [--max-devices N]
   ./Scripts/manage-review-worker.sh copy-code
@@ -263,7 +264,8 @@ validate_server_json() {
         == "$review_server_name" \
         && "$(printf '%s' "$json" | /usr/bin/jq -r '.server_type.name')" \
         == "$review_server_type" \
-        && "$(printf '%s' "$json" | /usr/bin/jq -r '.datacenter.location.name')" \
+        && "$(printf '%s' "$json" \
+            | /usr/bin/jq -r '.datacenter.location.name // .location.name')" \
         == "$review_server_location" \
         && "$(printf '%s' "$json" \
             | /usr/bin/jq -r '.labels["managed-by"] // empty')" \
@@ -455,6 +457,113 @@ provision() {
     log "Authenticate dedicated reviewer accounts before creating the review invitation."
 }
 
+strip_private_worker_state() {
+    /usr/bin/ssh "${ssh_options[@]}" "root@$server_address" '
+set -euo pipefail
+/usr/bin/systemctl disable --now docker.socket docker.service node-exporter \
+    >/dev/null 2>&1 || true
+if command -v tailscale >/dev/null 2>&1; then
+    tailscale logout >/dev/null 2>&1 || true
+    apt-mark unhold tailscale >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get -y purge tailscale >/dev/null 2>&1 \
+        || true
+    /bin/rm -rf /var/lib/tailscale
+    command -v tailscale >/dev/null 2>&1 \
+        && { echo "tailscale could not be removed" >&2; exit 1; }
+fi
+if command -v ufw >/dev/null 2>&1; then
+    ufw --force disable >/dev/null 2>&1 || true
+fi
+/usr/bin/pkill -u terminal-relay || true
+/bin/rm -rf \
+    /home/terminal-relay/.codex \
+    /home/terminal-relay/.claude \
+    /home/terminal-relay/.claude.json \
+    /home/terminal-relay/.cache \
+    /home/terminal-relay/.local/share/terminal-relay
+/usr/bin/find /workspace -mindepth 1 -maxdepth 1 -exec /bin/rm -rf {} +
+'
+}
+
+repurpose_server() {
+    local assume_yes="$1"
+    local source_name="$2"
+    local runtime_version
+    local source_json
+    local json
+    local firewall_id
+    local response
+
+    [[ -n "$source_name" ]] \
+        || die "repurpose requires the name of an existing server"
+    [[ "$source_name" != "$review_server_name" ]] \
+        || die "the source server is already named as the review worker"
+    runtime_version="$("$stable_runtime_preflight")" \
+        || die "current runtime payload has not reached the signed stable feed"
+    verify_provider_project
+    if source_json="$(hcloud server describe "$source_name" -o json \
+        2>/dev/null)"; then
+        if review_server_json >/dev/null 2>&1; then
+            die "a review server already exists; retire it before repurposing"
+        fi
+        [[ "$(printf '%s' "$source_json" | /usr/bin/jq -r '.server_type.name')" \
+            == "$review_server_type" ]] \
+            || die "the source server type does not match the review baseline"
+        [[ "$(printf '%s' "$source_json" \
+            | /usr/bin/jq -r '.datacenter.location.name // .location.name')" \
+            == "$review_server_location" ]] \
+            || die "the source server location does not match the review baseline"
+        [[ "$(printf '%s' "$source_json" \
+            | /usr/bin/jq -r '(.private_net // []) | length')" == 0 ]] \
+            || die "the source server is attached to a private network"
+
+        if [[ "$assume_yes" != true ]]; then
+            printf 'Type REPURPOSE %s to wipe this worker (workspace, agent accounts, Tailscale) and convert it into the synthetic review worker: ' \
+                "$source_name" >/dev/tty
+            IFS= read -r response </dev/tty || die "confirmation was not provided"
+            [[ "$response" == "REPURPOSE $source_name" ]] || die "cancelled"
+        fi
+
+        ensure_review_firewall bootstrap "$(current_public_ipv4)"
+        hcloud server update "$source_name" --name "$review_server_name" \
+            >/dev/null
+        hcloud server add-label --overwrite "$review_server_name" \
+            managed-by=terminal-relay >/dev/null
+        hcloud server add-label --overwrite "$review_server_name" \
+            purpose=app-review >/dev/null
+    elif review_server_json >/dev/null 2>&1; then
+        log "Resuming an interrupted repurpose of the existing review server."
+        ensure_review_firewall bootstrap "$(current_public_ipv4)"
+    else
+        die "the source server is unavailable in the review project"
+    fi
+    json="$(review_server_json)" \
+        || die "the renamed review server is unavailable"
+    while IFS= read -r firewall_id; do
+        [[ -n "$firewall_id" && "$firewall_id" != "$review_firewall_id" ]] \
+            || continue
+        hcloud firewall remove-from-resource "$firewall_id" \
+            --type server --server "$review_server_name" >/dev/null
+    done < <(printf '%s' "$json" \
+        | /usr/bin/jq -r '(.public_net.firewalls // [])[].id')
+    if ! printf '%s' "$json" | /usr/bin/jq -e \
+        --argjson id "$review_firewall_id" \
+        '(.public_net.firewalls // []) | any(.id == $id)' >/dev/null; then
+        hcloud firewall apply-to-resource "$review_firewall_id" \
+            --type server --server "$review_server_name" >/dev/null
+        json="$(review_server_json)"
+    fi
+    validate_server_json "$json"
+    server_address="$(printf '%s' "$json" \
+        | /usr/bin/jq -er '.public_net.ipv4.ip')"
+    prepare_ssh
+    strip_private_worker_state
+    install_review_worker "$runtime_version"
+    ensure_review_firewall review
+    log "Repurposed $source_name as the isolated App Review worker."
+    log "Authenticate dedicated reviewer accounts before creating the review invitation."
+}
+
 authenticate() {
     resolve_existing_server
     if ! /usr/bin/ssh "${ssh_options[@]}" "terminal-relay@$server_address" \
@@ -620,13 +729,14 @@ main() {
     local assume_yes=false
     local days=30
     local maximum_devices=8
+    local source_server=""
 
     case "$command" in
         -h|--help|"")
             usage
             return
             ;;
-        provision|authenticate|invite|copy-code|reset|revoke|verify|retire)
+        provision|repurpose|authenticate|invite|copy-code|reset|revoke|verify|retire)
             shift
             ;;
         *)
@@ -634,6 +744,11 @@ main() {
             exit 64
             ;;
     esac
+
+    if [[ "$command" == repurpose && $# -ge 1 && "$1" != --* ]]; then
+        source_server="$1"
+        shift
+    fi
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -668,6 +783,7 @@ main() {
 
     case "$command" in
         provision) provision "$assume_yes" ;;
+        repurpose) repurpose_server "$assume_yes" "$source_server" ;;
         authenticate) authenticate ;;
         invite) create_invitation "$days" "$maximum_devices" ;;
         copy-code) copy_code ;;
