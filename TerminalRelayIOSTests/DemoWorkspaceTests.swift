@@ -3,31 +3,6 @@ import XCTest
 
 @MainActor
 final class DemoWorkspaceTests: XCTestCase {
-    func testEmptyModelCanEnterInteractiveDemoWithoutPersistingAWorker() {
-        let suiteName = "DemoWorkspaceTests.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suiteName)!
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-        let store = WorkerProfileStore(defaults: defaults)
-        let model = WorkerSessionModel(
-            profileStore: store,
-            readStateDefaults: defaults
-        )
-
-        XCTAssertTrue(model.profiles.isEmpty)
-
-        model.enterDemoMode()
-
-        XCTAssertTrue(model.isDemoMode)
-        XCTAssertEqual(model.profile, DemoWorkspace.worker)
-        XCTAssertEqual(model.projects, DemoWorkspace.projects)
-        XCTAssertEqual(model.sessions, DemoWorkspace.sessions)
-        XCTAssertEqual(
-            model.workerOverviews[DemoWorkspace.worker.id],
-            DemoWorkspace.overview
-        )
-        XCTAssertTrue(store.load().isEmpty)
-    }
-
     func testDemoWorkspaceLoadsBundledFixturesWithoutRefreshingAWorker() async {
         let model = WorkerSessionModel(screenshotDemo: true)
         let originalProjects = model.projects

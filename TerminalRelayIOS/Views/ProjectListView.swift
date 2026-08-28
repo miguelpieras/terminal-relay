@@ -133,10 +133,6 @@ struct ProjectListView: View {
                 } actions: {
                     Button("Scan Mac Pairing Code", action: onAddWorker)
                         .buttonStyle(.borderedProminent)
-
-                    Button("Explore Demo") {
-                        model.enterDemoMode()
-                    }
                 }
             } else {
                 projectList
