@@ -142,6 +142,10 @@ and cannot request a general SSH shell or forwarding. The worker will remain
 online throughout review. Real users pair with their own private workers using
 the normal ten-minute, single-use Mac QR code.
 
+Terminal Relay is our original work, developed in public at
+github.com/miguelpieras/terminal-relay (Apache License 2.0) by
+AMURA VENTURES SL.
+
 ## Export compliance facts
 
 - The app contains and uses encryption: Yes.

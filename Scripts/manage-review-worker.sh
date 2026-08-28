@@ -635,12 +635,12 @@ create_invitation() {
     code="$(< "$code_file")"
     [[ "$code" == terminal-relay://pair-device\?* ]] \
         || die "the generated review pairing code is invalid"
-    printf '%s' "$code" | /usr/bin/security add-generic-password \
+    /usr/bin/security add-generic-password \
         -U \
         -s "$keychain_service" \
         -a "$keychain_account" \
         -l "Terminal Relay App Review pairing code" \
-        -w >/dev/null
+        -w "$code" >/dev/null
     printf '%s' "$code" | /usr/bin/pbcopy
     code=""
     log "Created the reusable review invitation and copied it to the clipboard."
