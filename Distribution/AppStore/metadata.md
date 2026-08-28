@@ -10,7 +10,7 @@
 - Apple ID: `6804198744`
 - App Store Connect status: Prepare for Submission
 - Version: 1.0
-- Current upload build: 8
+- Current upload build: 9
 - Copyright: 2026 AMURA VENTURES SL
 - Primary category: Developer Tools
 - Secondary category: Utilities
