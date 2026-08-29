@@ -315,14 +315,16 @@ def parse_live_sessions(output, repository):
         fields = line.split("|")
         if fields[0] != "session":
             continue
-        if len(fields) not in (5, 7, 8, 9) or fields[2] != repository:
+        if len(fields) not in (5, 7, 8, 9, 10) or fields[2] != repository:
             continue
+        if len(fields) == 10 and fields[9] not in ("terminal", "chat"):
+            raise RuntimeError("The worker returned an invalid session presentation.")
         provider = fields[1]
         if provider not in ("codex", "claude"):
             continue
         instance_id = require_thread_id(fields[4])
         thread_id = instance_id if provider == "claude" else None
-        if len(fields) == 9 and fields[8]:
+        if len(fields) >= 9 and fields[8]:
             thread_id = require_thread_id(fields[8])
         if thread_id is None:
             continue

@@ -28,7 +28,8 @@ case "$1" in
     status)
         printf '%s\n' \
             '__TERMINAL_RELAY_SESSION_V1__' \
-            'session|claude|alpha|0|cccccccc-cccc-4ccc-8ccc-cccccccccccc|123||0|cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+            'session|claude|alpha|0|cccccccc-cccc-4ccc-8ccc-cccccccccccc|123||0|cccccccc-cccc-4ccc-8ccc-cccccccccccc|terminal' \
+            'session|codex|alpha|0|ffffffff-ffff-4fff-8fff-ffffffffffff|150|||99999999-9999-4999-8999-999999999999|chat'
         ;;
     threads-v2)
         if [[ "$3" == "slow" ]]; then
@@ -310,7 +311,21 @@ assert {(thread["provider"], thread["threadID"]) for thread in threads} == {
     ("codex", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
     ("claude", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
     ("claude", "cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+    ("codex", "99999999-9999-4999-8999-999999999999"),
 }
+live_chat = next(
+    thread
+    for thread in threads
+    if thread["threadID"] == "99999999-9999-4999-8999-999999999999"
+)
+assert live_chat["activityState"] == "relay-active"
+assert live_chat["activeInstanceToken"] == "ffffffff-ffff-4fff-8fff-ffffffffffff"
+live_terminal = next(
+    thread
+    for thread in threads
+    if thread["threadID"] == "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+)
+assert live_terminal["activityState"] == "relay-active"
 assert responses[4]["result"]["structuredContent"]["threads"][0]["title"] == "Managed task"
 resumed = responses[5]["result"]["structuredContent"]["threads"]
 assert resumed[0]["threadID"] == "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
