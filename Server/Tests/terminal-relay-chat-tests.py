@@ -1032,6 +1032,7 @@ async def exercise_codex_adapter(module, root: pathlib.Path) -> None:
         str(root / "codex.sock"),
     )
     adapter.websocket = transport
+    adapter.title_generation_attempts = module.TITLE_GENERATION_MAX_ATTEMPTS
     events: list[dict] = []
 
     async def emit(event_type, payload, *, turn_id=None, item_id=None):
@@ -1479,6 +1480,9 @@ async def exercise_codex_reconnect(module, root: pathlib.Path) -> None:
     )
     adapter.websocket = first
     adapter.websocket_factory = lambda: second
+    # This exercise shares one fake transport between the live connection and
+    # websocket_factory; keep background title generation out of it.
+    adapter.title_generation_attempts = module.TITLE_GENERATION_MAX_ATTEMPTS
     # A delta that races the reconnect handshake: its bytes are already part
     # of the thread/read text, so replaying it would duplicate them.
     second.incoming.put(
@@ -1594,6 +1598,7 @@ async def exercise_codex_reconcile_failed_turn(module, root: pathlib.Path) -> No
     )
     adapter.websocket = first
     adapter.websocket_factory = lambda: second
+    adapter.title_generation_attempts = module.TITLE_GENERATION_MAX_ATTEMPTS
     events: list[dict] = []
 
     async def emit(event_type, payload, *, turn_id=None, item_id=None):
@@ -1638,6 +1643,7 @@ async def exercise_codex_close_timeout(module, root: pathlib.Path) -> None:
         str(project), THREAD_ID, {}, str(root / "codex-close-timeout.sock")
     )
     adapter.websocket = transport
+    adapter.title_generation_attempts = module.TITLE_GENERATION_MAX_ATTEMPTS
 
     async def emit(event_type, payload, *, turn_id=None, item_id=None):
         return {
@@ -2714,6 +2720,271 @@ def exercise_validation(module) -> None:
         raise AssertionError("accepted oversized JSON")
 
 
+async def exercise_conversation_titles(module, root: pathlib.Path) -> None:
+    from types import SimpleNamespace
+
+    project = root / "title-project"
+    project.mkdir()
+
+    # Title normalization rejects hallucinated or unusable model output.
+    assert module.codex_generated_title("not json") is None
+    assert module.codex_generated_title(json.dumps({"title": "x" * 40})) is None
+    assert (
+        module.codex_generated_title(json.dumps({"title": "  'Fix login.'  "}))
+        == "Fix login"
+    )
+    assert module.normalized_conversation_title("\x00\x01 \n") is None
+    assert module.normalized_conversation_title("a" * 300) == "a" * 200
+
+    # Claude: a completed first turn of an untitled session asks the CLI to
+    # generate and persist the title, and the sink receives the result. The
+    # first attempt failing leaves the session untitled for a retry on the
+    # next completed turn.
+    class FakeQuery:
+        def __init__(self):
+            self.requests: list[dict] = []
+            self.fail_first = True
+
+        async def _send_control_request(self, request):
+            self.requests.append(request)
+            if self.fail_first:
+                self.fail_first = False
+                raise RuntimeError("control transport hiccup")
+            return {"title": "  Add dark mode  "}
+
+    received: asyncio.Queue = asyncio.Queue()
+
+    class FakeClient:
+        def __init__(self, options):
+            self.options = options
+            self.queries: list[str] = []
+            self._query = FakeQuery()
+
+        async def connect(self):
+            return None
+
+        async def receive_messages(self):
+            while True:
+                value = await received.get()
+                if value is None:
+                    return
+                yield value
+
+        async def query(self, text):
+            self.queries.append(text)
+
+        async def disconnect(self):
+            await received.put(None)
+
+    class ClaudeAgentOptions:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    sdk = SimpleNamespace(
+        ClaudeSDKClient=FakeClient,
+        ClaudeAgentOptions=ClaudeAgentOptions,
+        get_session_info=lambda session_id, **_kwargs: SimpleNamespace(
+            session_id=session_id
+        ),
+        get_session_messages=lambda *_args, directory, limit, offset: [],
+    )
+    adapter = module.ClaudeAdapter(str(project), None, {"_newSession": True})
+    adapter._load_sdk = lambda: sdk
+    titles: list[str] = []
+    adapter.title_sink = titles.append
+
+    async def emit(event_type, payload, *, turn_id=None, item_id=None):
+        return {"type": event_type, "payload": payload}
+
+    await adapter.start(emit)
+    assert adapter.needs_generated_title is True
+    await adapter.start_turn(
+        {
+            "requestId": "31313131-3131-4131-8131-313131313131",
+            "payload": {"text": "Add a dark mode toggle to settings"},
+        }
+    )
+    ResultMessage = type("ResultMessage", (), {})
+    result = ResultMessage()
+    result.is_error = False
+    await received.put(result)
+    for _ in range(200):
+        if adapter.client._query.requests:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.05)
+    assert titles == []
+    assert adapter.needs_generated_title is True
+    second = ResultMessage()
+    second.is_error = False
+    await received.put(second)
+    for _ in range(200):
+        if titles:
+            break
+        await asyncio.sleep(0.01)
+    assert titles == ["Add dark mode"]
+    assert adapter.needs_generated_title is False
+    assert adapter.client._query.requests == [
+        {
+            "subtype": "generate_session_title",
+            "description": "Add a dark mode toggle to settings",
+            "persist": True,
+        }
+    ] * 2
+    # A later completed turn must not regenerate a settled title.
+    third = ResultMessage()
+    third.is_error = False
+    await received.put(third)
+    await asyncio.sleep(0.05)
+    assert len(adapter.client._query.requests) == 2
+    await adapter.close()
+
+    # Codex: the generation runs on its own connection, skips named threads,
+    # and names the conversation thread from the structured title turn.
+    generated_thread_id = "32323232-3232-4232-8232-323232323232"
+    title_turn_id = "33333333-3333-4333-8333-333333333333"
+
+    class FakeTitleWebSocket:
+        def __init__(self, existing_name=None):
+            self.existing_name = existing_name
+            self.sent: list[dict] = []
+            self.incoming: list[dict] = []
+            self.socket = None
+            self.closed = False
+
+        def connect(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+        def send_json(self, value):
+            self.sent.append(value)
+            method = value.get("method")
+            request_id = value.get("id")
+            if method == "initialize":
+                self.incoming.append(
+                    {"id": request_id, "result": {"serverInfo": {}}}
+                )
+            elif method == "thread/read":
+                assert value["params"] == {
+                    "threadId": THREAD_ID,
+                    "includeTurns": False,
+                }
+                self.incoming.append(
+                    {
+                        "id": request_id,
+                        "result": {
+                            "thread": {
+                                "id": THREAD_ID,
+                                "name": self.existing_name,
+                            }
+                        },
+                    }
+                )
+            elif method == "thread/start":
+                assert value["params"]["model"] == module.CODEX_TITLE_MODEL
+                assert value["params"]["ephemeral"] is True
+                assert value["params"]["threadSource"] == "system"
+                self.incoming.append(
+                    {
+                        "id": request_id,
+                        "result": {"thread": {"id": generated_thread_id}},
+                    }
+                )
+            elif method == "turn/start":
+                assert value["params"]["threadId"] == generated_thread_id
+                assert value["params"]["outputSchema"]["required"] == ["title"]
+                # A notification queued before the response exercises the
+                # pending buffer.
+                self.incoming.append(
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": generated_thread_id,
+                            "item": {
+                                "type": "agentMessage",
+                                "text": json.dumps(
+                                    {"title": "Fix login redirect"}
+                                ),
+                            },
+                        },
+                    }
+                )
+                self.incoming.append(
+                    {"id": request_id, "result": {"turn": {"id": title_turn_id}}}
+                )
+                self.incoming.append(
+                    {
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": generated_thread_id,
+                            "turn": {
+                                "id": title_turn_id,
+                                "status": "completed",
+                            },
+                        },
+                    }
+                )
+            elif method == "thread/name/set":
+                assert value["params"] == {
+                    "threadId": THREAD_ID,
+                    "name": "Fix login redirect",
+                }
+                self.incoming.append({"id": request_id, "result": {}})
+
+        def receive_json(self):
+            return self.incoming.pop(0)
+
+    codex_adapter = module.CodexAdapter(
+        str(project), THREAD_ID, {}, str(root / "title-codex.sock")
+    )
+    generation_transport = FakeTitleWebSocket()
+    codex_adapter.websocket_factory = lambda: generation_transport
+    codex_titles: list[str] = []
+    codex_adapter.title_sink = codex_titles.append
+    codex_adapter.emit = emit
+    codex_adapter.needs_generated_title = True
+    codex_adapter._capture_title_seed("please fix the login redirect loop")
+    # The live notification path is the production trigger.
+    await codex_adapter._notification(
+        "turn/completed",
+        {"turn": {"id": "34343434-3434-4434-8434-343434343434", "status": "completed"}},
+    )
+    assert codex_adapter.title_generation_task is not None
+    await codex_adapter.title_generation_task
+    assert codex_titles == ["Fix login redirect"]
+    assert codex_adapter.needs_generated_title is False
+    assert generation_transport.closed is True
+    assert [value.get("method") for value in generation_transport.sent] == [
+        "initialize",
+        "initialized",
+        "thread/read",
+        "thread/start",
+        "turn/start",
+        "thread/name/set",
+    ]
+
+    # An already-named thread short-circuits without an ephemeral turn.
+    named_adapter = module.CodexAdapter(
+        str(project), THREAD_ID, {}, str(root / "title-codex.sock")
+    )
+    named_transport = FakeTitleWebSocket(existing_name="Existing name")
+    named_adapter.websocket_factory = lambda: named_transport
+    named_titles: list[str] = []
+    named_adapter.title_sink = named_titles.append
+    named_adapter.needs_generated_title = True
+    named_adapter._capture_title_seed("seed")
+    named_adapter._schedule_title_generation()
+    await named_adapter.title_generation_task
+    assert named_titles == ["Existing name"]
+    assert [value.get("method") for value in named_transport.sent] == [
+        "initialize",
+        "initialized",
+        "thread/read",
+    ]
+
+
 async def exercise_early_attach(module, root: pathlib.Path) -> None:
     runtime = root / "er"
     runtime.mkdir(mode=0o700)
@@ -3566,6 +3837,7 @@ def exercise_account_routing(module, root: pathlib.Path) -> None:
     state = module.load_state(str(runtime), RELAY_ID)
     assert state["v"] == 2
     assert state["accountID"] == ACCOUNT_ID
+    assert "title" not in state
     state_path = pathlib.Path(broker.state_path)
     missing_identity = dict(state)
     missing_identity.pop("accountID")
@@ -3615,12 +3887,27 @@ def exercise_account_routing(module, root: pathlib.Path) -> None:
         )
         # Account-aware status reports a pre-account broker as a "legacy" row
         # so the caller can migrate it instead of leaving it running invisibly.
+        # An untitled broker emits an empty trailing title column.
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             module.emit_chat_status(str(runtime), account_aware=True)
         lines = [line for line in output.getvalue().splitlines() if line]
         assert lines == [
-            f"codex|{ACCOUNT_ID}|example-repository|{RELAY_ID}|{THREAD_ID}|0",
+            f"codex|{ACCOUNT_ID}|example-repository|{RELAY_ID}|{THREAD_ID}|0|",
+            f"legacy|codex|example-repository|{legacy_relay}|{THREAD_ID}|0",
+        ]
+        # A provider title reaches broker.json through the adapter's sink and
+        # lands hex-encoded in the status row.
+        assert provider.title_sink is not None
+        provider.title_sink("  Fix   login flow\n")
+        assert module.load_state(str(runtime), RELAY_ID)["title"] == "Fix login flow"
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            module.emit_chat_status(str(runtime), account_aware=True)
+        lines = [line for line in output.getvalue().splitlines() if line]
+        title_hex = "Fix login flow".encode("utf-8").hex()
+        assert lines == [
+            f"codex|{ACCOUNT_ID}|example-repository|{RELAY_ID}|{THREAD_ID}|0|{title_hex}",
             f"legacy|codex|example-repository|{legacy_relay}|{THREAD_ID}|0",
         ]
     finally:
@@ -3776,6 +4063,7 @@ def run() -> None:
         asyncio.run(exercise_claude_adapter(module, root_path))
         asyncio.run(exercise_claude_history_paging(module, root_path))
         asyncio.run(exercise_claude_reconnect(module, root_path))
+        asyncio.run(exercise_conversation_titles(module, root_path))
     print("Terminal Relay chat broker tests passed")
 
 

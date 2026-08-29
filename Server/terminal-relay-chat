@@ -101,6 +101,56 @@ ATTACHMENT_FILE_PATTERN = re.compile(
 ACTIVITY_EXEMPT_EVENTS = frozenset(
     {"history.page", "file.preview", "conversation.snapshot"}
 )
+# Generated conversation titles mirror the Codex desktop app: a small model
+# names each conversation from its first user prompt. The title is persisted
+# provider-side (Claude ai-title entry, Codex thread name) and mirrored into
+# broker.json so status listings can fill the chat row's title column.
+MAXIMUM_CONVERSATION_TITLE_BYTES = 200
+TITLE_GENERATION_MAX_SEED_CHARS = 1000
+TITLE_GENERATION_MAX_ATTEMPTS = 2
+CODEX_TITLE_MODEL = "gpt-5.6-luna"
+CODEX_TITLE_GENERATION_DEADLINE_SECONDS = 90
+CODEX_TITLE_SOCKET_TIMEOUT_SECONDS = 15
+CODEX_TITLE_INSTRUCTION = (
+    "Create a concise UI title for this coding task. Return only JSON "
+    "matching the provided schema. Use at most 36 characters and about "
+    "five words. Start with an imperative verb, preserve ticket IDs, "
+    "use the user's language, and omit ending punctuation.\n\nUser prompt:\n"
+)
+
+
+def normalized_conversation_title(value: Any) -> str | None:
+    """Bound a provider title the same way the session listing does."""
+    if not isinstance(value, str):
+        return None
+    text = re.sub(
+        r"\s+",
+        " ",
+        "".join(character if character.isprintable() else " " for character in value),
+    ).strip()
+    if not text:
+        return None
+    encoded = text.encode("utf-8")[:MAXIMUM_CONVERSATION_TITLE_BYTES]
+    return encoded.decode("utf-8", errors="ignore") or None
+
+
+def codex_generated_title(text: Any) -> str | None:
+    """Parse the structured title turn output, mirroring the status backfill."""
+    if not isinstance(text, str):
+        return None
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    title = value.get("title")
+    if not isinstance(title, str):
+        return None
+    title = re.sub(r"\s+", " ", title).strip().strip("\"'").rstrip(".!?")
+    if not title or len(title) > 36:
+        return None
+    return title
 
 
 class ChatError(Exception):
@@ -1210,6 +1260,51 @@ class ProviderAdapter:
         # reconnect instead of re-emitting history as live events, which would
         # duplicate items already shown under different live identities.
         self.request_snapshot_rebuild: Callable[[], Awaitable[None]] | None = None
+        # Set by the broker: receives the conversation title observed or
+        # generated through the provider, for the status listing.
+        self.title_sink: Callable[[str], None] | None = None
+        self.needs_generated_title = False
+        self.title_generation_seed: str | None = None
+        self.title_generation_attempts = 0
+        self.title_generation_task: asyncio.Task[None] | None = None
+
+    def _record_provider_title(self, title: Any) -> None:
+        normalized = normalized_conversation_title(title)
+        if normalized is None:
+            return
+        self.needs_generated_title = False
+        if self.title_sink is not None:
+            self.title_sink(normalized)
+
+    def _capture_title_seed(self, prompt: Any) -> None:
+        if self.title_generation_seed is not None or not isinstance(prompt, str):
+            return
+        stripped = prompt.strip()
+        if stripped:
+            self.title_generation_seed = stripped[:TITLE_GENERATION_MAX_SEED_CHARS]
+
+    def _schedule_title_generation(self) -> None:
+        if (
+            getattr(self, "closing", False)
+            or not self.needs_generated_title
+            or self.title_generation_seed is None
+            or self.title_generation_attempts >= TITLE_GENERATION_MAX_ATTEMPTS
+            or (
+                self.title_generation_task is not None
+                and not self.title_generation_task.done()
+            )
+        ):
+            return
+        self.title_generation_attempts += 1
+        self.title_generation_task = asyncio.create_task(self._generate_title())
+
+    async def _generate_title(self) -> None:
+        return None
+
+    def _cancel_title_generation(self) -> None:
+        if self.title_generation_task is not None:
+            self.title_generation_task.cancel()
+            self.title_generation_task = None
 
     async def start(self, emit: Callable[..., Awaitable[dict[str, Any]]]) -> str:
         self.emit = emit
@@ -1501,6 +1596,18 @@ class CodexAdapter(ProviderAdapter):
         self.interactions: dict[str, dict[str, Any]] = {}
         self.plan_buffers: dict[str, str] = {}
         self.reasoning_streamed: set[str] = set()
+        self.title_websocket: Any | None = None
+
+    def _cancel_title_generation(self) -> None:
+        super()._cancel_title_generation()
+        # The blocking worker only wakes from recv when its socket shuts, the
+        # same pattern close() uses for the live reader; without this a close
+        # mid-generation strands the executor thread until the deadline.
+        websocket = self.title_websocket
+        self.title_websocket = None
+        if websocket is not None:
+            with contextlib.suppress(Exception):
+                websocket.close()
 
     async def start(self, emit: Callable[..., Awaitable[dict[str, Any]]]) -> str:
         self.emit = emit
@@ -1546,6 +1653,17 @@ class CodexAdapter(ProviderAdapter):
             else result.get("threadId") if isinstance(result, dict) else None
         )
         self.thread_id = canonical_uuid(candidate or self.thread_id, "provider thread ID")
+        existing_title = (
+            normalized_conversation_title(thread.get("name"))
+            if isinstance(thread, dict)
+            else None
+        )
+        if existing_title is not None:
+            self._record_provider_title(existing_title)
+        else:
+            # The generation flow re-reads the thread and skips named threads,
+            # so a resume response that omitted the name cannot overwrite one.
+            self.needs_generated_title = True
         self.connection_ready.set()
         return self.thread_id
 
@@ -2092,6 +2210,8 @@ class CodexAdapter(ProviderAdapter):
                     payload["message"] = message
             await self.emit(event_type, payload, turn_id=turn_id)
             self.active_turn = None
+            if event_type == "turn.completed":
+                self._schedule_title_generation()
             return
         if method == "item/started" and isinstance(item, dict):
             mapped = self.map_item(item, completed=False)
@@ -2484,6 +2604,19 @@ class CodexAdapter(ProviderAdapter):
                 if occurred_at is not None:
                     record["occurredAt"] = occurred_at
                 mapped.append(record)
+        if self.title_generation_seed is None:
+            # A resumed untitled thread should be named after its original
+            # request, not whatever prompt happens to resume it.
+            for record in mapped:
+                record_payload = record.get("payload")
+                if (
+                    record["type"] == "message.completed"
+                    and isinstance(record_payload, dict)
+                    and record_payload.get("role") == "user"
+                ):
+                    self._capture_title_seed(record_payload.get("text"))
+                    if self.title_generation_seed is not None:
+                        break
         if before_item_id:
             before_index = next(
                 (
@@ -2501,6 +2634,7 @@ class CodexAdapter(ProviderAdapter):
         if self.active_turn:
             raise ChatError("turnActive", "A provider turn is already active.")
         payload = command["payload"]
+        self._capture_title_seed(payload["text"])
         inputs: list[dict[str, Any]] = [{"type": "text", "text": payload["text"]}]
         file_attachments: list[dict[str, Any]] = []
         for attachment in payload.get("attachments", []):
@@ -2580,6 +2714,192 @@ class CodexAdapter(ProviderAdapter):
                 raise error
         self.active_turn = canonical_uuid(turn_id, "turn ID")
         return {"turnId": self.active_turn, "clientUserMessageId": command["requestId"]}
+
+    async def _generate_title(self) -> None:
+        seed = self.title_generation_seed
+        thread_id = self.thread_id
+        if not seed or not thread_id:
+            return
+        try:
+            title = await asyncio.to_thread(
+                self._generate_title_blocking, thread_id, seed
+            )
+        except (asyncio.CancelledError, GeneratorExit):
+            raise
+        except Exception:
+            return
+        if title is not None:
+            self._record_provider_title(title)
+
+    def _generate_title_blocking(self, thread_id: str, seed: str) -> str | None:
+        """Name the thread through a dedicated app-server connection.
+
+        The live reader treats every notification as conversation traffic, so
+        the ephemeral title turn must not share its websocket.
+        """
+        deadline = time.monotonic() + CODEX_TITLE_GENERATION_DEADLINE_SECONDS
+        websocket = self.websocket_factory()
+        websocket.connect()
+        self.title_websocket = websocket
+        try:
+            if websocket.socket is not None:
+                websocket.socket.settimeout(CODEX_TITLE_SOCKET_TIMEOUT_SECONDS)
+            request_id = 0
+            pending: list[dict[str, Any]] = []
+
+            def receive() -> dict[str, Any]:
+                # Silence between messages is normal while the title model
+                # queues; only the overall deadline aborts the attempt.
+                while True:
+                    if time.monotonic() > deadline:
+                        raise ChatError(
+                            "providerTimeout", "The Codex title request timed out."
+                        )
+                    try:
+                        return websocket.receive_json()
+                    except TimeoutError:
+                        continue
+
+            def request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+                nonlocal request_id
+                request_id += 1
+                websocket.send_json(
+                    {"method": method, "id": request_id, "params": params}
+                )
+                while True:
+                    value = receive()
+                    if value.get("id") == request_id:
+                        if "error" in value or not isinstance(
+                            value.get("result"), dict
+                        ):
+                            raise ChatError(
+                                "providerRejected",
+                                "Codex rejected the title request.",
+                            )
+                        return value["result"]
+                    if "method" in value:
+                        pending.append(value)
+
+            request(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "terminal_relay",
+                        "title": "Terminal Relay",
+                        "version": "1.0.0",
+                    },
+                    "capabilities": {
+                        "experimentalApi": True,
+                        "requestAttestation": False,
+                    },
+                },
+            )
+            websocket.send_json({"method": "initialized", "params": {}})
+            existing = request(
+                "thread/read", {"threadId": thread_id, "includeTurns": False}
+            )
+            existing_thread = existing.get("thread")
+            if isinstance(existing_thread, dict):
+                existing_name = normalized_conversation_title(
+                    existing_thread.get("name")
+                )
+                if existing_name is not None:
+                    return existing_name
+            started = request(
+                "thread/start",
+                {
+                    "model": CODEX_TITLE_MODEL,
+                    "cwd": self.project_directory,
+                    "approvalPolicy": "never",
+                    "sandbox": "read-only",
+                    "ephemeral": True,
+                    "threadSource": "system",
+                    "config": {
+                        "model_reasoning_effort": "low",
+                        "features.enable_fanout": False,
+                        "features.hooks": False,
+                        "features.multi_agent": False,
+                        "features.multi_agent_v2": False,
+                        "features.plugins": False,
+                        "features.tool_suggest": False,
+                        "web_search": "disabled",
+                    },
+                },
+            )
+            generated_thread = started.get("thread")
+            generated_thread_id = (
+                generated_thread.get("id")
+                if isinstance(generated_thread, dict)
+                else None
+            )
+            if not isinstance(generated_thread_id, str):
+                return None
+            turn_result = request(
+                "turn/start",
+                {
+                    "threadId": generated_thread_id,
+                    "clientUserMessageId": new_uuid(),
+                    "input": [
+                        {"type": "text", "text": CODEX_TITLE_INSTRUCTION + seed}
+                    ],
+                    "outputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "title": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 36,
+                            }
+                        },
+                        "required": ["title"],
+                        "additionalProperties": False,
+                    },
+                },
+            )
+            turn = turn_result.get("turn")
+            turn_id = turn.get("id") if isinstance(turn, dict) else None
+            if not isinstance(turn_id, str):
+                return None
+            message_text = ""
+            while True:
+                if time.monotonic() > deadline:
+                    return None
+                value = pending.pop(0) if pending else receive()
+                method = value.get("method")
+                params = value.get("params")
+                if not isinstance(params, dict):
+                    continue
+                notification_thread_id = params.get("threadId")
+                if (
+                    isinstance(notification_thread_id, str)
+                    and notification_thread_id != generated_thread_id
+                ):
+                    continue
+                if method == "item/completed":
+                    item = params.get("item")
+                    if (
+                        isinstance(item, dict)
+                        and item.get("type") == "agentMessage"
+                        and isinstance(item.get("text"), str)
+                    ):
+                        message_text = item["text"]
+                elif method == "turn/completed":
+                    completed_turn = params.get("turn")
+                    if not isinstance(completed_turn, dict):
+                        continue
+                    if completed_turn.get("id") != turn_id:
+                        continue
+                    if completed_turn.get("status") != "completed":
+                        return None
+                    break
+            title = codex_generated_title(message_text)
+            if title is None:
+                return None
+            request("thread/name/set", {"threadId": thread_id, "name": title})
+            return normalized_conversation_title(title)
+        finally:
+            self.title_websocket = None
+            websocket.close()
 
     async def interrupt(self, turn_id: str) -> None:
         if self.active_turn != turn_id:
@@ -2720,6 +3040,7 @@ class CodexAdapter(ProviderAdapter):
 
     async def close(self) -> None:
         self.closing = True
+        self._cancel_title_generation()
         if self.thread_id and self.connection_ready.is_set():
             with contextlib.suppress(Exception):
                 await self.request(
@@ -2828,8 +3149,21 @@ class ClaudeAdapter(ProviderAdapter):
             )
             if info is None:
                 raise ChatError("notFound", "The Claude session was not found.", exit_code=66)
+            # custom_title folds in the CLI's ai-title entries; an untitled
+            # resumed session gets named after its next completed turn.
+            existing_title = normalized_conversation_title(
+                getattr(info, "custom_title", None)
+            )
+            if existing_title is not None:
+                self._record_provider_title(existing_title)
+            else:
+                self.needs_generated_title = True
+                self._capture_title_seed(getattr(info, "first_prompt", None))
         elif not self.thread_id:
             self.thread_id = new_uuid()
+            self.needs_generated_title = True
+        if new_session:
+            self.needs_generated_title = True
         options_kwargs: dict[str, Any] = {
             "cwd": self.project_directory,
             "include_partial_messages": True,
@@ -3257,6 +3591,8 @@ class ClaudeAdapter(ProviderAdapter):
             )
             self.active_turn = None
             self.turn_user_echo = None
+            if status == "completed":
+                self._schedule_title_generation()
             return
         # Everything else — SystemMessage and its subclasses (init, task and
         # hook events), RateLimitEvent, future lifecycle envelopes — is
@@ -3635,6 +3971,7 @@ class ClaudeAdapter(ProviderAdapter):
                     f"`{attachment['path']}`"
                     for attachment in files
                 )
+        self._capture_title_seed(prompt)
         try:
             await self.client.query(prompt)
         except Exception as error:
@@ -3653,6 +3990,33 @@ class ClaudeAdapter(ProviderAdapter):
             "turnId": self.active_turn,
             "clientUserMessageId": command["requestId"],
         }
+
+    async def _generate_title(self) -> None:
+        """Ask the CLI to title the session, exactly like its interactive UI.
+
+        The generate_session_title control request runs the CLI's own title
+        model and, with persist, appends the ai-title entry the session
+        listing already reads back as custom_title.
+        """
+        seed = self.title_generation_seed
+        query_channel = getattr(self.client, "_query", None)
+        send = getattr(query_channel, "_send_control_request", None)
+        if seed is None or not callable(send):
+            return
+        try:
+            response = await send(
+                {
+                    "subtype": "generate_session_title",
+                    "description": seed,
+                    "persist": True,
+                }
+            )
+        except (asyncio.CancelledError, GeneratorExit):
+            raise
+        except Exception:
+            return
+        if isinstance(response, dict):
+            self._record_provider_title(response.get("title"))
 
     async def interrupt(self, turn_id: str) -> None:
         if self.active_turn != turn_id:
@@ -3734,6 +4098,7 @@ class ClaudeAdapter(ProviderAdapter):
 
     async def close(self) -> None:
         self.closing = True
+        self._cancel_title_generation()
         await self._expire_pending_callbacks(
             "sessionEnded", "The chat session ended."
         )
@@ -3785,6 +4150,7 @@ class ChatBroker:
         )
         self.provider = provider
         provider.request_snapshot_rebuild = self.rebuild_snapshot
+        provider.title_sink = self._store_provider_title
         self.launch_options = launch_options
         # The restart intent written at chat start carries the same launch
         # arguments this broker was served with.
@@ -3836,6 +4202,10 @@ class ChatBroker:
         self.activity_at = 0
         self.persisted_activity_at = 0
         self.state_status: str | None = None
+        # Conversation title observed or generated through the provider; the
+        # provider stays the source of truth, so restarts re-seed it from
+        # there rather than from the previous broker.json.
+        self.title: str | None = None
         self.buffered_provider_events: list[
             tuple[str, dict[str, Any], str | None, str | None, bool]
         ] = []
@@ -4296,6 +4666,14 @@ class ChatBroker:
                 )
         self.rebuilding_snapshot = False
 
+    def _store_provider_title(self, title: str) -> None:
+        normalized = normalized_conversation_title(title)
+        if normalized is None or normalized == self.title:
+            return
+        self.title = normalized
+        if self.state_status is not None:
+            self._write_state(self.state_status)
+
     def _write_state(self, status: str) -> None:
         state = {
             "v": self.protocol_version,
@@ -4311,6 +4689,8 @@ class ChatBroker:
             "launchOptions": public_launch_options(self.launch_options),
             "activityAt": self.activity_at,
         }
+        if self.title is not None:
+            state["title"] = self.title
         if self.account_id is not None:
             state["accountID"] = self.account_id
         temporary = f"{self.state_path}.{os.getpid()}.{new_uuid()}.tmp"
@@ -5802,14 +6182,16 @@ def emit_chat_status(runtime_directory: str, account_aware: bool = False) -> Non
                     )
                 )
                 continue
+            title = normalized_conversation_title(state.get("title"))
             print(
-                "{}|{}|{}|{}|{}|{}".format(
+                "{}|{}|{}|{}|{}|{}|{}".format(
                     state["provider"],
                     account_id,
                     state["repository"],
                     state["relayId"],
                     state["providerThreadId"],
                     state["activityAt"],
+                    title.encode("utf-8").hex() if title is not None else "",
                 )
             )
         elif account_id is None:

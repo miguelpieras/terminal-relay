@@ -5093,7 +5093,7 @@ status_sessions() {
     chat_directories=("$runtime_directory"/chat-*)
     if [[ ${#chat_directories[@]} -gt 0 && "$status_protocol_v2" == "1" ]]; then
         while IFS='|' read -r tool bound_account_id repository instance \
-            bound_thread_id chat_activity; do
+            bound_thread_id chat_activity chat_title_hex; do
             if [[ "$tool" == "legacy" ]]; then
                 # A pre-account broker is still running but unreachable
                 # through account routing; migrate it instead of listing it.
@@ -5106,10 +5106,11 @@ status_sessions() {
             is_valid_instance "$instance" || continue
             is_valid_instance "$bound_thread_id" || continue
             [[ "$chat_activity" =~ ^[0-9]+$ ]] || chat_activity=0
+            [[ "$chat_title_hex" =~ ^([0-9a-f]{2}){0,200}$ ]] || chat_title_hex=""
             select_provider_account "$tool" "$bound_account_id" >/dev/null 2>&1 || continue
             session_name="$(chat_session_name_for "$tool" "$instance")"
             tmux_command has-session -t "$session_name" 2>/dev/null || continue
-            records+=("session|$tool|$bound_account_id|$repository|0|$instance|$chat_activity|||$bound_thread_id|chat")
+            records+=("session|$tool|$bound_account_id|$repository|0|$instance|$chat_activity|$chat_title_hex||$bound_thread_id|chat")
         done < <("$default_python_path" "$chat_path" inspect-status \
             --account-aware --runtime-directory "$runtime_directory" 2>/dev/null || true)
     elif [[ ${#chat_directories[@]} -gt 0 ]]; then
