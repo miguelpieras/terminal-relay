@@ -873,7 +873,36 @@ if operation == "list":
     ]
     page = rows[offset : offset + 100]
     next_cursor = str(offset + 100) if len(rows) > offset + 100 else None
-    print(json.dumps({"threads": page, "nextCursor": next_cursor}, separators=(",", ":")))
+    payload = {"threads": page, "nextCursor": next_cursor}
+    if archive_filter == "open" and any(
+        state[value["threadID"]].get("needsGeneration")
+        and value["activityState"] == "inactive"
+        for value in page
+    ):
+        payload["titleGenerationPending"] = True
+    print(json.dumps(payload, separators=(",", ":")))
+elif operation == "generate":
+    counts = {
+        "requested": 0,
+        "skippedNamed": 0,
+        "skippedActive": 0,
+        "missingPrompt": 0,
+        "missingTitle": 0,
+        "generated": 0,
+        "failed": 0,
+    }
+    for session_id, record in state.items():
+        if not record.get("needsGeneration"):
+            continue
+        counts["requested"] += 1
+        if record.get("activity", "inactive") != "inactive":
+            counts["skippedActive"] += 1
+            continue
+        record["title"] = "Generated Claude title"
+        record.pop("needsGeneration", None)
+        counts["generated"] += 1
+    save(state)
+    print(json.dumps({"titleGeneration": counts}, separators=(",", ":")))
 elif operation in {"read", "title", "activity", "rename"}:
     project = arguments[0]
     del project
@@ -1457,6 +1486,40 @@ assert rows[sys.argv[1]]["capabilities"]["resume"] is False
 assert rows[sys.argv[2]]["activityState"] == "unknown"
 assert rows[sys.argv[2]]["capabilities"]["archive"] is False
 ' "$external_claude_id" "$unknown_claude_id"
+
+echo "Claude title backfill strips the pending flag and titles dormant sessions"
+backfill_claude_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+"$python_path" - "$claude_sessions_state" "$backfill_claude_id" <<'PYTHON_CLAUDE_BACKFILL'
+import json
+import sys
+
+path, session_id = sys.argv[1:]
+with open(path, encoding="utf-8") as state_file:
+    state = json.load(state_file)
+state[session_id] = {
+    "title": "Fix the login bug please",
+    "updatedAt": 130,
+    "needsGeneration": True,
+}
+with open(path, "w", encoding="utf-8") as state_file:
+    json.dump(state, state_file, separators=(",", ":"))
+PYTHON_CLAUDE_BACKFILL
+claude_backfill_catalog="$(/bin/bash "$helper" threads-v2 claude beta open)"
+assert_contains "$claude_backfill_catalog" \
+    "\"threadID\":\"$backfill_claude_id\"" "Claude backfill listing"
+if [[ "$claude_backfill_catalog" == *titleGenerationPending* ]]; then
+    fail "threads-v2 leaked the Claude title generation flag"
+fi
+if "$tmux_path" -f /dev/null -L "$tmux_socket" \
+    has-session -t terminal-relay-claude-titles 2>/dev/null; then
+    fail "Claude title generation was scheduled while disabled"
+fi
+claude_backfill_counts="$(TERMINAL_RELAY_TEST_CLAUDE_TITLE_GENERATION=1 \
+    /bin/bash "$helper" __generate-claude-titles beta)"
+assert_contains "$claude_backfill_counts" '"generated":1' \
+    "Claude generated title count"
+assert_contains "$(/bin/bash "$helper" threads-v2 claude beta open)" \
+    '"title":"Generated Claude title"' "Claude generated title persistence"
 
 set +e
 /bin/bash "$helper" thread-resume-v2 claude beta "$claude_provider_thread_id" \

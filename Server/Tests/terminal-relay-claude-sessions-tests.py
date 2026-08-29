@@ -43,11 +43,12 @@ def capture_json(callable_value, *arguments):
     return json.loads(output.getvalue())
 
 
-def session(session_id, title, modified, cwd):
+def session(session_id, title, modified, cwd, custom_title=None, first_prompt=None):
     return SimpleNamespace(
         session_id=session_id,
         summary=title,
-        custom_title=None,
+        custom_title=custom_title,
+        first_prompt=first_prompt,
         last_modified=modified,
         cwd=str(cwd),
     )
@@ -246,6 +247,120 @@ def run() -> None:
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+
+        backfill_records = [
+            session(
+                SESSION_ONE,
+                "Fix the login bug please",
+                4_000,
+                project,
+                first_prompt="Fix the login bug please",
+            ),
+            session(
+                SESSION_TWO,
+                "External prompt",
+                3_000,
+                project,
+                first_prompt="External prompt",
+            ),
+            session(
+                SESSION_THREE,
+                "Kept title",
+                2_000,
+                project,
+                custom_title="Kept title",
+                first_prompt="Titled prompt",
+            ),
+            session(SESSION_FOUR, "Archived prompt", 1_000, project),
+        ]
+
+        def backfill_get_session_info(session_id, **_arguments):
+            return next(
+                (
+                    record
+                    for record in backfill_records
+                    if record.session_id == session_id
+                ),
+                None,
+            )
+
+        config_home = root_path / "claude-config"
+        session_store = config_home / "projects" / "encoded-project"
+        session_store.mkdir(parents=True)
+        session_file = session_store / f"{SESSION_ONE}.jsonl"
+        session_file.write_text("{}\n", encoding="utf-8")
+        os.utime(session_file, (1_000_000, 1_000_000))
+        renames = []
+
+        def backfill_rename(session_id, title, **_arguments):
+            record = backfill_get_session_info(session_id)
+            assert record is not None
+            record.custom_title = title
+            renames.append((session_id, title))
+            with session_file.open("a", encoding="utf-8") as handle:
+                handle.write("{}\n")
+
+        adapter.load_sdk = lambda: (
+            backfill_get_session_info,
+            lambda **_arguments: backfill_records,
+            backfill_rename,
+        )
+        adapter.provider_active_session_ids = (
+            lambda _project, _test_mode: {SESSION_TWO}
+        )
+
+        pending_catalog = capture_json(
+            adapter.list_command,
+            [str(project), str(archives), "open"],
+            True,
+        )
+        assert pending_catalog["titleGenerationPending"] is True
+        archived_pending_catalog = capture_json(
+            adapter.list_command,
+            [str(project), str(archives), "archived"],
+            True,
+        )
+        assert "titleGenerationPending" not in archived_pending_catalog
+
+        def fake_title_run(*_arguments, **kwargs):
+            assert kwargs["cwd"] != str(project)
+            return SimpleNamespace(returncode=0, stdout=b'"Fix login flow."\n')
+
+        adapter.subprocess.run = fake_title_run
+        os.environ["CLAUDE_CONFIG_DIR"] = str(config_home)
+        try:
+            generation_counts = capture_json(
+                adapter.generate_command,
+                [str(project), str(archives)],
+                True,
+            )
+        finally:
+            adapter.subprocess.run = original_run
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        generation = generation_counts["titleGeneration"]
+        assert generation["generated"] == 1
+        assert generation["skippedActive"] == 1
+        assert generation["skippedNamed"] == 1
+        assert generation["missingPrompt"] == 0
+        assert generation["failed"] == 0
+        assert renames == [(SESSION_ONE, "Fix login flow")]
+        assert int(session_file.stat().st_mtime) == 1_000_000
+
+        titled_catalog = capture_json(
+            adapter.list_command,
+            [str(project), str(archives), "open"],
+            True,
+        )
+        assert "titleGenerationPending" not in titled_catalog
+        assert titled_catalog["threads"][0]["title"] == "Fix login flow"
+
+        adapter.provider_active_session_ids = lambda _project, _test_mode: None
+        try:
+            adapter.generate_command([str(project), str(archives)], True)
+        except adapter.AdapterError as error:
+            assert error.exit_code == 70
+        else:
+            raise AssertionError("unknown activity allowed title generation")
 
         bad_marker = archives / SESSION_ONE
         bad_marker.write_text("corrupt\n", encoding="utf-8")

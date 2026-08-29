@@ -93,6 +93,7 @@ if [[ $test_mode -eq 1 ]]; then
     boot_id_path="${TERMINAL_RELAY_TEST_BOOT_ID_PATH:-$default_boot_id_path}"
     codex_shared_account_enabled="${TERMINAL_RELAY_TEST_CODEX_SHARED_ACCOUNT:-0}"
     codex_title_generation_enabled="${TERMINAL_RELAY_TEST_CODEX_TITLE_GENERATION:-0}"
+    claude_title_generation_enabled="${TERMINAL_RELAY_TEST_CLAUDE_TITLE_GENERATION:-0}"
     codex_app_server_socket="${TERMINAL_RELAY_TEST_CODEX_APP_SERVER_SOCKET:-$runtime_directory/codex.sock}"
     provider_socket_root="${TERMINAL_RELAY_TEST_PROVIDER_SOCKET_ROOT:-$runtime_directory}"
     agent_update_status_path="${TERMINAL_RELAY_TEST_AGENT_UPDATE_STATUS_PATH:-$default_agent_update_status_path}"
@@ -126,6 +127,7 @@ else
     boot_id_path="$default_boot_id_path"
     codex_shared_account_enabled=1
     codex_title_generation_enabled=1
+    claude_title_generation_enabled=1
     codex_app_server_socket="$runtime_directory/codex.sock"
     provider_socket_root="$runtime_directory"
     agent_update_status_path="$default_agent_update_status_path"
@@ -137,6 +139,7 @@ provider_accounts_root="${TERMINAL_RELAY_TEST_PROVIDER_ACCOUNTS_ROOT:-${runtime_
 provider_accounts_activation_marker="$provider_accounts_root/activated"
 codex_app_server_session="terminal-relay-account-server"
 codex_title_generator_session="terminal-relay-title-generator"
+claude_title_generator_session="terminal-relay-claude-titles"
 selected_account_id=""
 selected_account_provider=""
 selected_account_status=""
@@ -1452,6 +1455,46 @@ generate_codex_titles() {
     run_codex_rpc generate-titles "${thread_ids[@]}"
 }
 
+schedule_claude_title_generation() {
+    local launch_command
+    local repository="$1"
+
+    [[ "$claude_title_generation_enabled" == "1" ]] || return 0
+    is_valid_repository_name "$repository" || return 0
+    if tmux_command has-session -t "$claude_title_generator_session" 2>/dev/null; then
+        return 0
+    fi
+
+    if [[ -n "$selected_account_id" ]]; then
+        printf -v launch_command 'exec %q __generate-claude-titles %q %q' \
+            "$helper_path" "$selected_account_id" "$repository"
+    else
+        printf -v launch_command 'exec %q __generate-claude-titles %q' \
+            "$helper_path" "$repository"
+    fi
+    tmux_command new-session -d -s "$claude_title_generator_session" \
+        -c "${runtime_home:-${HOME:-/}}" "$launch_command" >/dev/null 2>&1 || true
+}
+
+generate_claude_titles() {
+    local account_id=""
+    local repository
+    local archive_directory
+    local project_directory
+
+    [[ "$claude_title_generation_enabled" == "1" ]] || return 0
+    if [[ $# -eq 2 ]]; then
+        account_id="$1"
+        shift
+        provider_accounts_activated || return 0
+        select_provider_account claude "$account_id" || return $?
+    fi
+    repository="$1"
+    project_directory="$(project_directory_for "$repository")" || return $?
+    archive_directory="$(claude_archive_directory_for "$repository")" || return $?
+    run_claude_sessions_adapter generate "$project_directory" "$archive_directory"
+}
+
 pause_after_codex_reservation_for_test() {
     local pause_file
 
@@ -1697,6 +1740,7 @@ select_provider_account() {
     codex_app_server_socket="$provider_socket_root/codex-$selected_account_id.sock"
     codex_app_server_session="terminal-relay-account-$selected_account_id"
     codex_title_generator_session="terminal-relay-title-$selected_account_id"
+    claude_title_generator_session="terminal-relay-claude-titles-$selected_account_id"
     codex_app_server_restart_marker="$runtime_directory/codex-$selected_account_id-app-server-restart-required"
     socket_bytes="$(printf '%s' "$codex_app_server_socket" | /usr/bin/wc -c | /usr/bin/tr -d '[:space:]')"
     [[ "$socket_bytes" =~ ^[0-9]+$ && $socket_bytes -le 100 ]] || {
@@ -2059,6 +2103,7 @@ select_legacy_provider_route() {
     codex_app_server_socket="${TERMINAL_RELAY_TEST_CODEX_APP_SERVER_SOCKET:-$runtime_directory/codex.sock}"
     codex_app_server_session="terminal-relay-account-server"
     codex_title_generator_session="terminal-relay-title-generator"
+    claude_title_generator_session="terminal-relay-claude-titles"
     codex_app_server_restart_marker="$runtime_directory/codex-app-server-restart-required"
 }
 
@@ -4081,6 +4126,7 @@ if len(lines) != 1:
 value = json.loads(lines[0])
 if not isinstance(value, dict) or not isinstance(value.get("threads"), list):
     raise SystemExit(70)
+value.pop("titleGenerationPending", None)
 active = {}
 for binding in bindings:
     fields = binding.split("|")
@@ -4188,6 +4234,12 @@ threads_v2() {
                 catalog="$(run_claude_sessions_adapter \
                     list "$project_directory" "$archive_directory" \
                     "$archive_filter")" || return $?
+            fi
+            # The adapter flags untitled dormant sessions; the flag never
+            # reaches clients (emit_thread_catalog_v2 strips it).
+            if [[ "$archive_filter" == "open" \
+                && "$catalog" == *'"titleGenerationPending":true'* ]]; then
+                schedule_claude_title_generation "$repository"
             fi
             ;;
     esac
@@ -7399,6 +7451,10 @@ case "$command_name" in
     __generate-codex-titles)
         [[ $# -ge 1 ]] || fail_usage "Invalid internal Codex title request."
         generate_codex_titles "$@"
+        ;;
+    __generate-claude-titles)
+        [[ $# -ge 1 && $# -le 2 ]] || fail_usage "Invalid internal Claude title request."
+        generate_claude_titles "$@"
         ;;
     __migrate-legacy-chats)
         [[ $# -eq 0 ]] || fail_usage "Invalid internal legacy chat migration request."
