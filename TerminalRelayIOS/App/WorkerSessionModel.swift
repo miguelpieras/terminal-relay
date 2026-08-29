@@ -96,24 +96,30 @@ final class WorkerSessionModel: ObservableObject {
         self.isDemoMode = screenshotDemo
         self.readActivityBySession = Self.loadReadState(from: readStateDefaults)
         let profiles: [WorkerProfile]
+#if DEBUG
         if screenshotDemo {
             profiles = [DemoWorkspace.worker]
         } else {
             profiles = profileStore.load()
         }
+#else
+        profiles = profileStore.load()
+#endif
         self.profiles = profiles
         self.profile = profileStore.selectedProfileID()
             .flatMap { selectedID in profiles.first { $0.id == selectedID } }
             ?? profiles.first
 
+#if DEBUG
         if screenshotDemo {
             projects = DemoWorkspace.projects
             sessions = DemoWorkspace.sessions
             workerOverviews = [DemoWorkspace.worker.id: DemoWorkspace.overview]
             loadDemoThreads()
-            publicKey = "ssh-ed25519 screenshot-demo-device"
+            publicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK2FtMdsbVxY9YB9fJv0y2P3m0TQe9u5gZ7L6n8J terminal-relay-ios"
             return
         }
+#endif
 
         do {
             self.publicKey = try identityStore.publicKeyForAuthorizedKeys()
@@ -1091,6 +1097,7 @@ final class WorkerSessionModel: ObservableObject {
         }
     }
 
+#if DEBUG
     private func loadDemoThreads() {
         for archived in [false, true] {
             for repositoryName in DemoWorkspace.projects {
@@ -1110,6 +1117,7 @@ final class WorkerSessionModel: ObservableObject {
             }
         }
     }
+#endif
 
     private func mergeLiveSessionsIntoThreadCatalogs(
         workerID: UUID,

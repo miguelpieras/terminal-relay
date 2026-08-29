@@ -18,16 +18,16 @@ final class DemoWorkspaceTests: XCTestCase {
         XCTAssertEqual(model.workerOverviews[DemoWorkspace.worker.id], DemoWorkspace.overview)
     }
 
-    func testDemoWorkspaceContainsOnlyPublishableExampleIdentity() {
-        XCTAssertEqual(DemoWorkspace.worker.host, "worker.example.com")
-        XCTAssertEqual(DemoWorkspace.worker.username, "example-user")
+    func testDemoWorkspaceContainsOnlyPublishableSyntheticIdentity() {
+        XCTAssertEqual(DemoWorkspace.worker.host, "buildbox.local")
+        XCTAssertEqual(DemoWorkspace.worker.username, "developer")
         XCTAssertTrue(
             DemoWorkspace.worker.expectedHostKeyFingerprint
-                .hasPrefix("SHA256:AAAA")
+                .hasPrefix("SHA256:7W16")
         )
         XCTAssertEqual(
             Set(DemoWorkspace.overview.accounts.values.compactMap(\.account)),
-            ["demo@example.com"]
+            ["dev@studio.local"]
         )
     }
 
@@ -103,9 +103,9 @@ final class DemoWorkspaceTests: XCTestCase {
             store.state.messages.first { $0.role == .assistant }
         )
         XCTAssertFalse(assistant.isStreaming)
-        XCTAssertTrue(assistant.text.contains("| Surface | Result |"))
+        XCTAssertTrue(assistant.text.contains("| Boundary | Result |"))
         XCTAssertTrue(assistant.text.contains("```swift"))
-        XCTAssertTrue(assistant.text.contains("https://example.com/security"))
+        XCTAssertTrue(assistant.text.contains("Direct to your worker; no hosted relay"))
         XCTAssertEqual(store.state.tools.first?.status, .completed)
         XCTAssertTrue(
             store.state.items.contains {

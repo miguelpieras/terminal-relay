@@ -3,14 +3,14 @@
 ## App record
 
 - Platform: iOS universal app for iPhone and iPad
-- Name: Terminal Relay: AI Coding
-- Subtitle: Private AI coding sessions
+- Name: Terminal Relay: Self-Hosted
+- Subtitle: Your workers. Direct over SSH.
 - Primary language: English (U.S.)
 - SKU: `terminal-relay-ios`
 - Apple ID: `6804198744`
 - App Store Connect status: Prepare for Submission
 - Version: 1.0
-- Current upload build: 9
+- Current upload build: 10
 - Copyright: 2026 AMURA VENTURES SL
 - Primary category: Developer Tools
 - Secondary category: Utilities
@@ -45,22 +45,28 @@ user-authorized content and services it connects to.
 
 ## Promotional text
 
-Continue your remote Codex and Claude coding sessions from your iPhone or iPad.
+A native, open-source client for persistent Codex and Claude sessions on SSH
+workers you own—without a hosted relay, app account, analytics, or tracking.
 
 ## Description
 
-Terminal Relay connects your iPhone or iPad to coding-agent sessions running
-on workers you control.
+Terminal Relay is a native, open-source client for persistent Codex and Claude
+coding sessions on SSH workers you own. It connects directly from your iPhone
+or iPad to your worker—there is no Terminal Relay cloud, hosted relay, or app
+account.
 
 Use it to:
 
-- Browse projects stored under `/workspace` on your workers.
-- Start or reconnect to Codex and Claude terminal sessions.
-- Move between Mac, iPhone, and iPad without stopping the remote agent.
-- Monitor worker availability and resource usage.
-- Pair securely with the Mac app by scanning a short-lived QR code.
-- Keep a dedicated SSH identity in the device Keychain.
-- Pin every worker's SSH host key.
+- Pair through the Mac app with a short-lived QR invitation that provisions a
+  device-specific Ed25519 key.
+- Pin every worker's SSH host key and communicate over a direct SSH connection.
+- Browse repositories under `/workspace` and start or reconnect to persistent
+  Codex and Claude sessions.
+- Review native streamed responses, tool results, diffs, approvals, and file
+  previews.
+- Move between Mac, iPhone, and iPad without stopping the remote agent, with a
+  live terminal available when needed.
+- Monitor worker availability, resource usage, and agent account limits.
 
 Terminal Relay does not provide hosted workers or agent accounts. You bring
 your own SSH-accessible worker, Tailscale network, repositories, and Codex or
@@ -73,7 +79,7 @@ The app contains no advertising, analytics, or tracking.
 
 ## Keywords
 
-terminal,ssh,coding,developer,remote,agent,worker,devtools,repository,private
+selfhosted,ssh,terminal,developer,remote,agent,worker,coding,repository,private
 
 ## Age rating questionnaire
 
@@ -115,11 +121,15 @@ privacy policy and are not a developer-operated collection service.
 
 ## Review notes
 
-Terminal Relay is a client for user-owned SSH workers. The app generates a
-device-specific Ed25519 key. The normal onboarding flow scans a QR code created
-by the Mac app; the code contains a short-lived SSH key restricted to
-authorizing that device key and cannot open a shell. Camera frames are
-processed only on the device.
+REVIEW SETUP (about 30 seconds): Terminal Relay has no app account or hosted
+demo. Pair the review device to the isolated worker with the code below to
+exercise the complete submitted app.
+
+Terminal Relay is a native client for user-owned SSH workers, not a hosted
+relay service or repackaged web app. The app generates a device-specific
+Ed25519 key. The normal onboarding flow scans a QR code created by the Mac app;
+the code contains a short-lived SSH key restricted to authorizing that device
+key and cannot open a shell. Camera frames are processed only on the device.
 
 For App Review, we provide an isolated worker containing only synthetic
 repositories and dedicated, limited agent accounts. It is not connected to our
@@ -145,6 +155,12 @@ the normal ten-minute, single-use Mac QR code.
 Terminal Relay is our original work, developed in public at
 github.com/miguelpieras/terminal-relay (Apache License 2.0) by
 AMURA VENTURES SL.
+
+The product's distinct implementation is visible throughout the live review
+path: direct SSH with no developer-operated relay, device-specific Keychain
+identity, strict host-key pinning, persistent native Codex and Claude sessions,
+streamed tool results and diffs, approvals, file previews, worker resource and
+account-limit status, and a live terminal.
 
 ## Export compliance facts
 
@@ -186,8 +202,9 @@ contact details on EU product pages.
 - Mac pairing close-up: `Distribution/Screenshots/mac-pairing.png`
 
 All images are direct captures of the native apps running with Debug-only
-screenshot fixtures. The fixtures use example worker, repository, session,
-account, SSH-key, and pairing values and never connect to a real worker.
+screenshot fixtures. The fixtures use synthetic worker, repository, session,
+account, SSH-key, and pairing values and never connect to a real worker. The
+fixtures are excluded from Release builds.
 
 ## App Store Connect preparation status
 

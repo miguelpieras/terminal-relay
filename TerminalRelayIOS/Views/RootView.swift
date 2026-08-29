@@ -300,7 +300,9 @@ struct RootView: View {
                 ContentUnavailableView {
                     Label("No Workers", systemImage: "server.rack")
                 } description: {
-                    Text("Scan the private pairing code shown by Terminal Relay on your Mac.")
+                    Text(
+                        "Pair a worker you own over direct SSH. Your device keeps its own key and pins the worker's host key; Terminal Relay runs no hosted relay."
+                    )
                 } actions: {
                     Button("Scan Mac Pairing Code") {
                         showsPairingScanner = true

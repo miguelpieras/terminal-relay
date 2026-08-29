@@ -102,30 +102,39 @@ struct TerminalScreen: View {
 
     @ViewBuilder
     private var sessionContent: some View {
+#if DEBUG
         if isDemo {
             DemoChatConversationView()
         } else {
-            switch chatController.phase {
-            case .preparing:
+            liveSessionContent
+        }
+#else
+        liveSessionContent
+#endif
+    }
+
+    @ViewBuilder
+    private var liveSessionContent: some View {
+        switch chatController.phase {
+        case .preparing:
+            preparationView
+        case .chat:
+            if let coordinator = chatController.coordinator {
+                ConversationView(
+                    coordinator: coordinator,
+                    startsCoordinator: false,
+                    attachmentActions: chatController.attachmentActions
+                )
+            } else {
                 preparationView
-            case .chat:
-                if let coordinator = chatController.coordinator {
-                    ConversationView(
-                        coordinator: coordinator,
-                        startsCoordinator: false,
-                        attachmentActions: chatController.attachmentActions
-                    )
-                } else {
-                    preparationView
-                }
-            case .terminal:
-                TerminalRepresentable(controller: controller)
-                if let recovery = recoveryPresentation {
-                    recoveryView(recovery)
-                }
-            case .failed(let message):
-                failureView(message)
             }
+        case .terminal:
+            TerminalRepresentable(controller: controller)
+            if let recovery = recoveryPresentation {
+                recoveryView(recovery)
+            }
+        case .failed(let message):
+            failureView(message)
         }
     }
 
@@ -230,6 +239,7 @@ struct TerminalScreen: View {
     }
 }
 
+#if DEBUG
 private struct DemoChatConversationView: View {
     @State private var fixture: MobileChatDemoFixture.Instance
 
@@ -262,6 +272,7 @@ private struct DemoChatConversationView: View {
         }
     }
 }
+#endif
 
 private struct MobileTerminalKeyBar: View {
     @ObservedObject var controller: TerminalSessionController

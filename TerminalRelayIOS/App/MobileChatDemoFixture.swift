@@ -1,5 +1,6 @@
 import Foundation
 
+#if DEBUG
 enum MobileChatDemoFixture {
     struct Instance {
         let coordinator: ConversationCoordinator
@@ -61,24 +62,24 @@ enum MobileChatDemoFixture {
         let turnID = "00000000-0000-4000-8000-000000009004"
         let assistantID = "assistant-demo"
         let finalMarkdown = """
-        ## Adaptive workspace polish
+        ## Direct SSH workspace
 
-        The conversation now feels native on every screen size:
+        The self-hosted connection is now clear on every screen size:
 
-        | Surface | Result |
+        | Boundary | Result |
         |:--|:--|
-        | iPhone | Focused transcript and anchored composer |
-        | iPad | Comfortable reading width in Split View |
-        | Mac | Keyboard-first controls and selectable output |
+        | Network | Direct to your worker; no hosted relay |
+        | Identity | Device key stays in Keychain |
+        | Trust | Worker host key is pinned |
 
         ```swift
-        struct ConversationView: View {
-            let isReadOnly: Bool
+        struct WorkerConnection: Sendable {
+            let hostKeyFingerprint: String
         }
         ```
 
-        I also verified the [direct SSH boundary](https://example.com/security)
-        and kept remote images disabled.
+        I also verified persistent Codex and Claude sessions across iPhone,
+        iPad, and Mac.
         """
         let snapshot = ConversationSnapshot(
             snapshotGeneration: generation,
@@ -89,7 +90,7 @@ enum MobileChatDemoFixture {
                         id: "user-demo",
                         turnID: turnID,
                         role: .user,
-                        text: "Make the chat experience excellent on iPhone, iPad, and Mac."
+                        text: "Make our self-hosted SSH architecture unmistakable on iPhone and iPad."
                     )
                 ),
                 .message(
@@ -97,7 +98,7 @@ enum MobileChatDemoFixture {
                         id: assistantID,
                         turnID: turnID,
                         role: .assistant,
-                        text: "## Adaptive workspace polish\n\n",
+                        text: "## Direct SSH workspace\n\n",
                         isStreaming: true
                     )
                 ),
@@ -106,10 +107,10 @@ enum MobileChatDemoFixture {
                         id: "tool-demo",
                         turnID: turnID,
                         kind: .shell,
-                        title: "Run interaction tests",
+                        title: "Verify the SSH security boundary",
                         status: .completed,
-                        input: "xcodebuild test",
-                        output: "All focused chat interaction tests passed.",
+                        input: "swift test --filter SSH",
+                        output: "Device key, host pinning, and direct transport checks passed.",
                         errorMessage: nil,
                         durationMilliseconds: 1_420,
                         exitCode: 0,
@@ -122,10 +123,10 @@ enum MobileChatDemoFixture {
                     ChatDiff(
                         id: "diff-demo",
                         turnID: turnID,
-                        path: "Shared/Chat/ConversationView.swift",
+                        path: "TerminalRelayIOS/Views/RootView.swift",
                         unifiedDiff: """
-                        - TerminalRepresentable(controller: controller)
-                        + ConversationView(coordinator: coordinator)
+                        - Text("Connect to a worker")
+                        + Text("Direct SSH. No hosted relay.")
                         """,
                         occurredAt: 1_800_000_003_000,
                         isTruncated: false
@@ -136,8 +137,8 @@ enum MobileChatDemoFixture {
                         id: "error-demo",
                         turnID: turnID,
                         type: "error",
-                        title: "Preview server was briefly unavailable",
-                        detail: "The agent recovered without losing the turn.",
+                        title: "Worker briefly went offline",
+                        detail: "The direct SSH session recovered without losing the turn.",
                         occurredAt: 1_800_000_004_000
                     )
                 ),
@@ -149,8 +150,8 @@ enum MobileChatDemoFixture {
                     providerConnectionGeneration:
                         "00000000-0000-4000-8000-000000009005",
                     providerRequestID: .string("demo-request"),
-                    title: "Apply the reviewed UI changes?",
-                    reason: "The diff only changes presentation code.",
+                    title: "Apply the reviewed SSH onboarding changes?",
+                    reason: "The diff makes the connection boundary explicit.",
                     context: "2 files · 38 additions · 14 deletions",
                     decisions: [
                         ApprovalDecision(id: "approve", label: "Approved"),
@@ -333,3 +334,4 @@ enum MobileChatDemoFixture {
         )
     }
 }
+#endif

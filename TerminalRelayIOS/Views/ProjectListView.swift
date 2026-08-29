@@ -129,7 +129,9 @@ struct ProjectListView: View {
                 ContentUnavailableView {
                     Label("No Projects", systemImage: "folder")
                 } description: {
-                    Text("Pair with the Terminal Relay app on your Mac to load projects and shared agent sessions.")
+                    Text(
+                        "Pair with your Mac to load projects and persistent agent sessions directly from your own SSH worker. No Terminal Relay account or cloud service is required."
+                    )
                 } actions: {
                     Button("Scan Mac Pairing Code", action: onAddWorker)
                         .buttonStyle(.borderedProminent)

@@ -30,6 +30,7 @@ enum ScreenshotDemoMode {
     }
 }
 
+#if DEBUG
 enum DemoWorkspace {
     private static let sessionIdentifiers = [
         "00000000-0000-4000-8000-000000002001",
@@ -39,22 +40,22 @@ enum DemoWorkspace {
 
     static let worker = WorkerProfile(
         id: UUID(uuidString: "00000000-0000-4000-8000-000000000001")!,
-        name: "Private Worker",
-        host: "worker.example.com",
+        name: "Studio Worker",
+        host: "buildbox.local",
         port: 22,
-        username: "example-user",
-        expectedHostKeyFingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        username: "developer",
+        expectedHostKeyFingerprint: "SHA256:7W16jOP8rCJB7JXwQ8wTt0dTiMNkZdJdYxPC5v/SdVA"
     )
 
-    static let projects = ["atlas", "launchpad", "northstar"]
+    static let projects = ["ios-client", "api-gateway", "docs-site"]
 
     static let sessions = [
         WorkerSessionSnapshot(
             kind: .codex,
-            repositoryName: "atlas",
+            repositoryName: "ios-client",
             attachedClientCount: 2,
             instanceToken: sessionIdentifiers[0],
-            title: "Build adaptive iPad workspace",
+            title: "Ship direct SSH onboarding",
             lastActivityAt: 1_800_000_000,
             reportedWorking: true,
             threadID: "00000000-0000-4000-8000-000000003001",
@@ -62,10 +63,10 @@ enum DemoWorkspace {
         ),
         WorkerSessionSnapshot(
             kind: .claude,
-            repositoryName: "atlas",
+            repositoryName: "ios-client",
             attachedClientCount: 1,
             instanceToken: sessionIdentifiers[1],
-            title: "Review private pairing flow",
+            title: "Review host-key pinning",
             lastActivityAt: 1_799_999_980,
             reportedWorking: false,
             threadID: "00000000-0000-4000-8000-000000003002",
@@ -73,10 +74,10 @@ enum DemoWorkspace {
         ),
         WorkerSessionSnapshot(
             kind: .codex,
-            repositoryName: "launchpad",
+            repositoryName: "api-gateway",
             attachedClientCount: 1,
             instanceToken: sessionIdentifiers[2],
-            title: "Prepare App Store release",
+            title: "Refine agent approval cards",
             lastActivityAt: 1_799_999_960,
             reportedWorking: false,
             threadID: "00000000-0000-4000-8000-000000003003",
@@ -87,9 +88,9 @@ enum DemoWorkspace {
     static let threads = [
         WorkerThreadSnapshot(
             kind: .codex,
-            repositoryName: "atlas",
+            repositoryName: "ios-client",
             threadID: "00000000-0000-4000-8000-000000004001",
-            title: "Polish onboarding empty state",
+            title: "Explain the direct SSH boundary",
             updatedAt: 1_799_999_900,
             isArchived: false,
             activeInstanceToken: nil,
@@ -98,9 +99,9 @@ enum DemoWorkspace {
         ),
         WorkerThreadSnapshot(
             kind: .codex,
-            repositoryName: "atlas",
+            repositoryName: "ios-client",
             threadID: "00000000-0000-4000-8000-000000004002",
-            title: "Retire old pairing copy",
+            title: "Remove hosted-relay wording",
             updatedAt: 1_799_990_000,
             isArchived: true,
             activeInstanceToken: nil,
@@ -119,7 +120,7 @@ enum DemoWorkspace {
         ),
         accounts: [
             .codex: WorkerAccountSnapshot(
-                account: "demo@example.com",
+                account: "dev@studio.local",
                 plan: "Team",
                 limits: [
                     WorkerAccountLimitSnapshot(name: "5-hour", usedPercent: 24),
@@ -127,7 +128,7 @@ enum DemoWorkspace {
                 ]
             ),
             .claude: WorkerAccountSnapshot(
-                account: "demo@example.com",
+                account: "dev@studio.local",
                 plan: "Pro",
                 limits: [
                     WorkerAccountLimitSnapshot(name: "Session", usedPercent: 18),
@@ -140,3 +141,4 @@ enum DemoWorkspace {
         updateStatus: nil
     )
 }
+#endif
