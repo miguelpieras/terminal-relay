@@ -412,6 +412,61 @@ final class MacConversationTableViewTests: XCTestCase {
         XCTAssertNotNil(descendant(of: cell, type: NSHostingView<AnyView>.self))
     }
 
+    func testDisablingLiveScrollStandInsKeepsOrdinaryCellsWithoutRestoration() {
+        let rows = (0..<80).map { index in
+            MixedRow(
+                id: "stable-live-row-\(index)",
+                contentRevision: 1,
+                text: "Stable hosted row \(index)",
+                usesNativeText: false,
+                usesLiveScrollText: true
+            )
+        }
+        let mounted = mountMixed(
+            rows: rows,
+            usesLiveScrollStandIns: false
+        )
+        let scrollView = mounted.table.enclosingScrollView!
+
+        MacConversationTableDiagnostics.reset()
+        NotificationCenter.default.post(
+            name: NSScrollView.willStartLiveScrollNotification,
+            object: scrollView
+        )
+        var proposed = scrollView.contentView.bounds
+        proposed.origin.y = max(0, proposed.origin.y - 1_200)
+        scrollView.contentView.setBoundsOrigin(
+            scrollView.contentView.constrainBoundsRect(proposed).origin
+        )
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        settle(mounted.hosting)
+
+        let visible = mounted.table.rows(in: scrollView.contentView.bounds)
+        XCTAssertNotEqual(visible.location, NSNotFound)
+        for index in visible.location..<NSMaxRange(visible) {
+            let cell = mounted.table.view(
+                atColumn: 0,
+                row: index,
+                makeIfNecessary: true
+            )
+            XCTAssertTrue(
+                cell?.identifier?.rawValue.hasSuffix(".hosted") == true,
+                "The opt-out must never replace ordinary rows with stand-ins."
+            )
+        }
+
+        NotificationCenter.default.post(
+            name: NSScrollView.didEndLiveScrollNotification,
+            object: scrollView
+        )
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        mounted.hosting.layoutSubtreeIfNeeded()
+
+        let diagnostics = MacConversationTableDiagnostics.snapshot()
+        XCTAssertEqual(diagnostics.targetedRowReloads, 0)
+        XCTAssertEqual(diagnostics.liveScrollRestorationPasses, 0)
+    }
+
     func testLiveScrollEndRestoresTransitionedCellOutsideVisibleBounds() throws {
         let rows = (0..<30).map { index in
             MixedRow(
@@ -2065,7 +2120,7 @@ final class MacConversationTableViewTests: XCTestCase {
         )
     }
 
-    func testStreamingTailHasExactDisplayOnlyPresentationDuringLiveScroll() throws {
+    func testStreamingTailUsesExactNativePresentationForItsWholeLifetime() throws {
         let source = String(repeating: "streaming exact text ", count: 200)
         let item = ConversationItem.message(
             ChatMessage(
@@ -2085,19 +2140,123 @@ final class MacConversationTableViewTests: XCTestCase {
         )
         for (index, row) in rows.enumerated() {
             guard case .item = row else { continue }
-            if row.nativeTextPresentation(
+            let ordinary = try XCTUnwrap(row.nativeTextPresentation(
                 dynamicTypeSize: .large,
                 colorScheme: .dark
-            ) == nil {
-                let live = try XCTUnwrap(row.liveScrollTextPresentation(
-                    dynamicTypeSize: .large,
-                    colorScheme: .dark
-                ))
-                XCTAssertEqual(live.fallbackString, projections[index].sourceText)
-                XCTAssertTrue(live.usesFastPlainTextRenderer)
-            }
+            ))
+            XCTAssertEqual(ordinary.fallbackString, projections[index].sourceText)
+            XCTAssertTrue(ordinary.usesFastPlainTextRenderer)
+            let live = try XCTUnwrap(row.liveScrollTextPresentation(
+                dynamicTypeSize: .large,
+                colorScheme: .dark
+            ))
+            XCTAssertEqual(live.fallbackString, projections[index].sourceText)
+            XCTAssertTrue(live.usesFastPlainTextRenderer)
         }
         XCTAssertEqual(projections.map(\.sourceText).joined(), source)
+    }
+
+    func testStreamingMarkdownTableCrossesTileBoundaryWithoutReplacingRows() throws {
+        let tablePrefix = "| Name | State |\n| --- | --- |\n"
+        // Markdown tiles reserve two synthetic fence delimiters within the
+        // 1 KiB rendered-row budget, leaving 340 bytes of source text.
+        let markdownSourceByteBudget = 340
+        let padding = String(
+            repeating: "a",
+            count: markdownSourceByteBudget - 1 - tablePrefix.utf8.count
+        )
+        var message = ChatMessage(
+            id: "streaming-boundary",
+            role: .assistant,
+            text: tablePrefix + padding,
+            isStreaming: true
+        )
+        func rows(for message: ChatMessage) -> [MacTranscriptRow] {
+            let item = ConversationItem.message(message)
+            return makeMacTranscriptRows(
+                item: item,
+                projections: TranscriptRowProjection.makeRows(item: item),
+                isExpanded: false,
+                copiedItemID: nil,
+                sectionRevision: 1
+            )
+        }
+        func table(
+            rows: [MacTranscriptRow],
+            revision: UInt64
+        ) -> MacConversationTableView<MacTranscriptRow> {
+            MacConversationTableView(
+                sections: [
+                    MacConversationTableSection(
+                        id: "item:streaming-boundary",
+                        revision: revision,
+                        rows: rows
+                    )
+                ],
+                snapshotGeneration: "generation",
+                usesLiveScrollStandIns: false,
+                reduceMotion: true,
+                commandHandle: MacConversationTableCommandHandle(),
+                onNearBottomChange: { _ in },
+                onAnchoredChange: { _ in },
+                makeRow: { _, _, _ in AnyView(EmptyView()) }
+            )
+        }
+
+        let initialRows = rows(for: message)
+        XCTAssertEqual(initialRows.count, 1)
+        let hosting = NSHostingView(
+            rootView: table(rows: initialRows, revision: 1)
+        )
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 300),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hosting
+        window.orderFront(nil)
+        Self.retainedWindows.append(window)
+        settle(hosting)
+        let nativeTable = try XCTUnwrap(
+            descendant(of: hosting, type: NSTableView.self)
+        )
+        let firstCell = try XCTUnwrap(nativeTable.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: true
+        ))
+        XCTAssertTrue(firstCell.identifier?.rawValue.hasSuffix(".native") == true)
+
+        message.append("bc")
+        let updatedRows = rows(for: message)
+        XCTAssertEqual(updatedRows.count, 2)
+        MacConversationTableDiagnostics.reset()
+        hosting.rootView = table(rows: updatedRows, revision: 2)
+        settle(hosting)
+
+        let diagnostics = MacConversationTableDiagnostics.snapshot()
+        XCTAssertEqual(diagnostics.reloadDataCalls, 0)
+        XCTAssertEqual(diagnostics.targetedRowReloads, 0)
+        XCTAssertTrue(firstCell === nativeTable.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: true
+        ))
+
+        message.complete(text: nil)
+        MacConversationTableDiagnostics.reset()
+        hosting.rootView = table(rows: rows(for: message), revision: 3)
+        settle(hosting)
+
+        let completedDiagnostics = MacConversationTableDiagnostics.snapshot()
+        XCTAssertEqual(completedDiagnostics.reloadDataCalls, 0)
+        XCTAssertEqual(completedDiagnostics.targetedRowReloads, 0)
+        XCTAssertTrue(firstCell === nativeTable.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: true
+        ))
     }
 
     func testCompletedCodeUsesSelectableNativeTilesWithoutDroppingSourceText() throws {
@@ -2153,7 +2312,7 @@ final class MacConversationTableViewTests: XCTestCase {
         XCTAssertEqual(projections.map(\.sourceText).joined(), source)
     }
 
-    func testStreamingCodeKeepsOnlyChangingTailHosted() {
+    func testStreamingCodeUsesNativeCellsIncludingChangingTail() {
         let source = String(repeating: "streaming code line\n", count: 500)
         var message = ChatMessage(
             id: "streaming-code",
@@ -2179,16 +2338,12 @@ final class MacConversationTableViewTests: XCTestCase {
             sectionRevision: 1
         )
         XCTAssertGreaterThan(rows.count, 2)
-        XCTAssertTrue(rows.dropLast().allSatisfy {
+        XCTAssertTrue(rows.allSatisfy {
             $0.nativeTextPresentation(
                 dynamicTypeSize: .large,
                 colorScheme: .light
             ) != nil
         })
-        XCTAssertNil(rows.last?.nativeTextPresentation(
-            dynamicTypeSize: .large,
-            colorScheme: .light
-        ))
     }
 
     func testCompletedUserCodeKeepsHostedBubbleComposition() {
@@ -2328,12 +2483,24 @@ final class MacConversationTableViewTests: XCTestCase {
             copiedItemID: nil,
             sectionRevision: 1
         )
-        XCTAssertTrue(runningRows.allSatisfy {
-            $0.nativeTextPresentation(
+        let runningProjections = TranscriptRowProjection.makeRows(
+            item: runningItem
+        )
+        XCTAssertEqual(runningRows.count, runningProjections.count)
+        for (row, projection) in zip(runningRows, runningProjections) {
+            let presentation = row.nativeTextPresentation(
                 dynamicTypeSize: .large,
                 colorScheme: .light
-            ) == nil
-        })
+            )
+            if projection.isFirstInItem || projection.isFirstInSection {
+                XCTAssertNil(
+                    presentation,
+                    "Only disclosure and tool-section headers stay hosted."
+                )
+            } else {
+                XCTAssertNotNil(presentation)
+            }
+        }
     }
 
     func testFooterDecisionDoesNotMaterializeAChunkedMessage() throws {
@@ -2367,7 +2534,7 @@ final class MacConversationTableViewTests: XCTestCase {
         )
     }
 
-    func testStreamingMessageRemainsHostedButCompletedUserUsesNativeBubbleAndFooter() {
+    func testStreamingMessageAndCompletedUserUseNativeTextCells() {
         let streaming = ConversationItem.message(
             ChatMessage(
                 id: "streaming",
@@ -2394,11 +2561,11 @@ final class MacConversationTableViewTests: XCTestCase {
             sectionRevision: 1
         )
         XCTAssertTrue(streamingRows.allSatisfy { row in
-            guard case .item = row else { return false }
+            guard case .item(let projection, _, _) = row else { return false }
             return row.nativeTextPresentation(
                 dynamicTypeSize: .large,
                 colorScheme: .light
-            ) == nil
+            )?.fallbackString == projection.sourceText
         })
 
         let userProjections = TranscriptRowProjection.makeRows(item: user)
@@ -2932,6 +3099,25 @@ final class MacConversationTableViewTests: XCTestCase {
         XCTAssertEqual(diagnostics.reloadDataCalls, 0)
         XCTAssertEqual(diagnostics.rowConfigurations, 0)
         XCTAssertEqual(diagnostics.explicitReconfigurations, 0)
+    }
+
+    func testOrdinaryPinnedContentRevisionDoesNotPrimeDocumentGeometry() {
+        var rows = makeRows(count: 200)
+        let mounted = mount(rows: rows)
+
+        MacConversationTableDiagnostics.reset()
+        rows[rows.count - 1] = Row(
+            id: rows[rows.count - 1].id,
+            contentRevision: 2
+        )
+        mounted.hosting.rootView = table(rows: rows)
+        settle(mounted.hosting)
+
+        XCTAssertEqual(
+            MacConversationTableDiagnostics.snapshot().pinnedGeometryPrimePasses,
+            0,
+            "Only initial population may apply provisional whole-document geometry."
+        )
     }
 
     func testPlainScrollingDoesNotReloadOrTouchOffscreenTranscriptRows() {
@@ -3839,11 +4025,8 @@ final class MacConversationTableViewTests: XCTestCase {
         #endif
     }
 
-    /// A message that completes during a live turn swaps its row from the
-    /// hosted streaming cell to a native tile. Reloading that one row leaves
-    /// the row view still owning the old cell, so the replacement kept its own
-    /// fitting width and painted its bubble against the transcript's leading
-    /// edge while every other row stayed centered.
+    /// A live message keeps the same native text-cell class through completion,
+    /// while the newly added footer still adopts the shared table column.
     func testCompletedLiveMessageKeepsTheSharedTranscriptColumn() async throws {
         let history: [ConversationItem] = [
             .message(
@@ -4045,12 +4228,14 @@ final class MacConversationTableViewTests: XCTestCase {
 
     private func mixedTable(
         rows: [MixedRow],
+        usesLiveScrollStandIns: Bool = true,
         onMakeHostedRow: @escaping (MixedRow) -> Void = { _ in },
         onNativeLink: @escaping @MainActor (URL) -> Bool = { _ in true }
     ) -> MacConversationTableView<MixedRow> {
         MacConversationTableView(
             sections: mixedSections(rows),
             snapshotGeneration: "generation",
+            usesLiveScrollStandIns: usesLiveScrollStandIns,
             reduceMotion: true,
             commandHandle: MacConversationTableCommandHandle(),
             onNearBottomChange: { _ in },
@@ -4135,6 +4320,7 @@ final class MacConversationTableViewTests: XCTestCase {
 
     private func mountMixed(
         rows: [MixedRow],
+        usesLiveScrollStandIns: Bool = true,
         onMakeHostedRow: @escaping (MixedRow) -> Void = { _ in },
         onNativeLink: @escaping @MainActor (URL) -> Bool = { _ in true },
         windowWidth: CGFloat = 800
@@ -4146,6 +4332,7 @@ final class MacConversationTableViewTests: XCTestCase {
         let hosting = NSHostingView(
             rootView: mixedTable(
                 rows: rows,
+                usesLiveScrollStandIns: usesLiveScrollStandIns,
                 onMakeHostedRow: onMakeHostedRow,
                 onNativeLink: onNativeLink
             )

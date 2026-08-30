@@ -914,7 +914,7 @@ final class ConversationStoreTests: XCTestCase {
         )
     }
 
-    func testPendingTurnIndicatorFillsOnlyInactiveGaps() {
+    func testPendingTurnIndicatorRemainsStableForTheRunningTurn() {
         func shows(_ turnState: TurnState, _ item: ConversationItem?) -> Bool {
             PendingTurnIndicator.showsPendingTurn(
                 turnState: turnState,
@@ -942,19 +942,16 @@ final class ConversationStoreTests: XCTestCase {
             completedTool = .tool(tool)
         }
 
-        // The model is thinking: turn active with nothing streaming yet, or
-        // after a tool finished and before the next block.
+        // Every item lifecycle keeps the same tail status row mounted. New
+        // reasoning, tools, and streamed text must not remove/reinsert it.
         XCTAssertTrue(shows(.running, nil))
         XCTAssertTrue(shows(.running, userMessage))
+        XCTAssertTrue(shows(.running, .message(streamingReply)))
+        XCTAssertTrue(shows(.running, .message(completedReply)))
+        XCTAssertTrue(shows(.running, runningTool))
         XCTAssertTrue(shows(.running, completedTool))
 
-        // Something already shows activity, or the turn is over.
-        XCTAssertFalse(shows(.running, .message(streamingReply)))
-        XCTAssertFalse(
-            shows(.running, .message(completedReply)),
-            "A sealed reply means the turn is ending, not thinking."
-        )
-        XCTAssertFalse(shows(.running, runningTool))
+        // The row leaves exactly once, when the running lifecycle ends.
         XCTAssertFalse(shows(.completed, userMessage))
         XCTAssertFalse(shows(.awaitingApproval, userMessage))
         XCTAssertFalse(shows(.idle, nil))

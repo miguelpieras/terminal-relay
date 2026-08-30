@@ -189,10 +189,10 @@ enum MacTranscriptRow: MacConversationTableRow {
         return projection.projectionSectionID
     }
 
-    /// Stable text tiles bypass SwiftUI hosting entirely. Interactive rows,
-    /// streaming tails, image content, and disclosure headers stay hosted; a
-    /// completed message footer is a separate small native control row, so the
-    /// final large-message text tile can use TextKit.
+    /// Text tiles, including the mutable streaming tail, use one native cell
+    /// for their whole lifetime. Interactive rows, image content, and
+    /// disclosure headers stay hosted; a completed message footer is a
+    /// separate small native control row.
     @MainActor
     func liveScrollTextPresentation(
         dynamicTypeSize: DynamicTypeSize,
@@ -485,10 +485,27 @@ enum MacTranscriptRow: MacConversationTableRow {
 
         switch projection.displayItem {
         case .message(let message):
-            guard !message.isStreaming,
-                  let content = message.contents.first,
-                  content.isComplete else {
-                return nil
+            guard let content = message.contents.first else { return nil }
+            if message.isStreaming || !content.isComplete {
+                switch content.kind {
+                case .imagePlaceholder:
+                    return nil
+                case .code:
+                    guard message.role != .user else { return nil }
+                    return Self.codeNativePresentation(
+                        text: projection.sourceText,
+                        projection: projection,
+                        identifier: identifier,
+                        fontScale: fontScale
+                    )
+                case .markdown, .plainText, .generic:
+                    return Self.streamingMessageNativePresentation(
+                        text: projection.sourceText,
+                        projection: projection,
+                        identifier: identifier,
+                        fontScale: fontScale
+                    )
+                }
             }
             switch content.kind {
             case .code:
@@ -515,9 +532,11 @@ enum MacTranscriptRow: MacConversationTableRow {
                 )
             }
             let source = content.text
-            // The prepared attributed representation flattens tables to text
-            // lines; rows carrying one stay hosted for real grid rendering.
-            if MarkdownSafety.containsTableCandidate(source) { return nil }
+            // Every bounded message tile keeps one native table-cell class for
+            // its whole lifetime. In particular, discovering a Markdown table
+            // as a streaming tile seals must not swap that visible row to a
+            // hosted cell; the attributed representation intentionally paints
+            // its readable text form inside the stable native cell.
             // Every role mounts its rich Markdown immediately when the AppKit
             // artifact is already translated for this style: both probes are
             // pure lookups (one NSCache read, one single-slot memo read) and
@@ -592,8 +611,7 @@ enum MacTranscriptRow: MacConversationTableRow {
 
         case .reasoning(let reasoning):
             guard isExpanded,
-                  !projection.isFirstInItem,
-                  !reasoning.isStreaming else {
+                  !projection.isFirstInItem else {
                 return nil
             }
             return Self.plainNativePresentation(
@@ -640,7 +658,7 @@ enum MacTranscriptRow: MacConversationTableRow {
                 fontScale: fontScale
             )
 
-        case .tool(let tool):
+        case .tool:
             if let metadataText = projection.metadataText {
                 guard isExpanded, !projection.isFirstInItem else { return nil }
                 return Self.plainNativePresentation(
@@ -657,9 +675,7 @@ enum MacTranscriptRow: MacConversationTableRow {
             }
             guard isExpanded,
                   !projection.isFirstInItem,
-                  !projection.isFirstInSection,
-                  tool.status != .pending,
-                  tool.status != .running else {
+                  !projection.isFirstInSection else {
                 return nil
             }
             return Self.plainNativePresentation(
@@ -729,6 +745,37 @@ enum MacTranscriptRow: MacConversationTableRow {
             isTrailing: footer.role == .user,
             fontScale: dynamicTypeSize.macTranscriptFontScale,
             accessibilityIdentifier: "conversation.item.\(footer.itemID).footer"
+        )
+    }
+
+    @MainActor
+    private static func streamingMessageNativePresentation(
+        text: String,
+        projection: TranscriptRowProjection,
+        identifier: String,
+        fontScale: CGFloat
+    ) -> MacConversationNativeTextPresentation {
+        MacConversationNativeTextPresentation(
+            fallbackString: text,
+            contentInsets: NSEdgeInsets(
+                top: projection.isFirstInItem ? 7 : 0,
+                left: 28,
+                bottom: 0,
+                right: 28
+            ),
+            firstRowTopInsetAdjustment: 15,
+            lastRowBottomInsetAdjustment: 9,
+            maximumContentWidth: 760,
+            fallbackFont: NSFont.systemFont(
+                ofSize: NSFont.systemFontSize * fontScale
+            ),
+            fallbackColor: .labelColor,
+            accessibilityLabel: projection.accessibilitySummary,
+            accessibilityIdentifier: identifier,
+            // Stream exact plain text through one native cell. Markdown is
+            // promoted inside that same cell only after the tile seals, so a
+            // 1 KiB boundary never removes and reinserts a visible table row.
+            usesFastPlainTextRenderer: true
         )
     }
 
@@ -1077,9 +1124,8 @@ struct ConversationView: View {
             pendingTurnRevealTask?.cancel()
             pendingTurnRevealTask = nil
             if isPending {
-                // Envelope boundaries (reasoning sealed, tool about to
-                // start) pass through a pending gap for one publish; only a
-                // gap that persists is the model actually thinking.
+                // Avoid flashing the status row for sub-quarter-second turns.
+                // Once revealed it remains mounted until the turn ends.
                 pendingTurnRevealTask = Task { @MainActor in
                     try? await Task.sleep(nanoseconds: 250_000_000)
                     guard !Task.isCancelled else { return }
@@ -1226,86 +1272,67 @@ struct ConversationView: View {
         var retainedItemIDs = Set<String>()
         retainedItemIDs.reserveCapacity(store.state.items.count)
         let renderedItems = store.state.items.filter { !$0.isTranscriptNoise }
-        for entry in TranscriptEntry.entries(of: renderedItems) {
-            switch entry {
-            case .item(let item):
-                retainedItemIDs.insert(item.id)
-                let isExpanded = store.expandedItemIDs.contains(item.id)
-                let isDisclosure: Bool
-                switch item {
-                case .reasoning, .tool, .diff, .generic:
-                    isDisclosure = true
-                case .message, .plan:
-                    isDisclosure = false
-                }
-                var sectionRevision = store.transcriptItemContentRevision(for: item.id)
-                    &* 1099511628211
-                if isExpanded { sectionRevision ^= 1 }
-                if store.copiedItemID == item.id
-                    || store.copiedItemID?.hasPrefix("\(item.id):") == true {
-                    sectionRevision ^= 2
-                }
-                sections.append(
-                    macTranscriptSectionCache.section(
-                        for: item.id,
-                        revision: sectionRevision
-                    ) {
-                        let visibleProjections: [TranscriptRowProjection]
-                        if isDisclosure && !isExpanded {
-                            visibleProjections = store.transcriptFirstProjection(for: item)
-                                .map { [$0] } ?? []
-                        } else {
-                            visibleProjections = store.transcriptProjections(for: item)
-                        }
-                        return makeMacTranscriptRows(
-                            item: item,
-                            projections: visibleProjections,
-                            isExpanded: isExpanded,
-                            copiedItemID: store.copiedItemID,
-                            sectionRevision: sectionRevision
-                        )
-                    }
-                )
-            case .toolGroup(let group):
-                retainedItemIDs.insert(group.id)
-                let isGroupExpanded = store.expandedItemIDs.contains(group.id)
-                // Collapsed groups hash only what their two fixed-height
-                // lines can show, so output deltas leave the section — and
-                // the table — completely untouched.
-                var hasher = Hasher()
-                hasher.combine(isGroupExpanded)
-                for tool in group.tools {
-                    hasher.combine(tool.id)
-                    hasher.combine(tool.status)
-                    hasher.combine(tool.title)
-                    hasher.combine(tool.kind)
-                    hasher.combine(tool.input?.utf8.count ?? -1)
-                    hasher.combine(tool.exitCode)
-                    if isGroupExpanded {
-                        hasher.combine(store.expandedItemIDs.contains(tool.id))
-                        hasher.combine(
-                            store.transcriptItemContentRevision(for: tool.id)
-                        )
-                        if store.copiedItemID == tool.id
-                            || store.copiedItemID?.hasPrefix("\(tool.id):") == true {
-                            hasher.combine(store.copiedItemID)
-                        }
-                    }
-                }
-                let groupRevision = UInt64(truncatingIfNeeded: hasher.finalize())
-                sections.append(
-                    macTranscriptSectionCache.section(
-                        for: group.id,
-                        revision: groupRevision
-                    ) {
-                        makeToolGroupRows(
-                            group: group,
-                            isGroupExpanded: isGroupExpanded,
-                            revision: groupRevision
-                        )
-                    }
-                )
+        for item in renderedItems {
+            retainedItemIDs.insert(item.id)
+            let isExpanded = store.expandedItemIDs.contains(item.id)
+            let isDisclosure: Bool
+            switch item {
+            case .reasoning, .tool, .diff, .generic:
+                isDisclosure = true
+            case .message, .plan:
+                isDisclosure = false
             }
+            let visibleProjections: [TranscriptRowProjection]
+            if isDisclosure && !isExpanded {
+                visibleProjections = store.transcriptFirstProjection(for: item)
+                    .map { [$0] } ?? []
+            } else {
+                visibleProjections = store.transcriptProjections(for: item)
+            }
+
+            // Collapsed activity rows only render a fixed headline. Streaming
+            // body deltas must not advance their table revision: doing so
+            // reconfigured the hosted row and armed whole-document geometry
+            // stabilization roughly 30 times per second even though no pixel
+            // in the row could change.
+            let visibleContentRevision: UInt64
+            if !isExpanded, case .reasoning(let reasoning) = item {
+                visibleContentRevision = reasoning.isStreaming ? 1 : 2
+            } else if !isExpanded, case .tool(let tool) = item {
+                var hasher = Hasher()
+                hasher.combine(tool.compactHeadline)
+                hasher.combine(tool.kind)
+                hasher.combine(tool.status)
+                hasher.combine(tool.durationMilliseconds)
+                hasher.combine(tool.exitCode)
+                visibleContentRevision = UInt64(
+                    truncatingIfNeeded: hasher.finalize()
+                )
+            } else if isDisclosure && !isExpanded {
+                visibleContentRevision = visibleProjections.first?.contentRevision ?? 0
+            } else {
+                visibleContentRevision = store.transcriptItemContentRevision(for: item.id)
+            }
+            var sectionRevision = visibleContentRevision &* 1099511628211
+            if isExpanded { sectionRevision ^= 1 }
+            if store.copiedItemID == item.id
+                || store.copiedItemID?.hasPrefix("\(item.id):") == true {
+                sectionRevision ^= 2
+            }
+            sections.append(
+                macTranscriptSectionCache.section(
+                    for: item.id,
+                    revision: sectionRevision
+                ) {
+                    makeMacTranscriptRows(
+                        item: item,
+                        projections: visibleProjections,
+                        isExpanded: isExpanded,
+                        copiedItemID: store.copiedItemID,
+                        sectionRevision: sectionRevision
+                    )
+                }
+            )
         }
         macTranscriptSectionCache.retain(itemIDs: retainedItemIDs)
         if showsPendingTurnIndicator {
@@ -1400,6 +1427,10 @@ struct ConversationView: View {
             transcriptMutation: store.transcriptMutation,
             dataRevision: transcriptContentRevision,
             styleRevision: styleHasher.finalize(),
+            // Keep mounted row views intact while the user scrolls. The old
+            // display-only stand-ins were restored with remove+insert batches,
+            // visibly blinking the page after every gesture.
+            usesLiveScrollStandIns: false,
             reduceMotion: reduceMotion,
             commandHandle: macTableCommandHandle,
             onNearBottomChange: { store.setNearBottom($0) },
@@ -1573,20 +1604,19 @@ struct ConversationView: View {
 
     #if os(iOS)
     private var iosTranscript: some View {
-        // The scroller's anchor identities must come from the same filtered
-        // entry list the ForEach renders; a hidden noise row or a grouped
-        // tool would otherwise become an anchor no view carries and prepends
-        // would lose the reading position.
+        // The scroller's anchor identities come from the same filtered item
+        // list the ForEach renders. Every provider item keeps one identity for
+        // its entire lifetime: live tools are never regrouped underneath the
+        // viewport when a second call arrives.
         let renderedItems = self.visibleItems.filter { !$0.isTranscriptNoise }
-        let entries = TranscriptEntry.entries(of: renderedItems)
         return ConversationTranscriptScroller(
             isConversationEmpty: store.state.items.isEmpty,
-            firstItemID: entries.first?.id,
+            firstItemID: renderedItems.first?.id,
             contentRevision: transcriptContentRevision,
             isNearBottom: store.isNearBottom,
             unreadCount: store.unreadCount,
             itemExists: { id in
-                entries.contains(where: { $0.id == id })
+                renderedItems.contains(where: { $0.id == id })
             },
             onNearBottomChange: { store.setNearBottom($0) },
             onAnchoredChange: { _ in },
@@ -1595,16 +1625,10 @@ struct ConversationView: View {
             VStack(alignment: .leading, spacing: 14) {
                 earlierContent
 
-                ForEach(entries) { entry in
-                    switch entry {
-                    case .item(let item):
-                        timelineView(for: item)
-                            .id(item.id)
-                            .accessibilityIdentifier("conversation.item.\(item.id)")
-                    case .toolGroup(let group):
-                        ToolGroupCard(group: group, store: store)
-                            .id(group.id)
-                    }
+                ForEach(renderedItems, id: \.id) { item in
+                    timelineView(for: item)
+                        .id(item.id)
+                        .accessibilityIdentifier("conversation.item.\(item.id)")
                 }
 
                 if showsPendingTurnIndicator {
@@ -2485,45 +2509,32 @@ private struct StreamingIndicator: View {
     }
 }
 
-/// Shown at the transcript tail while a turn is running but nothing is
-/// visibly streaming yet — the model is thinking (Claude emits no events
-/// during extended thinking) or between tool results and its next text.
+/// Shown at the transcript tail for the duration of a running turn.
 struct PendingTurnIndicator: View {
     var body: some View {
         HStack(spacing: 7) {
             ProgressView()
                 .controlSize(.mini)
                 .frame(width: 16)
-            Text("Thinking…")
+            Text("Working…")
                 .font(ChatTypography.activityLine)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
         }
         .frame(minHeight: ChatTypography.activityLineHeight)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Assistant is thinking")
+        .accessibilityLabel("Assistant is working")
     }
 
-    /// The indicator fills only the gaps where no transcript row shows
-    /// activity: an active turn whose tail item is neither streaming text or
-    /// reasoning nor a running tool. A completed assistant message at the
-    /// tail means the reply just landed and the turn is sealing — showing
-    /// "Thinking…" there would flash on every turn end.
+    /// One stable status row lives at the tail for the entire running turn.
+    /// Earlier versions repeatedly removed and reinserted a gap-only row
+    /// between reasoning, tools, and message blocks.
     static func showsPendingTurn(
         turnState: TurnState,
         lastItem: ConversationItem?
     ) -> Bool {
-        guard turnState == .running else { return false }
-        switch lastItem {
-        case .message(let message):
-            return message.role == .user && !message.isStreaming
-        case .reasoning(let reasoning):
-            return !reasoning.isStreaming
-        case .tool(let tool):
-            return tool.status != .running && tool.status != .pending
-        case .diff, .plan, .generic, nil:
-            return true
-        }
+        _ = lastItem
+        return turnState == .running
     }
 }
 
@@ -2558,7 +2569,11 @@ private struct ReasoningCard: View {
                     .padding(.leading, 23)
                     .padding(.bottom, 4)
             }
-        } else if let displayText {
+        } else {
+            // Keep one disclosure shell for the reasoning item's entire
+            // lifetime. Switching from a bare spinner row to a disclosure on
+            // the first text delta replaced the component under the viewport
+            // even though its compact height and identity should be stable.
             DisclosureCard(
                 title: reasoning.isStreaming ? "Thinking…" : "Reasoning summary",
                 symbol: "brain.head.profile",
@@ -2566,21 +2581,10 @@ private struct ReasoningCard: View {
                 isExpanded: isExpanded,
                 toggle: { actions.toggleExpanded(itemID: reasoning.id) }
             ) {
-                reasoningText(displayText)
+                if let displayText {
+                    reasoningText(displayText)
+                }
             }
-        } else if reasoning.isStreaming {
-            HStack(spacing: 7) {
-                Image(systemName: "brain.head.profile")
-                    .foregroundStyle(.secondary)
-                    .font(.caption)
-                    .frame(width: 16)
-                Text("Thinking…")
-                    .font(ChatTypography.activityLine)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            .frame(minHeight: ChatTypography.activityLineHeight)
-            .accessibilityElement(children: .combine)
         }
     }
 

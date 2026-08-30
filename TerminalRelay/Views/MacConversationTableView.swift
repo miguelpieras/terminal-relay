@@ -636,6 +636,7 @@ enum MacConversationTableDiagnostics {
         let maximumLiveScrollRestorationsPerPass: Int
         let maximumLiveScrollRestorationMilliseconds: Double
         let maximumLiveScrollEndMilliseconds: Double
+        let pinnedGeometryPrimePasses: Int
     }
 
     private(set) static var reloadDataCalls = 0
@@ -652,6 +653,7 @@ enum MacConversationTableDiagnostics {
     private(set) static var maximumLiveScrollRestorationsPerPass = 0
     private(set) static var maximumLiveScrollRestorationMilliseconds = 0.0
     private(set) static var maximumLiveScrollEndMilliseconds = 0.0
+    private(set) static var pinnedGeometryPrimePasses = 0
     private static var watchedMutationSourceID: String?
 
     static func reset() {
@@ -669,6 +671,7 @@ enum MacConversationTableDiagnostics {
         maximumLiveScrollRestorationsPerPass = 0
         maximumLiveScrollRestorationMilliseconds = 0
         maximumLiveScrollEndMilliseconds = 0
+        pinnedGeometryPrimePasses = 0
         watchedMutationSourceID = nil
     }
 
@@ -689,7 +692,8 @@ enum MacConversationTableDiagnostics {
                 maximumLiveScrollRestorationsPerPass,
             maximumLiveScrollRestorationMilliseconds:
                 maximumLiveScrollRestorationMilliseconds,
-            maximumLiveScrollEndMilliseconds: maximumLiveScrollEndMilliseconds
+            maximumLiveScrollEndMilliseconds: maximumLiveScrollEndMilliseconds,
+            pinnedGeometryPrimePasses: pinnedGeometryPrimePasses
         )
     }
 
@@ -740,6 +744,9 @@ enum MacConversationTableDiagnostics {
             milliseconds
         )
     }
+    static func recordedPinnedGeometryPrime() {
+        pinnedGeometryPrimePasses += 1
+    }
 }
 
 /// A view-based AppKit transcript. The table owns scrolling and row geometry;
@@ -752,6 +759,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
     var transcriptMutation: TranscriptMutation? = nil
     var dataRevision: Int? = nil
     var styleRevision: Int = 0
+    var usesLiveScrollStandIns = true
     let reduceMotion: Bool
     let commandHandle: MacConversationTableCommandHandle
     let onNearBottomChange: (Bool) -> Void
@@ -808,6 +816,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             transcriptMutation: transcriptMutation,
             dataRevision: dataRevision,
             styleRevision: styleRevision,
+            usesLiveScrollStandIns: usesLiveScrollStandIns,
             reduceMotion: reduceMotion,
             commandHandle: commandHandle,
             environment: context.environment,
@@ -841,6 +850,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         private var lastTranscriptMutationRevision: UInt64 = 0
         private var dataRevision: Int?
         private var styleRevision = 0
+        private var usesLiveScrollStandIns = true
         private var environment = EnvironmentValues()
         private var makeRow: (Row, Bool, Bool) -> AnyView = { _, _, _ in
             AnyView(EmptyView())
@@ -1172,6 +1182,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             transcriptMutation: TranscriptMutation?,
             dataRevision newDataRevision: Int?,
             styleRevision newStyleRevision: Int,
+            usesLiveScrollStandIns: Bool,
             reduceMotion: Bool,
             commandHandle: MacConversationTableCommandHandle,
             environment: EnvironmentValues,
@@ -1184,6 +1195,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             makeRow: @escaping (Row, Bool, Bool) -> AnyView
         ) {
             self.reduceMotion = reduceMotion
+            self.usesLiveScrollStandIns = usesLiveScrollStandIns
             self.environment = environment
             self.onNearBottomChange = onNearBottomChange
             self.onLiveScrollingChange = onLiveScrollingChange
@@ -1325,7 +1337,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                     MacConversationTableDiagnostics.recordedHeightInvalidation()
                 }
             }
-            if pendingMutationFollowsBottom, !isLiveScrolling,
+            if needsInitialAnchor, pendingMutationFollowsBottom, !isLiveScrolling,
                !selectionDragActive {
                 primePinnedDocumentGeometry()
             }
@@ -1385,8 +1397,8 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 isFirst: isFirst,
                 isLast: isLast
             )
-            let kind: MacConversationReusableCell.Kind = if isLiveScrolling,
-                preparedContent.kind == .native {
+            let kind: MacConversationReusableCell.Kind = if usesLiveScrollStandIns,
+                isLiveScrolling, preparedContent.kind == .native {
                 .nativeScroll
             } else {
                 preparedContent.kind
@@ -2281,11 +2293,11 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 dynamicTypeSize: environment.dynamicTypeSize,
                 colorScheme: environment.colorScheme
             ) {
-                return isLiveScrolling
+                return usesLiveScrollStandIns && isLiveScrolling
                     ? .native(liveScrollPresentation(for: presentation))
                     : .nativeFooter(presentation)
             }
-            if isLiveScrolling,
+            if usesLiveScrollStandIns, isLiveScrolling,
                let presentation = row.liveScrollTextPresentation(
                     dynamicTypeSize: environment.dynamicTypeSize,
                     colorScheme: environment.colorScheme
@@ -2314,9 +2326,11 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 dynamicTypeSize: environment.dynamicTypeSize,
                 colorScheme: environment.colorScheme
             ) != nil {
-                return isLiveScrolling ? .nativeScroll : .nativeFooter
+                return usesLiveScrollStandIns && isLiveScrolling
+                    ? .nativeScroll
+                    : .nativeFooter
             }
-            let presentation = isLiveScrolling
+            let presentation = usesLiveScrollStandIns && isLiveScrolling
                 ? row.liveScrollTextPresentation(
                     dynamicTypeSize: environment.dynamicTypeSize,
                     colorScheme: environment.colorScheme
@@ -2326,7 +2340,9 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                     colorScheme: environment.colorScheme
                 )
             guard presentation != nil else { return .hosted }
-            return isLiveScrolling ? .nativeScroll : .native
+            return usesLiveScrollStandIns && isLiveScrolling
+                ? .nativeScroll
+                : .native
         }
 
         private func liveScrollPresentation(
@@ -2538,7 +2554,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             scrollActivity.setLiveScrolling(true)
             scrollActivity.setIncrementalRestorationActive(false)
             let carriedCells = cancelLiveScrollRestoration(
-                requeueMountedCells: true
+                requeueMountedCells: usesLiveScrollStandIns
             )
             // Already-mounted rows have completed layout and can move without
             // any configuration work. Replacing them here would front-load a
@@ -2546,8 +2562,10 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             // rows newly realized (or changed) while scrolling use the cheap
             // display cell and are recorded for exact restoration below.
             liveScrollCells.removeAllObjects()
-            for cell in carriedCells {
-                liveScrollCells.add(cell)
+            if usesLiveScrollStandIns {
+                for cell in carriedCells {
+                    liveScrollCells.add(cell)
+                }
             }
             isLiveScrolling = true
             cancelMutationStabilization()
@@ -2571,6 +2589,17 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             // re-derived at mouse-up).
             if !selectionDragActive {
                 isFollowingBottom = isAtBottom
+            }
+            if !usesLiveScrollStandIns {
+                scrollActivity.setLiveScrolling(false)
+                scrollActivity.setIncrementalRestorationActive(false)
+                liveScrollCells.removeAllObjects()
+                cancelLiveScrollRestoration(requeueMountedCells: false)
+                flushLiveScrollDeferredHeightsWithoutStandIns()
+                sampleNearBottom()
+                onLiveScrollingChange(false)
+                scheduleViewportPrefetch()
+                return
             }
             scrollActivity.setIncrementalRestorationActive(true)
             scrollActivity.setLiveScrolling(false)
@@ -2632,6 +2661,28 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             onLiveScrollingChange(false)
             scheduleViewportPrefetch()
             scheduleLiveScrollRestorationIfNeeded()
+        }
+
+        /// Ordinary cells stay mounted when the stand-in mode is disabled.
+        /// Height changes accumulated during the gesture therefore need one
+        /// normal invalidation after release, without entering the native
+        /// scroll-cell restoration queue or replacing any row views.
+        private func flushLiveScrollDeferredHeightsWithoutStandIns() {
+            guard let tableView,
+                  !pendingLiveScrollHeightInvalidations.isEmpty else {
+                pendingLiveScrollHeightInvalidations.removeAll()
+                return
+            }
+            let followsBottom = isAtBottom || isFollowingBottom
+            prepareMutationStabilization(
+                followsBottom: followsBottom,
+                anchor: followsBottom ? nil : captureAnchor()
+            )
+            let indexes = pendingLiveScrollHeightInvalidations
+            pendingLiveScrollHeightInvalidations.removeAll()
+            tableView.noteHeightOfRows(withIndexesChanged: indexes)
+            MacConversationTableDiagnostics.recordedHeightInvalidation()
+            scheduleMutationStabilization()
         }
 
         private func scheduleLiveScrollRestorationIfNeeded() {
@@ -2884,6 +2935,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
 
         private func primePinnedDocumentGeometry() {
             guard let tableView, let scrollView, snapshot.count > 0 else { return }
+            MacConversationTableDiagnostics.recordedPinnedGeometryPrime()
             let estimatedHeight = CGFloat(snapshot.count) * tableView.rowHeight
                 + CGFloat(max(0, snapshot.count - 1)) * tableView.intercellSpacing.height
             if tableView.frame.height < estimatedHeight {
