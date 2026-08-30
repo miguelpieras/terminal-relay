@@ -522,6 +522,79 @@ struct TerminalRelayMarkdownTableStyle: MarkdownTableStyle {
     }
 }
 
+enum MarkdownTableAccessibility {
+    static let scrollViewIdentifier = "conversation.markdown-table"
+
+    /// SwiftUI's AppKit accessibility bridge can omit every Grid descendant
+    /// even while the real horizontal NSScrollView is mounted. Keep a bounded
+    /// semantic copy of the parsed table cells available to the stable native
+    /// host so VoiceOver can read the authoritative content through an AppKit
+    /// table hierarchy at every Dynamic Type size.
+    static func tables(in source: String) -> [[[String]]] {
+        var collector = MarkdownTableAccessibilityCollector()
+        collector.visit(Document(parsing: source))
+        return collector.tables
+    }
+}
+
+private struct MarkdownTableAccessibilityCollector: MarkupWalker {
+    var tables: [[[String]]] = []
+
+    mutating func visitTable(_ table: Markdown.Table) {
+        let header = Array(table.head.cells).map(\.plainText)
+        let body = Array(table.body.rows).map { row in
+            Array(row.cells).map(\.plainText)
+        }
+        tables.append([header] + body)
+    }
+}
+
+#if os(macOS)
+/// SwiftUI applies `accessibilityIdentifier` to an accessibility proxy rather
+/// than the backing `NSScrollView`. The conversation cell bridges the actual
+/// AppKit scroll views into its accessibility children, so tag that concrete
+/// view from a zero-impact descendant inside each table's scroll document.
+private struct MarkdownTableScrollViewMarker: NSViewRepresentable {
+    func makeNSView(context: Context) -> MarkerView {
+        MarkerView()
+    }
+
+    func updateNSView(_ nsView: MarkerView, context: Context) {
+        nsView.markEnclosingScrollView()
+    }
+
+    final class MarkerView: NSView {
+        override func viewDidMoveToSuperview() {
+            super.viewDidMoveToSuperview()
+            markEnclosingScrollView()
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            markEnclosingScrollView()
+        }
+
+        override func layout() {
+            super.layout()
+            markEnclosingScrollView()
+        }
+
+        func markEnclosingScrollView() {
+            var ancestor = superview
+            while let view = ancestor {
+                if let scrollView = view as? NSScrollView {
+                    scrollView.setAccessibilityIdentifier(
+                        MarkdownTableAccessibility.scrollViewIdentifier
+                    )
+                    return
+                }
+                ancestor = view.superview
+            }
+        }
+    }
+}
+#endif
+
 private struct TerminalRelayMarkdownTable: View {
     let configuration: MarkdownTableStyleConfiguration
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -530,13 +603,30 @@ private struct TerminalRelayMarkdownTable: View {
     var body: some View {
         Group {
             if dynamicTypeSize.isAccessibilitySize {
-                VStack(alignment: .leading, spacing: 8) {
-                    Grid { configuration.table.header }
-                    ForEach(Array(configuration.table.rows.enumerated()), id: \.offset) { index, row in
-                        Grid { row }
-                            .background(index.isMultiple(of: 2) ? Color.clear : Color.secondary.opacity(0.06))
+                ScrollView(.horizontal) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Grid { configuration.table.header }
+                        ForEach(Array(configuration.table.rows.enumerated()), id: \.offset) { index, row in
+                            Grid { row }
+                                .background(index.isMultiple(of: 2) ? Color.clear : Color.secondary.opacity(0.06))
+                        }
                     }
+                    .fixedSize(horizontal: true, vertical: false)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: {
+                        gridWidth = $0 > 0 ? $0 : nil
+                    }
+                    #if os(macOS)
+                    .background(MarkdownTableScrollViewMarker())
+                    #endif
                 }
+                .scrollIndicators(.visible)
+                .frame(maxWidth: gridWidth)
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Scrollable table")
+                .accessibilityIdentifier(
+                    MarkdownTableAccessibility.scrollViewIdentifier
+                )
+                .accessibilityHint("Swipe horizontally to read every table column.")
             } else {
                 ScrollView(.horizontal) {
                     tableGrid
@@ -544,6 +634,9 @@ private struct TerminalRelayMarkdownTable: View {
                         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: {
                             gridWidth = $0 > 0 ? $0 : nil
                         }
+                        #if os(macOS)
+                        .background(MarkdownTableScrollViewMarker())
+                        #endif
                 }
                 .scrollIndicators(.visible)
                 // A horizontal scroll view claims its whole axis. A table
@@ -552,6 +645,9 @@ private struct TerminalRelayMarkdownTable: View {
                 .frame(maxWidth: gridWidth)
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel("Scrollable table")
+                .accessibilityIdentifier(
+                    MarkdownTableAccessibility.scrollViewIdentifier
+                )
                 .accessibilityHint("Swipe horizontally to read every table column.")
             }
         }
@@ -1441,11 +1537,54 @@ struct RichMarkdownView: View {
     var exactFallbackText: String? = nil
     let isStreaming: Bool
 
+    /// Completed table tiles enter the hosted renderer with a fully populated
+    /// source. `StreamingMarkdownReader` deliberately starts from an empty
+    /// parse result and fills it from a task, which is correct while tokens
+    /// arrive but creates a visible blank interval when an already-complete
+    /// native cell adopts its hosted table. Projection tiles are strictly
+    /// bounded, so a cold cache miss is safe to sanitize synchronously here.
+    private let completedTableSource: String?
+
     @Environment(\.openURL) private var openURL
     @Environment(\.chatRowActions) private var actions
 
-    @State private var source = StreamingMarkdownSource()
-    @State private var didFinishStreaming = false
+    @State private var source: StreamingMarkdownSource
+    @State private var didFinishStreaming: Bool
+
+    init(
+        text: String,
+        exactFallbackText: String? = nil,
+        isStreaming: Bool
+    ) {
+        self.text = text
+        self.exactFallbackText = exactFallbackText
+        self.isStreaming = isStreaming
+
+        #if os(macOS)
+        let completedTableSource: String?
+        if !isStreaming, MarkdownSafety.containsTableCandidate(text) {
+            if let cached = SanitizedMarkdownCache.shared.lookup(raw: text) {
+                completedTableSource = cached
+            } else {
+                let sanitized = MarkdownSafety.sanitizedSource(text)
+                SanitizedMarkdownCache.shared.insert(
+                    raw: text,
+                    sanitized: sanitized
+                )
+                completedTableSource = sanitized
+            }
+        } else {
+            completedTableSource = nil
+        }
+        #else
+        let completedTableSource: String? = nil
+        #endif
+        self.completedTableSource = completedTableSource
+        _source = State(
+            initialValue: StreamingMarkdownSource(completedTableSource ?? "")
+        )
+        _didFinishStreaming = State(initialValue: false)
+    }
 
     @ViewBuilder
     var body: some View {
@@ -1562,7 +1701,14 @@ struct RichMarkdownView: View {
     @ViewBuilder
     private var markdownContent: some View {
         #if os(macOS)
-        streamingMarkdownContent
+        if let completedTableSource {
+            // `MarkdownView(String)` parses during this first view update, so
+            // the hybrid cell never replaces its Core Text fallback with the
+            // streaming reader's initially-empty document.
+            MarkdownView(completedTableSource)
+        } else {
+            streamingMarkdownContent
+        }
         #else
         if !isStreaming,
            let sanitized = SanitizedMarkdownCache.shared.lookup(raw: text) {

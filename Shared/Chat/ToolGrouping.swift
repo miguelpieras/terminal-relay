@@ -1,8 +1,9 @@
 import Foundation
 
 /// Codex-style presentation model for tool activity: consecutive tool calls
-/// collapse into one summary line ("Read files, ran commands") with a single
-/// live line while one is running, and every tool renders as a one-line
+/// collapse into one stable summary line ("Read files, ran commands") whose
+/// headline and spinner follow the active member in place, and every tool
+/// renders as a one-line
 /// headline ("Ran git status") instead of a multi-line card. Grouping is a
 /// pure function of the item list so the transcript and the iOS stack agree.
 enum TranscriptEntry: Identifiable {
@@ -124,15 +125,55 @@ struct ToolGroup: Identifiable {
     }
 }
 
-/// Collapsed summary line for a run of consecutive tool calls.
+/// Presentation of one member inside an expanded tool run. The outer group
+/// header permanently owns the first member's disclosure, so appending a
+/// second tool never inserts a duplicate first-member header or collapses the
+/// details the user explicitly revealed while the run was still a singleton.
+struct ToolGroupMemberPresentation: Equatable {
+    let isExpanded: Bool
+    let showsCompactLine: Bool
+}
+
+extension ToolGroup {
+    func memberPresentation(
+        itemID: String,
+        isExplicitlyExpanded: Bool
+    ) -> ToolGroupMemberPresentation {
+        let isLeadMember = itemID == items.first?.id
+        return ToolGroupMemberPresentation(
+            isExpanded: isLeadMember || isExplicitlyExpanded,
+            showsCompactLine: !isLeadMember
+        )
+    }
+}
+
+/// The one collapsed row for a run of consecutive tool calls. It carries the
+/// active member's headline while running, then the aggregate summary.
 struct ToolGroupHeaderModel: Equatable {
     let groupID: String
     let summary: String
     let symbol: String
     let hasFailure: Bool
     let isExpanded: Bool
+    let isRunning: Bool
 
     var id: String { "\(groupID):header" }
+
+    init(
+        groupID: String,
+        summary: String,
+        symbol: String,
+        hasFailure: Bool,
+        isExpanded: Bool,
+        isRunning: Bool = false
+    ) {
+        self.groupID = groupID
+        self.summary = summary
+        self.symbol = symbol
+        self.hasFailure = hasFailure
+        self.isExpanded = isExpanded
+        self.isRunning = isRunning
+    }
 }
 
 /// The single live line under a collapsed group while a member tool runs.
@@ -147,12 +188,26 @@ struct ToolGroupLiveModel: Equatable {
 
 extension ToolGroup {
     func headerModel(isExpanded: Bool) -> ToolGroupHeaderModel {
-        ToolGroupHeaderModel(
+        let headerSummary: String
+        if let runningTool {
+            headerSummary = runningTool.compactHeadline
+        } else if tools.count == 1, let tool = tools.first {
+            headerSummary = tool.composedHeadline(compactLine: nil)
+        } else {
+            headerSummary = summaryText
+        }
+        return ToolGroupHeaderModel(
             groupID: id,
-            summary: summaryText,
+            // Production starts a group wrapper with the first tool so a
+            // second consecutive call only updates this header instead of
+            // replacing the first tool row. Keep that singleton useful by
+            // showing the active command/path headline; once the run settles,
+            // the same header switches to the compact aggregate summary.
+            summary: headerSummary,
             symbol: dominantKind.symbolName,
             hasFailure: hasFailure,
-            isExpanded: isExpanded
+            isExpanded: isExpanded,
+            isRunning: runningTool != nil
         )
     }
 }

@@ -35,6 +35,29 @@ protocol MacTranscriptTableSelectionDelegate: AnyObject {
 final class MacTranscriptTableView: NSTableView {
     weak var selectionDelegate: MacTranscriptTableSelectionDelegate?
 
+    /// Keeps the scrollable document extent immutable while a live gesture
+    /// owns the viewport. Automatic row-height measurements may continue to
+    /// settle internally, but they are published only after the coordinator
+    /// releases this clamp and restores the user's row anchor at idle.
+    private var frozenDocumentHeight: CGFloat?
+
+    func setLiveScrollFrozenDocumentHeight(_ height: CGFloat?) {
+        frozenDocumentHeight = height.map { max(1, $0) }
+        guard let frozenDocumentHeight,
+              abs(frame.height - frozenDocumentHeight) > 0.5 else { return }
+        super.setFrameSize(NSSize(
+            width: frame.width,
+            height: frozenDocumentHeight
+        ))
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(NSSize(
+            width: newSize.width,
+            height: frozenDocumentHeight ?? newSize.height
+        ))
+    }
+
     override var acceptsFirstResponder: Bool { true }
 
     override func mouseDown(with event: NSEvent) {

@@ -37,6 +37,20 @@ xcodebuild \
     CURRENT_PROJECT_VERSION="$build_number" \
     test
 
+echo "Running optimized transcript scrolling benchmark"
+xcodebuild \
+    -project TerminalRelay.xcodeproj \
+    -scheme TerminalRelay \
+    -configuration Release \
+    -destination 'platform=macOS,arch=arm64' \
+    -derivedDataPath "$derived_data" \
+    CODE_SIGNING_ALLOWED=NO \
+    ENABLE_TESTABILITY=YES \
+    ONLY_ACTIVE_ARCH=YES \
+    CURRENT_PROJECT_VERSION="$build_number" \
+    -only-testing:TerminalRelayTests/MacConversationTableViewTests/testReleaseMixedConversationContinuousScrollPerformance \
+    test
+
 echo "Running Terminal Relay iOS tests"
 ios_simulator_id=$(/usr/bin/python3 - <<'PYTHON'
 import json

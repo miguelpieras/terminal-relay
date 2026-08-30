@@ -4,16 +4,31 @@ struct TranscriptMarkdownContinuation: Equatable, Sendable {
     var openFence: String?
     var startsAtLineBoundary: Bool
     var pendingFenceLine: TranscriptMarkdownFenceLineState
+    /// Header plus delimiter for a GFM table that is still receiving body
+    /// rows. Each independently parsed continuation tile prepends this
+    /// bounded pair so its rows remain a semantic grid.
+    var openTablePrefix: String?
+    /// A bounded pipe-bearing line waiting to see whether the next physical
+    /// line is a GFM delimiter. This permits the header/delimiter pair itself
+    /// to straddle a projection boundary.
+    var pendingTableHeader: String?
+    var pendingTableLine: TranscriptMarkdownTableLineState
 
     init(
         openFence: String?,
         startsAtLineBoundary: Bool,
-        pendingFenceLine: TranscriptMarkdownFenceLineState? = nil
+        pendingFenceLine: TranscriptMarkdownFenceLineState? = nil,
+        openTablePrefix: String? = nil,
+        pendingTableHeader: String? = nil,
+        pendingTableLine: TranscriptMarkdownTableLineState = .empty
     ) {
         self.openFence = openFence
         self.startsAtLineBoundary = startsAtLineBoundary
         self.pendingFenceLine = pendingFenceLine
             ?? (startsAtLineBoundary ? .indent(0) : .ordinary)
+        self.openTablePrefix = openTablePrefix
+        self.pendingTableHeader = pendingTableHeader
+        self.pendingTableLine = pendingTableLine
     }
 
     static let initial = TranscriptMarkdownContinuation(
@@ -40,6 +55,22 @@ enum TranscriptMarkdownFenceLineState: Equatable, Sendable {
         trailingWhitespaceOnly: Bool
     )
     case ordinary
+}
+
+/// Bounded source retained only until one physical line can be classified as
+/// a Markdown table header/delimiter/body row. `hasPipe` survives an
+/// over-budget line so table state can resume on the next bounded row, while
+/// `bytes` is discarded once it cannot be used as a synthetic prefix.
+struct TranscriptMarkdownTableLineState: Equatable, Sendable {
+    var bytes: [UInt8]
+    var hasPipe: Bool
+    var isRetainable: Bool
+
+    static let empty = TranscriptMarkdownTableLineState(
+        bytes: [],
+        hasPipe: false,
+        isRetainable: true
+    )
 }
 
 struct TranscriptTextSegment: Equatable, Sendable {
@@ -364,11 +395,18 @@ enum TranscriptTextProjection {
             initialStartsAtLineBoundary: initialContinuation.startsAtLineBoundary
         )
         var continuation = initialContinuation
+        let tracksTableContinuation = needsTableContinuationTracking(
+            source: source,
+            initialContinuation: initialContinuation
+        )
         return raw.map { segment in
             renderedMarkdownSegment(
                 segment,
                 continuation: &continuation,
-                maximumSyntheticFenceBytes: byteBudget.syntheticFenceBytes
+                maximumSyntheticFenceBytes: byteBudget.syntheticFenceBytes,
+                maximumRenderedBytes: maximumBytes,
+                maximumRenderedLines: maximumLines,
+                tracksTableContinuation: tracksTableContinuation
             )
         }
     }
@@ -389,6 +427,10 @@ enum TranscriptTextProjection {
         let byteBudget = markdownByteBudget(maximumBytes: maximumBytes)
         precondition(maximumLines >= 3)
         var continuation = initialContinuation
+        let tracksTableContinuation = needsTableContinuationTracking(
+            source: source,
+            initialContinuation: initialContinuation
+        )
         var suffix: [TranscriptTextSegment] = []
         suffix.reserveCapacity(limit)
         forEachSegment(
@@ -401,7 +443,10 @@ enum TranscriptTextProjection {
             let rendered = renderedMarkdownSegment(
                 raw,
                 continuation: &continuation,
-                maximumSyntheticFenceBytes: byteBudget.syntheticFenceBytes
+                maximumSyntheticFenceBytes: byteBudget.syntheticFenceBytes,
+                maximumRenderedBytes: maximumBytes,
+                maximumRenderedLines: maximumLines,
+                tracksTableContinuation: tracksTableContinuation
             )
             if suffix.count == limit {
                 suffix.removeFirst()
@@ -428,11 +473,18 @@ enum TranscriptTextProjection {
             initialStartsAtLineBoundary: initialContinuation.startsAtLineBoundary
         )
         var continuation = initialContinuation
+        let tracksTableContinuation = needsTableContinuationTracking(
+            source: source,
+            initialContinuation: initialContinuation
+        )
         return TranscriptFirstTextSegment(
             segment: renderedMarkdownSegment(
                 raw.segment,
                 continuation: &continuation,
-                maximumSyntheticFenceBytes: byteBudget.syntheticFenceBytes
+                maximumSyntheticFenceBytes: byteBudget.syntheticFenceBytes,
+                maximumRenderedBytes: maximumBytes,
+                maximumRenderedLines: maximumLines,
+                tracksTableContinuation: tracksTableContinuation
             ),
             hasMore: raw.hasMore
         )
@@ -441,7 +493,10 @@ enum TranscriptTextProjection {
     private static func renderedMarkdownSegment(
         _ segment: TranscriptTextSegment,
         continuation: inout TranscriptMarkdownContinuation,
-        maximumSyntheticFenceBytes: Int
+        maximumSyntheticFenceBytes: Int,
+        maximumRenderedBytes: Int,
+        maximumRenderedLines: Int,
+        tracksTableContinuation: Bool
     ) -> TranscriptTextSegment {
         let continuationAtStart = continuation
         let isPhysicalLineFragment = !continuation.startsAtLineBoundary
@@ -473,7 +528,9 @@ enum TranscriptTextProjection {
                 in: segment.text,
                 endsAtPhysicalLineEnd: segment.endsAtPhysicalLineEnd,
                 continuation: &continuation,
-                maximumSyntheticFenceBytes: maximumSyntheticFenceBytes
+                maximumSyntheticFenceBytes: maximumSyntheticFenceBytes,
+                maximumTablePrefixBytes: (maximumSyntheticFenceBytes + 1) * 2,
+                tracksTableContinuation: tracksTableContinuation
             )
             return TranscriptTextSegment(
                 index: segment.index,
@@ -483,6 +540,11 @@ enum TranscriptTextProjection {
                 endsAtPhysicalLineEnd: segment.endsAtPhysicalLineEnd
             )
         }
+        let tablePrefix = syntheticTablePrefix(
+            for: segment.text,
+            continuation: continuation,
+            maximumBytes: (maximumSyntheticFenceBytes + 1) * 2
+        )
         let prefix = syntheticFence(
             continuation.openFence,
             suffix: "\n",
@@ -492,7 +554,9 @@ enum TranscriptTextProjection {
             in: segment.text,
             endsAtPhysicalLineEnd: segment.endsAtPhysicalLineEnd,
             continuation: &continuation,
-            maximumSyntheticFenceBytes: maximumSyntheticFenceBytes
+            maximumSyntheticFenceBytes: maximumSyntheticFenceBytes,
+            maximumTablePrefixBytes: (maximumSyntheticFenceBytes + 1) * 2,
+            tracksTableContinuation: tracksTableContinuation
         )
         let suffix: String
         if let openFence = continuation.openFence {
@@ -507,26 +571,93 @@ enum TranscriptTextProjection {
         } else {
             suffix = ""
         }
+        let baseRenderedText = prefix + segment.text + suffix
+        let tableRenderedText = tablePrefix + baseRenderedText
+        let renderedText = tablePrefix.isEmpty
+            || tableRenderedText.utf8.count > maximumRenderedBytes
+            || logicalLineCount(
+                tableRenderedText,
+                stoppingAt: maximumRenderedLines + 1
+            ) > maximumRenderedLines
+            ? baseRenderedText
+            : tableRenderedText
         return TranscriptTextSegment(
             index: segment.index,
             text: segment.text,
-            renderedText: prefix + segment.text + suffix,
+            renderedText: renderedText,
             markdownContinuation: continuationAtStart,
             endsAtPhysicalLineEnd: segment.endsAtPhysicalLineEnd
         )
+    }
+
+    /// Supplies just enough authored structure for an independently parsed
+    /// table continuation to remain a GFM table. The prefix is rendering-only
+    /// and bounded by the same fixed reserve used for fence continuation.
+    private static func syntheticTablePrefix(
+        for text: String,
+        continuation: TranscriptMarkdownContinuation,
+        maximumBytes: Int
+    ) -> String {
+        guard continuation.startsAtLineBoundary,
+              continuation.openFence == nil else {
+            return ""
+        }
+        let firstLine = firstPhysicalLine(in: text)
+        if let prefix = continuation.openTablePrefix,
+           isTableBodyLine(firstLine),
+           prefix.utf8.count <= maximumBytes {
+            return prefix
+        }
+        if let header = continuation.pendingTableHeader,
+           isTableDelimiterLine(firstLine) {
+            let prefix = header + "\n"
+            return prefix.utf8.count <= maximumBytes ? prefix : ""
+        }
+        return ""
+    }
+
+    private static func firstPhysicalLine(in text: String) -> String {
+        let utf8 = text.utf8
+        var end = utf8.startIndex
+        while end < utf8.endIndex {
+            guard logicalLineBreakLength(in: utf8, at: end) == 0 else {
+                break
+            }
+            end = utf8.index(after: end)
+        }
+        return String(decoding: utf8[utf8.startIndex..<end], as: UTF8.self)
+    }
+
+    private static func needsTableContinuationTracking(
+        source: String,
+        initialContinuation: TranscriptMarkdownContinuation
+    ) -> Bool {
+        initialContinuation.openTablePrefix != nil
+            || initialContinuation.pendingTableHeader != nil
+            || !initialContinuation.pendingTableLine.bytes.isEmpty
+            || source.utf8.contains(0x7C)
     }
 
     private static func consumeFenceState(
         in text: String,
         endsAtPhysicalLineEnd: Bool,
         continuation: inout TranscriptMarkdownContinuation,
-        maximumSyntheticFenceBytes: Int
+        maximumSyntheticFenceBytes: Int,
+        maximumTablePrefixBytes: Int,
+        tracksTableContinuation: Bool
     ) {
         let utf8 = text.utf8
         var index = utf8.startIndex
         while index < utf8.endIndex {
             let lineBreakBytes = logicalLineBreakLength(in: utf8, at: index)
             if lineBreakBytes > 0 {
+                if tracksTableContinuation {
+                    commitPendingTableLine(
+                        isInsideFence: continuation.openFence != nil,
+                        continuation: &continuation,
+                        maximumPrefixBytes: maximumTablePrefixBytes
+                    )
+                }
                 commitPendingFenceLine(
                     continuation: &continuation,
                     maximumSyntheticFenceBytes: maximumSyntheticFenceBytes
@@ -536,6 +667,13 @@ enum TranscriptTextProjection {
                     index = utf8.index(after: index)
                 }
                 continue
+            }
+            if tracksTableContinuation {
+                consumeTableByte(
+                    utf8[index],
+                    continuation: &continuation,
+                    maximumPrefixBytes: maximumTablePrefixBytes
+                )
             }
             consumeFenceByte(
                 utf8[index],
@@ -552,12 +690,101 @@ enum TranscriptTextProjection {
         // context.
         if endsAtPhysicalLineEnd,
            !endsWithLogicalLineBreak(utf8, at: utf8.endIndex) {
+            if tracksTableContinuation {
+                commitPendingTableLine(
+                    isInsideFence: continuation.openFence != nil,
+                    continuation: &continuation,
+                    maximumPrefixBytes: maximumTablePrefixBytes
+                )
+            }
             commitPendingFenceLine(
                 continuation: &continuation,
                 maximumSyntheticFenceBytes: maximumSyntheticFenceBytes
             )
             continuation.startsAtLineBoundary = false
         }
+    }
+
+    private static func consumeTableByte(
+        _ byte: UInt8,
+        continuation: inout TranscriptMarkdownContinuation,
+        maximumPrefixBytes: Int
+    ) {
+        continuation.pendingTableLine.hasPipe =
+            continuation.pendingTableLine.hasPipe || byte == 0x7C
+        guard continuation.pendingTableLine.isRetainable else { return }
+        guard continuation.pendingTableLine.bytes.count < maximumPrefixBytes else {
+            continuation.pendingTableLine.bytes.removeAll(keepingCapacity: false)
+            continuation.pendingTableLine.isRetainable = false
+            return
+        }
+        continuation.pendingTableLine.bytes.append(byte)
+    }
+
+    private static func commitPendingTableLine(
+        isInsideFence: Bool,
+        continuation: inout TranscriptMarkdownContinuation,
+        maximumPrefixBytes: Int
+    ) {
+        let hasPipe = continuation.pendingTableLine.hasPipe
+        let line = continuation.pendingTableLine.isRetainable
+            ? String(decoding: continuation.pendingTableLine.bytes, as: UTF8.self)
+            : nil
+        continuation.pendingTableLine.bytes.removeAll(keepingCapacity: true)
+        continuation.pendingTableLine.hasPipe = false
+        continuation.pendingTableLine.isRetainable = true
+
+        guard !isInsideFence else {
+            continuation.openTablePrefix = nil
+            continuation.pendingTableHeader = nil
+            return
+        }
+
+        if continuation.openTablePrefix != nil {
+            // Exact line retention is unnecessary for body rows. Keeping the
+            // pipe bit separately lets an exceptionally wide row stay inside
+            // the table without retaining or duplicating that row in state.
+            if hasPipe,
+               line.map(isTableBodyLine) ?? true {
+                continuation.pendingTableHeader = nil
+                return
+            }
+            continuation.openTablePrefix = nil
+        }
+
+        guard let line else {
+            continuation.pendingTableHeader = nil
+            return
+        }
+        if let header = continuation.pendingTableHeader,
+           isTableDelimiterLine(line) {
+            let prefix = header + "\n" + line + "\n"
+            continuation.openTablePrefix = prefix.utf8.count <= maximumPrefixBytes
+                ? prefix
+                : nil
+            continuation.pendingTableHeader = nil
+            return
+        }
+        continuation.pendingTableHeader = isTableHeaderLine(line) ? line : nil
+    }
+
+    private static func isTableHeaderLine(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        return !trimmed.isEmpty
+            && trimmed.contains("|")
+            && !trimmed.hasPrefix("```")
+            && !trimmed.hasPrefix("~~~")
+    }
+
+    private static func isTableBodyLine(_ line: String) -> Bool {
+        isTableHeaderLine(line)
+    }
+
+    private static func isTableDelimiterLine(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        return !trimmed.isEmpty
+            && trimmed.contains("-")
+            && trimmed.allSatisfy { "|-: ".contains($0) }
     }
 
     private static func consumeFenceByte(

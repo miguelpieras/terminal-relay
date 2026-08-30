@@ -67,6 +67,82 @@ final class ToolGroupingTests: XCTestCase {
         XCTAssertEqual(grown.first?.id, "toolgroup:t1")
     }
 
+    func testStableProductionGroupingStartsWithSingletonWrapper() {
+        let initial = TranscriptEntry.entries(
+            of: [tool(
+                id: "t1",
+                status: .running,
+                input: #"{"command":"swift test"}"#
+            )],
+            minimumGroupSize: 1
+        )
+        let grown = TranscriptEntry.entries(
+            of: [
+                tool(id: "t1", input: #"{"command":"swift test"}"#),
+                tool(id: "t2", status: .running),
+            ],
+            minimumGroupSize: 1
+        )
+        let settled = TranscriptEntry.entries(
+            of: [tool(id: "t1"), tool(id: "t2")],
+            minimumGroupSize: 1
+        )
+
+        guard case .toolGroup(let singleton) = initial.first,
+              case .toolGroup(let group) = grown.first,
+              case .toolGroup(let settledGroup) = settled.first else {
+            return XCTFail("Expected stable tool-group wrappers")
+        }
+        XCTAssertEqual(singleton.id, group.id)
+        XCTAssertEqual(singleton.headerModel(isExpanded: false).id,
+                       group.headerModel(isExpanded: false).id)
+        XCTAssertEqual(group.headerModel(isExpanded: false).id,
+                       settledGroup.headerModel(isExpanded: false).id)
+        XCTAssertFalse(settledGroup.headerModel(isExpanded: false).isRunning)
+        XCTAssertEqual(settledGroup.headerModel(isExpanded: false).summary,
+                       "Ran commands")
+        XCTAssertEqual(singleton.headerModel(isExpanded: false).summary,
+                       "Running swift test")
+        XCTAssertTrue(singleton.headerModel(isExpanded: false).isRunning)
+        XCTAssertEqual(group.headerModel(isExpanded: false).summary,
+                       "Running a command")
+        XCTAssertTrue(group.headerModel(isExpanded: false).isRunning)
+    }
+
+    func testExpandedLeadPresentationSurvivesSingletonToMultiTransition() throws {
+        let first = tool(id: "t1", input: #"{"command":"swift test"}"#)
+        let second = tool(id: "t2", status: .running)
+        guard case .toolGroup(let singleton) = TranscriptEntry.entries(
+            of: [first],
+            minimumGroupSize: 1
+        ).first,
+        case .toolGroup(let grown) = TranscriptEntry.entries(
+            of: [first, second],
+            minimumGroupSize: 1
+        ).first else {
+            return XCTFail("Expected stable tool-group wrappers")
+        }
+
+        let singletonLead = singleton.memberPresentation(
+            itemID: "t1",
+            isExplicitlyExpanded: false
+        )
+        let grownLead = grown.memberPresentation(
+            itemID: "t1",
+            isExplicitlyExpanded: false
+        )
+        XCTAssertEqual(singletonLead, grownLead)
+        XCTAssertTrue(grownLead.isExpanded)
+        XCTAssertFalse(grownLead.showsCompactLine)
+
+        let appended = grown.memberPresentation(
+            itemID: "t2",
+            isExplicitlyExpanded: false
+        )
+        XCTAssertFalse(appended.isExpanded)
+        XCTAssertTrue(appended.showsCompactLine)
+    }
+
     func testNonToolItemSplitsRuns() {
         let entries = TranscriptEntry.entries(of: [
             tool(id: "t1"),

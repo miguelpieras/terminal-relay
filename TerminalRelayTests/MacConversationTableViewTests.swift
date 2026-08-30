@@ -36,7 +36,11 @@ final class MacConversationTableViewTests: XCTestCase {
         var backgroundCornerRadius: CGFloat = 0
         var usesFastPlainTextRenderer = false
         var promotesFastRendererWhenIdle = false
+        var deferredRichText: String? = nil
+        var deferredRichTextDelayNanoseconds: UInt64 = 0
+        var prefersHostedRenderer = false
         var usesLiveScrollText = false
+        var suppressesLiveScrollText = false
         var linkURL: URL? = nil
         var mutationSourceIDOverride: String? = nil
         var selectionRoleLabelOverride: String? = nil
@@ -59,11 +63,31 @@ final class MacConversationTableViewTests: XCTestCase {
             if let linkURL {
                 attributes[.link] = linkURL
             }
+            let immediate = deferredRichText == nil
+                ? NSAttributedString(string: text, attributes: attributes)
+                : nil
+            let deferred: MacConversationNativeTextPresentation
+                .DeferredAttributedString? = deferredRichText.map { richText in
+                    { @Sendable in
+                        if deferredRichTextDelayNanoseconds > 0 {
+                            try? await Task.sleep(
+                                nanoseconds: deferredRichTextDelayNanoseconds
+                            )
+                            guard !Task.isCancelled else { return nil }
+                        }
+                        return MacConversationNativeTextPresentation.DeferredArtifact {
+                            NSAttributedString(
+                                string: richText,
+                                attributes: [
+                                    .font: NSFont.systemFont(ofSize: 14),
+                                    .foregroundColor: NSColor.labelColor,
+                                ]
+                            )
+                        }
+                    }
+                }
             return MacConversationNativeTextPresentation(
-                attributedString: NSAttributedString(
-                    string: text,
-                    attributes: attributes
-                ),
+                attributedString: immediate,
                 fallbackString: text,
                 contentInsets: NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12),
                 firstRowTopInsetAdjustment: firstRowTopInsetAdjustment,
@@ -77,8 +101,10 @@ final class MacConversationTableViewTests: XCTestCase {
                 horizontalAlignment: horizontalAlignment,
                 accessibilityLabel: "Native transcript text",
                 accessibilityIdentifier: nativeAccessibilityIdentifier,
+                deferredAttributedString: deferred,
                 usesFastPlainTextRenderer: usesFastPlainTextRenderer,
-                promotesFastRendererWhenIdle: promotesFastRendererWhenIdle
+                promotesFastRendererWhenIdle: promotesFastRendererWhenIdle,
+                prefersHostedRenderer: prefersHostedRenderer
             )
         }
 
@@ -86,6 +112,7 @@ final class MacConversationTableViewTests: XCTestCase {
             dynamicTypeSize: DynamicTypeSize,
             colorScheme: ColorScheme
         ) -> MacConversationNativeTextPresentation? {
+            guard !suppressesLiveScrollText else { return nil }
             guard usesLiveScrollText else {
                 return nativeTextPresentation(
                     dynamicTypeSize: dynamicTypeSize,
@@ -412,7 +439,7 @@ final class MacConversationTableViewTests: XCTestCase {
         XCTAssertNotNil(descendant(of: cell, type: NSHostingView<AnyView>.self))
     }
 
-    func testDisablingLiveScrollStandInsKeepsOrdinaryCellsWithoutRestoration() {
+    func testDisablingLiveScrollStandInsKeepsStableCellsWithoutRestoration() {
         let rows = (0..<80).map { index in
             MixedRow(
                 id: "stable-live-row-\(index)",
@@ -443,6 +470,8 @@ final class MacConversationTableViewTests: XCTestCase {
 
         let visible = mounted.table.rows(in: scrollView.contentView.bounds)
         XCTAssertNotEqual(visible.location, NSNotFound)
+        var lightweightCell: NSView?
+        var lightweightRow = NSNotFound
         for index in visible.location..<NSMaxRange(visible) {
             let cell = mounted.table.view(
                 atColumn: 0,
@@ -450,21 +479,510 @@ final class MacConversationTableViewTests: XCTestCase {
                 makeIfNecessary: true
             )
             XCTAssertTrue(
-                cell?.identifier?.rawValue.hasSuffix(".hosted") == true,
-                "The opt-out must never replace ordinary rows with stand-ins."
+                cell?.identifier?.rawValue.hasSuffix(".native") == true,
+                "Every eligible row keeps one stable native outer cell."
+            )
+            XCTAssertFalse(
+                cell?.identifier?.rawValue.hasSuffix(".native-scroll") == true
+            )
+            if let cell,
+               descendant(
+                    of: cell,
+                    type: MacConversationScrollTextView.self
+               )?.isHiddenOrHasHiddenAncestor == false,
+               descendant(of: cell, type: NSHostingView<AnyView>.self) == nil {
+                lightweightCell = cell
+                lightweightRow = index
+            }
+        }
+        let coldCell = try! XCTUnwrap(
+            lightweightCell,
+            "The pass must realize at least one cold Core Text row."
+        )
+
+        NotificationCenter.default.post(
+            name: NSScrollView.didEndLiveScrollNotification,
+            object: scrollView
+        )
+        let deadline = Date().addingTimeInterval(2)
+        var settledHost = descendant(
+            of: coldCell,
+            type: NSHostingView<AnyView>.self
+        )
+        while settledHost == nil, Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(1.0 / 60.0))
+            mounted.hosting.layoutSubtreeIfNeeded()
+            settledHost = descendant(
+                of: coldCell,
+                type: NSHostingView<AnyView>.self
             )
         }
+
+        let diagnostics = MacConversationTableDiagnostics.snapshot()
+        XCTAssertNotNil(settledHost)
+        XCTAssertTrue(coldCell === mounted.table.view(
+            atColumn: 0,
+            row: lightweightRow,
+            makeIfNecessary: false
+        ))
+        XCTAssertEqual(diagnostics.targetedRowReloads, 0)
+        XCTAssertEqual(diagnostics.liveScrollRestorationPasses, 0)
+    }
+
+    func testColdNativeRowRealizedDuringLiveScrollPromotesInPlaceWhenIdle() throws {
+        let rows = (0..<80).map { index in
+            let source = index == 0
+                ? "[Cold Markdown](https://example.com/cold) **source**"
+                : "Cold native row \(index)"
+            return MixedRow(
+                id: "cold-live-row-\(index)",
+                contentRevision: 1,
+                text: source,
+                usesNativeText: true,
+                usesFastPlainTextRenderer: true,
+                promotesFastRendererWhenIdle: true,
+                deferredRichText: index == 0 ? "Cold Markdown source" : source
+            )
+        }
+        let mounted = mountMixed(
+            rows: rows,
+            usesLiveScrollStandIns: false
+        )
+        let scrollView = try XCTUnwrap(mounted.table.enclosingScrollView)
+        XCTAssertFalse(
+            NSLocationInRange(
+                0,
+                mounted.table.rows(in: scrollView.contentView.bounds)
+            ),
+            "The regression row must be cold and unrealized before scrolling."
+        )
+
+        MacConversationTableDiagnostics.reset()
+        NotificationCenter.default.post(
+            name: NSScrollView.willStartLiveScrollNotification,
+            object: scrollView
+        )
+        scrollView.contentView.scroll(to: .zero)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        mounted.hosting.layoutSubtreeIfNeeded()
+
+        let scrollingCell = try XCTUnwrap(mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: true
+        ))
+        let scrollingSurface = try XCTUnwrap(descendant(
+            of: scrollingCell,
+            type: MacConversationScrollTextView.self
+        ))
+        XCTAssertFalse(scrollingSurface.isHiddenOrHasHiddenAncestor)
+        XCTAssertEqual(scrollingSurface.attributedString.string, rows[0].text)
+        XCTAssertEqual(
+            scrollingCell.layer?.masksToBounds,
+            true,
+            "A frozen cold row must clip exact Core Text geometry to its cached row bounds."
+        )
+        XCTAssertNil(
+            descendant(of: scrollingCell, type: NSTextView.self),
+            "Cold live-scroll realization must not construct TextKit."
+        )
+
+        NotificationCenter.default.post(
+            name: NSScrollView.didEndLiveScrollNotification,
+            object: scrollView
+        )
+        let deadline = Date().addingTimeInterval(2)
+        var richTextView = descendant(of: scrollingCell, type: NSTextView.self)
+        while richTextView?.isHidden != false, Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(1.0 / 60.0))
+            mounted.hosting.layoutSubtreeIfNeeded()
+            richTextView = descendant(of: scrollingCell, type: NSTextView.self)
+        }
+
+        let settledCell = try XCTUnwrap(mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: false
+        ))
+        let diagnostics = MacConversationTableDiagnostics.snapshot()
+        XCTAssertTrue(
+            scrollingCell === settledCell,
+            "Idle rich-text adoption must preserve the reusable row cell."
+        )
+        XCTAssertEqual(richTextView?.string, "Cold Markdown source")
+        XCTAssertEqual(richTextView?.isHidden, false)
+        XCTAssertTrue(scrollingSurface.isHiddenOrHasHiddenAncestor)
+        XCTAssertEqual(scrollingCell.layer?.masksToBounds, false)
+        XCTAssertEqual(diagnostics.reloadDataCalls, 0)
+        XCTAssertEqual(diagnostics.targetedRowReloads, 0)
+        XCTAssertEqual(diagnostics.liveScrollRestorationPasses, 0)
+    }
+
+    func testSemanticHostedRendererAdoptsInsideSameNativeCellAfterLiveScroll() throws {
+        let rows = (0..<80).map { index in
+            MixedRow(
+                id: "semantic-live-row-\(index)",
+                contentRevision: 1,
+                text: index == 0
+                    ? "| Name | State |\n| --- | --- |\n| Relay | Smooth |"
+                    : "Ordinary native row \(index)",
+                usesNativeText: true,
+                usesFastPlainTextRenderer: true,
+                prefersHostedRenderer: index == 0
+            )
+        }
+        let mounted = mountMixed(
+            rows: rows,
+            usesLiveScrollStandIns: false
+        )
+        let scrollView = try XCTUnwrap(mounted.table.enclosingScrollView)
+        XCTAssertFalse(NSLocationInRange(
+            0,
+            mounted.table.rows(in: scrollView.contentView.bounds)
+        ))
+
+        MacConversationTableDiagnostics.reset()
+        NotificationCenter.default.post(
+            name: NSScrollView.willStartLiveScrollNotification,
+            object: scrollView
+        )
+        scrollView.contentView.scroll(to: .zero)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        mounted.hosting.layoutSubtreeIfNeeded()
+
+        let scrollingCell = try XCTUnwrap(mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: true
+        ))
+        XCTAssertTrue(
+            scrollingCell.identifier?.rawValue.hasSuffix(".native") == true
+        )
+        XCTAssertNil(
+            descendant(of: scrollingCell, type: NSHostingView<AnyView>.self),
+            "The semantic host must not mount during a live-scroll frame."
+        )
+
+        NotificationCenter.default.post(
+            name: NSScrollView.didEndLiveScrollNotification,
+            object: scrollView
+        )
+        let deadline = Date().addingTimeInterval(2)
+        var semanticHost = descendant(
+            of: scrollingCell,
+            type: NSHostingView<AnyView>.self
+        )
+        while semanticHost == nil, Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(1.0 / 60.0))
+            mounted.hosting.layoutSubtreeIfNeeded()
+            semanticHost = descendant(
+                of: scrollingCell,
+                type: NSHostingView<AnyView>.self
+            )
+        }
+
+        let settledCell = try XCTUnwrap(mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: false
+        ))
+        let diagnostics = MacConversationTableDiagnostics.snapshot()
+        XCTAssertTrue(scrollingCell === settledCell)
+        XCTAssertNotNil(semanticHost)
+        XCTAssertNotNil(
+            scrollingCell.hitTest(NSPoint(
+                x: scrollingCell.bounds.midX,
+                y: scrollingCell.bounds.midY
+            )),
+            "Hosted table links and horizontal scrolling must receive events."
+        )
+        XCTAssertEqual(diagnostics.reloadDataCalls, 0)
+        XCTAssertEqual(diagnostics.targetedRowReloads, 0)
+        XCTAssertEqual(diagnostics.liveScrollRestorationPasses, 0)
+
+        var ordinaryRows = rows
+        ordinaryRows[0] = MixedRow(
+            id: rows[0].id,
+            contentRevision: 2,
+            text: "Reused as ordinary native text",
+            usesNativeText: true
+        )
+        mounted.hosting.rootView = mixedTable(
+            rows: ordinaryRows,
+            usesLiveScrollStandIns: false
+        )
+        settle(mounted.hosting)
+        let reusedCell = try XCTUnwrap(mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: false
+        ))
+        XCTAssertTrue(reusedCell === scrollingCell)
+        XCTAssertNil(descendant(
+            of: reusedCell,
+            type: NSHostingView<AnyView>.self
+        ))
+        XCTAssertNil(
+            reusedCell.hitTest(NSPoint(
+                x: reusedCell.bounds.midX,
+                y: reusedCell.bounds.midY
+            )),
+            "Reused native rows must return to table-owned hit testing."
+        )
+    }
+
+    func testStableAndOrdinaryNativeClassTransitionsUseCorrectReuseIdentity() throws {
+        var rows = [MixedRow(
+            id: "shell-transition",
+            contentRevision: 1,
+            text: "Stable native shell",
+            usesNativeText: true
+        )]
+        let mounted = mountMixed(
+            rows: rows,
+            usesLiveScrollStandIns: false
+        )
+        let stableCell = try XCTUnwrap(mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: false
+        ))
+        XCTAssertEqual(
+            stableCell.identifier?.rawValue,
+            "test.mixed-row.stable.native"
+        )
+
+        MacConversationTableDiagnostics.reset()
+        rows[0] = MixedRow(
+            id: rows[0].id,
+            contentRevision: 2,
+            text: "Ordinary native cell",
+            usesNativeText: true,
+            suppressesLiveScrollText: true
+        )
+        mounted.hosting.rootView = mixedTable(
+            rows: rows,
+            usesLiveScrollStandIns: false
+        )
+        settle(mounted.hosting)
+        let ordinaryCell = try XCTUnwrap(mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: false
+        ))
+        XCTAssertFalse(ordinaryCell === stableCell)
+        XCTAssertEqual(
+            ordinaryCell.identifier?.rawValue,
+            "test.mixed-row.native"
+        )
+        XCTAssertNil(descendant(
+            of: ordinaryCell,
+            type: MacConversationScrollTextView.self
+        ))
+        XCTAssertNotNil(descendant(of: ordinaryCell, type: NSTextView.self))
+
+        rows[0] = MixedRow(
+            id: rows[0].id,
+            contentRevision: 3,
+            text: "Stable native shell again",
+            usesNativeText: true
+        )
+        mounted.hosting.rootView = mixedTable(
+            rows: rows,
+            usesLiveScrollStandIns: false
+        )
+        settle(mounted.hosting)
+        let stableAgain = try XCTUnwrap(mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: false
+        ))
+        let diagnostics = MacConversationTableDiagnostics.snapshot()
+        XCTAssertFalse(stableAgain === ordinaryCell)
+        XCTAssertEqual(
+            stableAgain.identifier?.rawValue,
+            "test.mixed-row.stable.native"
+        )
+        XCTAssertEqual(diagnostics.reloadDataCalls, 0)
+        XCTAssertEqual(diagnostics.targetedRowReloads, 2)
+    }
+
+    func testRemovingNestedNativeRendererCancelsItsDeferredPromotion() throws {
+        var rows = [MixedRow(
+            id: "nested-cancel",
+            contentRevision: 1,
+            text: "Fast fallback",
+            usesNativeText: true,
+            usesFastPlainTextRenderer: true,
+            promotesFastRendererWhenIdle: true,
+            deferredRichText: "Detached renderer must not adopt this",
+            deferredRichTextDelayNanoseconds: 500_000_000
+        )]
+        let mounted = mountMixed(
+            rows: rows,
+            usesLiveScrollStandIns: false
+        )
+        let outerCell = try XCTUnwrap(mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: false
+        ))
+        let detachedTextView = try XCTUnwrap(descendant(
+            of: outerCell,
+            type: NSTextView.self
+        ))
+        var retainedNestedRenderer: NSView = detachedTextView
+        while let parent = retainedNestedRenderer.superview,
+              parent !== outerCell {
+            retainedNestedRenderer = parent
+        }
+        XCTAssertTrue(retainedNestedRenderer.superview === outerCell)
+
+        rows[0] = MixedRow(
+            id: rows[0].id,
+            contentRevision: 2,
+            text: "Hosted replacement",
+            usesNativeText: true,
+            prefersHostedRenderer: true
+        )
+        mounted.hosting.rootView = mixedTable(
+            rows: rows,
+            usesLiveScrollStandIns: false
+        )
+        settle(mounted.hosting)
+        XCTAssertNil(retainedNestedRenderer.superview)
+        XCTAssertNotNil(descendant(
+            of: outerCell,
+            type: NSHostingView<AnyView>.self
+        ))
+
+        RunLoop.main.run(until: Date().addingTimeInterval(0.65))
+        XCTAssertNotEqual(
+            detachedTextView.string,
+            "Detached renderer must not adopt this",
+            "Removing a nested renderer must cancel its queued rich promotion."
+        )
+        XCTAssertTrue(outerCell === mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: false
+        ))
+    }
+
+    func testSelectedColdRowRetriesPromotionAfterSelectionClears() throws {
+        let rows = (0..<80).map { index in
+            MixedRow(
+                id: "selected-cold-row-\(index)",
+                contentRevision: 1,
+                text: "Selectable cold Markdown row \(index)",
+                usesNativeText: true,
+                usesFastPlainTextRenderer: true,
+                promotesFastRendererWhenIdle: true,
+                deferredRichText: "Selectable cold Markdown row \(index)"
+            )
+        }
+        let mounted = mountMixed(
+            rows: rows,
+            usesLiveScrollStandIns: false
+        )
+        let scrollView = try XCTUnwrap(mounted.table.enclosingScrollView)
+
+        scrollView.contentView.scroll(to: .zero)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        settle(mounted.hosting)
+        let firstRect = mounted.table.rect(ofRow: 0)
+        dragSelection(
+            in: mounted,
+            fromTablePoint: NSPoint(
+                x: firstRect.minX + 42,
+                y: firstRect.midY
+            ),
+            toTablePoint: NSPoint(
+                x: firstRect.minX + 180,
+                y: firstRect.midY
+            )
+        )
+        NSPasteboard.general.clearContents()
+        (mounted.table as? MacTranscriptTableView)?.copy(nil)
+        XCTAssertFalse(
+            NSPasteboard.general.string(forType: .string)?.isEmpty ?? true,
+            "The setup must leave a selection endpoint in the regression row."
+        )
+
+        var bottom = scrollView.contentView.bounds
+        bottom.origin.y = mounted.table.bounds.height
+        scrollView.contentView.scroll(
+            to: scrollView.contentView.constrainBoundsRect(bottom).origin
+        )
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        settle(mounted.hosting)
+
+        MacConversationTableDiagnostics.reset()
+        NotificationCenter.default.post(
+            name: NSScrollView.willStartLiveScrollNotification,
+            object: scrollView
+        )
+        scrollView.contentView.scroll(to: .zero)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        mounted.hosting.layoutSubtreeIfNeeded()
+        let scrollingCell = try XCTUnwrap(mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: true
+        ))
+        XCTAssertNil(descendant(of: scrollingCell, type: NSTextView.self))
 
         NotificationCenter.default.post(
             name: NSScrollView.didEndLiveScrollNotification,
             object: scrollView
         )
         RunLoop.main.run(until: Date().addingTimeInterval(0.1))
-        mounted.hosting.layoutSubtreeIfNeeded()
+        XCTAssertNil(
+            descendant(of: scrollingCell, type: NSTextView.self),
+            "The selected row must keep its exact Core Text string until the endpoint clears."
+        )
 
+        let clearPoint = mounted.table.convert(
+            NSPoint(x: firstRect.minX + 24, y: firstRect.midY),
+            to: nil
+        )
+        mounted.table.mouseDown(
+            with: mouseEvent(
+                .leftMouseDown,
+                at: clearPoint,
+                in: mounted.window
+            )
+        )
+        mounted.table.mouseUp(
+            with: mouseEvent(
+                .leftMouseUp,
+                at: clearPoint,
+                in: mounted.window
+            )
+        )
+
+        let deadline = Date().addingTimeInterval(2)
+        var promotedTextView = descendant(
+            of: scrollingCell,
+            type: NSTextView.self
+        )
+        while promotedTextView == nil, Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(1.0 / 60.0))
+            mounted.hosting.layoutSubtreeIfNeeded()
+            promotedTextView = descendant(
+                of: scrollingCell,
+                type: NSTextView.self
+            )
+        }
         let diagnostics = MacConversationTableDiagnostics.snapshot()
+        XCTAssertNotNil(promotedTextView)
+        XCTAssertTrue(scrollingCell === mounted.table.view(
+            atColumn: 0,
+            row: 0,
+            makeIfNecessary: false
+        ))
         XCTAssertEqual(diagnostics.targetedRowReloads, 0)
-        XCTAssertEqual(diagnostics.liveScrollRestorationPasses, 0)
+        XCTAssertEqual(diagnostics.reloadDataCalls, 0)
     }
 
     func testLiveScrollEndRestoresTransitionedCellOutsideVisibleBounds() throws {
@@ -1329,7 +1847,7 @@ final class MacConversationTableViewTests: XCTestCase {
         fontScale: CGFloat = 1,
         colorScheme: ColorScheme = .light
     ) async {
-        guard case .item(let projection, _, _) = row,
+        guard case .item(let projection, _, _, _) = row,
               case .message(let message) = projection.displayItem,
               let source = message.contents.first?.text,
               let prepared = await SanitizedMarkdownCache.shared
@@ -2561,7 +3079,7 @@ final class MacConversationTableViewTests: XCTestCase {
             sectionRevision: 1
         )
         XCTAssertTrue(streamingRows.allSatisfy { row in
-            guard case .item(let projection, _, _) = row else { return false }
+            guard case .item(let projection, _, _, _) = row else { return false }
             return row.nativeTextPresentation(
                 dynamicTypeSize: .large,
                 colorScheme: .light
@@ -2663,6 +3181,7 @@ final class MacConversationTableViewTests: XCTestCase {
                     )
                 ],
                 snapshotGeneration: "generation",
+                usesLiveScrollStandIns: false,
                 reduceMotion: true,
                 commandHandle: MacConversationTableCommandHandle(),
                 onNearBottomChange: { _ in },
@@ -2689,6 +3208,13 @@ final class MacConversationTableViewTests: XCTestCase {
         let cell = try XCTUnwrap(
             table.view(atColumn: 0, row: 0, makeIfNecessary: true)
         )
+        XCTAssertEqual(cell.fittingSize.height, 60, accuracy: 0.5)
+        XCTAssertEqual(
+            table.rect(ofRow: 0).height,
+            60,
+            accuracy: 0.5,
+            "The constraint-free footer must publish its exact 22pt controls plus transcript edge insets."
+        )
         XCTAssertNil(descendant(of: cell, type: NSHostingView<AnyView>.self))
         XCTAssertEqual(hostedBuilds, 0)
         let controls = try XCTUnwrap(descendant(of: cell, type: NSStackView.self))
@@ -2703,6 +3229,99 @@ final class MacConversationTableViewTests: XCTestCase {
         button.performClick(nil)
         XCTAssertEqual(copiedItemID, "message")
         XCTAssertEqual(button.accessibilityLabel(), "Message copied")
+    }
+
+    func testColdNativeFootersUseDeterministicGeometryDuringLiveScroll() throws {
+        let rows = (0..<300).map { index in
+            FooterRow(
+                id: "footer-\(index)",
+                contentRevision: 1,
+                itemID: "message-\(index)",
+                isTrailing: index.isMultiple(of: 2)
+            )
+        }
+        let hosting = NSHostingView(
+            rootView: MacConversationTableView(
+                sections: [
+                    MacConversationTableSection(
+                        id: "footers",
+                        revision: 1,
+                        rows: rows
+                    )
+                ],
+                snapshotGeneration: "generation",
+                usesLiveScrollStandIns: false,
+                reduceMotion: true,
+                commandHandle: MacConversationTableCommandHandle(),
+                onNearBottomChange: { _ in },
+                onAnchoredChange: { _ in },
+                makeRow: { _, _, _ in AnyView(EmptyView()) }
+            )
+        )
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 300),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hosting
+        window.orderFront(nil)
+        Self.retainedWindows.append(window)
+        settle(hosting)
+
+        let table = try XCTUnwrap(descendant(of: hosting, type: NSTableView.self))
+        let scrollView = try XCTUnwrap(table.enclosingScrollView)
+        let initiallyVisible = table.rows(in: scrollView.contentView.bounds)
+        let targetIndex = initiallyVisible.location == 0
+            ? rows.count - 1
+            : 0
+        XCTAssertNil(
+            table.view(
+                atColumn: 0,
+                row: targetIndex,
+                makeIfNecessary: false
+            )
+        )
+        let startingDocumentHeight = table.bounds.height
+        MacConversationTableDiagnostics.reset()
+        NotificationCenter.default.post(
+            name: NSScrollView.willStartLiveScrollNotification,
+            object: scrollView
+        )
+        scrollView.contentView.scroll(
+            to: NSPoint(x: 0, y: table.rect(ofRow: targetIndex).minY)
+        )
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        settle(hosting)
+
+        let targetCell = try XCTUnwrap(
+            table.view(
+                atColumn: 0,
+                row: targetIndex,
+                makeIfNecessary: true
+            )
+        )
+        XCTAssertEqual(
+            table.rect(ofRow: targetIndex).height,
+            targetCell.fittingSize.height,
+            accuracy: 0.5
+        )
+        XCTAssertEqual(
+            table.bounds.height,
+            startingDocumentHeight,
+            accuracy: 0.5,
+            "Cold footer realization must not change the published document extent mid-gesture."
+        )
+        XCTAssertGreaterThan(
+            MacConversationTableDiagnostics.snapshot()
+                .frozenNativeFooterMeasurements,
+            0,
+            "Cold footers must be measured through their frozen live-scroll height."
+        )
+        NotificationCenter.default.post(
+            name: NSScrollView.didEndLiveScrollNotification,
+            object: scrollView
+        )
     }
 
     func testCompletedAssistantNativeFallbackTracksDynamicType() {
@@ -3153,14 +3772,24 @@ final class MacConversationTableViewTests: XCTestCase {
         XCTAssertLessThan(diagnostics.rowConfigurations, mounted.table.numberOfRows)
     }
 
-    func testContentMutationDuringLiveScrollDoesNotCorrectClipOrigin() {
-        var rows = makeRows(count: 1_000)
-        let mounted = mount(rows: rows)
-        guard let scrollView = mounted.table.enclosingScrollView else {
-            return XCTFail("Expected enclosing scroll view")
+    func testContentMutationDuringLiveScrollDoesNotCorrectClipOrigin() throws {
+        var rows = (0..<160).map { index in
+            MixedRow(
+                id: "mutation-row-\(index)",
+                contentRevision: 1,
+                text: "Settled row \(index)",
+                usesNativeText: true,
+                maximumContentWidth: 640
+            )
         }
+        let mounted = mountMixed(
+            rows: rows,
+            usesLiveScrollStandIns: false
+        )
+        let scrollView = try XCTUnwrap(mounted.table.enclosingScrollView)
+        markUserScrollInput(in: mounted.table)
         var proposed = scrollView.contentView.bounds
-        proposed.origin.y = max(0, proposed.origin.y - 240)
+        proposed.origin.y = mounted.table.rect(ofRow: 80).minY
         scrollView.contentView.setBoundsOrigin(
             scrollView.contentView.constrainBoundsRect(proposed).origin
         )
@@ -3169,34 +3798,247 @@ final class MacConversationTableViewTests: XCTestCase {
 
         let visible = mounted.table.rows(in: scrollView.contentView.bounds)
         XCTAssertNotEqual(visible.location, NSNotFound)
+        let changedIndex = visible.location + min(1, visible.length - 1)
+        let originalCell = try XCTUnwrap(mounted.table.view(
+            atColumn: 0,
+            row: changedIndex,
+            makeIfNecessary: true
+        ))
+        let originalOffset = mounted.table.rect(ofRow: changedIndex).minY
+            - scrollView.contentView.bounds.minY
+        let originalDocumentHeight = mounted.table.bounds.height
+
         NotificationCenter.default.post(
             name: NSScrollView.willStartLiveScrollNotification,
             object: scrollView
         )
+        var endedLiveScroll = false
         defer {
-            NotificationCenter.default.post(
-                name: NSScrollView.didEndLiveScrollNotification,
-                object: scrollView
-            )
+            if !endedLiveScroll {
+                NotificationCenter.default.post(
+                    name: NSScrollView.didEndLiveScrollNotification,
+                    object: scrollView
+                )
+            }
         }
         let userOwnedOrigin = scrollView.contentView.bounds.origin
         MacConversationTableDiagnostics.reset()
-        rows[visible.location] = Row(
-            id: rows[visible.location].id,
-            contentRevision: 2
+        rows[changedIndex] = MixedRow(
+            id: rows[changedIndex].id,
+            contentRevision: 2,
+            text: String(repeating: "Streaming growth stays deferred.\n", count: 18),
+            usesNativeText: true,
+            maximumContentWidth: 640
         )
-        mounted.hosting.rootView = table(rows: rows)
+        mounted.hosting.rootView = mixedTable(
+            rows: rows,
+            usesLiveScrollStandIns: false
+        )
         settle(mounted.hosting)
 
-        let diagnostics = MacConversationTableDiagnostics.snapshot()
+        var diagnostics = MacConversationTableDiagnostics.snapshot()
         XCTAssertEqual(diagnostics.explicitReconfigurations, 1)
         XCTAssertEqual(diagnostics.heightInvalidationPasses, 0)
         XCTAssertEqual(diagnostics.scrollOriginCorrections, 0)
+        XCTAssertEqual(diagnostics.reloadDataCalls, 0)
+        XCTAssertEqual(diagnostics.targetedRowReloads, 0)
+        XCTAssertEqual(
+            mounted.table.bounds.height,
+            originalDocumentHeight,
+            accuracy: 0.5,
+            "Streaming mutations must not republish document extent during the gesture."
+        )
         XCTAssertEqual(
             scrollView.contentView.bounds.origin.y,
             userOwnedOrigin.y,
             accuracy: 0.01,
-            "Streaming mutations must not fight live or momentum scrolling"
+            "Streaming mutations must not fight live or momentum scrolling."
+        )
+        XCTAssertTrue(
+            mounted.table.view(
+                atColumn: 0,
+                row: changedIndex,
+                makeIfNecessary: false
+            ) === originalCell,
+            "The stable outer cell must survive the streaming mutation."
+        )
+
+        NotificationCenter.default.post(
+            name: NSScrollView.didEndLiveScrollNotification,
+            object: scrollView
+        )
+        endedLiveScroll = true
+        settle(mounted.hosting)
+        settle(mounted.hosting)
+        diagnostics = MacConversationTableDiagnostics.snapshot()
+        XCTAssertGreaterThan(
+            mounted.table.bounds.height,
+            originalDocumentHeight + 40,
+            "The deferred content height must publish once the gesture is idle."
+        )
+        XCTAssertEqual(
+            mounted.table.rect(ofRow: changedIndex).minY
+                - scrollView.contentView.bounds.minY,
+            originalOffset,
+            accuracy: 1,
+            "Idle height publication must preserve the visible row anchor."
+        )
+        XCTAssertTrue(
+            mounted.table.view(
+                atColumn: 0,
+                row: changedIndex,
+                makeIfNecessary: false
+            ) === originalCell,
+            "Idle adoption must update inside the same outer cell."
+        )
+        XCTAssertEqual(diagnostics.reloadDataCalls, 0)
+        XCTAssertEqual(diagnostics.targetedRowReloads, 0)
+        XCTAssertEqual(diagnostics.liveScrollRestorationPasses, 0)
+        XCTAssertGreaterThanOrEqual(diagnostics.heightInvalidationPasses, 1)
+    }
+
+    func testLiveScrollDirectionReversalPreservesExtentIdentityAndRowMapping() throws {
+        let rows = (0..<180).map { index in
+            MixedRow(
+                id: "reversal-row-\(index)",
+                contentRevision: 1,
+                text: index.isMultiple(of: 3)
+                    ? "Row \(index) first line\nsecond line\nthird line"
+                    : "Row \(index)",
+                usesNativeText: index.isMultiple(of: 2),
+                maximumContentWidth: 640,
+                usesLiveScrollText: true
+            )
+        }
+        let mounted = mountMixed(
+            rows: rows,
+            usesLiveScrollStandIns: false
+        )
+        let scrollView = try XCTUnwrap(mounted.table.enclosingScrollView)
+        markUserScrollInput(in: mounted.table)
+        var proposed = scrollView.contentView.bounds
+        proposed.origin.y = mounted.table.rect(ofRow: 80).minY
+        scrollView.contentView.setBoundsOrigin(
+            scrollView.contentView.constrainBoundsRect(proposed).origin
+        )
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        settle(mounted.hosting)
+
+        let originalVisible = mounted.table.rows(in: scrollView.contentView.bounds)
+        XCTAssertNotEqual(originalVisible.location, NSNotFound)
+        let retainedIndex = originalVisible.location + (originalVisible.length / 2)
+        let retainedCell = try XCTUnwrap(mounted.table.view(
+            atColumn: 0,
+            row: retainedIndex,
+            makeIfNecessary: true
+        ))
+        let originalOrigin = scrollView.contentView.bounds.origin
+        let originalDocumentHeight = mounted.table.bounds.height
+        let originalFirstOffset = mounted.table.rect(
+            ofRow: originalVisible.location
+        ).minY - originalOrigin.y
+
+        MacConversationTableDiagnostics.reset()
+        NotificationCenter.default.post(
+            name: NSScrollView.willStartLiveScrollNotification,
+            object: scrollView
+        )
+        var endedLiveScroll = false
+        defer {
+            if !endedLiveScroll {
+                NotificationCenter.default.post(
+                    name: NSScrollView.didEndLiveScrollNotification,
+                    object: scrollView
+                )
+            }
+        }
+
+        func move(to requestedY: CGFloat) {
+            var bounds = scrollView.contentView.bounds
+            bounds.origin.y = requestedY
+            scrollView.contentView.setBoundsOrigin(
+                scrollView.contentView.constrainBoundsRect(bounds).origin
+            )
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+            settle(mounted.hosting)
+        }
+
+        move(to: originalOrigin.y + 180)
+        XCTAssertEqual(
+            mounted.table.bounds.height,
+            originalDocumentHeight,
+            accuracy: 0.5
+        )
+        let probe = NSPoint(
+            x: mounted.table.bounds.midX,
+            y: scrollView.contentView.bounds.midY
+        )
+        let mappedRow = mounted.table.row(at: probe)
+        let visibleAfterMove = mounted.table.rows(in: scrollView.contentView.bounds)
+        XCTAssertNotEqual(mappedRow, -1)
+        XCTAssertTrue(
+            NSLocationInRange(mappedRow, visibleAfterMove),
+            "row(at:) must remain coherent with rows(in:) while document extent is frozen."
+        )
+        XCTAssertTrue(
+            mounted.table.rect(ofRow: mappedRow).contains(probe),
+            "The mapped selection row must own the probed table point."
+        )
+
+        move(to: originalOrigin.y)
+        XCTAssertEqual(
+            mounted.table.bounds.height,
+            originalDocumentHeight,
+            accuracy: 0.5
+        )
+        let returnedVisible = mounted.table.rows(in: scrollView.contentView.bounds)
+        XCTAssertEqual(returnedVisible.location, originalVisible.location)
+        XCTAssertEqual(
+            mounted.table.rect(ofRow: originalVisible.location).minY
+                - scrollView.contentView.bounds.minY,
+            originalFirstOffset,
+            accuracy: 0.5
+        )
+        XCTAssertTrue(
+            mounted.table.view(
+                atColumn: 0,
+                row: retainedIndex,
+                makeIfNecessary: false
+            ) === retainedCell,
+            "Reversing direction must not replace a retained visible row."
+        )
+
+        let duringGesture = MacConversationTableDiagnostics.snapshot()
+        XCTAssertEqual(duringGesture.reloadDataCalls, 0)
+        XCTAssertEqual(duringGesture.targetedRowReloads, 0)
+        XCTAssertEqual(duringGesture.heightInvalidationPasses, 0)
+        XCTAssertEqual(duringGesture.scrollOriginCorrections, 0)
+        NotificationCenter.default.post(
+            name: NSScrollView.didEndLiveScrollNotification,
+            object: scrollView
+        )
+        endedLiveScroll = true
+        settle(mounted.hosting)
+        settle(mounted.hosting)
+
+        let afterIdle = MacConversationTableDiagnostics.snapshot()
+        XCTAssertEqual(afterIdle.reloadDataCalls, 0)
+        XCTAssertEqual(afterIdle.targetedRowReloads, 0)
+        XCTAssertEqual(afterIdle.liveScrollRestorationPasses, 0)
+        XCTAssertTrue(
+            mounted.table.view(
+                atColumn: 0,
+                row: retainedIndex,
+                makeIfNecessary: false
+            ) === retainedCell,
+            "Idle adoption must remain inside the retained outer cell."
+        )
+        XCTAssertEqual(
+            mounted.table.rect(ofRow: originalVisible.location).minY
+                - scrollView.contentView.bounds.minY,
+            originalFirstOffset,
+            accuracy: 1,
+            "Idle height publication must preserve the returned row anchor."
         )
     }
 
@@ -3670,28 +4512,92 @@ final class MacConversationTableViewTests: XCTestCase {
         XCTAssertEqual(restoredOffset, anchoredOffset, accuracy: 1)
     }
 
-    func testPinnedInsertRemainsAtBottom() {
-        var rows = makeRows(count: 200)
-        let mounted = mount(rows: rows)
-        guard let scrollView = mounted.table.enclosingScrollView else {
-            return XCTFail("Expected enclosing scroll view")
+    func testPinnedInsertRemainsAtBottom() throws {
+        var rows = makeMixedRows(count: 200)
+        let mounted = mountMixed(
+            rows: rows,
+            usesLiveScrollStandIns: false
+        )
+        let scrollView = try XCTUnwrap(mounted.table.enclosingScrollView)
+        XCTAssertLessThanOrEqual(distanceFromBottom(in: mounted.table), 8)
+        let originalDocumentHeight = mounted.table.bounds.height
+        let originalOrigin = scrollView.contentView.bounds.origin
+
+        MacConversationTableDiagnostics.reset()
+        NotificationCenter.default.post(
+            name: NSScrollView.willStartLiveScrollNotification,
+            object: scrollView
+        )
+        var endedLiveScroll = false
+        defer {
+            if !endedLiveScroll {
+                NotificationCenter.default.post(
+                    name: NSScrollView.didEndLiveScrollNotification,
+                    object: scrollView
+                )
+            }
         }
-        rows.append(Row(id: "new-tail", contentRevision: 1))
-        mounted.hosting.rootView = table(rows: rows)
+        rows.append(MixedRow(
+            id: "new-tail",
+            contentRevision: 1,
+            text: String(repeating: "New streamed tail line.\n", count: 12),
+            usesNativeText: true,
+            maximumContentWidth: 640
+        ))
+        mounted.hosting.rootView = mixedTable(
+            rows: rows,
+            usesLiveScrollStandIns: false
+        )
         settle(mounted.hosting)
 
-        let proposed = NSRect(
-            x: scrollView.contentView.bounds.minX,
-            y: mounted.table.frame.height,
-            width: scrollView.contentView.bounds.width,
-            height: scrollView.contentView.bounds.height
-        )
-        let maximum = scrollView.contentView.constrainBoundsRect(proposed).minY
+        var diagnostics = MacConversationTableDiagnostics.snapshot()
         XCTAssertEqual(
-            scrollView.contentView.bounds.minY,
-            maximum,
-            accuracy: 2
+            mounted.table.bounds.height,
+            originalDocumentHeight,
+            accuracy: 0.5,
+            "Appending at the bottom must not expand the published extent mid-gesture."
         )
+        XCTAssertEqual(
+            scrollView.contentView.bounds.origin.y,
+            originalOrigin.y,
+            accuracy: 0.5
+        )
+        XCTAssertLessThanOrEqual(
+            scrollView.contentView.bounds.maxY,
+            mounted.table.bounds.maxY + 0.5,
+            "The frozen document must never expose a blank gap below its rows."
+        )
+        XCTAssertEqual(diagnostics.heightInvalidationPasses, 0)
+        XCTAssertEqual(diagnostics.reloadDataCalls, 0)
+        XCTAssertEqual(diagnostics.targetedRowReloads, 0)
+
+        NotificationCenter.default.post(
+            name: NSScrollView.didEndLiveScrollNotification,
+            object: scrollView
+        )
+        endedLiveScroll = true
+        settle(mounted.hosting)
+        settle(mounted.hosting)
+        diagnostics = MacConversationTableDiagnostics.snapshot()
+        XCTAssertGreaterThan(mounted.table.bounds.height, originalDocumentHeight)
+        XCTAssertLessThanOrEqual(
+            distanceFromBottom(in: mounted.table),
+            8,
+            "Releasing the clamp at the bottom must follow the newly published tail."
+        )
+        XCTAssertLessThanOrEqual(
+            scrollView.contentView.bounds.maxY,
+            mounted.table.bounds.maxY + 0.5,
+            "Idle publication must not leave a blank gap below the transcript."
+        )
+        XCTAssertNotEqual(
+            mounted.table.rows(in: scrollView.contentView.bounds).location,
+            NSNotFound
+        )
+        XCTAssertEqual(diagnostics.reloadDataCalls, 0)
+        XCTAssertEqual(diagnostics.targetedRowReloads, 0)
+        XCTAssertEqual(diagnostics.liveScrollRestorationPasses, 0)
+        XCTAssertGreaterThanOrEqual(diagnostics.heightInvalidationPasses, 1)
     }
 
     func testAppendReconfiguresFormerAndNewGlobalLastRows() {
@@ -3857,56 +4763,6 @@ final class MacConversationTableViewTests: XCTestCase {
 
         let table = try XCTUnwrap(descendant(of: hosting, type: NSTableView.self))
         let scrollView = try XCTUnwrap(table.enclosingScrollView)
-        let maximumOrigin = max(
-            0,
-            table.bounds.height - scrollView.contentView.bounds.height
-        )
-        XCTAssertGreaterThan(table.numberOfRows, 4_000)
-        scrollView.contentView.scroll(to: NSPoint(x: 0, y: maximumOrigin))
-        scrollView.reflectScrolledClipView(scrollView.contentView)
-        settle(hosting)
-
-        MacConversationTableDiagnostics.reset()
-        MacConversationTableDiagnostics.watchConfigurations(
-            for: "fixture-large-message"
-        )
-        NotificationCenter.default.post(
-            name: NSScrollView.willStartLiveScrollNotification,
-            object: scrollView
-        )
-        let completed = expectation(description: "continuous mixed transcript pass")
-        var result: TranscriptDisplayLinkDriver.Result?
-        let driver = TranscriptDisplayLinkDriver(
-            scrollView: scrollView,
-            destinationY: 0,
-            pointsPerFrame: 360
-        ) { measured in
-            result = measured
-            completed.fulfill()
-        }
-        driver.start(in: window)
-        await fulfillment(of: [completed], timeout: 120)
-        let diagnostics = MacConversationTableDiagnostics.snapshot()
-        NotificationCenter.default.post(
-            name: NSScrollView.didEndLiveScrollNotification,
-            object: scrollView
-        )
-        let endDiagnostics = MacConversationTableDiagnostics.snapshot()
-        XCTAssertEqual(
-            endDiagnostics.targetedRowReloads,
-            diagnostics.targetedRowReloads,
-            "didEndLiveScroll must not synchronously rebuild the mounted page."
-        )
-        waitForLiveScrollRestoration(in: table, hosting: hosting)
-        let restoredDiagnostics = MacConversationTableDiagnostics.snapshot()
-
-        let measured = try XCTUnwrap(result)
-        let visible = visibleRowCount(in: table)
-        let mounted = mountedRowCount(in: table)
-        let rowAtMaximum = table.row(at: NSPoint(
-            x: table.bounds.midX,
-            y: measured.originAtMaximumCallback + 1
-        ))
         let diagnosticRows = items.flatMap { item -> [MacTranscriptRow] in
             let rows = makeMacTranscriptRows(
                 item: item,
@@ -3924,6 +4780,128 @@ final class MacConversationTableViewTests: XCTestCase {
             return rows
         }
         let sourceIDsByRow = diagnosticRows.map(\.mutationSourceID)
+        let largeMessageRows = sourceIDsByRow.indices.filter {
+            sourceIDsByRow[$0] == "fixture-large-message"
+        }
+        let firstLargeMessageRow = try XCTUnwrap(largeMessageRows.first)
+        let anchorOffset = min(600, max(1, largeMessageRows.count / 2))
+        let anchorRow = min(
+            table.numberOfRows - 1,
+            firstLargeMessageRow + anchorOffset
+        )
+        let maximumOrigin = max(
+            0,
+            table.bounds.height - scrollView.contentView.bounds.height
+        )
+        XCTAssertGreaterThan(table.numberOfRows, 4_000)
+        let desiredStartOrigin = min(
+            maximumOrigin,
+            table.rect(ofRow: anchorRow).minY
+        )
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: desiredStartOrigin))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        settle(hosting)
+
+        // Measure a fixed, representative 240-frame pass through cold rows
+        // belonging to the 512 KiB message, then reverse direction without
+        // ending the gesture. Driving from the multi-million-
+        // point document bottom all the way to zero made the old benchmark
+        // take minutes when geometry was healthy; its accidental short run
+        // was itself evidence that the document height had collapsed.
+        let pointsPerFrame: CGFloat = 360
+        let timedFrameCount = 240
+        let framesPerDirection = timedFrameCount / 2
+        let startOrigin = scrollView.contentView.bounds.origin.y
+        let firstDestinationOrigin = max(
+            0,
+            startOrigin - (CGFloat(framesPerDirection) * pointsPerFrame)
+        )
+        let firstLegCallbacks = Int(
+            ceil((startOrigin - firstDestinationOrigin) / pointsPerFrame)
+        )
+        XCTAssertEqual(firstLegCallbacks, framesPerDirection)
+        let expectedCallbackCount = firstLegCallbacks * 2
+
+        MacConversationTableDiagnostics.reset()
+        MacConversationTableDiagnostics.watchConfigurations(
+            for: "fixture-large-message"
+        )
+        NotificationCenter.default.post(
+            name: NSScrollView.willStartLiveScrollNotification,
+            object: scrollView
+        )
+        let completed = expectation(description: "continuous mixed transcript pass")
+        var result: TranscriptDisplayLinkDriver.Result?
+        let driver = TranscriptDisplayLinkDriver(
+            scrollView: scrollView,
+            destinationsY: [firstDestinationOrigin, startOrigin],
+            pointsPerFrame: pointsPerFrame
+        ) { measured in
+            result = measured
+            completed.fulfill()
+        }
+        driver.start(in: window)
+        await fulfillment(of: [completed], timeout: 120)
+        let diagnostics = MacConversationTableDiagnostics.snapshot()
+        let releaseVisible = table.rows(in: scrollView.contentView.bounds)
+        XCTAssertNotEqual(releaseVisible.location, NSNotFound)
+        let releaseAnchorIndex = releaseVisible.location
+        let releaseAnchorOffset = table.rect(ofRow: releaseAnchorIndex).minY
+            - scrollView.contentView.bounds.minY
+        // The first intersecting row is the viewport pixel anchor, but it can
+        // be clipped to a sub-pixel sliver and legitimately leave AppKit's
+        // mounted-view set after idle layout. Use an interior visible row for
+        // the separate outer-cell identity assertion so it measures renderer
+        // replacement, not edge-row virtualization.
+        let releaseIdentityIndex = min(
+            table.numberOfRows - 1,
+            releaseVisible.location + max(0, releaseVisible.length / 2)
+        )
+        let releaseAnchorCell = try XCTUnwrap(table.view(
+            atColumn: 0,
+            row: releaseIdentityIndex,
+            makeIfNecessary: false
+        ))
+        NotificationCenter.default.post(
+            name: NSScrollView.didEndLiveScrollNotification,
+            object: scrollView
+        )
+        let endDiagnostics = MacConversationTableDiagnostics.snapshot()
+        XCTAssertEqual(
+            endDiagnostics.targetedRowReloads,
+            diagnostics.targetedRowReloads,
+            "didEndLiveScroll must not synchronously rebuild the mounted page."
+        )
+        waitForLiveScrollRestoration(in: table, hosting: hosting)
+        settle(hosting)
+        let firstIdleDocumentHeight = table.bounds.height
+        settle(hosting)
+        let postEndDocumentHeight = table.bounds.height
+        let idleDocumentHeightDelta = abs(
+            postEndDocumentHeight - firstIdleDocumentHeight
+        )
+        let restoredDiagnostics = MacConversationTableDiagnostics.snapshot()
+        let settledAnchorCell = try XCTUnwrap(table.view(
+            atColumn: 0,
+            row: releaseIdentityIndex,
+            makeIfNecessary: false
+        ))
+        let postEndAnchorError = abs(
+            table.rect(ofRow: releaseAnchorIndex).minY
+                - scrollView.contentView.bounds.minY
+                - releaseAnchorOffset
+        )
+
+        let measured = try XCTUnwrap(result)
+        let postEndDocumentDrift = abs(
+            postEndDocumentHeight - measured.startingDocumentHeight
+        ) / max(1, measured.startingDocumentHeight)
+        let visible = visibleRowCount(in: table)
+        let mounted = mountedRowCount(in: table)
+        let rowAtMaximum = table.row(at: NSPoint(
+            x: table.bounds.midX,
+            y: measured.originAtMaximumCallback + 1
+        ))
         let sourceAtMaximum = sourceIDsByRow.indices.contains(rowAtMaximum)
             ? sourceIDsByRow[rowAtMaximum]
             : "unknown"
@@ -3945,7 +4923,24 @@ final class MacConversationTableViewTests: XCTestCase {
                 + "estimated_row_height=\(table.rowHeight) "
                 + "table_rows=\(table.numberOfRows) "
                 + "source_rows=\(sourceIDsByRow.count) "
-                + "document_height=\(table.bounds.height) "
+                + "live_stable=\(diagnostics.liveStableShellConfigurations) "
+                + "live_nonstable=\(diagnostics.liveNonStableConfigurations) "
+                + "live_footers=\(diagnostics.liveNativeFooterConfigurations) "
+                + "live_hosted=\(diagnostics.liveHostedConfigurations) "
+                + "frozen_measures=\(diagnostics.frozenStableShellMeasurements) "
+                + "frozen_height_sum=\(diagnostics.totalFrozenStableShellHeight) "
+                + "footer_frozen_measures=\(diagnostics.frozenNativeFooterMeasurements) "
+                + "footer_frozen_height_sum=\(diagnostics.totalFrozenNativeFooterHeight) "
+                + "start_origin=\(measured.startingOrigin) "
+                + "final_origin=\(measured.finalOrigin) "
+                + "max_origin_error=\(measured.maximumOriginError) "
+                + "start_document_height=\(measured.startingDocumentHeight) "
+                + "min_document_height=\(measured.minimumDocumentHeight) "
+                + "max_document_height=\(measured.maximumDocumentHeight) "
+                + "post_end_document_height=\(postEndDocumentHeight) "
+                + "post_end_document_drift=\(postEndDocumentDrift) "
+                + "idle_document_height_delta=\(idleDocumentHeightDelta) "
+                + "post_end_anchor_error=\(postEndAnchorError) "
                 + "mounted=\(mounted) visible=\(visible) "
                 + "end_ms=\(restoredDiagnostics.maximumLiveScrollEndMilliseconds) "
                 + "restore_max_ms=\(restoredDiagnostics.maximumLiveScrollRestorationMilliseconds) "
@@ -3959,16 +4954,85 @@ final class MacConversationTableViewTests: XCTestCase {
             + "maxNoMount=\(measured.maximumNoMountCallbackMilliseconds) "
             + "mountsAtMax=\(measured.configurationsAtMaximumCallback) "
             + "rowAtMax=\(rowAtMaximum) sourceAtMax=\(sourceAtMaximum) "
+            + "liveStable=\(diagnostics.liveStableShellConfigurations) "
+            + "liveNonstable=\(diagnostics.liveNonStableConfigurations) "
+            + "liveFooters=\(diagnostics.liveNativeFooterConfigurations) "
+            + "liveHosted=\(diagnostics.liveHostedConfigurations) "
+            + "frozenMeasures=\(diagnostics.frozenStableShellMeasurements) "
+            + "frozenHeightSum=\(diagnostics.totalFrozenStableShellHeight) "
+            + "footerFrozenMeasures=\(diagnostics.frozenNativeFooterMeasurements) "
+            + "footerFrozenHeightSum=\(diagnostics.totalFrozenNativeFooterHeight) "
+            + "estimatedRowHeight=\(table.rowHeight) "
+            + "tableRows=\(table.numberOfRows) "
+            + "maxOriginError=\(measured.maximumOriginError) "
+            + "startHeight=\(measured.startingDocumentHeight) "
+            + "minHeight=\(measured.minimumDocumentHeight) "
+            + "maxHeight=\(measured.maximumDocumentHeight) "
+            + "postEndHeight=\(postEndDocumentHeight) "
+            + "postEndDrift=\(postEndDocumentDrift) "
+            + "idleHeightDelta=\(idleDocumentHeightDelta) "
+            + "postEndAnchorError=\(postEndAnchorError) "
             + "endMs=\(restoredDiagnostics.maximumLiveScrollEndMilliseconds) "
             + "restoreMaxMs=\(restoredDiagnostics.maximumLiveScrollRestorationMilliseconds) "
             + "restoreMaxRows=\(restoredDiagnostics.maximumLiveScrollRestorationsPerPass)"
         XCTContext.runActivity(
             named: "TranscriptMixedRelease \(performanceSummary)"
         ) { _ in }
-        XCTAssertGreaterThan(measured.callbackMilliseconds.count, 120)
+        XCTAssertEqual(
+            measured.callbackMilliseconds.count,
+            expectedCallbackCount,
+            "A document-height collapse must not truncate the timed pass. "
+                + performanceSummary
+        )
+        XCTAssertLessThan(
+            measured.maximumOriginError,
+            1,
+            "Every callback must land at its requested scroll origin. "
+                + performanceSummary
+        )
+        XCTAssertGreaterThan(
+            measured.minimumDocumentHeight,
+            measured.startingDocumentHeight * 0.99,
+            "Realizing cold rows must not collapse whole-document geometry. "
+                + performanceSummary
+        )
+        XCTAssertLessThan(
+            measured.maximumDocumentHeight,
+            measured.startingDocumentHeight * 1.01,
+            "Realizing cold rows must not expand whole-document geometry. "
+                + performanceSummary
+        )
+        XCTAssertLessThan(
+            idleDocumentHeightDelta,
+            0.5,
+            "Automatic row-height reconciliation must settle within bounded idle layout ticks. "
+                + performanceSummary
+        )
+        XCTAssertLessThan(
+            postEndAnchorError,
+            1,
+            "Idle height publication must preserve the visible row's pixel anchor. "
+                + performanceSummary
+        )
+        XCTAssertTrue(
+            settledAnchorCell === releaseAnchorCell,
+            "Gesture end must not replace the visible outer cell."
+        )
+        XCTAssertLessThanOrEqual(
+            scrollView.contentView.bounds.maxY,
+            table.bounds.maxY + 0.5,
+            "Idle reconciliation must not expose a blank gap below the transcript."
+        )
         XCTAssertLessThan(measured.p95Milliseconds, 4, performanceSummary)
         XCTAssertLessThan(measured.p99Milliseconds, 8.3, performanceSummary)
-        XCTAssertLessThan(measured.hitchRatio, 0.01, performanceSummary)
+        // A real display link measures delivered-frame cadence, so missed
+        // frames are a product-facing signal. The headless XCTest fallback is
+        // a best-effort RunLoop timer: process scheduling before the callback
+        // is outside the renderer and can vary after the full build suite.
+        // Its callback duration gates below still measure the work we own.
+        if measured.driverKind == .displayLink {
+            XCTAssertLessThan(measured.hitchRatio, 0.01, performanceSummary)
+        }
         XCTAssertLessThan(
             measured.maximumMilliseconds,
             16.7,
@@ -3985,31 +5049,33 @@ final class MacConversationTableViewTests: XCTestCase {
             "The timed pass must actually cross the 512 KiB logical message."
         )
         XCTAssertLessThanOrEqual(mounted, visible + 12)
-        XCTAssertGreaterThan(
+        XCTAssertEqual(
             restoredDiagnostics.targetedRowReloads,
             diagnostics.targetedRowReloads,
-            "Rows realized through the display-only scroll cell must restore after the gesture."
+            "The production path keeps ordinary cells mounted through gesture end."
+        )
+        XCTAssertEqual(
+            restoredDiagnostics.reloadDataCalls,
+            diagnostics.reloadDataCalls,
+            "Gesture end must not reload the table."
+        )
+        XCTAssertEqual(
+            restoredDiagnostics.liveScrollRestorationPasses,
+            0,
+            "Disabling stand-ins must leave no incremental cell-replacement queue."
         )
         XCTAssertLessThan(
             restoredDiagnostics.maximumLiveScrollEndMilliseconds,
             16.7,
             "Ending the gesture must stay within one 60 Hz frame."
         )
-        // Visible rows restore in ONE batch so the viewport reaches its
-        // resting rendering atomically (a row-per-frame walk read as a
-        // quarter-second ripple); off-screen rows keep the incremental pace.
-        // The binding budget is therefore the pass duration below, not a row
-        // count — this assertion demanded one row per pass and had been
-        // failing since batched restoration shipped.
-        XCTAssertLessThanOrEqual(
+        XCTAssertEqual(
             restoredDiagnostics.maximumLiveScrollRestorationsPerPass,
-            visible + 12,
-            "A restoration pass must stay bounded by the viewport."
+            0
         )
-        XCTAssertLessThan(
+        XCTAssertEqual(
             restoredDiagnostics.maximumLiveScrollRestorationMilliseconds,
-            16.7,
-            "Every incremental restoration pass must stay within one 60 Hz frame."
+            0
         )
         for index in 0..<table.numberOfRows {
             guard let cell = table.view(
@@ -4131,7 +5197,22 @@ final class MacConversationTableViewTests: XCTestCase {
                 accuracy: 0.5,
                 "Row \(index) must span the table; a cell left at its own fitting width shifts its column."
             )
-            let container = try XCTUnwrap(cell.subviews.first)
+            // Stable native rows retain their hidden live-scroll surface after
+            // adopting the settled renderer. Validate the visible renderer's
+            // layout container rather than assuming the first child is still
+            // the painted surface.
+            let firstChild = try XCTUnwrap(cell.subviews.first)
+            let container: NSView
+            if firstChild.isHidden {
+                let visibleRenderer = try XCTUnwrap(cell.subviews.last {
+                    !$0.isHidden && $0.bounds.width > 0
+                })
+                container = try XCTUnwrap(
+                    visibleRenderer.subviews.first { !$0.isHidden }
+                )
+            } else {
+                container = firstChild
+            }
             let box = container.convert(container.bounds, to: table)
             XCTAssertEqual(
                 box.midX,
@@ -4508,17 +5589,28 @@ private final class TranscriptDisplayLinkDriver: NSObject {
         let maximumCallbackIndex: Int
         let configurationsAtMaximumCallback: Int
         let originAtMaximumCallback: CGFloat
+        let startingOrigin: CGFloat
+        let finalOrigin: CGFloat
+        let maximumOriginError: CGFloat
+        let startingDocumentHeight: CGFloat
+        let minimumDocumentHeight: CGFloat
+        let maximumDocumentHeight: CGFloat
     }
 
     private weak var scrollView: NSScrollView?
-    private let destinationY: CGFloat
+    private let destinationsY: [CGFloat]
     private let pointsPerFrame: CGFloat
     private let completion: (Result) -> Void
+    private var destinationIndex = 0
     private var displayLink: CADisplayLink?
     private var fallbackTimer: Timer?
     private var callbackMilliseconds: [Double] = []
     private var configurationCounts: [Int] = []
     private var callbackOrigins: [CGFloat] = []
+    private var originErrors: [CGFloat] = []
+    private var documentHeights: [CGFloat] = []
+    private var startingOrigin: CGFloat?
+    private var startingDocumentHeight: CGFloat?
     private var lastTimestamp: CFTimeInterval?
     private var lastNominalDuration: CFTimeInterval?
     private var deliveredFrameIntervals = 0
@@ -4529,12 +5621,13 @@ private final class TranscriptDisplayLinkDriver: NSObject {
 
     init(
         scrollView: NSScrollView,
-        destinationY: CGFloat,
+        destinationsY: [CGFloat],
         pointsPerFrame: CGFloat,
         completion: @escaping (Result) -> Void
     ) {
+        precondition(!destinationsY.isEmpty)
         self.scrollView = scrollView
-        self.destinationY = destinationY
+        self.destinationsY = destinationsY
         self.pointsPerFrame = pointsPerFrame
         self.completion = completion
     }
@@ -4601,7 +5694,14 @@ private final class TranscriptDisplayLinkDriver: NSObject {
 
         let clipView = scrollView.contentView
         let currentY = clipView.bounds.origin.y
-        let nextY = max(destinationY, currentY - pointsPerFrame)
+        if startingOrigin == nil {
+            startingOrigin = currentY
+            startingDocumentHeight = scrollView.documentView?.bounds.height ?? 0
+        }
+        let destinationY = destinationsY[destinationIndex]
+        let delta = destinationY - currentY
+        let boundedStep = min(pointsPerFrame, abs(delta))
+        let nextY = currentY + (delta < 0 ? -boundedStep : boundedStep)
         let diagnosticsBefore = MacConversationTableDiagnostics.snapshot()
         let started = CACurrentMediaTime()
         var proposed = clipView.bounds
@@ -4609,6 +5709,8 @@ private final class TranscriptDisplayLinkDriver: NSObject {
         clipView.scroll(to: clipView.constrainBoundsRect(proposed).origin)
         scrollView.reflectScrolledClipView(clipView)
         callbackMilliseconds.append((CACurrentMediaTime() - started) * 1_000)
+        originErrors.append(abs(clipView.bounds.origin.y - nextY))
+        documentHeights.append(scrollView.documentView?.bounds.height ?? 0)
         let diagnosticsAfter = MacConversationTableDiagnostics.snapshot()
         configurationCounts.append(
             diagnosticsAfter.rowConfigurations
@@ -4616,8 +5718,12 @@ private final class TranscriptDisplayLinkDriver: NSObject {
         )
         callbackOrigins.append(currentY)
 
-        if nextY <= destinationY + 0.5 {
-            awaitsFinalDisplayTick = true
+        if abs(nextY - destinationY) <= 0.5 {
+            if destinationIndex + 1 < destinationsY.count {
+                destinationIndex += 1
+            } else {
+                awaitsFinalDisplayTick = true
+            }
         }
     }
 
@@ -4663,7 +5769,17 @@ private final class TranscriptDisplayLinkDriver: NSObject {
                 originAtMaximumCallback:
                     callbackOrigins.indices.contains(maximumCallbackIndex)
                         ? callbackOrigins[maximumCallbackIndex]
-                        : 0
+                        : 0,
+                startingOrigin: startingOrigin ?? 0,
+                finalOrigin: scrollView?.contentView.bounds.origin.y ?? 0,
+                maximumOriginError: originErrors.max() ?? 0,
+                startingDocumentHeight: startingDocumentHeight ?? 0,
+                minimumDocumentHeight: documentHeights.min()
+                    ?? startingDocumentHeight
+                    ?? 0,
+                maximumDocumentHeight: documentHeights.max()
+                    ?? startingDocumentHeight
+                    ?? 0
             )
         )
     }

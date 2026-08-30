@@ -49,10 +49,16 @@ struct MacMessageFooter: Equatable {
 
 enum MacTranscriptRow: MacConversationTableRow {
     case history(id: String, revision: UInt64)
-    case item(TranscriptRowProjection, isExpanded: Bool, copiedItemID: String?)
+    case item(
+        TranscriptRowProjection,
+        isExpanded: Bool,
+        copiedItemID: String?,
+        showsCompactLine: Bool = true
+    )
     case messageFooter(MacMessageFooter, revision: UInt64)
     case toolGroupHeader(ToolGroupHeaderModel, revision: UInt64)
     case toolGroupLive(ToolGroupLiveModel, revision: UInt64)
+    case toolGroupFooter(groupID: String)
     case pendingTurn
     case approval(ApprovalRequest, revision: UInt64)
     case question(QuestionRequest, revision: UInt64)
@@ -60,10 +66,11 @@ enum MacTranscriptRow: MacConversationTableRow {
     var id: String {
         switch self {
         case .history(let id, _): id
-        case .item(let projection, _, _): projection.id
+        case .item(let projection, _, _, _): projection.id
         case .messageFooter(let footer, _): footer.id
         case .toolGroupHeader(let header, _): header.id
         case .toolGroupLive(let live, _): live.id
+        case .toolGroupFooter(let groupID): "\(groupID):footer"
         case .pendingTurn: "pending-turn"
         case .approval(let approval, _): "approval:\(approval.id)"
         case .question(let question, _): "question:\(question.id)"
@@ -78,7 +85,9 @@ enum MacTranscriptRow: MacConversationTableRow {
             return revision
         case .pendingTurn:
             return 0
-        case .item(let projection, let isExpanded, let copiedItemID):
+        case .toolGroupFooter:
+            return 0
+        case .item(let projection, let isExpanded, let copiedItemID, _):
             var revision = projection.contentRevision &* 1099511628211
             revision ^= isExpanded ? 1 : 0
             if copiedItemID == projection.sourceItemID
@@ -92,10 +101,11 @@ enum MacTranscriptRow: MacConversationTableRow {
     var reuseIdentifier: String {
         switch self {
         case .history: "transcript.history"
-        case .item(let projection, _, _): "transcript.\(projection.kind.rawValue)"
+        case .item(let projection, _, _, _): "transcript.\(projection.kind.rawValue)"
         case .messageFooter: "transcript.message-footer"
         case .toolGroupHeader: "transcript.toolgroup-header"
         case .toolGroupLive: "transcript.toolgroup-live"
+        case .toolGroupFooter: "transcript.toolgroup-footer"
         case .pendingTurn: "transcript.pending-turn"
         case .approval: "transcript.approval"
         case .question: "transcript.question"
@@ -107,7 +117,7 @@ enum MacTranscriptRow: MacConversationTableRow {
     /// to route a logical update to the visible tiles that belong to it.
     var mutationSourceID: String {
         switch self {
-        case .item(let projection, _, _):
+        case .item(let projection, _, _, _):
             projection.sourceItemID
         case .messageFooter(let footer, _):
             footer.itemID
@@ -120,7 +130,7 @@ enum MacTranscriptRow: MacConversationTableRow {
     /// The table asks for a bounded band around the viewport, never the full
     /// transcript, so preparation stays ahead of cell realization.
     var preparedMarkdownText: String? {
-        guard case .item(let projection, _, _) = self,
+        guard case .item(let projection, _, _, _) = self,
               case .message(let message) = projection.displayItem,
               !message.isStreaming,
               let content = message.contents.first,
@@ -143,7 +153,7 @@ enum MacTranscriptRow: MacConversationTableRow {
     /// hidden collapsed bodies and non-text rows contribute nothing.
     var selectionText: String? {
         switch self {
-        case .item(let projection, let isExpanded, _):
+        case .item(let projection, let isExpanded, _, _):
             guard projection.kind.isDisclosure else {
                 return projection.rowText
             }
@@ -171,13 +181,14 @@ enum MacTranscriptRow: MacConversationTableRow {
             return header.summary
         case .toolGroupLive(let live, _):
             return live.headline
-        case .history, .messageFooter, .pendingTurn, .approval, .question:
+        case .history, .messageFooter, .toolGroupFooter, .pendingTurn,
+             .approval, .question:
             return nil
         }
     }
 
     var selectionRoleLabel: String? {
-        guard case .item(let projection, _, _) = self,
+        guard case .item(let projection, _, _, _) = self,
               case .message(let message) = projection.displayItem else {
             return nil
         }
@@ -185,7 +196,7 @@ enum MacTranscriptRow: MacConversationTableRow {
     }
 
     var selectionSectionID: String? {
-        guard case .item(let projection, _, _) = self else { return id }
+        guard case .item(let projection, _, _, _) = self else { return id }
         return projection.projectionSectionID
     }
 
@@ -198,7 +209,7 @@ enum MacTranscriptRow: MacConversationTableRow {
         dynamicTypeSize: DynamicTypeSize,
         colorScheme: ColorScheme
     ) -> MacConversationNativeTextPresentation? {
-        guard case .item(let projection, let isExpanded, _) = self else {
+        guard case .item(let projection, let isExpanded, _, _) = self else {
             return nil
         }
         if let native = nativeTextPresentation(
@@ -469,7 +480,7 @@ enum MacTranscriptRow: MacConversationTableRow {
         dynamicTypeSize: DynamicTypeSize,
         colorScheme: ColorScheme
     ) -> MacConversationNativeTextPresentation? {
-        guard case .item(let projection, let isExpanded, _) = self else {
+        guard case .item(let projection, let isExpanded, _, _) = self else {
             return nil
         }
         let fontScale = dynamicTypeSize.macTranscriptFontScale
@@ -532,11 +543,17 @@ enum MacTranscriptRow: MacConversationTableRow {
                 )
             }
             let source = content.text
+            let prefersHostedTableRenderer = MarkdownSafety
+                .containsTableCandidate(source)
+                && !MarkdownTableAccessibility.tables(in: source).isEmpty
+            let accessibilityLabel = prefersHostedTableRenderer
+                ? "Scrollable table"
+                : projection.accessibilitySummary
             // Every bounded message tile keeps one native table-cell class for
-            // its whole lifetime. In particular, discovering a Markdown table
-            // as a streaming tile seals must not swap that visible row to a
-            // hosted cell; the attributed representation intentionally paints
-            // its readable text form inside the stable native cell.
+            // its whole lifetime. Once a table tile seals, the same cell can
+            // adopt its full SwiftUI renderer while idle, preserving the grid,
+            // horizontal scrolling, and table accessibility without a table
+            // remove/insert or native-to-hosted reuse-kind swap.
             // Every role mounts its rich Markdown immediately when the AppKit
             // artifact is already translated for this style: both probes are
             // pure lookups (one NSCache read, one single-slot memo read) and
@@ -580,7 +597,11 @@ enum MacTranscriptRow: MacConversationTableRow {
                     projection: projection,
                     identifier: identifier,
                     fontScale: fontScale,
-                    deferredAttributedString: deferred
+                    deferredAttributedString: deferred,
+                    accessibilityTableSource: prefersHostedTableRenderer
+                        ? source
+                        : nil,
+                    prefersHostedRenderer: prefersHostedTableRenderer
                 )
             }
             // A warm artifact mounts as rich text directly; only genuinely
@@ -602,11 +623,15 @@ enum MacTranscriptRow: MacConversationTableRow {
                     ofSize: NSFont.systemFontSize * fontScale
                 ),
                 fallbackColor: .labelColor,
-                accessibilityLabel: projection.accessibilitySummary,
+                accessibilityLabel: accessibilityLabel,
                 accessibilityIdentifier: identifier,
+                accessibilityTableSource: prefersHostedTableRenderer
+                    ? source
+                    : nil,
                 deferredAttributedString: deferred,
                 usesFastPlainTextRenderer: !isWarmRich,
-                promotesFastRendererWhenIdle: !isWarmRich
+                promotesFastRendererWhenIdle: !isWarmRich,
+                prefersHostedRenderer: prefersHostedTableRenderer
             )
 
         case .reasoning(let reasoning):
@@ -803,7 +828,9 @@ enum MacTranscriptRow: MacConversationTableRow {
         identifier: String,
         fontScale: CGFloat,
         deferredAttributedString:
-            MacConversationNativeTextPresentation.DeferredAttributedString? = nil
+            MacConversationNativeTextPresentation.DeferredAttributedString? = nil,
+        accessibilityTableSource: String? = nil,
+        prefersHostedRenderer: Bool = false
     ) -> MacConversationNativeTextPresentation {
         var corners: MacConversationNativeTextPresentation.RoundedCorners = []
         if projection.isFirstInItem {
@@ -845,9 +872,13 @@ enum MacTranscriptRow: MacConversationTableRow {
                 ofSize: NSFont.systemFontSize * fontScale
             ),
             fallbackColor: .labelColor,
-            accessibilityLabel: projection.accessibilitySummary,
+            accessibilityLabel: prefersHostedRenderer
+                ? "Scrollable table"
+                : projection.accessibilitySummary,
             accessibilityIdentifier: identifier,
-            deferredAttributedString: deferredAttributedString
+            accessibilityTableSource: accessibilityTableSource,
+            deferredAttributedString: deferredAttributedString,
+            prefersHostedRenderer: prefersHostedRenderer
         )
     }
 
@@ -970,13 +1001,15 @@ func makeMacTranscriptRows(
     projections: [TranscriptRowProjection],
     isExpanded: Bool,
     copiedItemID: String?,
-    sectionRevision: UInt64
+    sectionRevision: UInt64,
+    showsCompactLine: Bool = true
 ) -> [MacTranscriptRow] {
     var rows = projections.map { projection in
         MacTranscriptRow.item(
             projection,
             isExpanded: isExpanded,
-            copiedItemID: copiedItemID
+            copiedItemID: copiedItemID,
+            showsCompactLine: showsCompactLine
         )
     }
     if case .message(let message) = item,
@@ -1033,6 +1066,36 @@ private final class MacTranscriptSectionCache {
         entries = entries.filter { itemIDs.contains($0.key) }
         retainedItemIDs = itemIDs
     }
+}
+#endif
+
+private extension ConversationItem {
+    /// Items that own visible transcript geometry. An empty reasoning record
+    /// keeps its stable shell while streaming, then leaves no zero-height row
+    /// behind if it completes without producing user-visible text.
+    var isRenderedTranscriptItem: Bool {
+        guard !isTranscriptNoise else { return false }
+        guard case .reasoning(let reasoning) = self else { return true }
+        return reasoning.isStreaming
+            || !reasoning.text.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ).isEmpty
+    }
+}
+
+#if os(macOS)
+/// Concrete marker for the empty overlay. SwiftUI's accessibility identifier
+/// is proxy-only on some macOS releases, so mounted transition tests need a
+/// real AppKit descendant to prove the overlay never covers pending work.
+private struct ConversationEmptyStateMarker: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        view.setAccessibilityElement(false)
+        view.setAccessibilityIdentifier("conversation.empty-state")
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
 }
 #endif
 
@@ -1269,11 +1332,86 @@ struct ConversationView: View {
                 )
             )
         }
-        var retainedItemIDs = Set<String>()
-        retainedItemIDs.reserveCapacity(store.state.items.count)
-        let renderedItems = store.state.items.filter { !$0.isTranscriptNoise }
-        for item in renderedItems {
-            retainedItemIDs.insert(item.id)
+        var retainedSectionIDs = Set<String>()
+        retainedSectionIDs.reserveCapacity(store.state.items.count)
+        // Start each tool run inside its final group wrapper. The section ID,
+        // header row ID both derive from the first tool and therefore survive
+        // every later member append unchanged.
+        let renderedEntries = TranscriptEntry.entries(
+            of: store.state.items.filter(\.isRenderedTranscriptItem),
+            minimumGroupSize: 1
+        )
+        for entry in renderedEntries {
+            if case .toolGroup(let group) = entry {
+                retainedSectionIDs.insert(group.id)
+                let isGroupExpanded = store.expandedItemIDs.contains(group.id)
+                let header = group.headerModel(
+                    isExpanded: isGroupExpanded
+                )
+                var headerHasher = Hasher()
+                headerHasher.combine(header.summary)
+                headerHasher.combine(header.symbol)
+                headerHasher.combine(header.hasFailure)
+                headerHasher.combine(header.isRunning)
+                headerHasher.combine(isGroupExpanded)
+                let headerRevision = UInt64(
+                    truncatingIfNeeded: headerHasher.finalize()
+                )
+                var sectionHasher = Hasher()
+                sectionHasher.combine(headerRevision)
+                if isGroupExpanded {
+                    for item in group.items {
+                        let member = group.memberPresentation(
+                            itemID: item.id,
+                            isExplicitlyExpanded:
+                                store.expandedItemIDs.contains(item.id)
+                        )
+                        sectionHasher.combine(item.id)
+                        sectionHasher.combine(member.isExpanded)
+                        if member.isExpanded {
+                            sectionHasher.combine(
+                                store.transcriptItemContentRevision(
+                                    for: item.id
+                                )
+                            )
+                            sectionHasher.combine(
+                                store.copiedItemID == item.id
+                                    || store.copiedItemID?.hasPrefix(
+                                        "\(item.id):"
+                                    ) == true
+                            )
+                        } else if case .tool(let tool) = item {
+                            // A collapsed member paints only its compact line.
+                            // Streaming input/output bytes behind that line
+                            // must not invalidate the group section.
+                            sectionHasher.combine(tool.compactHeadline)
+                            sectionHasher.combine(tool.kind)
+                            sectionHasher.combine(tool.status)
+                            sectionHasher.combine(tool.durationMilliseconds)
+                            sectionHasher.combine(tool.exitCode)
+                        }
+                    }
+                }
+                let sectionRevision = UInt64(
+                    truncatingIfNeeded: sectionHasher.finalize()
+                )
+                sections.append(
+                    macTranscriptSectionCache.section(
+                        for: group.id,
+                        revision: sectionRevision
+                    ) {
+                        makeToolGroupRows(
+                            group: group,
+                            isGroupExpanded: isGroupExpanded,
+                            revision: sectionRevision,
+                            headerRevision: headerRevision
+                        )
+                    }
+                )
+                continue
+            }
+            guard case .item(let item) = entry else { continue }
+            retainedSectionIDs.insert(item.id)
             let isExpanded = store.expandedItemIDs.contains(item.id)
             let isDisclosure: Bool
             switch item {
@@ -1334,7 +1472,7 @@ struct ConversationView: View {
                 }
             )
         }
-        macTranscriptSectionCache.retain(itemIDs: retainedItemIDs)
+        macTranscriptSectionCache.retain(itemIDs: retainedSectionIDs)
         if showsPendingTurnIndicator {
             sections.append(
                 MacConversationTableSection(
@@ -1377,20 +1515,42 @@ struct ConversationView: View {
     private func makeToolGroupRows(
         group: ToolGroup,
         isGroupExpanded: Bool,
-        revision: UInt64
+        revision: UInt64,
+        headerRevision: UInt64
     ) -> [MacTranscriptRow] {
         var rows: [MacTranscriptRow] = [
             .toolGroupHeader(
                 group.headerModel(isExpanded: isGroupExpanded),
-                revision: revision
+                revision: headerRevision
             ),
         ]
         if isGroupExpanded {
             for item in group.items {
-                let isExpanded = store.expandedItemIDs.contains(item.id)
+                // The stable outer group header permanently owns the lead
+                // tool's disclosure. If another tool arrives after the user
+                // expanded a singleton, the lead body and row identities stay
+                // exactly as they were; only the new member row is appended.
+                let member = group.memberPresentation(
+                    itemID: item.id,
+                    isExplicitlyExpanded:
+                        store.expandedItemIDs.contains(item.id)
+                )
                 let projections: [TranscriptRowProjection]
-                if isExpanded {
+                if member.isExpanded {
                     projections = store.transcriptProjections(for: item)
+                        .filter {
+                            guard !member.showsCompactLine,
+                                  $0.isFirstInItem else {
+                                return true
+                            }
+                            // Only the compact tool/title projection is
+                            // replaced by the stable group header. A provider
+                            // may omit the title entirely; in that case the
+                            // first projection is real input/output and must
+                            // remain visible when the singleton expands.
+                            return $0.section != .toolTitle
+                                && $0.section != .toolHeader
+                        }
                 } else {
                     projections = store.transcriptFirstProjection(for: item)
                         .map { [$0] } ?? []
@@ -1398,21 +1558,17 @@ struct ConversationView: View {
                 rows.append(contentsOf: makeMacTranscriptRows(
                     item: item,
                     projections: projections,
-                    isExpanded: isExpanded,
+                    isExpanded: member.isExpanded,
                     copiedItemID: store.copiedItemID,
-                    sectionRevision: revision
+                    sectionRevision: revision,
+                    showsCompactLine: member.showsCompactLine
                 ))
             }
-        } else if let runningTool = group.runningTool {
-            rows.append(
-                .toolGroupLive(
-                    ToolGroupLiveModel(
-                        groupID: group.id,
-                        headline: runningTool.compactHeadline
-                    ),
-                    revision: revision
-                )
-            )
+            // Permanently own the group's trailing conversation padding.
+            // Later members insert before this zero-content edge, so no
+            // already-visible member ever flips global `isLast`, reconfigures,
+            // or changes height merely because another tool started.
+            rows.append(.toolGroupFooter(groupID: group.id))
         }
         return rows
     }
@@ -1515,13 +1671,13 @@ struct ConversationView: View {
         isLast: Bool
     ) -> some View {
         let beginsItem: Bool = {
-            if case .item(let projection, _, _) = row {
+            if case .item(let projection, _, _, _) = row {
                 return projection.isFirstInItem
             }
             return true
         }()
         let endsItem: Bool = {
-            if case .item(let projection, let isExpanded, _) = row {
+            if case .item(let projection, let isExpanded, _, _) = row {
                 if case .message(let message) = projection.displayItem,
                    !message.isStreaming,
                    message.hasText {
@@ -1538,9 +1694,10 @@ struct ConversationView: View {
         // headers) sit tight like a list; messages keep the roomier spacing.
         let itemSpacing: CGFloat = {
             switch row {
-            case .toolGroupHeader, .toolGroupLive, .pendingTurn:
+            case .toolGroupHeader, .toolGroupLive, .toolGroupFooter,
+                 .pendingTurn:
                 return ChatTypography.activityLinePadding
-            case .item(let projection, _, _):
+            case .item(let projection, _, _, _):
                 return projection.kind.isDisclosure
                     ? ChatTypography.activityLinePadding
                     : 7
@@ -1552,8 +1709,17 @@ struct ConversationView: View {
             switch row {
             case .history:
                 historyControl
-            case .item(let projection, _, _):
-                timelineView(for: projection)
+            case .item(
+                let projection,
+                let isExpanded,
+                _,
+                let showsCompactLine
+            ):
+                timelineView(
+                    for: projection,
+                    isExpanded: isExpanded,
+                    showsCompactLine: showsCompactLine
+                )
                     .accessibilityIdentifier(
                         projection.isFirstInItem
                             ? "conversation.item.\(projection.sourceItemID)"
@@ -1574,6 +1740,10 @@ struct ConversationView: View {
                     .accessibilityIdentifier(
                         "conversation.toolgroup.\(live.groupID).live"
                     )
+            case .toolGroupFooter:
+                Color.clear
+                    .frame(height: 0)
+                    .accessibilityHidden(true)
             case .pendingTurn:
                 PendingTurnIndicator()
                     .accessibilityIdentifier("conversation.pending-turn")
@@ -1604,19 +1774,21 @@ struct ConversationView: View {
 
     #if os(iOS)
     private var iosTranscript: some View {
-        // The scroller's anchor identities come from the same filtered item
-        // list the ForEach renders. Every provider item keeps one identity for
-        // its entire lifetime: live tools are never regrouped underneath the
-        // viewport when a second call arrives.
-        let renderedItems = self.visibleItems.filter { !$0.isTranscriptNoise }
+        // The first tool starts in the same group wrapper that owns the full
+        // consecutive run. Appending a second tool updates that wrapper in
+        // place instead of replacing the first component under the viewport.
+        let renderedEntries = TranscriptEntry.entries(
+            of: self.visibleItems.filter(\.isRenderedTranscriptItem),
+            minimumGroupSize: 1
+        )
         return ConversationTranscriptScroller(
-            isConversationEmpty: store.state.items.isEmpty,
-            firstItemID: renderedItems.first?.id,
+            isConversationEmpty: isConversationEmpty,
+            firstItemID: renderedEntries.first?.id,
             contentRevision: transcriptContentRevision,
             isNearBottom: store.isNearBottom,
             unreadCount: store.unreadCount,
             itemExists: { id in
-                renderedItems.contains(where: { $0.id == id })
+                renderedEntries.contains(where: { $0.id == id })
             },
             onNearBottomChange: { store.setNearBottom($0) },
             onAnchoredChange: { _ in },
@@ -1625,10 +1797,18 @@ struct ConversationView: View {
             VStack(alignment: .leading, spacing: 14) {
                 earlierContent
 
-                ForEach(renderedItems, id: \.id) { item in
-                    timelineView(for: item)
-                        .id(item.id)
-                        .accessibilityIdentifier("conversation.item.\(item.id)")
+                ForEach(renderedEntries) { entry in
+                    switch entry {
+                    case .item(let item):
+                        timelineView(for: item)
+                            .id(entry.id)
+                            .accessibilityIdentifier(
+                                "conversation.item.\(item.id)"
+                            )
+                    case .toolGroup(let group):
+                        ToolGroupCard(group: group, store: store)
+                            .id(entry.id)
+                    }
                 }
 
                 if showsPendingTurnIndicator {
@@ -1808,7 +1988,11 @@ struct ConversationView: View {
 
     #if os(macOS)
     @ViewBuilder
-    private func timelineView(for projection: TranscriptRowProjection) -> some View {
+    private func timelineView(
+        for projection: TranscriptRowProjection,
+        isExpanded: Bool,
+        showsCompactLine: Bool
+    ) -> some View {
         switch projection.displayItem {
         case .message(let message):
             ChatMessageView(
@@ -1819,20 +2003,21 @@ struct ConversationView: View {
         case .reasoning(let reasoning):
             ReasoningCard(
                 reasoning: reasoning,
-                isExpanded: store.expandedItemIDs.contains(reasoning.id),
+                isExpanded: isExpanded,
                 segment: projection
             )
         case .tool(let tool):
             ToolActivityCard(
                 tool: tool,
-                isExpanded: store.expandedItemIDs.contains(tool.id),
+                isExpanded: isExpanded,
                 copiedItemID: store.copiedItemID,
-                segment: projection
+                segment: projection,
+                showsCompactLine: showsCompactLine
             )
         case .diff(let diff):
             DiffCard(
                 diff: diff,
-                isExpanded: store.expandedItemIDs.contains(diff.id),
+                isExpanded: isExpanded,
                 segment: projection
             )
         case .plan(let plan):
@@ -1840,7 +2025,7 @@ struct ConversationView: View {
         case .generic(let generic):
             GenericActivityCard(
                 item: generic,
-                isExpanded: store.expandedItemIDs.contains(generic.id),
+                isExpanded: isExpanded,
                 segment: projection
             )
         }
@@ -1870,12 +2055,17 @@ struct ConversationView: View {
         .frame(maxWidth: .infinity)
         .padding(.vertical, 52)
         .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("conversation.empty-state")
+        #if os(macOS)
+        .background(ConversationEmptyStateMarker())
+        #endif
     }
 
     private var isConversationEmpty: Bool {
-        store.state.items.isEmpty
+        !store.state.items.contains(where: \.isRenderedTranscriptItem)
             && store.state.approvals.isEmpty
             && store.state.questions.isEmpty
+            && !showsPendingTurnIndicator
     }
 
     private var isAwaitingInitialSnapshot: Bool {
@@ -2574,15 +2764,17 @@ private struct ReasoningCard: View {
             // lifetime. Switching from a bare spinner row to a disclosure on
             // the first text delta replaced the component under the viewport
             // even though its compact height and identity should be stable.
-            DisclosureCard(
-                title: reasoning.isStreaming ? "Thinking…" : "Reasoning summary",
-                symbol: "brain.head.profile",
-                statusColor: reasoning.isStreaming ? .blue : .secondary,
-                isExpanded: isExpanded,
-                toggle: { actions.toggleExpanded(itemID: reasoning.id) }
-            ) {
-                if let displayText {
-                    reasoningText(displayText)
+            if reasoning.isStreaming || displayText != nil {
+                DisclosureCard(
+                    title: reasoning.isStreaming ? "Thinking…" : "Reasoning summary",
+                    symbol: "brain.head.profile",
+                    statusColor: reasoning.isStreaming ? .blue : .secondary,
+                    isExpanded: isExpanded,
+                    toggle: { actions.toggleExpanded(itemID: reasoning.id) }
+                ) {
+                    if let displayText {
+                        reasoningText(displayText)
+                    }
                 }
             }
         }
@@ -2602,17 +2794,20 @@ private struct ToolActivityCard: View {
     let isExpanded: Bool
     let copiedItemID: String?
     var segment: TranscriptRowProjection?
+    var showsCompactLine: Bool
 
     init(
         tool: ToolActivity,
         isExpanded: Bool,
         copiedItemID: String?,
-        segment: TranscriptRowProjection? = nil
+        segment: TranscriptRowProjection? = nil,
+        showsCompactLine: Bool = true
     ) {
         self.tool = tool
         self.isExpanded = isExpanded
         self.copiedItemID = copiedItemID
         self.segment = segment
+        self.showsCompactLine = showsCompactLine
     }
 
     @Environment(\.chatRowActions) private var actions
@@ -2637,7 +2832,7 @@ private struct ToolActivityCard: View {
                     .padding(.leading, 23)
                     .padding(.bottom, 4)
             }
-        } else {
+        } else if showsCompactLine {
             compactLine
             if isExpanded, segment?.section != .toolTitle {
                 toolContent
@@ -2646,6 +2841,10 @@ private struct ToolActivityCard: View {
                     .padding(.bottom, 4)
                     .transition(.opacity)
             }
+        } else if isExpanded {
+            toolContent
+                .padding(.leading, 23)
+                .padding(.bottom, 4)
         }
     }
 
@@ -2739,9 +2938,9 @@ private struct ToolActivityCard: View {
     }
 }
 
-/// Collapsed summary line for a run of tool calls: "Read files, ran
-/// commands". Hosted on both platforms; a fixed single-line height keeps the
-/// transcript still while member tools stream underneath.
+/// The stable collapsed line for a run of tool calls. Its text and leading
+/// glyph update in place from the active member to the final aggregate
+/// summary; its fixed height keeps the transcript still as the run grows.
 struct ToolGroupHeaderRow: View {
     let header: ToolGroupHeaderModel
 
@@ -2752,10 +2951,18 @@ struct ToolGroupHeaderRow: View {
             actions.toggleExpanded(itemID: header.groupID)
         } label: {
             HStack(spacing: 7) {
-                Image(systemName: header.symbol)
-                    .font(.caption)
-                    .foregroundStyle(header.hasFailure ? Color.red : Color.secondary)
-                    .frame(width: 16)
+                if header.isRunning {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .frame(width: 16)
+                } else {
+                    Image(systemName: header.symbol)
+                        .font(.caption)
+                        .foregroundStyle(
+                            header.hasFailure ? Color.red : Color.secondary
+                        )
+                        .frame(width: 16)
+                }
                 Text(header.summary)
                     .font(ChatTypography.activityLine)
                     .foregroundStyle(.secondary)
@@ -2812,22 +3019,29 @@ struct ToolGroupCard: View {
 
     var body: some View {
         let isExpanded = store.expandedItemIDs.contains(group.id)
+        let headerAccessibilityIdentifier = group.items.count == 1
+            ? "conversation.item.\(group.items[0].id)"
+            : "conversation.toolgroup.\(group.id)"
         VStack(alignment: .leading, spacing: 4) {
             ToolGroupHeaderRow(header: group.headerModel(isExpanded: isExpanded))
-                .accessibilityIdentifier("conversation.toolgroup.\(group.id)")
+                .accessibilityIdentifier(headerAccessibilityIdentifier)
             if isExpanded {
                 ForEach(group.items, id: \.id) { item in
                     if case .tool(let tool) = item {
+                        let member = group.memberPresentation(
+                            itemID: item.id,
+                            isExplicitlyExpanded:
+                                store.expandedItemIDs.contains(tool.id)
+                        )
                         ToolActivityCard(
                             tool: tool,
-                            isExpanded: store.expandedItemIDs.contains(tool.id),
-                            copiedItemID: store.copiedItemID
+                            isExpanded: member.isExpanded,
+                            copiedItemID: store.copiedItemID,
+                            showsCompactLine: member.showsCompactLine
                         )
                         .accessibilityIdentifier("conversation.item.\(item.id)")
                     }
                 }
-            } else if let runningTool = group.runningTool {
-                ToolGroupLiveRow(headline: runningTool.compactHeadline)
             }
         }
     }

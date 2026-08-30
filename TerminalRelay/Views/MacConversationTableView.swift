@@ -341,10 +341,21 @@ struct MacConversationNativeTextPresentation {
     let fallbackParagraphStyle: NSParagraphStyle?
     let accessibilityLabel: String?
     let accessibilityIdentifier: String?
+    /// The exact bounded Markdown tile used by the hosted table renderer.
+    /// This can differ from `fallbackString` for synthetic long-table
+    /// continuations, whose authoritative source bytes intentionally omit the
+    /// repeated header needed to parse the tile independently.
+    let accessibilityTableSource: String?
     let linkHandler: LinkHandler?
     let deferredAttributedString: DeferredAttributedString?
     let usesFastPlainTextRenderer: Bool
     let promotesFastRendererWhenIdle: Bool
+    /// Keeps the table-owned reusable cell stable while allowing a completed
+    /// row whose semantics require SwiftUI (currently Markdown tables) to use
+    /// the ordinary hosted row as its final renderer. Rows realized during a
+    /// gesture first paint their bounded native presentation, then adopt the
+    /// host inside the same outer cell when the viewport is idle.
+    let prefersHostedRenderer: Bool
 
     init(
         attributedString: NSAttributedString? = nil,
@@ -377,10 +388,12 @@ struct MacConversationNativeTextPresentation {
         fallbackParagraphStyle: NSParagraphStyle? = nil,
         accessibilityLabel: String? = nil,
         accessibilityIdentifier: String? = nil,
+        accessibilityTableSource: String? = nil,
         linkHandler: LinkHandler? = nil,
         deferredAttributedString: DeferredAttributedString? = nil,
         usesFastPlainTextRenderer: Bool = false,
-        promotesFastRendererWhenIdle: Bool = false
+        promotesFastRendererWhenIdle: Bool = false,
+        prefersHostedRenderer: Bool = false
     ) {
         // Prepared transcript artifacts are immutable and cache-owned. Keep
         // their identity so mounting a native cell does not allocate/copy the
@@ -418,10 +431,12 @@ struct MacConversationNativeTextPresentation {
             as? NSParagraphStyle
         self.accessibilityLabel = accessibilityLabel
         self.accessibilityIdentifier = accessibilityIdentifier
+        self.accessibilityTableSource = accessibilityTableSource
         self.linkHandler = linkHandler
         self.deferredAttributedString = deferredAttributedString
         self.usesFastPlainTextRenderer = usesFastPlainTextRenderer
         self.promotesFastRendererWhenIdle = promotesFastRendererWhenIdle
+        self.prefersHostedRenderer = prefersHostedRenderer
     }
 
     /// Copies layout and styling into the frame-critical scroll presentation.
@@ -461,6 +476,7 @@ struct MacConversationNativeTextPresentation {
             fallbackParagraphStyle: fallbackParagraphStyle,
             accessibilityLabel: accessibilityLabel,
             accessibilityIdentifier: accessibilityIdentifier,
+            accessibilityTableSource: accessibilityTableSource,
             usesFastPlainTextRenderer: true
         )
     }
@@ -632,6 +648,14 @@ enum MacConversationTableDiagnostics {
         let heightInvalidationPasses: Int
         let scrollOriginCorrections: Int
         let watchedSourceConfigurations: Int
+        let liveStableShellConfigurations: Int
+        let liveNonStableConfigurations: Int
+        let liveNativeFooterConfigurations: Int
+        let liveHostedConfigurations: Int
+        let frozenStableShellMeasurements: Int
+        let totalFrozenStableShellHeight: CGFloat
+        let frozenNativeFooterMeasurements: Int
+        let totalFrozenNativeFooterHeight: CGFloat
         let liveScrollRestorationPasses: Int
         let maximumLiveScrollRestorationsPerPass: Int
         let maximumLiveScrollRestorationMilliseconds: Double
@@ -649,6 +673,14 @@ enum MacConversationTableDiagnostics {
     private(set) static var heightInvalidationPasses = 0
     private(set) static var scrollOriginCorrections = 0
     private(set) static var watchedSourceConfigurations = 0
+    private(set) static var liveStableShellConfigurations = 0
+    private(set) static var liveNonStableConfigurations = 0
+    private(set) static var liveNativeFooterConfigurations = 0
+    private(set) static var liveHostedConfigurations = 0
+    private(set) static var frozenStableShellMeasurements = 0
+    private(set) static var totalFrozenStableShellHeight: CGFloat = 0
+    private(set) static var frozenNativeFooterMeasurements = 0
+    private(set) static var totalFrozenNativeFooterHeight: CGFloat = 0
     private(set) static var liveScrollRestorationPasses = 0
     private(set) static var maximumLiveScrollRestorationsPerPass = 0
     private(set) static var maximumLiveScrollRestorationMilliseconds = 0.0
@@ -667,6 +699,14 @@ enum MacConversationTableDiagnostics {
         heightInvalidationPasses = 0
         scrollOriginCorrections = 0
         watchedSourceConfigurations = 0
+        liveStableShellConfigurations = 0
+        liveNonStableConfigurations = 0
+        liveNativeFooterConfigurations = 0
+        liveHostedConfigurations = 0
+        frozenStableShellMeasurements = 0
+        totalFrozenStableShellHeight = 0
+        frozenNativeFooterMeasurements = 0
+        totalFrozenNativeFooterHeight = 0
         liveScrollRestorationPasses = 0
         maximumLiveScrollRestorationsPerPass = 0
         maximumLiveScrollRestorationMilliseconds = 0
@@ -687,6 +727,14 @@ enum MacConversationTableDiagnostics {
             heightInvalidationPasses: heightInvalidationPasses,
             scrollOriginCorrections: scrollOriginCorrections,
             watchedSourceConfigurations: watchedSourceConfigurations,
+            liveStableShellConfigurations: liveStableShellConfigurations,
+            liveNonStableConfigurations: liveNonStableConfigurations,
+            liveNativeFooterConfigurations: liveNativeFooterConfigurations,
+            liveHostedConfigurations: liveHostedConfigurations,
+            frozenStableShellMeasurements: frozenStableShellMeasurements,
+            totalFrozenStableShellHeight: totalFrozenStableShellHeight,
+            frozenNativeFooterMeasurements: frozenNativeFooterMeasurements,
+            totalFrozenNativeFooterHeight: totalFrozenNativeFooterHeight,
             liveScrollRestorationPasses: liveScrollRestorationPasses,
             maximumLiveScrollRestorationsPerPass:
                 maximumLiveScrollRestorationsPerPass,
@@ -709,9 +757,25 @@ enum MacConversationTableDiagnostics {
     static func recordedPreciseMutation() { preciseMutationPasses += 1 }
     static func recordedConfiguration(
         mutationSourceID: String,
-        isExplicit: Bool
+        isExplicit: Bool,
+        isLiveScrolling: Bool = false,
+        usesStableNativeShell: Bool = false,
+        isNativeFooter: Bool = false,
+        isHosted: Bool = false
     ) {
         rowConfigurations += 1
+        if isLiveScrolling {
+            if usesStableNativeShell {
+                liveStableShellConfigurations += 1
+            } else {
+                liveNonStableConfigurations += 1
+                if isNativeFooter {
+                    liveNativeFooterConfigurations += 1
+                } else if isHosted {
+                    liveHostedConfigurations += 1
+                }
+            }
+        }
         if mutationSourceID == watchedMutationSourceID {
             watchedSourceConfigurations += 1
         }
@@ -721,6 +785,14 @@ enum MacConversationTableDiagnostics {
             ordinaryMountConfigurations += 1
         }
         measuredRows += 1
+    }
+    static func recordedFrozenStableShellMeasurement(height: CGFloat) {
+        frozenStableShellMeasurements += 1
+        totalFrozenStableShellHeight += height
+    }
+    static func recordedFrozenNativeFooterMeasurement(height: CGFloat) {
+        frozenNativeFooterMeasurements += 1
+        totalFrozenNativeFooterHeight += height
     }
     static func recordedHeightInvalidation() { heightInvalidationPasses += 1 }
     static func recordedScrollOriginCorrection() { scrollOriginCorrections += 1 }
@@ -845,6 +917,16 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         private weak var scrollView: NSScrollView?
         private weak var tableView: NSTableView?
         private var snapshot = MacConversationTableSnapshot<Row>.empty
+        /// Distinguishes rows whose exact automatic height was published in a
+        /// prior idle layout from genuinely cold rows that still own the
+        /// table-wide provisional estimate.
+        private var realizedRowIDs: Set<String> = []
+        /// A row first seen during the current gesture stays provisional for
+        /// that entire gesture, including a direction reversal. Treating it
+        /// as settled merely because the first leg realized it republished a
+        /// different exact height on the return leg and collapsed the table's
+        /// automatic-height cache behind the frozen document extent.
+        private var liveScrollColdRowIDs: Set<String> = []
         private var sectionIndexByID: [String: Int] = [:]
         private var snapshotGeneration: String?
         private var lastTranscriptMutationRevision: UInt64 = 0
@@ -945,6 +1027,21 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             let rowID: String
             let localRowIndex: Int
             let offset: CGFloat
+        }
+
+        private struct CellReuseIdentity: Equatable {
+            let rowReuseIdentifier: String
+            let kind: MacConversationReusableCell.Kind
+            let usesStableNativeShell: Bool
+
+            var identifier: NSUserInterfaceItemIdentifier {
+                let suffix = usesStableNativeShell
+                    ? "stable.\(kind.rawValue)"
+                    : kind.rawValue
+                return NSUserInterfaceItemIdentifier(
+                    "\(rowReuseIdentifier).\(suffix)"
+                )
+            }
         }
 
         private final class LiveScrollRestoration {
@@ -1059,6 +1156,10 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
         }
 
         func detach() {
+            realizedRowIDs.removeAll()
+            liveScrollColdRowIDs.removeAll()
+            (tableView as? MacTranscriptTableView)?
+                .setLiveScrollFrozenDocumentHeight(nil)
             stopSelectionAutoscroll()
             if isLiveScrolling {
                 onLiveScrollingChange(false)
@@ -1294,6 +1395,8 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                     snapshot = newSnapshot
                     rebuildSectionIndex()
                     snapshotGeneration = newSnapshotGeneration
+                    realizedRowIDs.removeAll(keepingCapacity: true)
+                    liveScrollColdRowIDs.removeAll(keepingCapacity: true)
                     tableView.reloadData()
                     MacConversationTableDiagnostics.recordedReload()
                     didReload = true
@@ -1390,6 +1493,8 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             guard let location = snapshot.location(ofFlatIndex: index) else { return nil }
             let section = snapshot.sections[location.section]
             let row = section.rows[location.row]
+            let wasRealized = realizedRowIDs.contains(row.id)
+            let wasColdDuringLiveScroll = liveScrollColdRowIDs.contains(row.id)
             let isFirst = index == 0
             let isLast = index == snapshot.count - 1
             let preparedContent = cellContent(
@@ -1403,9 +1508,12 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             } else {
                 preparedContent.kind
             }
-            let identifier = NSUserInterfaceItemIdentifier(
-                "\(row.reuseIdentifier).\(kind.rawValue)"
+            let reuseIdentity = CellReuseIdentity(
+                rowReuseIdentifier: row.reuseIdentifier,
+                kind: kind,
+                usesStableNativeShell: preparedContent.usesStableNativeShell
             )
+            let identifier = reuseIdentity.identifier
             let cell: MacConversationReusableCell
             if let reused = tableView.makeView(withIdentifier: identifier, owner: nil)
                 as? MacConversationReusableCell,
@@ -1416,7 +1524,9 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 case .hosted:
                     cell = MacConversationHostedCell()
                 case .native:
-                    cell = MacConversationNativeTextCell()
+                    cell = preparedContent.usesStableNativeShell
+                        ? MacConversationScrollTextCell(kind: .native)
+                        : MacConversationNativeTextCell()
                 case .nativeScroll:
                     cell = MacConversationScrollTextCell()
                 case .nativeFooter:
@@ -1424,6 +1534,15 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 }
                 cell.identifier = identifier
             }
+            let freezesLiveHeight = isLiveScrolling
+                && (preparedContent.usesStableNativeShell
+                    || preparedContent.kind == .nativeFooter)
+            // Reuse deliberately retains the old row's freeze through AppKit's
+            // final teardown measurement. Clear it only after this view has a
+            // new assignment, then configure the lightweight Core Text/manual
+            // footer surface so its exact deterministic geometry can become
+            // the new freeze without mounting TextKit or SwiftUI.
+            cell.setLiveScrollFrozenHeight(nil)
             configure(
                 cell,
                 with: row,
@@ -1432,6 +1551,24 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 preparedContent: preparedContent,
                 isExplicit: false
             )
+            if freezesLiveHeight {
+                let height = wasRealized && !wasColdDuringLiveScroll
+                    ? cell.fittingSize.height
+                    : tableView.rowHeight
+                cell.setLiveScrollFrozenHeight(
+                    max(1, height)
+                )
+                if !usesLiveScrollStandIns {
+                    liveScrollCells.add(cell)
+                    if !wasRealized {
+                        liveScrollColdRowIDs.insert(row.id)
+                    }
+                }
+            }
+            if isLiveScrolling, !usesLiveScrollStandIns {
+                pendingLiveScrollHeightInvalidations.insert(index)
+            }
+            realizedRowIDs.insert(row.id)
             if kind == .nativeScroll {
                 liveScrollCells.add(cell)
             }
@@ -2038,7 +2175,8 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                         if oldRow != row {
                             let flatIndex = newBase + index
                             changedIndexes.insert(flatIndex)
-                            if cellKind(for: oldRow) != cellKind(for: row) {
+                            if cellReuseIdentity(for: oldRow)
+                                != cellReuseIdentity(for: row) {
                                 cellClassChanges.insert(flatIndex)
                             }
                         }
@@ -2097,7 +2235,9 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                     row: index,
                     makeIfNecessary: false
                 ) as? MacConversationReusableCell else { continue }
-                if cell.kind != cellKind(for: snapshot[index]) {
+                let desiredIdentity = cellReuseIdentity(for: snapshot[index])
+                if cell.kind != desiredIdentity.kind
+                    || cell.identifier != desiredIdentity.identifier {
                     cellClassChanges.insert(index)
                 }
             }
@@ -2259,12 +2399,13 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             cell.selectionPromotionVeto = { [weak self] in
                 self?.selection.hasEndpoint(inRowWithID: rowID) ?? false
             }
-            cell.setContent(
-                preparedContent ?? cellContent(
+            let content = preparedContent ?? cellContent(
                     for: row,
                     isFirst: isFirst,
                     isLast: isLast
-                ),
+                )
+            cell.setContent(
+                content,
                 scrollActivity: scrollActivity,
                 nativeLinkHandler: onNativeLink,
                 nativeCopyMessageHandler: onNativeCopyMessage
@@ -2279,7 +2420,11 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             }
             MacConversationTableDiagnostics.recordedConfiguration(
                 mutationSourceID: row.mutationSourceID,
-                isExplicit: isExplicit
+                isExplicit: isExplicit,
+                isLiveScrolling: isLiveScrolling,
+                usesStableNativeShell: content.usesStableNativeShell,
+                isNativeFooter: content.kind == .nativeFooter,
+                isHosted: content.kind == .hosted
             )
             return true
         }
@@ -2304,13 +2449,34 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                ) {
                 return .native(presentation)
             }
+            let liveScrollPresentation = usesLiveScrollStandIns
+                ? nil
+                : row.liveScrollTextPresentation(
+                    dynamicTypeSize: environment.dynamicTypeSize,
+                    colorScheme: environment.colorScheme
+                )
             if let presentation = row.nativeTextPresentation(
                 dynamicTypeSize: environment.dynamicTypeSize,
                 colorScheme: environment.colorScheme
             ) {
-                return .native(presentation)
+                let hostedRenderer: AnyView? = presentation.prefersHostedRenderer
+                    ? AnyView(
+                        makeRow(row, isFirst, isLast)
+                            .id(row.id)
+                            .environment(\.self, environment)
+                            .environment(
+                                \.macTranscriptScrollActivity,
+                                scrollActivity
+                            )
+                    )
+                    : nil
+                return .native(
+                    presentation,
+                    hostedRenderer: hostedRenderer,
+                    liveScrollPresentation: liveScrollPresentation
+                )
             }
-            return .hosted(AnyView(
+            let hostedRenderer = AnyView(
                 makeRow(row, isFirst, isLast)
                     .id(row.id)
                     .environment(\.self, environment)
@@ -2318,7 +2484,19 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                         \.macTranscriptScrollActivity,
                         scrollActivity
                     )
-            ))
+            )
+            if let liveScrollPresentation {
+                // Disclosure/activity rows need SwiftUI when settled, but the
+                // same stable native outer cell can paint their exact compact
+                // line during a gesture. This avoids both a host mount in the
+                // frame callback and an NSTableCellView replacement at end.
+                return .native(
+                    liveScrollPresentation,
+                    hostedRenderer: hostedRenderer,
+                    liveScrollPresentation: liveScrollPresentation
+                )
+            }
+            return .hosted(hostedRenderer)
         }
 
         private func cellKind(for row: Row) -> MacConversationReusableCell.Kind {
@@ -2329,6 +2507,13 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 return usesLiveScrollStandIns && isLiveScrolling
                     ? .nativeScroll
                     : .nativeFooter
+            }
+            if !usesLiveScrollStandIns,
+               row.liveScrollTextPresentation(
+                    dynamicTypeSize: environment.dynamicTypeSize,
+                    colorScheme: environment.colorScheme
+               ) != nil {
+                return .native
             }
             let presentation = usesLiveScrollStandIns && isLiveScrolling
                 ? row.liveScrollTextPresentation(
@@ -2343,6 +2528,21 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             return usesLiveScrollStandIns && isLiveScrolling
                 ? .nativeScroll
                 : .native
+        }
+
+        private func cellReuseIdentity(for row: Row) -> CellReuseIdentity {
+            let kind = cellKind(for: row)
+            let usesStableNativeShell = !usesLiveScrollStandIns
+                && kind == .native
+                && row.liveScrollTextPresentation(
+                    dynamicTypeSize: environment.dynamicTypeSize,
+                    colorScheme: environment.colorScheme
+                ) != nil
+            return CellReuseIdentity(
+                rowReuseIdentifier: row.reuseIdentifier,
+                kind: kind,
+                usesStableNativeShell: usesStableNativeShell
+            )
         }
 
         private func liveScrollPresentation(
@@ -2551,6 +2751,7 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             // drag's own gates already pause every correction owner.
             guard !selectionDragActive else { return }
             guard !isLiveScrolling else { return }
+            liveScrollColdRowIDs.removeAll(keepingCapacity: true)
             scrollActivity.setLiveScrolling(true)
             scrollActivity.setIncrementalRestorationActive(false)
             let carriedCells = cancelLiveScrollRestoration(
@@ -2567,7 +2768,15 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                     liveScrollCells.add(cell)
                 }
             }
+            if let tableView = tableView as? MacTranscriptTableView {
+                tableView.setLiveScrollFrozenDocumentHeight(
+                    max(1, tableView.bounds.height)
+                )
+            }
             isLiveScrolling = true
+            if !usesLiveScrollStandIns {
+                freezeMountedStableShellsForLiveScroll()
+            }
             cancelMutationStabilization()
             onLiveScrollingChange(true)
         }
@@ -2591,17 +2800,29 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
                 isFollowingBottom = isAtBottom
             }
             if !usesLiveScrollStandIns {
+                let followsBottom = isAtBottom || isFollowingBottom
+                prepareMutationStabilization(
+                    followsBottom: followsBottom,
+                    anchor: followsBottom ? nil : captureAnchor()
+                )
+                thawMountedStableShellsAfterLiveScroll()
+                (tableView as? MacTranscriptTableView)?
+                    .setLiveScrollFrozenDocumentHeight(nil)
                 scrollActivity.setLiveScrolling(false)
                 scrollActivity.setIncrementalRestorationActive(false)
                 liveScrollCells.removeAllObjects()
                 cancelLiveScrollRestoration(requeueMountedCells: false)
                 flushLiveScrollDeferredHeightsWithoutStandIns()
+                liveScrollColdRowIDs.removeAll(keepingCapacity: true)
                 sampleNearBottom()
                 onLiveScrollingChange(false)
                 scheduleViewportPrefetch()
                 return
             }
             scrollActivity.setIncrementalRestorationActive(true)
+            liveScrollColdRowIDs.removeAll(keepingCapacity: true)
+            (tableView as? MacTranscriptTableView)?
+                .setLiveScrollFrozenDocumentHeight(nil)
             scrollActivity.setLiveScrolling(false)
             guard let tableView else {
                 liveScrollCells.removeAllObjects()
@@ -2661,6 +2882,60 @@ struct MacConversationTableView<Row: MacConversationTableRow>: NSViewRepresentab
             onLiveScrollingChange(false)
             scheduleViewportPrefetch()
             scheduleLiveScrollRestorationIfNeeded()
+        }
+
+        /// Rows mounted just before a gesture can still be waiting for their
+        /// first settled TextKit/SwiftUI layout. Freeze those existing stable
+        /// shells at the table's already-published height too; otherwise that
+        /// late layout can expand a multi-million-point document during the
+        /// first display-link callbacks even though every newly realized row
+        /// is protected by `viewFor`.
+        private func freezeMountedStableShellsForLiveScroll() {
+            guard let tableView, let scrollView else { return }
+            let visible = tableView.rows(in: scrollView.contentView.bounds)
+            guard visible.location != NSNotFound else { return }
+            for index in visible.location..<NSMaxRange(visible) {
+                guard let cell = tableView.view(
+                    atColumn: 0,
+                    row: index,
+                    makeIfNecessary: false
+                ) as? MacConversationReusableCell,
+                cell.kind == .native || cell.kind == .nativeFooter else {
+                    continue
+                }
+                liveScrollCells.add(cell)
+                cell.setLiveScrollFrozenHeight(
+                    max(1, tableView.rect(ofRow: index).height)
+                )
+            }
+        }
+
+        private func thawMountedStableShellsAfterLiveScroll() {
+            guard let tableView else {
+                pendingLiveScrollHeightInvalidations.removeAll()
+                return
+            }
+            var mountedIndexes = IndexSet()
+            for cell in liveScrollCells.allObjects {
+                guard cell.kind == .native || cell.kind == .nativeFooter else {
+                    continue
+                }
+                let index = tableView.row(for: cell)
+                guard index >= 0,
+                      snapshot.location(ofFlatIndex: index) != nil else { continue }
+                cell.setLiveScrollFrozenHeight(nil)
+                mountedIndexes.insert(index)
+            }
+            // Rows traversed and recycled during the gesture keep their
+            // already-published provisional height until they are next
+            // realized at idle. Republishing every off-screen measurement in
+            // one didEnd batch changed a multi-million-point document by
+            // thousands of points and moved the resting row. Only mounted
+            // content can affect what the user sees at release.
+            pendingLiveScrollHeightInvalidations.formIntersection(
+                mountedIndexes
+            )
+            pendingLiveScrollHeightInvalidations.formUnion(mountedIndexes)
         }
 
         /// Ordinary cells stay mounted when the stand-in mode is disabled.
@@ -3303,7 +3578,11 @@ private class MacConversationReusableCell: NSTableCellView {
 
     enum Content {
         case hosted(AnyView)
-        case native(MacConversationNativeTextPresentation)
+        case native(
+            MacConversationNativeTextPresentation,
+            hostedRenderer: AnyView? = nil,
+            liveScrollPresentation: MacConversationNativeTextPresentation? = nil
+        )
         case nativeFooter(MacConversationNativeFooterPresentation)
 
         var kind: Kind {
@@ -3312,6 +3591,18 @@ private class MacConversationReusableCell: NSTableCellView {
             case .native: .native
             case .nativeFooter: .nativeFooter
             }
+        }
+
+        /// Production scrolling keeps one lightweight outer AppKit cell for
+        /// the row's whole lifetime. The optional scroll presentation is the
+        /// signal that this content can paint without constructing TextKit or
+        /// an NSHostingView in a gesture callback, then adopt its settled
+        /// renderer inside that same cell once the viewport is idle.
+        var usesStableNativeShell: Bool {
+            guard case let .native(_, _, liveScrollPresentation) = self else {
+                return false
+            }
+            return liveScrollPresentation != nil
         }
     }
 
@@ -3367,8 +3658,18 @@ private class MacConversationReusableCell: NSTableCellView {
     /// Paints or clears this cell's part of the transcript selection.
     func setSelectionHighlight(_ highlight: MacTranscriptRowHighlight) {}
 
+    /// Stable live-scroll shells override this to keep the table's existing
+    /// cached row height until their inner renderer is adopted at idle.
+    func setLiveScrollFrozenHeight(_ height: CGFloat?) {}
+
+    /// Gives cells with a deferred renderer swap a deterministic retry point
+    /// when a selection endpoint is established or released. A vetoed idle
+    /// adoption must remain pending without polling the main run loop.
+    func selectionStateDidChange() {}
+
     func applyResolvedSelectionHighlight() {
         setSelectionHighlight(selectionHighlightResolver?() ?? .none)
+        selectionStateDidChange()
     }
 
     override func prepareForReuse() {
@@ -3545,21 +3846,22 @@ private final class MacConversationNativeFooterCell: MacConversationReusableCell
     private let controls = NSStackView(frame: .zero)
     private let copyButton = MacConversationHoverIconButton(frame: .zero)
     private let timestampLabel = NSTextField(labelWithString: "")
-    private var topConstraint: NSLayoutConstraint!
-    private var bottomConstraint: NSLayoutConstraint!
-    private var controlsLeadingConstraint: NSLayoutConstraint!
-    private var controlsTrailingConstraint: NSLayoutConstraint!
     private var copiedResetTask: Task<Void, Never>?
     private var copyMessageHandler: (@MainActor (String) -> Void)?
     private var itemID: String?
     private var controlsRevealed = false
+    private var isTrailing = false
+    private var frozenLiveScrollHeight: CGFloat?
 
     var footerItemID: String? { itemID }
 
     init() {
         super.init(kind: .nativeFooter)
 
-        layoutContainer.translatesAutoresizingMaskIntoConstraints = false
+        // The stack is frame-positioned by this constraint-free outer cell,
+        // but its arranged children still use their own intrinsic/22pt
+        // constraints. Disable autoresizing-mask constraints so the stack's
+        // initial zero frame cannot conflict with those required child sizes.
         controls.translatesAutoresizingMaskIntoConstraints = false
         controls.orientation = .horizontal
         controls.alignment = .centerY
@@ -3584,34 +3886,7 @@ private final class MacConversationNativeFooterCell: MacConversationReusableCell
         controls.addArrangedSubview(copyButton)
         controls.addArrangedSubview(timestampLabel)
 
-        topConstraint = layoutContainer.topAnchor.constraint(equalTo: topAnchor)
-        bottomConstraint = layoutContainer.bottomAnchor.constraint(equalTo: bottomAnchor)
-        controlsLeadingConstraint = controls.leadingAnchor.constraint(
-            equalTo: layoutContainer.leadingAnchor
-        )
-        controlsTrailingConstraint = controls.trailingAnchor.constraint(
-            equalTo: layoutContainer.trailingAnchor
-        )
-        let preferredWidth = layoutContainer.widthAnchor.constraint(
-            equalToConstant: 760
-        )
-        preferredWidth.priority = .defaultHigh
         NSLayoutConstraint.activate([
-            layoutContainer.leadingAnchor.constraint(
-                greaterThanOrEqualTo: leadingAnchor,
-                constant: 28
-            ),
-            layoutContainer.trailingAnchor.constraint(
-                lessThanOrEqualTo: trailingAnchor,
-                constant: -28
-            ),
-            layoutContainer.centerXAnchor.constraint(equalTo: centerXAnchor),
-            layoutContainer.widthAnchor.constraint(lessThanOrEqualToConstant: 760),
-            preferredWidth,
-            topConstraint,
-            bottomConstraint,
-            controls.topAnchor.constraint(equalTo: layoutContainer.topAnchor),
-            controls.bottomAnchor.constraint(equalTo: layoutContainer.bottomAnchor),
             copyButton.widthAnchor.constraint(equalToConstant: 22),
             copyButton.heightAnchor.constraint(equalToConstant: 22),
         ])
@@ -3622,6 +3897,8 @@ private final class MacConversationNativeFooterCell: MacConversationReusableCell
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
+
+    override var isFlipped: Bool { true }
 
     /// Controls fade in only while the pointer is over the owning message or
     /// this row's controls; the row keeps its constant height either way.
@@ -3646,6 +3923,59 @@ private final class MacConversationNativeFooterCell: MacConversationReusableCell
             return nil
         }
         return view
+    }
+
+    override var fittingSize: NSSize {
+        if let frozenLiveScrollHeight {
+            MacConversationTableDiagnostics
+                .recordedFrozenNativeFooterMeasurement(
+                    height: frozenLiveScrollHeight
+                )
+        }
+        return NSSize(
+            width: max(1, bounds.width > 1 ? bounds.width : 800),
+            height: frozenLiveScrollHeight ?? exactRowHeight
+        )
+    }
+
+    override var intrinsicContentSize: NSSize { fittingSize }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        let widthChanged = abs(newSize.width - bounds.width) > 0.5
+        super.setFrameSize(newSize)
+        if widthChanged {
+            needsLayout = true
+        }
+    }
+
+    override func layout() {
+        super.layout()
+        let columnWidth = min(760, max(0, bounds.width - 56))
+        let columnX = (bounds.width - columnWidth) / 2
+        let controlsSize = controls.fittingSize
+        let controlsWidth = min(columnWidth, max(0, controlsSize.width))
+        let controlsX = isTrailing ? columnWidth - controlsWidth : 0
+        layoutContainer.frame = NSRect(
+            x: columnX,
+            y: topInset,
+            width: columnWidth,
+            height: 22
+        )
+        controls.frame = NSRect(
+            x: controlsX,
+            y: 0,
+            width: controlsWidth,
+            height: 22
+        )
+    }
+
+    override func setLiveScrollFrozenHeight(_ height: CGFloat?) {
+        frozenLiveScrollHeight = height
+        if height != nil {
+            wantsLayer = true
+        }
+        layer?.masksToBounds = height != nil
+        invalidateIntrinsicContentSize()
     }
 
     override func hoverRevealTarget(contains point: NSPoint) -> Bool {
@@ -3673,23 +4003,7 @@ private final class MacConversationNativeFooterCell: MacConversationReusableCell
         }
         copyMessageHandler = nativeCopyMessageHandler
 
-        topConstraint.constant = isFirst ? 22 : 2
-        bottomConstraint.constant = -(isLast ? 16 : 8)
-        if presentation.isTrailing {
-            if controlsLeadingConstraint.isActive {
-                controlsLeadingConstraint.isActive = false
-            }
-            if !controlsTrailingConstraint.isActive {
-                controlsTrailingConstraint.isActive = true
-            }
-        } else {
-            if controlsTrailingConstraint.isActive {
-                controlsTrailingConstraint.isActive = false
-            }
-            if !controlsLeadingConstraint.isActive {
-                controlsLeadingConstraint.isActive = true
-            }
-        }
+        isTrailing = presentation.isTrailing
         // Under a trailing bubble the timestamp leads the copy control so the
         // glyph hugs the bubble edge; leading messages keep the mirrored order.
         let orderedControls = presentation.isTrailing
@@ -3716,6 +4030,8 @@ private final class MacConversationNativeFooterCell: MacConversationReusableCell
         copyButton.setAccessibilityIdentifier(
             presentation.accessibilityIdentifier.map { "\($0).copy" }
         )
+        invalidateIntrinsicContentSize()
+        needsLayout = true
     }
 
     override func prepareForReuse() {
@@ -3729,8 +4045,18 @@ private final class MacConversationNativeFooterCell: MacConversationReusableCell
         copyButton.setAccessibilityIdentifier(nil)
         setCopyState(copied: false)
         setControlsRevealed(false, animated: false)
+        isTrailing = false
+        // NSTableView may ask a recycled view for its fitting size once more
+        // after teardown. Keep the gesture's published height until `viewFor`
+        // explicitly assigns this cell to its next row (or thaws it at idle),
+        // otherwise that final measurement leaks the cleared 44pt/rebuilt
+        // content height back into the old row while the document is moving.
         super.prepareForReuse()
     }
+
+    private var topInset: CGFloat { isFirst ? 22 : 2 }
+    private var bottomInset: CGFloat { isLast ? 16 : 8 }
+    private var exactRowHeight: CGFloat { topInset + 22 + bottomInset }
 
     @objc
     private func copyMessage() {
@@ -3761,11 +4087,155 @@ private final class MacConversationNativeFooterCell: MacConversationReusableCell
     }
 }
 
-/// The cell used for rows that enter the viewport during a live gesture. It
-/// intentionally has no Auto Layout graph and no selectable AppKit text
-/// control: NSTableView can realize it with one Core Text measurement and
-/// direct frames. Visible rows are replaced by the selectable/rich native cell
-/// immediately after scrolling ends.
+/// Bridges a semantic SwiftUI table host into AppKit's accessibility graph.
+/// `NSHostingView.accessibilityChildren()` is empty on some macOS releases
+/// even though the hosted horizontal `ScrollView` is mounted. Expose one
+/// stable labeled group per real table scroller, so VoiceOver can enter every
+/// hosted grid without turning the hosting view itself into a leaf. A single
+/// bounded Markdown tile may contain more than one table.
+@MainActor
+private final class MacConversationSemanticHostingView:
+    NSHostingView<AnyView>
+{
+    private var semanticGroups: [NSAccessibilityElement] = []
+    private let fallbackTable = NSAccessibilityElement()
+    private var semanticTables: [NSAccessibilityElement] = []
+    private var semanticLabel: String?
+    private var semanticIdentifier: String?
+    private var semanticSource: String?
+
+    required init(rootView: AnyView) {
+        super.init(rootView: rootView)
+        fallbackTable.setAccessibilityRole(.table)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func configureSemanticTableAccessibility(
+        label: String?,
+        identifier: String?,
+        source: String?
+    ) {
+        semanticLabel = label == "Scrollable table" ? label : nil
+        semanticIdentifier = identifier
+        let nextSource = semanticLabel == nil ? nil : source
+        if semanticSource != nextSource {
+            semanticSource = nextSource
+            semanticTables = nextSource.map {
+                Self.makeSemanticTables(
+                    from: MarkdownTableAccessibility.tables(in: $0)
+                )
+            } ?? []
+        }
+        if semanticLabel == nil {
+            semanticGroups.removeAll()
+            semanticTables.removeAll()
+        }
+    }
+
+    override func accessibilityChildren() -> [Any]? {
+        guard let semanticLabel else {
+            return super.accessibilityChildren()
+        }
+        let scrollers = horizontalTableScrollViews(in: self)
+        if scrollers.isEmpty {
+            let group = semanticGroup(at: 0, label: semanticLabel)
+            if let semanticTable = semanticTables.first {
+                semanticTable.setAccessibilityParent(group)
+                group.setAccessibilityChildren([semanticTable])
+            } else {
+                // The synchronous table root normally installs its scroller
+                // before accessibility is queried. Keep a correctly-role'd
+                // placeholder for the narrow pre-layout interval only.
+                fallbackTable.setAccessibilityParent(group)
+                group.setAccessibilityChildren([fallbackTable])
+            }
+            return [group]
+        }
+        return scrollers.enumerated().map { index, scroller in
+            let group = semanticGroup(at: index, label: semanticLabel)
+            if semanticTables.indices.contains(index) {
+                let semanticTable = semanticTables[index]
+                semanticTable.setAccessibilityParent(group)
+                group.setAccessibilityChildren([scroller, semanticTable])
+            } else {
+                group.setAccessibilityChildren([scroller])
+            }
+            return group
+        }
+    }
+
+    private static func makeSemanticTables(
+        from tables: [[[String]]]
+    ) -> [NSAccessibilityElement] {
+        tables.enumerated().map { tableIndex, rows in
+            let table = NSAccessibilityElement()
+            table.setAccessibilityRole(.table)
+            table.setAccessibilityLabel("Table \(tableIndex + 1) contents")
+            let rowElements = rows.enumerated().map { rowIndex, cells in
+                let row = NSAccessibilityElement()
+                row.setAccessibilityRole(.row)
+                row.setAccessibilityLabel(
+                    rowIndex == 0 ? "Column headers" : "Row \(rowIndex)"
+                )
+                row.setAccessibilityParent(table)
+                let cellElements = cells.map { text in
+                    let cell = NSAccessibilityElement()
+                    cell.setAccessibilityRole(.cell)
+                    cell.setAccessibilityLabel(text)
+                    cell.setAccessibilityParent(row)
+                    return cell
+                }
+                row.setAccessibilityChildren(cellElements)
+                return row
+            }
+            table.setAccessibilityChildren(rowElements)
+            return table
+        }
+    }
+
+    private func semanticGroup(
+        at index: Int,
+        label: String
+    ) -> NSAccessibilityElement {
+        while semanticGroups.count <= index {
+            let group = NSAccessibilityElement()
+            group.setAccessibilityRole(.group)
+            group.setAccessibilityParent(self)
+            semanticGroups.append(group)
+        }
+        let group = semanticGroups[index]
+        group.setAccessibilityLabel(label)
+        group.setAccessibilityIdentifier(
+            semanticIdentifier.map { "\($0).table.\(index)" }
+        )
+        return group
+    }
+
+    private func horizontalTableScrollViews(in root: NSView) -> [NSScrollView] {
+        var result: [NSScrollView] = []
+        for subview in root.subviews {
+            if let scrollView = subview as? NSScrollView,
+               scrollView.hasHorizontalScroller,
+               scrollView.documentView != nil,
+               scrollView.accessibilityIdentifier()
+                    == MarkdownTableAccessibility.scrollViewIdentifier {
+                result.append(scrollView)
+            }
+            result.append(contentsOf: horizontalTableScrollViews(in: subview))
+        }
+        return result
+    }
+}
+
+/// The constraint-free outer cell used for rows that can paint an exact Core
+/// Text surface during a live gesture. In production it remains the SAME table
+/// cell for the row's lifetime and adopts a selectable native renderer or
+/// SwiftUI host inside itself only after the viewport is idle. The legacy
+/// stand-in mode also uses it as a short-lived `.nativeScroll` cell.
 @MainActor
 private final class MacConversationScrollTextCell: MacConversationReusableCell {
     private struct Geometry {
@@ -3774,20 +4244,41 @@ private final class MacConversationScrollTextCell: MacConversationReusableCell {
         let height: CGFloat
     }
 
-    /// Stand-ins are draw-only and exist for at most a beat after a gesture
-    /// (selection mouse-down force-closes wheel windows, and restoration is
-    /// capped). They stay hit-test transparent like every text row so the
-    /// table owns drags; selection over them is row-granular until the row
-    /// promotes, and they paint no highlight (accepted scope limit).
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    private struct PendingSettledAdoption {
+        let presentation: MacConversationNativeTextPresentation
+        let hostedRenderer: AnyView?
+        let scrollActivity: MacTranscriptScrollActivity
+        let nativeLinkHandler: MacConversationNativeTextPresentation.LinkHandler
+        let nativeCopyMessageHandler: @MainActor (String) -> Void
+        let generation: UInt64
+        let representedRowID: String?
+    }
+
+    /// The Core Text surface stays hit-test transparent so the table owns
+    /// drags. Once the stable shell contains SwiftUI, hosted controls and the
+    /// nested horizontal table scroller receive pointer events normally.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        hostedRenderer == nil ? nil : super.hitTest(point)
+    }
 
     private let textContainerView = NSView(frame: .zero)
     private let scrollTextView = MacConversationScrollTextView(frame: .zero)
     private var presentation: MacConversationNativeTextPresentation?
     private var lastWidth: CGFloat = -1
+    private var settledNativeCell: MacConversationNativeTextCell?
+    private var hostedRenderer: NSHostingView<AnyView>?
+    private var hostedSelectionOverlay: NSView?
+    private var deferredSettledAdoptionTask: Task<Void, Never>?
+    private var pendingSettledAdoption: PendingSettledAdoption?
+    private var isSettledAdoptionQueued = false
+    private var presentationGeneration: UInt64 = 0
+    private var settledRowID: String?
+    private var currentSelectionHighlight = MacTranscriptRowHighlight.none
+    private var frozenLiveScrollHeight: CGFloat?
 
-    init() {
-        super.init(kind: .nativeScroll)
+    override init(kind: Kind = .nativeScroll) {
+        precondition(kind == .nativeScroll || kind == .native)
+        super.init(kind: kind)
         addSubview(textContainerView)
         textContainerView.addSubview(scrollTextView)
     }
@@ -3805,11 +4296,37 @@ private final class MacConversationScrollTextCell: MacConversationReusableCell {
         nativeLinkHandler: @escaping MacConversationNativeTextPresentation.LinkHandler,
         nativeCopyMessageHandler: @escaping @MainActor (String) -> Void
     ) {
-        guard case let .native(presentation) = content else {
+        guard case let .native(
+            presentation,
+            hostedRenderer,
+            liveScrollPresentation
+        ) = content else {
             assertionFailure("Scroll transcript cell received non-text content")
             return
         }
+        if kind == .native {
+            guard let liveScrollPresentation else {
+                assertionFailure("Stable native shell requires a scroll presentation")
+                return
+            }
+            setStableContent(
+                settledPresentation: presentation,
+                hostedRenderer: hostedRenderer,
+                liveScrollPresentation: liveScrollPresentation,
+                scrollActivity: scrollActivity,
+                nativeLinkHandler: nativeLinkHandler,
+                nativeCopyMessageHandler: nativeCopyMessageHandler
+            )
+            return
+        }
+        showScrollPresentation(presentation)
+    }
+
+    private func showScrollPresentation(
+        _ presentation: MacConversationNativeTextPresentation
+    ) {
         self.presentation = presentation
+        textContainerView.isHidden = false
         scrollTextView.attributedString = presentation.attributedString
             ?? Self.fallbackAttributedString(
                 presentation.fallbackString,
@@ -3840,7 +4357,230 @@ private final class MacConversationScrollTextCell: MacConversationReusableCell {
         needsLayout = true
     }
 
+    private func setStableContent(
+        settledPresentation: MacConversationNativeTextPresentation,
+        hostedRenderer rootView: AnyView?,
+        liveScrollPresentation: MacConversationNativeTextPresentation,
+        scrollActivity: MacTranscriptScrollActivity,
+        nativeLinkHandler: @escaping MacConversationNativeTextPresentation.LinkHandler,
+        nativeCopyMessageHandler: @escaping @MainActor (String) -> Void
+    ) {
+        presentationGeneration &+= 1
+        let generation = presentationGeneration
+        deferredSettledAdoptionTask?.cancel()
+        deferredSettledAdoptionTask = nil
+        isSettledAdoptionQueued = false
+        let representedRowID = representedRowID
+        pendingSettledAdoption = PendingSettledAdoption(
+            presentation: settledPresentation,
+            hostedRenderer: rootView,
+            scrollActivity: scrollActivity,
+            nativeLinkHandler: nativeLinkHandler,
+            nativeCopyMessageHandler: nativeCopyMessageHandler,
+            generation: generation,
+            representedRowID: representedRowID
+        )
+
+        if scrollActivity.isLiveScrollActive {
+            // A cell already showing this exact row remains completely
+            // untouched while the gesture owns the viewport. Cold/recycled
+            // rows paint through the lightweight Core Text surface. Both
+            // paths queue only an in-place settled adoption for idle time.
+            if settledRowID != representedRowID
+                || (settledNativeCell == nil && hostedRenderer == nil) {
+                clearSettledRenderer()
+                showScrollPresentation(liveScrollPresentation)
+            }
+            schedulePendingSettledAdoption()
+            return
+        }
+
+        setLiveScrollFrozenHeight(nil)
+        guard selectionPromotionVeto?() != true else {
+            if settledNativeCell == nil && hostedRenderer == nil {
+                showScrollPresentation(liveScrollPresentation)
+            }
+            return
+        }
+        pendingSettledAdoption = nil
+        adoptSettledRenderer(
+            presentation: settledPresentation,
+            hostedRenderer: rootView,
+            scrollActivity: scrollActivity,
+            nativeLinkHandler: nativeLinkHandler,
+            nativeCopyMessageHandler: nativeCopyMessageHandler
+        )
+    }
+
+    private func adoptSettledRenderer(
+        presentation: MacConversationNativeTextPresentation,
+        hostedRenderer rootView: AnyView?,
+        scrollActivity: MacTranscriptScrollActivity,
+        nativeLinkHandler: @escaping MacConversationNativeTextPresentation.LinkHandler,
+        nativeCopyMessageHandler: @escaping @MainActor (String) -> Void
+    ) {
+        setLiveScrollFrozenHeight(nil)
+        textContainerView.isHidden = true
+        if let rootView {
+            clearSettledNativeRenderer()
+            let hosting: NSHostingView<AnyView>
+            if let hostedRenderer {
+                hostedRenderer.rootView = rootView
+                hosting = hostedRenderer
+            } else {
+                let created = MacConversationSemanticHostingView(
+                    rootView: rootView
+                )
+                created.frame = initialSettledRendererFrame()
+                created.autoresizingMask = [.width, .height]
+                created.translatesAutoresizingMaskIntoConstraints = true
+                addSubview(created)
+                hostedRenderer = created
+                hosting = created
+            }
+            // Keep NSHostingView as an accessibility container. Promoting it
+            // to an AppKit element turns the SwiftUI bridge into a labeled
+            // leaf and hides the table/grid descendants from VoiceOver. The
+            // hosted table root supplies its own `.contain` semantics/label.
+            hosting.setAccessibilityElement(false)
+            hosting.setAccessibilityLabel(nil)
+            hosting.setAccessibilityIdentifier(
+                presentation.accessibilityIdentifier
+            )
+            (hosting as? MacConversationSemanticHostingView)?
+                .configureSemanticTableAccessibility(
+                    label: presentation.accessibilityLabel,
+                    identifier: presentation.accessibilityIdentifier,
+                    source: presentation.accessibilityTableSource
+                )
+            hosting.isHidden = false
+        } else {
+            clearHostedRenderer()
+            let nativeCell: MacConversationNativeTextCell
+            if let settledNativeCell {
+                nativeCell = settledNativeCell
+            } else {
+                let created = MacConversationNativeTextCell()
+                created.frame = initialSettledRendererFrame()
+                created.autoresizingMask = [.width, .height]
+                created.translatesAutoresizingMaskIntoConstraints = true
+                addSubview(created)
+                settledNativeCell = created
+                nativeCell = created
+            }
+            nativeCell.representedRowID = representedRowID
+            nativeCell.contentRevision = contentRevision
+            nativeCell.isFirst = isFirst
+            nativeCell.isLast = isLast
+            nativeCell.selectionHighlightResolver = selectionHighlightResolver
+            nativeCell.selectionPromotionVeto = selectionPromotionVeto
+            nativeCell.setContent(
+                .native(presentation),
+                scrollActivity: scrollActivity,
+                nativeLinkHandler: nativeLinkHandler,
+                nativeCopyMessageHandler: nativeCopyMessageHandler
+            )
+            nativeCell.setSelectionHighlight(currentSelectionHighlight)
+        }
+        settledRowID = representedRowID
+        renderHostedSelectionHighlight()
+        invalidateIntrinsicContentSize()
+        needsLayout = true
+    }
+
+    private func initialSettledRendererFrame() -> NSRect {
+        let availableWidth = max(bounds.width, superview?.bounds.width ?? 0)
+        let width = availableWidth > 1 ? availableWidth : 800
+        return NSRect(
+            x: 0,
+            y: 0,
+            width: width,
+            height: max(1, bounds.height)
+        )
+    }
+
+    private func schedulePendingSettledAdoption() {
+        guard let pendingSettledAdoption,
+              !isSettledAdoptionQueued,
+              selectionPromotionVeto?() != true else { return }
+        isSettledAdoptionQueued = true
+        deferredSettledAdoptionTask = Task { @MainActor [weak self] in
+            await pendingSettledAdoption.scrollActivity
+                .adoptHeightChangingContentWhenIdle { [weak self] in
+                    guard let self else { return }
+                    self.isSettledAdoptionQueued = false
+                    guard self.presentationGeneration
+                            == pendingSettledAdoption.generation,
+                          self.representedRowID
+                            == pendingSettledAdoption.representedRowID,
+                          self.selectionPromotionVeto?() != true,
+                          self.pendingSettledAdoption?.generation
+                            == pendingSettledAdoption.generation else {
+                        return
+                    }
+                    self.pendingSettledAdoption = nil
+                    self.adoptSettledRenderer(
+                        presentation: pendingSettledAdoption.presentation,
+                        hostedRenderer:
+                            pendingSettledAdoption.hostedRenderer,
+                        scrollActivity: pendingSettledAdoption.scrollActivity,
+                        nativeLinkHandler:
+                            pendingSettledAdoption.nativeLinkHandler,
+                        nativeCopyMessageHandler:
+                            pendingSettledAdoption.nativeCopyMessageHandler
+                    )
+                }
+        }
+    }
+
+    private func clearHostedRenderer() {
+        hostedSelectionOverlay?.removeFromSuperview()
+        hostedSelectionOverlay = nil
+        hostedRenderer?.removeFromSuperview()
+        hostedRenderer = nil
+    }
+
+    private func clearSettledRenderer() {
+        clearHostedRenderer()
+        clearSettledNativeRenderer()
+        settledRowID = nil
+    }
+
+    private func clearSettledNativeRenderer() {
+        guard let settledNativeCell else { return }
+        // AppKit does not call prepareForReuse() for this nested renderer.
+        // Reset explicitly so its asynchronous rich/host promotion cannot
+        // mutate a detached renderer after the stable shell changes mode.
+        settledNativeCell.prepareForReuse()
+        settledNativeCell.removeFromSuperview()
+        self.settledNativeCell = nil
+    }
+
     override var fittingSize: NSSize {
+        if let frozenLiveScrollHeight {
+            MacConversationTableDiagnostics
+                .recordedFrozenStableShellMeasurement(
+                    height: frozenLiveScrollHeight
+                )
+            return NSSize(
+                width: max(1, bounds.width),
+                height: frozenLiveScrollHeight
+            )
+        }
+        if let settledRenderer = (settledNativeCell as NSView?)
+            ?? hostedRenderer {
+            let width = bounds.width > 1 ? bounds.width : 800
+            settledRenderer.setFrameSize(NSSize(
+                width: width,
+                height: max(1, settledRenderer.frame.height)
+            ))
+            settledRenderer.layoutSubtreeIfNeeded()
+            let measured = settledRenderer.fittingSize
+            return NSSize(
+                width: width,
+                height: max(1, measured.height)
+            )
+        }
         guard presentation != nil else {
             return NSSize(width: max(1, bounds.width), height: 44)
         }
@@ -3864,6 +4604,11 @@ private final class MacConversationScrollTextCell: MacConversationReusableCell {
 
     override func layout() {
         super.layout()
+        if let settledRenderer = (settledNativeCell as NSView?)
+            ?? hostedRenderer {
+            settledRenderer.frame = bounds
+            return
+        }
         guard bounds.width > 0, presentation != nil else { return }
         let geometry = geometry(for: bounds.width)
         textContainerView.frame = geometry.containerFrame
@@ -3871,13 +4616,93 @@ private final class MacConversationScrollTextCell: MacConversationReusableCell {
     }
 
     override func prepareForReuse() {
+        presentationGeneration &+= 1
+        deferredSettledAdoptionTask?.cancel()
+        deferredSettledAdoptionTask = nil
+        pendingSettledAdoption = nil
+        isSettledAdoptionQueued = false
+        if kind == .nativeScroll {
+            // Legacy replacement stand-ins never survive gesture end.
+            frozenLiveScrollHeight = nil
+            layer?.masksToBounds = false
+        }
+        clearSettledRenderer()
+        currentSelectionHighlight = .none
         presentation = nil
+        textContainerView.isHidden = false
         scrollTextView.setAccessibilityLabel(nil)
         scrollTextView.setAccessibilityIdentifier(nil)
         textContainerView.layer?.backgroundColor = NSColor.clear.cgColor
         textContainerView.layer?.cornerRadius = 0
         textContainerView.layer?.maskedCorners = []
         super.prepareForReuse()
+    }
+
+    override func setLiveScrollFrozenHeight(_ height: CGFloat?) {
+        frozenLiveScrollHeight = height
+        if height != nil {
+            wantsLayer = true
+        }
+        layer?.masksToBounds = height != nil
+    }
+
+    override func selectionStateDidChange() {
+        schedulePendingSettledAdoption()
+    }
+
+    override func hoverRevealTarget(contains point: NSPoint) -> Bool {
+        if let settledNativeCell {
+            return settledNativeCell.hoverRevealTarget(
+                contains: convert(point, to: settledNativeCell)
+            )
+        }
+        if hostedRenderer != nil {
+            let columnWidth = min(760, bounds.width - 56)
+            guard columnWidth > 0 else { return false }
+            let leadingEdge = (bounds.width - columnWidth) / 2
+            return point.x >= leadingEdge && point.x <= leadingEdge + columnWidth
+        }
+        return textContainerView.frame.contains(point)
+    }
+
+    override func selectionHit(
+        at point: NSPoint
+    ) -> MacConversationSelectionHit? {
+        guard let settledNativeCell else { return nil }
+        return settledNativeCell.selectionHit(
+            at: convert(point, to: settledNativeCell)
+        )
+    }
+
+    override func setSelectionHighlight(
+        _ highlight: MacTranscriptRowHighlight
+    ) {
+        currentSelectionHighlight = highlight
+        settledNativeCell?.setSelectionHighlight(highlight)
+        renderHostedSelectionHighlight()
+    }
+
+    private func renderHostedSelectionHighlight() {
+        guard currentSelectionHighlight != .none,
+              let hostedRenderer else {
+            hostedSelectionOverlay?.removeFromSuperview()
+            hostedSelectionOverlay = nil
+            return
+        }
+        if hostedSelectionOverlay == nil {
+            let overlay = NSView(frame: bounds)
+            overlay.autoresizingMask = [.width, .height]
+            overlay.wantsLayer = true
+            addSubview(
+                overlay,
+                positioned: .below,
+                relativeTo: hostedRenderer
+            )
+            hostedSelectionOverlay = overlay
+        }
+        hostedSelectionOverlay?.layer?.backgroundColor = transcriptSelectionColor
+            .withAlphaComponent(0.45)
+            .cgColor
     }
 
     private func geometry(for width: CGFloat) -> Geometry {
@@ -4034,16 +4859,28 @@ private final class MacConversationNativeTextCell:
     MacConversationReusableCell,
     NSTextViewDelegate
 {
+    private struct PendingIdlePromotion {
+        let generation: UInt64
+        let representedRowID: String?
+        let scrollActivity: MacTranscriptScrollActivity
+        let action: @MainActor (MacConversationNativeTextCell) -> Void
+    }
+
     override func hoverRevealTarget(contains point: NSPoint) -> Bool {
-        textContainerView.convert(textContainerView.bounds, to: self)
+        if let hostedRenderer, isUsingHostedRenderer {
+            return hostedRenderer.convert(hostedRenderer.bounds, to: self)
+                .contains(point)
+        }
+        return textContainerView.convert(textContainerView.bounds, to: self)
             .contains(point)
     }
 
-    /// Text rows are hit-test transparent: the table owns every selection
-    /// drag, so streaming's remove+insert churn can never destroy the view
-    /// that owns an in-flight mouse-down. Links, cursor, and context menus
-    /// route through the table instead.
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    /// Native text rows are hit-test transparent so the table owns selection.
+    /// A semantic hosted renderer must receive events itself: Markdown-table
+    /// horizontal scrolling, links, and row actions all live inside that host.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        isUsingHostedRenderer ? super.hitTest(point) : nil
+    }
 
     private let layoutContainer = NSView(frame: .zero)
     private let textContainerView = NSView(frame: .zero)
@@ -4074,6 +4911,12 @@ private final class MacConversationNativeTextCell:
     private var fastTextTrailingConstraint: NSLayoutConstraint!
     private var linkHandler: MacConversationNativeTextPresentation.LinkHandler?
     private var deferredPreparationTask: Task<Void, Never>?
+    private var idlePromotionTask: Task<Void, Never>?
+    private var pendingIdlePromotion: PendingIdlePromotion?
+    private var isIdlePromotionQueued = false
+    private var hostedRenderer: NSHostingView<AnyView>?
+    private var hostedSelectionOverlay: NSView?
+    private var isUsingHostedRenderer = false
     private var presentationGeneration: UInt64 = 0
     private let selectionUnderlay = MacConversationSelectionUnderlay(frame: .zero)
     private var currentSelectionHighlight = MacTranscriptRowHighlight.none
@@ -4211,7 +5054,7 @@ private final class MacConversationNativeTextCell:
         nativeLinkHandler: @escaping MacConversationNativeTextPresentation.LinkHandler,
         nativeCopyMessageHandler: @escaping @MainActor (String) -> Void
     ) {
-        guard case let .native(presentation) = content else {
+        guard case let .native(presentation, hostedRenderer, _) = content else {
             assertionFailure("Native transcript cell received hosted content")
             return
         }
@@ -4220,6 +5063,19 @@ private final class MacConversationNativeTextCell:
         let generation = presentationGeneration
         deferredPreparationTask?.cancel()
         deferredPreparationTask = nil
+        idlePromotionTask?.cancel()
+        idlePromotionTask = nil
+        pendingIdlePromotion = nil
+        isIdlePromotionQueued = false
+        let wantsHostedRenderer = presentation.prefersHostedRenderer
+            && hostedRenderer != nil
+        assert(
+            !presentation.prefersHostedRenderer || hostedRenderer != nil,
+            "A semantic hosted presentation requires its ordinary row root."
+        )
+        if !wantsHostedRenderer || scrollActivity.isLiveScrollActive {
+            clearHostedRenderer()
+        }
 
         leadingLimitConstraint.constant = presentation.contentInsets.left
         trailingLimitConstraint.constant = -presentation.contentInsets.right
@@ -4370,12 +5226,66 @@ private final class MacConversationNativeTextCell:
             renderer: usesFastRenderer ? .selectableFast : .rich
         )
 
+        if let hostedRenderer,
+           presentation.prefersHostedRenderer {
+            let representedRowID = representedRowID
+            if scrollActivity.isLiveScrollActive {
+                // Keep painting the bounded native fallback throughout the
+                // gesture, then install SwiftUI inside this SAME table cell.
+                // The activity queue owns the height/anchor transition.
+                registerPendingIdlePromotion(
+                    generation: generation,
+                    representedRowID: representedRowID,
+                    scrollActivity: scrollActivity
+                ) { cell in
+                    cell.adoptHostedRenderer(
+                        hostedRenderer,
+                        accessibilityLabel: presentation.accessibilityLabel,
+                        accessibilityIdentifier:
+                            presentation.accessibilityIdentifier,
+                        accessibilitySource:
+                            presentation.accessibilityTableSource
+                    )
+                }
+            } else if selectionPromotionVeto?() != true {
+                adoptHostedRenderer(
+                    hostedRenderer,
+                    accessibilityLabel: presentation.accessibilityLabel,
+                    accessibilityIdentifier: presentation.accessibilityIdentifier,
+                    accessibilitySource: presentation.accessibilityTableSource
+                )
+            } else {
+                registerPendingIdlePromotion(
+                    generation: generation,
+                    representedRowID: representedRowID,
+                    scrollActivity: scrollActivity
+                ) { cell in
+                    cell.adoptHostedRenderer(
+                        hostedRenderer,
+                        accessibilityLabel: presentation.accessibilityLabel,
+                        accessibilityIdentifier:
+                            presentation.accessibilityIdentifier,
+                        accessibilitySource:
+                            presentation.accessibilityTableSource
+                    )
+                }
+            }
+            return
+        }
+
         if usesFastRenderer {
             guard presentation.promotesFastRendererWhenIdle else { return }
-            guard !scrollActivity.isLiveScrollActive else { return }
             let representedRowID = representedRowID
             let immediate = presentation.attributedString
             let deferred = presentation.deferredAttributedString
+            // Preparation may finish while a gesture owns the viewport, but
+            // adoption may not. Always start the row-local task here: cells
+            // first realized during a live scroll otherwise never get another
+            // configuration from which to schedule their rich artifact when
+            // stand-in cells are disabled. The scroll-activity queue below is
+            // the single gate for the height-changing renderer swap and drains
+            // only after the gesture (and any selection/restoration owner) is
+            // idle, preserving this exact reusable cell and its row identity.
             deferredPreparationTask = Task { @MainActor [weak self] in
                 let deferredArtifact: MacConversationNativeTextPresentation.DeferredArtifact?
                 if let deferred {
@@ -4385,19 +5295,15 @@ private final class MacConversationNativeTextCell:
                 }
                 guard !Task.isCancelled,
                       immediate != nil || deferredArtifact != nil else { return }
-                await scrollActivity.adoptHeightChangingContentWhenIdle { [weak self] in
-                    guard let self,
-                          self.presentationGeneration == generation,
-                          self.representedRowID == representedRowID else { return }
-                    // A row holding a selection endpoint keeps its fast
-                    // plain string: promotion would swap the text the
-                    // endpoint's offsets refer to mid-selection. The tile
-                    // stays plain until the selection releases it (accepted
-                    // scope limit).
-                    guard self.selectionPromotionVeto?() != true else { return }
+                guard let self else { return }
+                self.registerPendingIdlePromotion(
+                    generation: generation,
+                    representedRowID: representedRowID,
+                    scrollActivity: scrollActivity
+                ) { cell in
                     let resolved = deferredArtifact?.resolve() ?? immediate
                     guard let resolved else { return }
-                    self.adoptRichText(
+                    cell.adoptRichText(
                         resolved,
                         presentation: presentation,
                         nativeLinkHandler: nativeLinkHandler
@@ -4414,14 +5320,115 @@ private final class MacConversationNativeTextCell:
         deferredPreparationTask = Task { @MainActor [weak self] in
             guard let deferredArtifact = await deferredAttributedString(),
                   !Task.isCancelled else { return }
-            await scrollActivity.adoptHeightChangingContentWhenIdle { [weak self] in
-                guard let self,
-                      self.presentationGeneration == generation,
-                      self.representedRowID == representedRowID else { return }
+            guard let self else { return }
+            self.registerPendingIdlePromotion(
+                generation: generation,
+                representedRowID: representedRowID,
+                scrollActivity: scrollActivity
+            ) { cell in
                 guard let prepared = deferredArtifact.resolve() else { return }
-                self.setAttributedString(prepared, renderer: .rich)
+                cell.setAttributedString(prepared, renderer: .rich)
             }
         }
+    }
+
+    private func registerPendingIdlePromotion(
+        generation: UInt64,
+        representedRowID: String?,
+        scrollActivity: MacTranscriptScrollActivity,
+        action: @escaping @MainActor (MacConversationNativeTextCell) -> Void
+    ) {
+        guard presentationGeneration == generation,
+              self.representedRowID == representedRowID else { return }
+        pendingIdlePromotion = PendingIdlePromotion(
+            generation: generation,
+            representedRowID: representedRowID,
+            scrollActivity: scrollActivity,
+            action: action
+        )
+        schedulePendingIdlePromotion()
+    }
+
+    private func schedulePendingIdlePromotion() {
+        guard let pendingIdlePromotion,
+              !isIdlePromotionQueued,
+              selectionPromotionVeto?() != true else { return }
+        isIdlePromotionQueued = true
+        idlePromotionTask = Task { @MainActor [weak self] in
+            await pendingIdlePromotion.scrollActivity
+                .adoptHeightChangingContentWhenIdle { [weak self] in
+                    guard let self else { return }
+                    self.isIdlePromotionQueued = false
+                    guard self.presentationGeneration
+                            == pendingIdlePromotion.generation,
+                          self.representedRowID
+                            == pendingIdlePromotion.representedRowID,
+                          self.selectionPromotionVeto?() != true,
+                          self.pendingIdlePromotion?.generation
+                            == pendingIdlePromotion.generation else {
+                        return
+                    }
+                    self.pendingIdlePromotion = nil
+                    pendingIdlePromotion.action(self)
+                }
+        }
+    }
+
+    private func adoptHostedRenderer(
+        _ rootView: AnyView,
+        accessibilityLabel: String?,
+        accessibilityIdentifier: String?,
+        accessibilitySource: String?
+    ) {
+        let hosting: NSHostingView<AnyView>
+        if let existing = hostedRenderer {
+            existing.rootView = rootView
+            hosting = existing
+        } else {
+            let created = MacConversationSemanticHostingView(
+                rootView: rootView
+            )
+            created.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(created)
+            NSLayoutConstraint.activate([
+                created.leadingAnchor.constraint(equalTo: leadingAnchor),
+                created.trailingAnchor.constraint(equalTo: trailingAnchor),
+                created.topAnchor.constraint(equalTo: topAnchor),
+                created.bottomAnchor.constraint(equalTo: bottomAnchor),
+            ])
+            hostedRenderer = created
+            hosting = created
+        }
+        // The SwiftUI root owns the semantic table group and its descendants.
+        // Making NSHostingView itself an AppKit accessibility element flattens
+        // that bridge into a leaf and makes the grid unreachable.
+        hosting.setAccessibilityElement(false)
+        hosting.setAccessibilityLabel(nil)
+        hosting.setAccessibilityIdentifier(accessibilityIdentifier)
+        (hosting as? MacConversationSemanticHostingView)?
+            .configureSemanticTableAccessibility(
+                label: accessibilityLabel,
+                identifier: accessibilityIdentifier,
+                source: accessibilitySource
+            )
+        hosting.isHidden = false
+        isUsingHostedRenderer = true
+        layoutContainer.isHidden = true
+        setActive(topConstraint, false)
+        setActive(bottomConstraint, false)
+        applyResolvedSelectionHighlight()
+        invalidateIntrinsicContentSize()
+    }
+
+    private func clearHostedRenderer() {
+        hostedSelectionOverlay?.removeFromSuperview()
+        hostedSelectionOverlay = nil
+        hostedRenderer?.removeFromSuperview()
+        hostedRenderer = nil
+        isUsingHostedRenderer = false
+        layoutContainer.isHidden = false
+        setActive(topConstraint, true)
+        setActive(bottomConstraint, true)
     }
 
     private func adoptRichText(
@@ -4472,6 +5479,7 @@ private final class MacConversationNativeTextCell:
     override func selectionHit(
         at point: NSPoint
     ) -> MacConversationSelectionHit? {
+        guard !isUsingHostedRenderer else { return nil }
         if !fastTextField.isHidden {
             guard let layout = currentFastHitLayout() else { return nil }
             let fieldPoint = convert(point, to: fastTextField)
@@ -4553,7 +5561,19 @@ private final class MacConversationNativeTextCell:
         renderSelectionHighlight()
     }
 
+    override func selectionStateDidChange() {
+        schedulePendingIdlePromotion()
+    }
+
     private func renderSelectionHighlight() {
+        if isUsingHostedRenderer {
+            selectionUnderlay.highlightRects = []
+            clearRichTemporaryHighlight()
+            renderHostedSelectionHighlight()
+            return
+        }
+        hostedSelectionOverlay?.removeFromSuperview()
+        hostedSelectionOverlay = nil
         if !fastTextField.isHidden {
             clearRichTemporaryHighlight()
             let length = (
@@ -4612,6 +5632,29 @@ private final class MacConversationNativeTextCell:
         )
     }
 
+    private func renderHostedSelectionHighlight() {
+        guard currentSelectionHighlight != .none,
+              let hostedRenderer else {
+            hostedSelectionOverlay?.removeFromSuperview()
+            hostedSelectionOverlay = nil
+            return
+        }
+        if hostedSelectionOverlay == nil {
+            let overlay = NSView(frame: bounds)
+            overlay.autoresizingMask = [.width, .height]
+            overlay.wantsLayer = true
+            addSubview(
+                overlay,
+                positioned: .below,
+                relativeTo: hostedRenderer
+            )
+            hostedSelectionOverlay = overlay
+        }
+        hostedSelectionOverlay?.layer?.backgroundColor = transcriptSelectionColor
+            .withAlphaComponent(0.45)
+            .cgColor
+    }
+
     private func currentFastHitLayout() -> MacTranscriptFastTextLayout? {
         let width = fastTextField.bounds.width
         guard width > 1 else { return nil }
@@ -4632,6 +5675,11 @@ private final class MacConversationNativeTextCell:
         presentationGeneration &+= 1
         deferredPreparationTask?.cancel()
         deferredPreparationTask = nil
+        idlePromotionTask?.cancel()
+        idlePromotionTask = nil
+        pendingIdlePromotion = nil
+        isIdlePromotionQueued = false
+        clearHostedRenderer()
         fastHitLayout = nil
         fastHitLayoutKey = (0, -1)
         linkHandler = nil
