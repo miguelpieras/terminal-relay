@@ -1028,8 +1028,9 @@ final class AdversarialConversationRegressionTests: XCTestCase {
         _ = window
     }
 
-    func testEmptyReasoningCompletionKeepsPendingShellWithoutEmptyBlink() throws {
+    func testEmptyReasoningNeverBlinksAndKeepsStableWorkingShell() throws {
         let store = ConversationStore(streamingPublishNanoseconds: 0)
+        let whitespaceShell = String(repeating: " ", count: 1_025)
         try store.apply(
             ChatTestFixtures.event(
                 "turn.started",
@@ -1044,7 +1045,7 @@ final class AdversarialConversationRegressionTests: XCTestCase {
                 sequence: 2,
                 itemID: "empty-reasoning-gap",
                 turnID: "turn-1",
-                payload: .object(["text": .string("")])
+                payload: .object(["text": .string(whitespaceShell)])
             )
         )
         let coordinator = ConversationCoordinator(
@@ -1062,10 +1063,43 @@ final class AdversarialConversationRegressionTests: XCTestCase {
             )
         )
         let window = mount(hosting, height: 500)
-        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
         hosting.layoutSubtreeIfNeeded()
         let table = try XCTUnwrap(descendant(of: hosting, type: NSTableView.self))
-        XCTAssertEqual(table.numberOfRows, 2)
+        XCTAssertEqual(
+            table.numberOfRows,
+            1,
+            "Empty reasoning must not create a transient Thinking row."
+        )
+        let stableShell = try XCTUnwrap(
+            table.view(atColumn: 0, row: 0, makeIfNecessary: true)
+        )
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertEqual(
+            descendants(of: hosting, type: NSProgressIndicator.self).filter {
+                !$0.isHiddenOrHasHiddenAncestor
+            }.count,
+            0,
+            "The cosmetic Working label must stay hidden during a short phase gap."
+        )
+
+        RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertEqual(
+            descendants(of: hosting, type: NSProgressIndicator.self).filter {
+                !$0.isHiddenOrHasHiddenAncestor
+            }.count,
+            1,
+            "A stable half-second gap should reveal one Working spinner."
+        )
+        XCTAssertTrue(
+            stableShell === table.view(
+                atColumn: 0,
+                row: 0,
+                makeIfNecessary: true
+            ),
+            "Revealing Working must update the same fixed-height shell."
+        )
 
         try store.apply(
             ChatTestFixtures.event(
@@ -1073,14 +1107,21 @@ final class AdversarialConversationRegressionTests: XCTestCase {
                 sequence: 3,
                 itemID: "empty-reasoning-gap",
                 turnID: "turn-1",
-                payload: .object(["text": .string("")])
+                payload: .object(["text": .string(whitespaceShell)])
             )
         )
         settle(hosting)
         XCTAssertEqual(
             table.numberOfRows,
             1,
-            "The completed empty reasoning row must leave exactly the stable pending-turn shell."
+            "Completing empty reasoning must leave the same turn activity shell."
+        )
+        XCTAssertTrue(
+            stableShell === table.view(
+                atColumn: 0,
+                row: 0,
+                makeIfNecessary: true
+            )
         )
         XCTAssertFalse(
             descendants(of: hosting, type: NSView.self).contains {
@@ -1096,12 +1137,517 @@ final class AdversarialConversationRegressionTests: XCTestCase {
                 turnID: "turn-1"
             )
         )
-        settle(hosting)
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertEqual(table.numberOfRows, 1)
+        XCTAssertTrue(
+            stableShell === table.view(
+                atColumn: 0,
+                row: 0,
+                makeIfNecessary: true
+            ),
+            "Turn completion must not flash away a newly revealed Working cue."
+        )
+        XCTAssertEqual(visibleProgressIndicators(in: hosting).count, 1)
+        XCTAssertFalse(
+            descendants(of: hosting, type: NSView.self).contains {
+                $0.accessibilityIdentifier() == "conversation.empty-state"
+            },
+            "The minimum dwell must finish before the empty overlay replaces the shell."
+        )
+
+        RunLoop.main.run(until: Date().addingTimeInterval(0.55))
+        hosting.layoutSubtreeIfNeeded()
         XCTAssertTrue(
             descendants(of: hosting, type: NSView.self).contains {
                 $0.accessibilityIdentifier() == "conversation.empty-state"
             },
             "Once the turn settles with no visible content, the real empty state may appear."
+        )
+        _ = window
+    }
+
+    func testNewerCommandExclusivelyOwnsActivityWithoutMovingTailShell() throws {
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        try store.apply(
+            ChatTestFixtures.event(
+                "turn.started",
+                sequence: 1,
+                turnID: "turn-1",
+                payload: .object(["status": .string("streaming")])
+            )
+        )
+        try store.apply(
+            ChatTestFixtures.event(
+                "reasoning.started",
+                sequence: 2,
+                itemID: "reasoning-1",
+                turnID: "turn-1",
+                payload: .object(["text": .string("Considering options")])
+            )
+        )
+        let coordinator = ConversationCoordinator(
+            store: store,
+            transport: ChatFixtureTransport(),
+            identity: ChatTestFixtures.identity,
+            retryPolicy: .immediate
+        )
+        let hosting = NSHostingView(
+            rootView: ConversationView(
+                coordinator: coordinator,
+                isReadOnly: true,
+                showsComposer: false,
+                startsCoordinator: false
+            )
+        )
+        let window = mount(hosting, height: 500)
+        let table = try XCTUnwrap(descendant(of: hosting, type: NSTableView.self))
+        XCTAssertEqual(table.numberOfRows, 2)
+        let stableShell = try XCTUnwrap(
+            table.view(atColumn: 0, row: 1, makeIfNecessary: true)
+        )
+        let reasoningCell = try XCTUnwrap(
+            table.view(atColumn: 0, row: 0, makeIfNecessary: true)
+        )
+        let thinkingMarkers = activityMarkers(
+            in: reasoningCell,
+            kind: "thinking"
+        )
+        XCTAssertEqual(
+            thinkingMarkers.count,
+            1,
+            "The mounted reasoning row must expose exactly one concrete Thinking owner."
+        )
+        XCTAssertEqual(thinkingMarkers.first?.accessibilityLabel(), "Thinking…")
+        XCTAssertEqual(
+            visibleProgressIndicators(in: hosting).count,
+            0,
+            "Thinking uses its single reasoning owner; the Working spinner stays hidden."
+        )
+
+        MacConversationTableDiagnostics.reset()
+        try store.apply(
+            ChatTestFixtures.event(
+                "tool.started",
+                sequence: 3,
+                itemID: "tool-1",
+                turnID: "turn-1",
+                payload: .object([
+                    "kind": .string("shell"),
+                    "title": .string("Command"),
+                    "status": .string("running"),
+                    "input": .string(#"{"command":"git status"}"#),
+                ])
+            )
+        )
+        settle(hosting)
+
+        XCTAssertEqual(table.numberOfRows, 3)
+        XCTAssertTrue(
+            stableShell === table.view(
+                atColumn: 0,
+                row: 2,
+                makeIfNecessary: true
+            ),
+            "Starting a command must not replace the fixed turn activity shell."
+        )
+        XCTAssertEqual(
+            visibleProgressIndicators(in: hosting).count,
+            1,
+            "Only the command owner may expose an active spinner."
+        )
+        XCTAssertTrue(
+            activityMarkers(in: reasoningCell, kind: "thinking").isEmpty,
+            "The older reasoning row must become neutral when the command owns activity."
+        )
+        let executingMarkers = activityMarkers(
+            in: hosting,
+            kind: "executing"
+        )
+        XCTAssertEqual(executingMarkers.count, 1)
+        XCTAssertTrue(
+            executingMarkers[0].accessibilityLabel()?.contains("git status") == true
+        )
+        XCTAssertEqual(
+            MacConversationTableDiagnostics.snapshot().reloadDataCalls,
+            0
+        )
+        _ = window
+    }
+
+    func testWorkingHandsOffToCommandWithoutOverlapOrShellReplacement() throws {
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        try store.apply(
+            ChatTestFixtures.event(
+                "turn.started",
+                sequence: 1,
+                turnID: "turn-1",
+                payload: .object(["status": .string("streaming")])
+            )
+        )
+        let coordinator = ConversationCoordinator(
+            store: store,
+            transport: ChatFixtureTransport(),
+            identity: ChatTestFixtures.identity,
+            retryPolicy: .immediate
+        )
+        let hosting = NSHostingView(
+            rootView: ConversationView(
+                coordinator: coordinator,
+                isReadOnly: true,
+                showsComposer: false,
+                startsCoordinator: false
+            )
+        )
+        let window = mount(hosting, height: 500)
+        let table = try XCTUnwrap(descendant(of: hosting, type: NSTableView.self))
+        let stableShell = try XCTUnwrap(
+            table.view(atColumn: 0, row: 0, makeIfNecessary: true)
+        )
+        let stableShellHeight = table.rect(ofRow: 0).height
+        RunLoop.main.run(until: Date().addingTimeInterval(0.6))
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertEqual(visibleProgressIndicators(in: stableShell).count, 1)
+
+        MacConversationTableDiagnostics.reset()
+        try store.apply(
+            ChatTestFixtures.event(
+                "tool.started",
+                sequence: 2,
+                itemID: "tool-1",
+                turnID: "turn-1",
+                payload: .object([
+                    "kind": .string("shell"),
+                    "title": .string("Command"),
+                    "status": .string("running"),
+                    "input": .string(#"{"command":"git status"}"#),
+                ])
+            )
+        )
+        settle(hosting)
+
+        XCTAssertEqual(table.numberOfRows, 2)
+        let toolHeader = try XCTUnwrap(
+            table.view(atColumn: 0, row: 0, makeIfNecessary: true)
+        )
+        XCTAssertTrue(
+            stableShell === table.view(
+                atColumn: 0,
+                row: 1,
+                makeIfNecessary: true
+            )
+        )
+        XCTAssertEqual(
+            table.rect(ofRow: 1).height,
+            stableShellHeight,
+            accuracy: 0.5,
+            "Inserting the command must not resize the stable activity shell."
+        )
+        XCTAssertEqual(visibleProgressIndicators(in: stableShell).count, 1)
+        XCTAssertEqual(visibleProgressIndicators(in: toolHeader).count, 0)
+
+        let deadline = Date().addingTimeInterval(0.55)
+        while Date() < deadline {
+            hosting.layoutSubtreeIfNeeded()
+            let workingOwners = visibleProgressIndicators(in: stableShell).count
+            let commandOwners = visibleProgressIndicators(in: toolHeader).count
+            XCTAssertLessThanOrEqual(
+                workingOwners + commandOwners,
+                1,
+                "Working and the command must never render active together."
+            )
+            RunLoop.main.run(until: Date().addingTimeInterval(0.005))
+        }
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertEqual(visibleProgressIndicators(in: stableShell).count, 0)
+        XCTAssertEqual(visibleProgressIndicators(in: toolHeader).count, 1)
+        XCTAssertTrue(
+            stableShell === table.view(
+                atColumn: 0,
+                row: 1,
+                makeIfNecessary: true
+            ),
+            "The fixed shell must survive the ownership handoff in place."
+        )
+        XCTAssertEqual(
+            table.rect(ofRow: 1).height,
+            stableShellHeight,
+            accuracy: 0.5
+        )
+        let diagnostics = MacConversationTableDiagnostics.snapshot()
+        XCTAssertEqual(diagnostics.reloadDataCalls, 0)
+        XCTAssertEqual(diagnostics.targetedRowReloads, 0)
+        _ = window
+    }
+
+    func testNewTurnCancelsPendingWorkingHideWithoutBlinking() throws {
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        try store.apply(
+            ChatTestFixtures.event(
+                "turn.started",
+                sequence: 1,
+                turnID: "turn-1",
+                payload: .object(["status": .string("streaming")])
+            )
+        )
+        let coordinator = ConversationCoordinator(
+            store: store,
+            transport: ChatFixtureTransport(),
+            identity: ChatTestFixtures.identity,
+            retryPolicy: .immediate
+        )
+        let hosting = NSHostingView(
+            rootView: ConversationView(
+                coordinator: coordinator,
+                isReadOnly: true,
+                showsComposer: false,
+                startsCoordinator: false
+            )
+        )
+        let window = mount(hosting, height: 500)
+        let table = try XCTUnwrap(descendant(of: hosting, type: NSTableView.self))
+        let stableShell = try XCTUnwrap(
+            table.view(atColumn: 0, row: 0, makeIfNecessary: true)
+        )
+        RunLoop.main.run(until: Date().addingTimeInterval(0.6))
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertEqual(visibleProgressIndicators(in: stableShell).count, 1)
+
+        try store.apply(
+            ChatTestFixtures.event(
+                "turn.completed",
+                sequence: 2,
+                turnID: "turn-1"
+            )
+        )
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        try store.apply(
+            ChatTestFixtures.event(
+                "turn.started",
+                sequence: 3,
+                turnID: "turn-2",
+                payload: .object(["status": .string("streaming")])
+            )
+        )
+        settle(hosting)
+
+        XCTAssertEqual(table.numberOfRows, 1)
+        XCTAssertTrue(
+            stableShell === table.view(
+                atColumn: 0,
+                row: 0,
+                makeIfNecessary: true
+            )
+        )
+        XCTAssertEqual(visibleProgressIndicators(in: stableShell).count, 1)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.55))
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertEqual(visibleProgressIndicators(in: stableShell).count, 1)
+        XCTAssertTrue(
+            stableShell === table.view(
+                atColumn: 0,
+                row: 0,
+                makeIfNecessary: true
+            ),
+            "A succeeding turn must cancel the old hide task without replacing the shell."
+        )
+        _ = window
+    }
+
+    func testNewTurnRestartsPendingWorkingRevealDelay() throws {
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        try store.apply(
+            ChatTestFixtures.event(
+                "turn.started",
+                sequence: 1,
+                payload: .object(["status": .string("streaming")])
+            )
+        )
+        let coordinator = ConversationCoordinator(
+            store: store,
+            transport: ChatFixtureTransport(),
+            identity: ChatTestFixtures.identity,
+            retryPolicy: .immediate
+        )
+        let hosting = NSHostingView(
+            rootView: ConversationView(
+                coordinator: coordinator,
+                isReadOnly: true,
+                showsComposer: false,
+                startsCoordinator: false
+            )
+        )
+        let window = mount(hosting, height: 500)
+        let table = try XCTUnwrap(descendant(of: hosting, type: NSTableView.self))
+        let stableShell = try XCTUnwrap(
+            table.view(atColumn: 0, row: 0, makeIfNecessary: true)
+        )
+
+        RunLoop.main.run(until: Date().addingTimeInterval(0.24))
+        XCTAssertEqual(visibleProgressIndicators(in: stableShell).count, 0)
+        try store.apply(
+            ChatTestFixtures.event(
+                "turn.completed",
+                sequence: 2
+            )
+        )
+        try store.apply(
+            ChatTestFixtures.event(
+                "turn.started",
+                sequence: 3,
+                payload: .object(["status": .string("streaming")])
+            )
+        )
+        settle(hosting)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        hosting.layoutSubtreeIfNeeded()
+
+        XCTAssertTrue(
+            stableShell === table.view(
+                atColumn: 0,
+                row: 0,
+                makeIfNecessary: true
+            )
+        )
+        XCTAssertEqual(
+            visibleProgressIndicators(in: stableShell).count,
+            0,
+            "Turn one’s timer must not reveal Working before turn two earns its own delay."
+        )
+
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertEqual(visibleProgressIndicators(in: stableShell).count, 1)
+        _ = window
+    }
+
+    func testOverdueRevealCannotFlashWorkingAfterTurnCompletion() throws {
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        try store.apply(
+            ChatTestFixtures.event(
+                "turn.started",
+                sequence: 1,
+                turnID: "turn-1",
+                payload: .object(["status": .string("streaming")])
+            )
+        )
+        let coordinator = ConversationCoordinator(
+            store: store,
+            transport: ChatFixtureTransport(),
+            identity: ChatTestFixtures.identity,
+            retryPolicy: .immediate
+        )
+        let hosting = NSHostingView(
+            rootView: ConversationView(
+                coordinator: coordinator,
+                isReadOnly: true,
+                showsComposer: false,
+                startsCoordinator: false
+            )
+        )
+        let window = mount(hosting, height: 500)
+
+        // Hold the main actor until the reveal task is overdue, then mutate the
+        // authoritative state before queued SwiftUI work can run. A timer that
+        // validates only its captured generation would now flash Working.
+        Thread.sleep(forTimeInterval: 0.58)
+        try store.apply(
+            ChatTestFixtures.event(
+                "turn.completed",
+                sequence: 2,
+                turnID: "turn-1"
+            )
+        )
+        settle(hosting)
+
+        XCTAssertEqual(visibleProgressIndicators(in: hosting).count, 0)
+        XCTAssertTrue(activityMarkers(in: hosting, kind: "working").isEmpty)
+        XCTAssertTrue(
+            descendants(of: hosting, type: NSView.self).contains {
+                $0.accessibilityIdentifier() == "conversation.empty-state"
+            },
+            "An overdue cosmetic reveal must yield to the completed turn."
+        )
+        _ = window
+    }
+
+    func testOverdueHideCannotBlinkWorkingAfterCommandCompletes() throws {
+        let store = ConversationStore(streamingPublishNanoseconds: 0)
+        try store.apply(
+            ChatTestFixtures.event(
+                "turn.started",
+                sequence: 1,
+                turnID: "turn-1",
+                payload: .object(["status": .string("streaming")])
+            )
+        )
+        let coordinator = ConversationCoordinator(
+            store: store,
+            transport: ChatFixtureTransport(),
+            identity: ChatTestFixtures.identity,
+            retryPolicy: .immediate
+        )
+        let hosting = NSHostingView(
+            rootView: ConversationView(
+                coordinator: coordinator,
+                isReadOnly: true,
+                showsComposer: false,
+                startsCoordinator: false
+            )
+        )
+        let window = mount(hosting, height: 500)
+        let table = try XCTUnwrap(descendant(of: hosting, type: NSTableView.self))
+        let stableShell = try XCTUnwrap(
+            table.view(atColumn: 0, row: 0, makeIfNecessary: true)
+        )
+        RunLoop.main.run(until: Date().addingTimeInterval(0.6))
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertEqual(visibleProgressIndicators(in: stableShell).count, 1)
+
+        try store.apply(
+            ChatTestFixtures.event(
+                "tool.started",
+                sequence: 2,
+                itemID: "tool-1",
+                turnID: "turn-1",
+                payload: .object([
+                    "kind": .string("shell"),
+                    "title": .string("Command"),
+                    "status": .string("running"),
+                    "input": .string(#"{"command":"git status"}"#),
+                ])
+            )
+        )
+        settle(hosting)
+        XCTAssertEqual(visibleProgressIndicators(in: stableShell).count, 1)
+
+        // The pending hide is now overdue but cannot run while this test owns
+        // the main actor. Completing the command restores Working before the
+        // queued callback resumes, so that stale callback must abort.
+        Thread.sleep(forTimeInterval: 0.5)
+        try store.apply(
+            ChatTestFixtures.event(
+                "tool.completed",
+                sequence: 3,
+                itemID: "tool-1",
+                turnID: "turn-1",
+                payload: .object([
+                    "title": .string("Command"),
+                    "exitCode": .number(0),
+                ])
+            )
+        )
+        settle(hosting)
+
+        XCTAssertEqual(visibleProgressIndicators(in: stableShell).count, 1)
+        XCTAssertEqual(activityMarkers(in: hosting, kind: "working").count, 1)
+        XCTAssertTrue(activityMarkers(in: hosting, kind: "executing").isEmpty)
+        XCTAssertTrue(
+            stableShell === table.view(
+                atColumn: 0,
+                row: table.numberOfRows - 1,
+                makeIfNecessary: true
+            ),
+            "The same fixed activity shell must survive the overdue handoff."
         )
         _ = window
     }
@@ -1194,7 +1740,7 @@ final class AdversarialConversationRegressionTests: XCTestCase {
             onNearBottomChange: { _ in },
             onAnchoredChange: { _ in },
             makeRow: { row, _, _ in
-                guard case .item(let projection, _, _, _) = row,
+                guard case .item(let projection, _, _, _, _) = row,
                       case .message(let message) = projection.displayItem,
                       let content = message.contents.first else {
                     return AnyView(EmptyView())
@@ -1300,6 +1846,20 @@ final class AdversarialConversationRegressionTests: XCTestCase {
             result.append(contentsOf: descendants(of: child, type: type))
         }
         return result
+    }
+
+    private func visibleProgressIndicators(in root: NSView) -> [NSProgressIndicator] {
+        descendants(of: root, type: NSProgressIndicator.self).filter {
+            !$0.isHiddenOrHasHiddenAncestor
+        }
+    }
+
+    private func activityMarkers(in root: NSView, kind: String) -> [NSView] {
+        descendants(of: root, type: NSView.self).filter { view in
+            !view.isHiddenOrHasHiddenAncestor
+                && view.accessibilityIdentifier()
+                    == "conversation.activity.\(kind)"
+        }
     }
 
     private func horizontalTableScrollView(in root: NSView) -> NSScrollView? {

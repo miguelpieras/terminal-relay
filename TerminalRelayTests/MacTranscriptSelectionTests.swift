@@ -463,6 +463,59 @@ final class MacTranscriptSelectionTests: XCTestCase {
         }
     }
 
+    func testNeutralActivityRowsKeepCopyAndLiveScrollFallbackSettled() throws {
+        let reasoning = ChatReasoning(
+            id: "reasoning-1",
+            turnID: "turn",
+            text: "Considering options",
+            isStreaming: true,
+            occurredAt: 1
+        )
+        let reasoningProjection = try XCTUnwrap(
+            TranscriptRowProjection.makeRows(item: .reasoning(reasoning)).first
+        )
+        let neutralReasoning = MacTranscriptRow.item(
+            reasoningProjection,
+            isExpanded: false,
+            copiedItemID: nil,
+            presentsActiveStatus: false
+        )
+        XCTAssertEqual(neutralReasoning.selectionText, "Reasoning")
+        let reasoningStandIn = try XCTUnwrap(
+            neutralReasoning.liveScrollTextPresentation(
+                dynamicTypeSize: .large,
+                colorScheme: .light
+            )
+        )
+        XCTAssertEqual(reasoningStandIn.fallbackString, "Reasoning")
+        XCTAssertEqual(reasoningStandIn.accessibilityLabel, "Reasoning")
+
+        let tool = makeTool(status: .running)
+        let toolProjection = try XCTUnwrap(
+            TranscriptRowProjection.makeRows(item: .tool(tool)).first
+        )
+        let neutralTool = MacTranscriptRow.item(
+            toolProjection,
+            isExpanded: false,
+            copiedItemID: nil,
+            presentsActiveStatus: false
+        )
+        let settledHeadline = tool.composedHeadline(
+            compactLine: toolProjection.compactLine,
+            presentsActiveStatus: false
+        )
+        XCTAssertEqual(neutralTool.selectionText, settledHeadline)
+        let toolStandIn = try XCTUnwrap(
+            neutralTool.liveScrollTextPresentation(
+                dynamicTypeSize: .large,
+                colorScheme: .light
+            )
+        )
+        XCTAssertEqual(toolStandIn.fallbackString, settledHeadline)
+        XCTAssertEqual(toolStandIn.accessibilityLabel, settledHeadline)
+        XCTAssertFalse(toolStandIn.fallbackString.contains("Running"))
+    }
+
     func testActivityChromeAndInteractiveRowsAreExcluded() {
         XCTAssertEqual(
             MacTranscriptRow.toolGroupHeader(
@@ -484,7 +537,9 @@ final class MacTranscriptSelectionTests: XCTestCase {
             ).selectionText,
             "Running ls"
         )
-        XCTAssertNil(MacTranscriptRow.pendingTurn.selectionText)
+        XCTAssertNil(
+            MacTranscriptRow.pendingTurn(showsWorking: true).selectionText
+        )
         XCTAssertNil(
             MacTranscriptRow.history(id: "history", revision: 1).selectionText
         )

@@ -22,7 +22,8 @@ enum TranscriptEntry: Identifiable {
     /// a hidden row can never split a run.
     static func entries(
         of items: some Sequence<ConversationItem>,
-        minimumGroupSize: Int = 2
+        minimumGroupSize: Int = 2,
+        leadingToolIdentityItemID: String? = nil
     ) -> [TranscriptEntry] {
         var entries: [TranscriptEntry] = []
         var run: [ConversationItem] = []
@@ -30,7 +31,12 @@ enum TranscriptEntry: Identifiable {
         func flushRun() {
             guard !run.isEmpty else { return }
             if run.count >= minimumGroupSize {
-                entries.append(.toolGroup(ToolGroup(items: run)))
+                entries.append(.toolGroup(ToolGroup(
+                    items: run,
+                    identityItemID: entries.isEmpty
+                        ? leadingToolIdentityItemID
+                        : nil
+                )))
             } else {
                 entries.append(contentsOf: run.map(TranscriptEntry.item))
             }
@@ -48,6 +54,40 @@ enum TranscriptEntry: Identifiable {
         flushRun()
         return entries
     }
+
+    /// When an eager transcript window begins inside a rendered tool run,
+    /// recover that run's original lead without retaining its hidden members.
+    /// Empty reasoning records are skipped just as they are by `entries`, so
+    /// moving the window cannot silently give the same visible group a new ID.
+    static func leadingToolIdentityItemID(
+        in items: [ConversationItem],
+        visibleStartIndex: Int
+    ) -> String? {
+        guard items.indices.contains(visibleStartIndex) else {
+            return nil
+        }
+
+        var firstRenderedIndex = visibleStartIndex
+        while firstRenderedIndex < items.endIndex,
+              !items[firstRenderedIndex].isRenderedTranscriptItem {
+            firstRenderedIndex += 1
+        }
+        guard firstRenderedIndex < items.endIndex,
+              case .tool = items[firstRenderedIndex] else {
+            return nil
+        }
+
+        var cursor = firstRenderedIndex
+        var leadingID: String?
+        while cursor > items.startIndex {
+            cursor -= 1
+            let precedingItem = items[cursor]
+            guard precedingItem.isRenderedTranscriptItem else { continue }
+            guard case .tool = precedingItem else { break }
+            leadingID = precedingItem.id
+        }
+        return leadingID
+    }
 }
 
 /// A maximal run of consecutive tool items. Identity comes from the first
@@ -55,8 +95,34 @@ enum TranscriptEntry: Identifiable {
 /// expansion state.
 struct ToolGroup: Identifiable {
     let items: [ConversationItem]
+    private let identityItemID: String?
 
-    var id: String { "toolgroup:\(items.first?.id ?? "empty")" }
+    init(
+        items: [ConversationItem],
+        identityItemID: String? = nil
+    ) {
+        self.items = items
+        self.identityItemID = identityItemID
+    }
+
+    var id: String {
+        "toolgroup:\(identityItemID ?? items.first?.id ?? "empty")"
+    }
+
+    /// The original run leader remains authoritative even when the eager iOS
+    /// transcript window no longer retains that member.
+    var leadItemID: String? {
+        identityItemID ?? items.first?.id
+    }
+
+    var hasHiddenLeadingMembers: Bool {
+        guard let identityItemID else { return false }
+        return identityItemID != items.first?.id
+    }
+
+    var isStandaloneSingleton: Bool {
+        items.count == 1 && !hasHiddenLeadingMembers
+    }
 
     var tools: [ToolActivity] {
         items.compactMap {
@@ -139,7 +205,7 @@ extension ToolGroup {
         itemID: String,
         isExplicitlyExpanded: Bool
     ) -> ToolGroupMemberPresentation {
-        let isLeadMember = itemID == items.first?.id
+        let isLeadMember = itemID == leadItemID
         return ToolGroupMemberPresentation(
             isExpanded: isLeadMember || isExplicitlyExpanded,
             showsCompactLine: !isLeadMember
@@ -188,11 +254,31 @@ struct ToolGroupLiveModel: Equatable {
 
 extension ToolGroup {
     func headerModel(isExpanded: Bool) -> ToolGroupHeaderModel {
+        headerModel(
+            isExpanded: isExpanded,
+            activeToolID: runningTool?.id
+        )
+    }
+
+    /// Builds the group headline for the one tool selected by the transcript's
+    /// global activity arbiter. Passing `nil` deliberately makes the group a
+    /// neutral history row even if a stale member still reports as running.
+    func headerModel(
+        isExpanded: Bool,
+        activeToolID: String?
+    ) -> ToolGroupHeaderModel {
+        let presentedRunningTool = tools.last {
+            $0.id == activeToolID
+                && ($0.status == .running || $0.status == .pending)
+        }
         let headerSummary: String
-        if let runningTool {
-            headerSummary = runningTool.compactHeadline
+        if let presentedRunningTool {
+            headerSummary = presentedRunningTool.compactHeadline
         } else if tools.count == 1, let tool = tools.first {
-            headerSummary = tool.composedHeadline(compactLine: nil)
+            headerSummary = tool.composedHeadline(
+                compactLine: nil,
+                presentsActiveStatus: false
+            )
         } else {
             headerSummary = summaryText
         }
@@ -207,7 +293,7 @@ extension ToolGroup {
             symbol: dominantKind.symbolName,
             hasFailure: hasFailure,
             isExpanded: isExpanded,
-            isRunning: runningTool != nil
+            isRunning: presentedRunningTool != nil
         )
     }
 }
@@ -232,7 +318,12 @@ extension ToolActivity {
     /// detail ("Ran git status", "Reading checkout.js"). Falls back to the
     /// provider title when the input carries nothing extractable.
     var compactHeadline: String {
-        let isActive = status == .running || status == .pending
+        compactHeadline(presentsActiveStatus: true)
+    }
+
+    func compactHeadline(presentsActiveStatus: Bool) -> String {
+        let isActive = presentsActiveStatus
+            && (status == .running || status == .pending)
         switch kind {
         case .shell:
             if let command = inputDetail(keys: ["command", "cmd"]) {
@@ -281,8 +372,17 @@ extension ToolActivity {
     /// compact line, a duration of one second or more, and the outcome joined
     /// with " · ". Shared by the SwiftUI header and macOS selection copy so
     /// copied text always matches the rendered pixels.
-    func composedHeadline(compactLine: String?) -> String {
-        var components = [compactLine ?? compactHeadline]
+    func composedHeadline(
+        compactLine: String?,
+        presentsActiveStatus: Bool = true
+    ) -> String {
+        let isActive = presentsActiveStatus
+            && (status == .running || status == .pending)
+        var components = [
+            compactLine.map {
+                isActive ? $0 : Self.settledCompactLine($0)
+            } ?? compactHeadline(presentsActiveStatus: presentsActiveStatus),
+        ]
         if let duration = durationMilliseconds, duration >= 1000 {
             components.append(
                 Duration.milliseconds(duration).formatted(
@@ -294,6 +394,25 @@ extension ToolActivity {
             components.append(outcome)
         }
         return components.joined(separator: " · ")
+    }
+
+    /// Projected rows retain the exact compact line but deliberately discard
+    /// the potentially large raw tool input. When a newer phase takes status
+    /// ownership, convert the controlled present-tense verb in that retained
+    /// line instead of falling back to a less specific generic headline.
+    private static func settledCompactLine(_ value: String) -> String {
+        let replacements = [
+            ("Running ", "Ran "),
+            ("Reading ", "Read "),
+            ("Editing ", "Edited "),
+            ("Searching ", "Searched "),
+            ("Fetching ", "Fetched "),
+            ("Updating the plan", "Updated the plan"),
+        ]
+        for (active, settled) in replacements where value.hasPrefix(active) {
+            return settled + value.dropFirst(active.count)
+        }
+        return value
     }
 
     /// Status suffix for the compact line; only outcomes worth a glance

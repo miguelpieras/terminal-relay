@@ -914,47 +914,124 @@ final class ConversationStoreTests: XCTestCase {
         )
     }
 
-    func testPendingTurnIndicatorRemainsStableForTheRunningTurn() {
-        func shows(_ turnState: TurnState, _ item: ConversationItem?) -> Bool {
-            PendingTurnIndicator.showsPendingTurn(
+    func testTranscriptActivityPresentationSelectsExactlyOneNewestOwner() {
+        func presentation(
+            _ turnState: TurnState,
+            _ items: [ConversationItem],
+            activeTurnID: String? = "turn-1"
+        ) -> TranscriptActivityPresentation {
+            TranscriptActivityPresentation.resolve(
                 turnState: turnState,
-                lastItem: item
+                activeTurnID: activeTurnID,
+                items: items
             )
         }
         let userMessage = ConversationItem.message(
-            ChatMessage(id: "u", role: .user, text: "hello")
+            ChatMessage(
+                id: "u",
+                turnID: "turn-1",
+                role: .user,
+                text: "hello"
+            )
         )
-        var streamingReply = ChatMessage(id: "a", role: .assistant, text: "…")
-        streamingReply.isStreaming = true
-        var completedReply = streamingReply
-        completedReply.complete(text: "done")
-        let runningTool = ConversationItem.tool(
+        let streamingReply = ConversationItem.message(
+            ChatMessage(
+                id: "a",
+                turnID: "turn-1",
+                role: .assistant,
+                text: "reply",
+                isStreaming: true
+            )
+        )
+        let thinking = ConversationItem.reasoning(
+            ChatReasoning(
+                id: "r",
+                turnID: "turn-1",
+                text: "considering",
+                isStreaming: true,
+                occurredAt: nil
+            )
+        )
+        let emptyThinking = ConversationItem.reasoning(
+            ChatReasoning(
+                id: "empty-r",
+                turnID: "turn-1",
+                text: " \n ",
+                isStreaming: true,
+                occurredAt: nil
+            )
+        )
+        let largeEmptyThinking = ConversationItem.reasoning(
+            ChatReasoning(
+                id: "large-empty-r",
+                turnID: "turn-1",
+                text: String(repeating: " ", count: 1_025),
+                isStreaming: true,
+                occurredAt: nil
+            )
+        )
+        var tool = ToolActivity(
+            id: "t", turnID: "turn-1", kind: .shell, title: "Run",
+            status: .running, input: nil, output: nil, errorMessage: nil,
+            durationMilliseconds: nil, exitCode: nil, occurredAt: nil,
+            isTruncated: false, originalByteCount: nil
+        )
+        let runningTool = ConversationItem.tool(tool)
+        tool.status = .completed
+        let completedTool = ConversationItem.tool(tool)
+        let staleTool = ConversationItem.tool(
             ToolActivity(
-                id: "t", turnID: nil, kind: .shell, title: "Run",
+                id: "stale", turnID: "old-turn", kind: .shell, title: "Run",
                 status: .running, input: nil, output: nil, errorMessage: nil,
                 durationMilliseconds: nil, exitCode: nil, occurredAt: nil,
                 isTruncated: false, originalByteCount: nil
             )
         )
-        var completedTool = runningTool
-        if case .tool(var tool) = completedTool {
-            tool.status = .completed
-            completedTool = .tool(tool)
-        }
+        let unscopedStaleTool = ConversationItem.tool(
+            ToolActivity(
+                id: "unscoped-stale", turnID: nil, kind: .shell,
+                title: "Run", status: .running, input: nil, output: nil,
+                errorMessage: nil, durationMilliseconds: nil, exitCode: nil,
+                occurredAt: nil, isTruncated: false, originalByteCount: nil
+            )
+        )
 
-        // Every item lifecycle keeps the same tail status row mounted. New
-        // reasoning, tools, and streamed text must not remove/reinsert it.
-        XCTAssertTrue(shows(.running, nil))
-        XCTAssertTrue(shows(.running, userMessage))
-        XCTAssertTrue(shows(.running, .message(streamingReply)))
-        XCTAssertTrue(shows(.running, .message(completedReply)))
-        XCTAssertTrue(shows(.running, runningTool))
-        XCTAssertTrue(shows(.running, completedTool))
-
-        // The row leaves exactly once, when the running lifecycle ends.
-        XCTAssertFalse(shows(.completed, userMessage))
-        XCTAssertFalse(shows(.awaitingApproval, userMessage))
-        XCTAssertFalse(shows(.idle, nil))
+        XCTAssertEqual(presentation(.running, []), .working)
+        XCTAssertEqual(presentation(.running, [userMessage]), .working)
+        XCTAssertEqual(presentation(.running, [emptyThinking]), .working)
+        XCTAssertEqual(presentation(.running, [largeEmptyThinking]), .working)
+        XCTAssertEqual(
+            presentation(.running, [streamingReply, thinking]),
+            .thinking(itemID: "r")
+        )
+        XCTAssertEqual(
+            presentation(.running, [streamingReply, thinking, runningTool]),
+            .executing(toolID: "t")
+        )
+        XCTAssertEqual(
+            presentation(.running, [thinking, runningTool, streamingReply]),
+            .working,
+            "A newer streamed reply owns the phase instead of stale tool/reasoning flags."
+        )
+        XCTAssertEqual(
+            presentation(.running, [staleTool]),
+            .working,
+            "An active item from an older turn must not own the current status."
+        )
+        XCTAssertEqual(
+            presentation(.running, [unscopedStaleTool]),
+            .working,
+            "A legacy item with no turn identity must not steal a known live turn."
+        )
+        XCTAssertEqual(
+            presentation(.running, [runningTool], activeTurnID: nil),
+            .working,
+            "A no-ID turn must not resurrect an unscoped active row."
+        )
+        XCTAssertEqual(presentation(.running, [completedTool]), .working)
+        XCTAssertEqual(presentation(.completed, [runningTool]), .inactive)
+        XCTAssertEqual(presentation(.awaitingApproval, [runningTool]), .inactive)
+        XCTAssertEqual(presentation(.idle, []), .inactive)
     }
 
     func testInvalidPreparedTranscriptAuthorityDoesNotAdvanceSequence() throws {

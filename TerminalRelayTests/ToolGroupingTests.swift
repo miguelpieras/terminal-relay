@@ -67,6 +67,178 @@ final class ToolGroupingTests: XCTestCase {
         XCTAssertEqual(grown.first?.id, "toolgroup:t1")
     }
 
+    func testWindowCutThroughToolRunKeepsOriginalGroupIdentity() throws {
+        var items = (1...151).map { tool(id: "t\($0)") }
+
+        func windowGroup(in items: [ConversationItem]) throws -> ToolGroup {
+            let start = items.count - 150
+            let identity = TranscriptEntry.leadingToolIdentityItemID(
+                in: items,
+                visibleStartIndex: start
+            )
+            let entry = try XCTUnwrap(TranscriptEntry.entries(
+                of: items[start...],
+                minimumGroupSize: 1,
+                leadingToolIdentityItemID: identity
+            ).first)
+            return try XCTUnwrap({
+                guard case .toolGroup(let group) = entry else { return nil }
+                return group
+            }(), "Expected a tool group")
+        }
+
+        let firstWindow = try windowGroup(in: items)
+        XCTAssertEqual(firstWindow.items.first?.id, "t2")
+        XCTAssertEqual(firstWindow.id, "toolgroup:t1")
+        XCTAssertTrue(firstWindow.hasHiddenLeadingMembers)
+        XCTAssertEqual(
+            firstWindow.memberPresentation(
+                itemID: "t2",
+                isExplicitlyExpanded: false
+            ),
+            ToolGroupMemberPresentation(
+                isExpanded: false,
+                showsCompactLine: true
+            )
+        )
+
+        items.append(tool(id: "t152", status: .running))
+        let shiftedWindow = try windowGroup(in: items)
+        XCTAssertEqual(shiftedWindow.items.first?.id, "t3")
+        XCTAssertEqual(shiftedWindow.id, firstWindow.id)
+        XCTAssertEqual(
+            shiftedWindow.memberPresentation(
+                itemID: "t3",
+                isExplicitlyExpanded: false
+            ),
+            ToolGroupMemberPresentation(
+                isExpanded: false,
+                showsCompactLine: true
+            )
+        )
+    }
+
+    func testWindowContinuationWithOneVisibleMemberIsNotASingleton() throws {
+        let group = ToolGroup(
+            items: [tool(id: "t2")],
+            identityItemID: "t1"
+        )
+
+        XCTAssertEqual(group.id, "toolgroup:t1")
+        XCTAssertTrue(group.hasHiddenLeadingMembers)
+        XCTAssertFalse(group.isStandaloneSingleton)
+        XCTAssertEqual(group.leadItemID, "t1")
+        XCTAssertEqual(
+            group.memberPresentation(
+                itemID: "t2",
+                isExplicitlyExpanded: false
+            ),
+            ToolGroupMemberPresentation(
+                isExpanded: false,
+                showsCompactLine: true
+            )
+        )
+    }
+
+    func testBrowsingFreezesBoundedWindowUntilReturningToLatest() {
+        var items = (1...151).map { tool(id: "t\($0)") }
+        let tail = ConversationTranscriptWindow.visibleItems(
+            in: items,
+            firstVisibleItemID: nil,
+            lastVisibleItemID: nil,
+            limit: 150
+        )
+        XCTAssertEqual(tail.first?.id, "t2")
+
+        let browsingAnchor = ConversationTranscriptWindow.anchor(
+            isNearBottom: false,
+            current: ConversationTranscriptWindow.Anchor(
+                firstItemID: nil,
+                lastItemID: nil
+            ),
+            visibleItems: tail
+        )
+        XCTAssertEqual(browsingAnchor.firstItemID, "t2")
+        XCTAssertEqual(browsingAnchor.lastItemID, "t151")
+
+        items.append(tool(id: "t152", status: .running))
+        let pinned = ConversationTranscriptWindow.visibleItems(
+            in: items,
+            firstVisibleItemID: browsingAnchor.firstItemID,
+            lastVisibleItemID: browsingAnchor.lastItemID,
+            limit: 150
+        )
+        XCTAssertEqual(pinned.first?.id, "t2")
+        XCTAssertEqual(pinned.last?.id, "t151")
+        XCTAssertEqual(pinned.count, 150)
+
+        items.append(contentsOf: (153...10_152).map {
+            tool(id: "t\($0)", status: .running)
+        })
+        let heavilyBacklogged = ConversationTranscriptWindow.visibleItems(
+            in: items,
+            firstVisibleItemID: browsingAnchor.firstItemID,
+            lastVisibleItemID: browsingAnchor.lastItemID,
+            limit: 150
+        )
+        XCTAssertEqual(heavilyBacklogged.first?.id, "t2")
+        XCTAssertEqual(heavilyBacklogged.last?.id, "t151")
+        XCTAssertEqual(heavilyBacklogged.count, 150)
+
+        let latestAnchor = ConversationTranscriptWindow.anchor(
+            isNearBottom: true,
+            current: browsingAnchor,
+            visibleItems: heavilyBacklogged
+        )
+        XCTAssertNil(latestAnchor.firstItemID)
+        XCTAssertNil(latestAnchor.lastItemID)
+        XCTAssertEqual(
+            ConversationTranscriptWindow.visibleItems(
+                in: items,
+                firstVisibleItemID: latestAnchor.firstItemID,
+                lastVisibleItemID: latestAnchor.lastItemID,
+                limit: 150
+            ).first?.id,
+            "t10003"
+        )
+    }
+
+    func testFirstOnlyWindowFallbackRemainsBounded() {
+        let items = (1...10_151).map { tool(id: "t\($0)") }
+        let visible = ConversationTranscriptWindow.visibleItems(
+            in: items,
+            firstVisibleItemID: "t2",
+            lastVisibleItemID: nil,
+            limit: 150
+        )
+
+        XCTAssertEqual(visible.first?.id, "t2")
+        XCTAssertEqual(visible.last?.id, "t151")
+        XCTAssertEqual(visible.count, 150)
+    }
+
+    func testWindowIdentitySkipsHiddenReasoningLikeProductionGrouping() {
+        let items: [ConversationItem] = [
+            tool(id: "t1"),
+            .reasoning(ChatReasoning(
+                id: "empty-reasoning",
+                turnID: nil,
+                text: " \n\t",
+                isStreaming: true,
+                occurredAt: nil
+            )),
+            tool(id: "t2"),
+        ]
+
+        XCTAssertEqual(
+            TranscriptEntry.leadingToolIdentityItemID(
+                in: items,
+                visibleStartIndex: 1
+            ),
+            "t1"
+        )
+    }
+
     func testStableProductionGroupingStartsWithSingletonWrapper() {
         let initial = TranscriptEntry.entries(
             of: [tool(
@@ -107,6 +279,19 @@ final class ToolGroupingTests: XCTestCase {
         XCTAssertEqual(group.headerModel(isExpanded: false).summary,
                        "Running a command")
         XCTAssertTrue(group.headerModel(isExpanded: false).isRunning)
+
+        let neutral = singleton.headerModel(
+            isExpanded: false,
+            activeToolID: nil
+        )
+        XCTAssertFalse(neutral.isRunning)
+        XCTAssertEqual(neutral.summary, "Ran swift test")
+        XCTAssertFalse(
+            group.headerModel(
+                isExpanded: false,
+                activeToolID: "not-in-this-group"
+            ).isRunning
+        )
     }
 
     func testExpandedLeadPresentationSurvivesSingletonToMultiTransition() throws {

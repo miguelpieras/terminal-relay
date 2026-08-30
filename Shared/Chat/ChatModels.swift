@@ -244,11 +244,16 @@ private struct PersistentChatText: Equatable, Sendable {
         let previous: SealedChunk?
         let chunk: String
         let chunkCount: Int
+        let hasNonWhitespace: Bool
 
         init(previous: SealedChunk?, chunk: String) {
             self.previous = previous
             self.chunk = chunk
             chunkCount = (previous?.chunkCount ?? 0) + 1
+            hasNonWhitespace = previous?.hasNonWhitespace == true
+                || chunk.unicodeScalars.contains {
+                    !CharacterSet.whitespacesAndNewlines.contains($0)
+                }
         }
     }
 
@@ -346,6 +351,12 @@ private struct PersistentChatText: Equatable, Sendable {
         (sealedTail?.chunkCount ?? 0) + (valueTail.isEmpty ? 0 : 1)
     }
     var isMaterialized: Bool { materializationCache.value != nil }
+    var hasNonWhitespace: Bool {
+        sealedTail?.hasNonWhitespace == true
+            || valueTail.unicodeScalars.contains {
+                !CharacterSet.whitespacesAndNewlines.contains($0)
+            }
+    }
 
     /// Exact append lineage check used by main-actor streaming bookkeeping.
     /// A false result means callers must rebuild from a prepared snapshot; it
@@ -654,6 +665,7 @@ struct ChatReasoning: Codable, Equatable, Identifiable, Sendable {
     var textUTF8Count: Int { textStorage.utf8Count }
     var textStorageChunkCount: Int { textStorage.chunkCount }
     var isTextStorageMaterialized: Bool { textStorage.isMaterialized }
+    var hasNonWhitespaceText: Bool { textStorage.hasNonWhitespace }
 
     mutating func appendText(_ delta: String) {
         textStorage = textStorage.appending(delta)

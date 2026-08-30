@@ -53,20 +53,21 @@ enum MacTranscriptRow: MacConversationTableRow {
         TranscriptRowProjection,
         isExpanded: Bool,
         copiedItemID: String?,
-        showsCompactLine: Bool = true
+        showsCompactLine: Bool = true,
+        presentsActiveStatus: Bool = true
     )
     case messageFooter(MacMessageFooter, revision: UInt64)
     case toolGroupHeader(ToolGroupHeaderModel, revision: UInt64)
     case toolGroupLive(ToolGroupLiveModel, revision: UInt64)
     case toolGroupFooter(groupID: String)
-    case pendingTurn
+    case pendingTurn(showsWorking: Bool)
     case approval(ApprovalRequest, revision: UInt64)
     case question(QuestionRequest, revision: UInt64)
 
     var id: String {
         switch self {
         case .history(let id, _): id
-        case .item(let projection, _, _, _): projection.id
+        case .item(let projection, _, _, _, _): projection.id
         case .messageFooter(let footer, _): footer.id
         case .toolGroupHeader(let header, _): header.id
         case .toolGroupLive(let live, _): live.id
@@ -83,17 +84,24 @@ enum MacTranscriptRow: MacConversationTableRow {
              .approval(_, let revision), .question(_, let revision),
              .toolGroupHeader(_, let revision), .toolGroupLive(_, let revision):
             return revision
-        case .pendingTurn:
-            return 0
+        case .pendingTurn(let showsWorking):
+            return showsWorking ? 1 : 0
         case .toolGroupFooter:
             return 0
-        case .item(let projection, let isExpanded, let copiedItemID, _):
+        case .item(
+            let projection,
+            let isExpanded,
+            let copiedItemID,
+            _,
+            let presentsActiveStatus
+        ):
             var revision = projection.contentRevision &* 1099511628211
             revision ^= isExpanded ? 1 : 0
             if copiedItemID == projection.sourceItemID
                 || copiedItemID?.hasPrefix("\(projection.sourceItemID):") == true {
                 revision ^= 2
             }
+            if presentsActiveStatus { revision ^= 4 }
             return revision
         }
     }
@@ -101,7 +109,7 @@ enum MacTranscriptRow: MacConversationTableRow {
     var reuseIdentifier: String {
         switch self {
         case .history: "transcript.history"
-        case .item(let projection, _, _, _): "transcript.\(projection.kind.rawValue)"
+        case .item(let projection, _, _, _, _): "transcript.\(projection.kind.rawValue)"
         case .messageFooter: "transcript.message-footer"
         case .toolGroupHeader: "transcript.toolgroup-header"
         case .toolGroupLive: "transcript.toolgroup-live"
@@ -117,7 +125,7 @@ enum MacTranscriptRow: MacConversationTableRow {
     /// to route a logical update to the visible tiles that belong to it.
     var mutationSourceID: String {
         switch self {
-        case .item(let projection, _, _, _):
+        case .item(let projection, _, _, _, _):
             projection.sourceItemID
         case .messageFooter(let footer, _):
             footer.itemID
@@ -130,7 +138,7 @@ enum MacTranscriptRow: MacConversationTableRow {
     /// The table asks for a bounded band around the viewport, never the full
     /// transcript, so preparation stays ahead of cell realization.
     var preparedMarkdownText: String? {
-        guard case .item(let projection, _, _, _) = self,
+        guard case .item(let projection, _, _, _, _) = self,
               case .message(let message) = projection.displayItem,
               !message.isStreaming,
               let content = message.contents.first,
@@ -153,7 +161,13 @@ enum MacTranscriptRow: MacConversationTableRow {
     /// hidden collapsed bodies and non-text rows contribute nothing.
     var selectionText: String? {
         switch self {
-        case .item(let projection, let isExpanded, _, _):
+        case .item(
+            let projection,
+            let isExpanded,
+            _,
+            _,
+            let presentsActiveStatus
+        ):
             guard projection.kind.isDisclosure else {
                 return projection.rowText
             }
@@ -161,12 +175,15 @@ enum MacTranscriptRow: MacConversationTableRow {
                 switch projection.displayItem {
                 case .tool(let tool):
                     return tool.composedHeadline(
-                        compactLine: projection.compactLine
+                        compactLine: projection.compactLine,
+                        presentsActiveStatus: presentsActiveStatus
                     )
                 case .reasoning(let reasoning):
-                    return reasoning.isStreaming
+                    return reasoning.isStreaming && presentsActiveStatus
                         ? "Thinking…"
-                        : "Reasoning summary"
+                        : (reasoning.isStreaming
+                            ? "Reasoning"
+                            : "Reasoning summary")
                 case .diff(let diff):
                     return diff.path ?? "File changes"
                 case .generic(let generic):
@@ -188,7 +205,7 @@ enum MacTranscriptRow: MacConversationTableRow {
     }
 
     var selectionRoleLabel: String? {
-        guard case .item(let projection, _, _, _) = self,
+        guard case .item(let projection, _, _, _, _) = self,
               case .message(let message) = projection.displayItem else {
             return nil
         }
@@ -196,7 +213,7 @@ enum MacTranscriptRow: MacConversationTableRow {
     }
 
     var selectionSectionID: String? {
-        guard case .item(let projection, _, _, _) = self else { return id }
+        guard case .item(let projection, _, _, _, _) = self else { return id }
         return projection.projectionSectionID
     }
 
@@ -209,7 +226,13 @@ enum MacTranscriptRow: MacConversationTableRow {
         dynamicTypeSize: DynamicTypeSize,
         colorScheme: ColorScheme
     ) -> MacConversationNativeTextPresentation? {
-        guard case .item(let projection, let isExpanded, _, _) = self else {
+        guard case .item(
+            let projection,
+            let isExpanded,
+            _,
+            _,
+            let presentsActiveStatus
+        ) = self else {
             return nil
         }
         if let native = nativeTextPresentation(
@@ -230,11 +253,16 @@ enum MacTranscriptRow: MacConversationTableRow {
             let line: String
             switch projection.displayItem {
             case .tool(let tool):
-                var text = projection.compactLine ?? tool.compactHeadline
-                if let outcome = tool.compactOutcome { text += " · \(outcome)" }
-                line = text
+                line = tool.composedHeadline(
+                    compactLine: projection.compactLine,
+                    presentsActiveStatus: presentsActiveStatus
+                )
             case .reasoning(let reasoning):
-                line = reasoning.isStreaming ? "Thinking…" : "Reasoning summary"
+                line = reasoning.isStreaming && presentsActiveStatus
+                    ? "Thinking…"
+                    : (reasoning.isStreaming
+                        ? "Reasoning"
+                        : "Reasoning summary")
             case .diff(let diff):
                 line = diff.path ?? "File changes"
             case .generic(let generic):
@@ -260,7 +288,7 @@ enum MacTranscriptRow: MacConversationTableRow {
                     ofSize: NSFont.systemFontSize * fontScale
                 ),
                 fallbackColor: .secondaryLabelColor,
-                accessibilityLabel: projection.accessibilitySummary,
+                accessibilityLabel: line,
                 accessibilityIdentifier: "conversation.item.\(projection.sourceItemID)",
                 usesFastPlainTextRenderer: true
             )
@@ -293,7 +321,10 @@ enum MacTranscriptRow: MacConversationTableRow {
             )
         // Disclosure first rows returned above as compact activity lines, so
         // only message tiles and expanded disclosure body tiles reach here.
-        let semanticHeader = Self.liveScrollSemanticHeader(for: projection)
+        let semanticHeader = Self.liveScrollSemanticHeader(
+            for: projection,
+            presentsActiveStatus: presentsActiveStatus
+        )
         let source = projection.kind.isDisclosure && !isExpanded
             ? ""
             : projection.rowText
@@ -336,7 +367,8 @@ enum MacTranscriptRow: MacConversationTableRow {
     }
 
     private static func liveScrollSemanticHeader(
-        for projection: TranscriptRowProjection
+        for projection: TranscriptRowProjection,
+        presentsActiveStatus: Bool
     ) -> String? {
         switch projection.displayItem {
         case .message(let message):
@@ -347,14 +379,25 @@ enum MacTranscriptRow: MacConversationTableRow {
             return "Image"
         case .reasoning(let reasoning):
             guard projection.isFirstInItem else { return nil }
-            return reasoning.isStreaming ? "Thinking…" : "Reasoning summary"
+            return reasoning.isStreaming && presentsActiveStatus
+                ? "Thinking…"
+                : (reasoning.isStreaming
+                    ? "Reasoning"
+                    : "Reasoning summary")
         case .tool(let tool):
             var components: [String] = []
             if projection.isFirstInItem {
                 if projection.section != .toolTitle {
                     components.append(projection.accessibilitySummary)
                 }
-                components.append(tool.status.rawValue.capitalized)
+                switch tool.status {
+                case .running, .pending:
+                    components.append(
+                        presentsActiveStatus ? "Running" : "Previous activity"
+                    )
+                case .completed, .failed, .cancelled:
+                    components.append(tool.status.rawValue.capitalized)
+                }
             }
             if projection.isFirstInSection {
                 switch projection.section {
@@ -373,7 +416,7 @@ enum MacTranscriptRow: MacConversationTableRow {
             if projection.rowText.isEmpty,
                projection.section != .toolTitle {
                 components.append(
-                    tool.status == .running
+                    presentsActiveStatus && tool.status == .running
                         ? "Waiting for output…"
                         : "No additional output"
                 )
@@ -480,7 +523,7 @@ enum MacTranscriptRow: MacConversationTableRow {
         dynamicTypeSize: DynamicTypeSize,
         colorScheme: ColorScheme
     ) -> MacConversationNativeTextPresentation? {
-        guard case .item(let projection, let isExpanded, _, _) = self else {
+        guard case .item(let projection, let isExpanded, _, _, _) = self else {
             return nil
         }
         let fontScale = dynamicTypeSize.macTranscriptFontScale
@@ -1002,14 +1045,16 @@ func makeMacTranscriptRows(
     isExpanded: Bool,
     copiedItemID: String?,
     sectionRevision: UInt64,
-    showsCompactLine: Bool = true
+    showsCompactLine: Bool = true,
+    presentsActiveStatus: Bool = true
 ) -> [MacTranscriptRow] {
     var rows = projections.map { projection in
         MacTranscriptRow.item(
             projection,
             isExpanded: isExpanded,
             copiedItemID: copiedItemID,
-            showsCompactLine: showsCompactLine
+            showsCompactLine: showsCompactLine,
+            presentsActiveStatus: presentsActiveStatus
         )
     }
     if case .message(let message) = item,
@@ -1069,18 +1114,109 @@ private final class MacTranscriptSectionCache {
 }
 #endif
 
-private extension ConversationItem {
-    /// Items that own visible transcript geometry. An empty reasoning record
-    /// keeps its stable shell while streaming, then leaves no zero-height row
-    /// behind if it completes without producing user-visible text.
+extension ConversationItem {
+    /// Items that own visible transcript geometry. Provider lifecycles often
+    /// start and finish an empty reasoning record within a few milliseconds;
+    /// mounting that empty shell makes "Thinking…" visibly blink. Reasoning
+    /// joins the transcript only once it has user-visible text.
     var isRenderedTranscriptItem: Bool {
         guard !isTranscriptNoise else { return false }
         guard case .reasoning(let reasoning) = self else { return true }
-        return reasoning.isStreaming
-            || !reasoning.text.trimmingCharacters(
-                in: .whitespacesAndNewlines
-            ).isEmpty
+        return reasoning.hasVisibleTranscriptText
     }
+}
+
+private extension ChatReasoning {
+    var hasVisibleTranscriptText: Bool {
+        hasNonWhitespaceText
+    }
+}
+
+/// Exactly one transcript surface owns the current turn's activity status.
+/// The newest active current-turn item wins; the stable tail slot is the
+/// fallback while the assistant is otherwise working or streaming its reply.
+enum TranscriptActivityPresentation: Hashable {
+    case inactive
+    case working
+    case thinking(itemID: String)
+    case executing(toolID: String)
+
+    static func resolve(
+        turnState: TurnState,
+        activeTurnID: String?,
+        items: [ConversationItem]
+    ) -> Self {
+        guard turnState == .running else { return .inactive }
+        // Without an active identity there is no safe way to distinguish a
+        // new no-ID turn from an unfinished legacy row retained from an older
+        // turn. Prefer the neutral current-turn fallback over resurrecting a
+        // stale Thinking/Running owner.
+        guard let activeTurnID else { return .working }
+
+        func belongsToActiveTurn(_ itemTurnID: String?) -> Bool {
+            // A legacy nil-turn record cannot prove it belongs to this live
+            // turn; treating it as active can resurrect a stale command.
+            return itemTurnID == activeTurnID
+        }
+
+        for item in items.reversed() {
+            let itemTurnID: String? = switch item {
+            case .message(let value): value.turnID
+            case .reasoning(let value): value.turnID
+            case .tool(let value): value.turnID
+            case .diff(let value): value.turnID
+            case .plan(let value): value.turnID
+            case .generic(let value): value.turnID
+            }
+            // Items are chronological. Once the reverse scan leaves the
+            // active turn, no older item can own its presentation.
+            if let itemTurnID,
+               itemTurnID != activeTurnID {
+                break
+            }
+            switch item {
+            case .message(let message):
+                guard message.role == .assistant,
+                      message.isStreaming,
+                      belongsToActiveTurn(message.turnID) else {
+                    continue
+                }
+                return .working
+
+            case .reasoning(let reasoning):
+                guard reasoning.isStreaming,
+                      belongsToActiveTurn(reasoning.turnID),
+                      reasoning.hasVisibleTranscriptText else {
+                    continue
+                }
+                return .thinking(itemID: reasoning.id)
+
+            case .tool(let tool):
+                guard !item.isTranscriptNoise,
+                      tool.status == .running || tool.status == .pending,
+                      belongsToActiveTurn(tool.turnID) else {
+                    continue
+                }
+                return .executing(toolID: tool.id)
+
+            case .diff, .plan, .generic:
+                continue
+            }
+        }
+        return .working
+    }
+
+    var showsWorking: Bool { self == .working }
+
+    var activeToolID: String? {
+        guard case .executing(let toolID) = self else { return nil }
+        return toolID
+    }
+
+    func presentsThinking(itemID: String) -> Bool {
+        self == .thinking(itemID: itemID)
+    }
+
 }
 
 #if os(macOS)
@@ -1097,7 +1233,56 @@ private struct ConversationEmptyStateMarker: NSViewRepresentable {
 
     func updateNSView(_ nsView: NSView, context: Context) {}
 }
+
+/// Hosted SwiftUI table rows do not reliably vend their semantic children to
+/// AppKit. Keep one concrete, non-interactive accessibility element behind
+/// the row that currently owns activity so VoiceOver sees the same exclusive
+/// status as the pixels and live-scroll fallback.
+private struct ConversationActivityAccessibilityMarker: NSViewRepresentable {
+    let kind: String
+    let label: String
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        configure(view)
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        configure(nsView)
+    }
+
+    private func configure(_ view: NSView) {
+        view.setAccessibilityElement(true)
+        view.setAccessibilityRole(.staticText)
+        view.setAccessibilityIdentifier("conversation.activity.\(kind)")
+        view.setAccessibilityLabel(label)
+    }
+}
 #endif
+
+private extension View {
+    @ViewBuilder
+    func conversationActivityAccessibility(
+        kind: String,
+        label: String,
+        isActive: Bool
+    ) -> some View {
+        #if os(macOS)
+        background {
+            if isActive {
+                ConversationActivityAccessibilityMarker(
+                    kind: kind,
+                    label: label
+                )
+                .allowsHitTesting(false)
+            }
+        }
+        #else
+        self
+        #endif
+    }
+}
 
 /// Coarse scroll geometry: only boundary crossings and content-height motion
 /// change this value, so the scroll-geometry action never runs on plain
@@ -1118,6 +1303,60 @@ private struct ConversationScrollGeometrySample: Equatable {
 @MainActor
 private final class ConversationScrollScratch {
     var lastSample = ConversationScrollGeometrySample.initial
+}
+
+/// Keeps the bounded eager iOS transcript from evicting the rows a reader owns.
+/// At the latest edge the window follows the tail; once browsing begins both
+/// ends freeze, with new arrivals withheld until the reader returns to latest.
+enum ConversationTranscriptWindow {
+    struct Anchor: Equatable {
+        let firstItemID: String?
+        let lastItemID: String?
+    }
+
+    static func visibleItems(
+        in items: [ConversationItem],
+        firstVisibleItemID: String?,
+        lastVisibleItemID: String?,
+        limit: Int
+    ) -> ArraySlice<ConversationItem> {
+        func boundedSlice(from index: Int) -> ArraySlice<ConversationItem> {
+            let boundedEndIndex = items.index(
+                index,
+                offsetBy: max(1, limit),
+                limitedBy: items.endIndex
+            ) ?? items.endIndex
+            return items[index..<boundedEndIndex]
+        }
+
+        if let firstVisibleItemID,
+           let index = items.firstIndex(where: { $0.id == firstVisibleItemID }) {
+            guard let lastVisibleItemID else {
+                return boundedSlice(from: index)
+            }
+            if let lastIndex = items.firstIndex(where: {
+                $0.id == lastVisibleItemID
+            }), lastIndex >= index {
+                return items[index...lastIndex]
+            }
+            return boundedSlice(from: index)
+        }
+        return items.suffix(limit)
+    }
+
+    static func anchor(
+        isNearBottom: Bool,
+        current: Anchor,
+        visibleItems: ArraySlice<ConversationItem>
+    ) -> Anchor {
+        guard !isNearBottom else {
+            return Anchor(firstItemID: nil, lastItemID: nil)
+        }
+        return Anchor(
+            firstItemID: current.firstItemID ?? visibleItems.first?.id,
+            lastItemID: current.lastItemID ?? visibleItems.last?.id
+        )
+    }
 }
 
 struct ConversationView: View {
@@ -1183,22 +1422,14 @@ struct ConversationView: View {
                 coordinator.start()
             }
         }
-        .onChange(of: isPendingTurnGap, initial: true) { _, isPending in
-            pendingTurnRevealTask?.cancel()
-            pendingTurnRevealTask = nil
-            if isPending {
-                // Avoid flashing the status row for sub-quarter-second turns.
-                // Once revealed it remains mounted until the turn ends.
-                pendingTurnRevealTask = Task { @MainActor in
-                    try? await Task.sleep(nanoseconds: 250_000_000)
-                    guard !Task.isCancelled else { return }
-                    showsPendingTurnIndicator = true
-                }
-            } else {
-                showsPendingTurnIndicator = false
-            }
+        .onChange(of: workingVisibilityRequest, initial: true) { _, request in
+            updateWorkingVisibility(request: request)
         }
         .onDisappear {
+            workingRevealTask?.cancel()
+            workingRevealTask = nil
+            workingRevealGeneration &+= 1
+            hideWorkingNow()
             if startsCoordinator {
                 Task {
                     await coordinator.detach()
@@ -1244,14 +1475,128 @@ struct ConversationView: View {
     private static let transcriptWindowStep = 150
 
     @State private var firstVisibleItemID: String?
-    @State private var showsPendingTurnIndicator = false
-    @State private var pendingTurnRevealTask: Task<Void, Never>?
+    @State private var lastVisibleItemID: String?
+    @State private var showsWorkingActivity = false
+    @State private var workingRevealTask: Task<Void, Never>?
+    @State private var workingRevealGeneration: UInt64 = 0
+    @State private var workingShownAt: TimeInterval?
 
-    private var isPendingTurnGap: Bool {
-        PendingTurnIndicator.showsPendingTurn(
+    private struct WorkingVisibilityRequest: Equatable {
+        let turnLifecycleRevision: UInt64
+        let activeTurnID: String?
+        let shouldReveal: Bool
+    }
+
+    private var resolvedActivityPresentation: TranscriptActivityPresentation {
+        TranscriptActivityPresentation.resolve(
             turnState: store.state.turnState,
-            lastItem: store.state.items.last
+            activeTurnID: store.state.activeTurnID,
+            items: store.state.items
         )
+    }
+
+    private var hasTurnActivitySlot: Bool {
+        store.state.turnState == .running || showsWorkingActivity
+    }
+
+    private var shouldRevealWorking: Bool {
+        store.state.turnState == .running
+            && resolvedActivityPresentation.showsWorking
+    }
+
+    private var workingVisibilityRequest: WorkingVisibilityRequest {
+        WorkingVisibilityRequest(
+            turnLifecycleRevision: store.turnLifecycleRevision,
+            activeTurnID: store.state.activeTurnID,
+            shouldReveal: shouldRevealWorking
+        )
+    }
+
+    /// While the cosmetic Working cue completes its short minimum dwell, it
+    /// remains the sole active presentation owner. Real rows still mount
+    /// immediately, but their status chrome stays neutral until this flips.
+    private var transcriptActivityPresentation: TranscriptActivityPresentation {
+        showsWorkingActivity ? .working : resolvedActivityPresentation
+    }
+
+    private var presentsWorkingActivity: Bool {
+        showsWorkingActivity
+    }
+
+    private func updateWorkingVisibility(request: WorkingVisibilityRequest) {
+        workingRevealTask?.cancel()
+        workingRevealTask = nil
+        workingRevealGeneration &+= 1
+        let generation = workingRevealGeneration
+
+        if request.shouldReveal {
+            guard !showsWorkingActivity else { return }
+            workingRevealTask = workingVisibilityTask(
+                delayNanoseconds: 500_000_000,
+                generation: generation,
+                expectedRequest: request,
+                showsWorking: true
+            )
+            return
+        }
+
+        guard showsWorkingActivity else {
+            workingShownAt = nil
+            return
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        let elapsed = now - (workingShownAt ?? now)
+        let remaining = max(0, 0.5 - elapsed)
+        guard remaining > 0 else {
+            hideWorkingNow()
+            return
+        }
+        workingRevealTask = workingVisibilityTask(
+            delayNanoseconds: UInt64((remaining * 1_000_000_000).rounded(.up)),
+            generation: generation,
+            expectedRequest: request,
+            showsWorking: false
+        )
+    }
+
+    private func workingVisibilityTask(
+        delayNanoseconds: UInt64,
+        generation: UInt64,
+        expectedRequest: WorkingVisibilityRequest,
+        showsWorking: Bool
+    ) -> Task<Void, Never> {
+        Task { @MainActor in
+            do {
+                try await Task.sleep(nanoseconds: delayNanoseconds)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled,
+                  generation == workingRevealGeneration,
+                  workingVisibilityRequest == expectedRequest else {
+                return
+            }
+            if showsWorking {
+                workingShownAt = ProcessInfo.processInfo.systemUptime
+                setWorkingVisible(true)
+            } else {
+                hideWorkingNow()
+            }
+        }
+    }
+
+    private func hideWorkingNow() {
+        workingShownAt = nil
+        setWorkingVisible(false)
+    }
+
+    private func setWorkingVisible(_ isVisible: Bool) {
+        guard showsWorkingActivity != isVisible else { return }
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            showsWorkingActivity = isVisible
+        }
     }
 
     #if os(macOS)
@@ -1262,16 +1607,45 @@ struct ConversationView: View {
     #endif
 
     private var visibleItems: ArraySlice<ConversationItem> {
-        let items = store.state.items
-        if let firstVisibleItemID,
-           let index = items.firstIndex(where: { $0.id == firstVisibleItemID }) {
-            return items[index...]
+        ConversationTranscriptWindow.visibleItems(
+            in: store.state.items,
+            firstVisibleItemID: firstVisibleItemID,
+            lastVisibleItemID: lastVisibleItemID,
+            limit: Self.transcriptWindowStep
+        )
+    }
+
+    private func setIOSNearBottom(_ isNearBottom: Bool) {
+        synchronizeIOSWindowAnchor(isNearBottom: isNearBottom)
+        store.setNearBottom(isNearBottom)
+    }
+
+    private func synchronizeIOSWindowAnchor(isNearBottom: Bool) {
+        let anchor = ConversationTranscriptWindow.anchor(
+            isNearBottom: isNearBottom,
+            current: ConversationTranscriptWindow.Anchor(
+                firstItemID: firstVisibleItemID,
+                lastItemID: lastVisibleItemID
+            ),
+            visibleItems: visibleItems
+        )
+        if firstVisibleItemID != anchor.firstItemID {
+            firstVisibleItemID = anchor.firstItemID
         }
-        return items.suffix(Self.transcriptWindowStep)
+        if lastVisibleItemID != anchor.lastItemID {
+            lastVisibleItemID = anchor.lastItemID
+        }
     }
 
     private var hasHiddenLocalItems: Bool {
         visibleItems.first?.id != store.state.items.first?.id
+    }
+
+    private var leadingVisibleToolIdentityItemID: String? {
+        TranscriptEntry.leadingToolIdentityItemID(
+            in: store.state.items,
+            visibleStartIndex: visibleItems.startIndex
+        )
     }
 
     /// Everything the hosted transcript content can visually depend on.
@@ -1285,6 +1659,7 @@ struct ConversationView: View {
         hasher.combine(store.state.items.first?.id)
         hasher.combine(store.state.items.last?.id)
         hasher.combine(firstVisibleItemID)
+        hasher.combine(lastVisibleItemID)
         hasher.combine(store.expandedItemIDs)
         hasher.combine(store.copiedItemID)
         hasher.combine(store.respondingInteractionIDs)
@@ -1293,7 +1668,9 @@ struct ConversationView: View {
         hasher.combine(store.isLoadingOlderHistory)
         hasher.combine(store.state.hasOlderHistory)
         hasher.combine(store.state.didTruncateHistory)
-        hasher.combine(showsPendingTurnIndicator)
+        hasher.combine(hasTurnActivitySlot)
+        hasher.combine(presentsWorkingActivity)
+        hasher.combine(transcriptActivityPresentation)
         hasher.combine(colorScheme)
         hasher.combine(dynamicTypeSize)
         return hasher.finalize()
@@ -1313,6 +1690,7 @@ struct ConversationView: View {
     @State private var macTranscriptSectionCache = MacTranscriptSectionCache()
 
     private var macSections: [MacConversationTableSection<MacTranscriptRow>] {
+        let activityPresentation = transcriptActivityPresentation
         var sections: [MacConversationTableSection<MacTranscriptRow>] = []
         if store.state.hasOlderHistory {
             var hasher = Hasher()
@@ -1346,7 +1724,9 @@ struct ConversationView: View {
                 retainedSectionIDs.insert(group.id)
                 let isGroupExpanded = store.expandedItemIDs.contains(group.id)
                 let header = group.headerModel(
-                    isExpanded: isGroupExpanded
+                    isExpanded: isGroupExpanded,
+                    activeToolID:
+                        activityPresentation.activeToolID
                 )
                 var headerHasher = Hasher()
                 headerHasher.combine(header.summary)
@@ -1403,6 +1783,7 @@ struct ConversationView: View {
                         makeToolGroupRows(
                             group: group,
                             isGroupExpanded: isGroupExpanded,
+                            header: header,
                             revision: sectionRevision,
                             headerRevision: headerRevision
                         )
@@ -1457,6 +1838,22 @@ struct ConversationView: View {
                 || store.copiedItemID?.hasPrefix("\(item.id):") == true {
                 sectionRevision ^= 2
             }
+            let presentsActiveStatus: Bool = switch item {
+            case .reasoning(let reasoning):
+                reasoning.isStreaming
+                    && activityPresentation.presentsThinking(
+                        itemID: reasoning.id
+                    )
+            case .tool(let tool):
+                activityPresentation.activeToolID == tool.id
+            case .message, .diff, .plan, .generic:
+                false
+            }
+            if presentsActiveStatus {
+                // The same stable cell changes only its active/neutral chrome
+                // when a newer phase takes ownership.
+                sectionRevision ^= 4
+            }
             sections.append(
                 macTranscriptSectionCache.section(
                     for: item.id,
@@ -1467,18 +1864,23 @@ struct ConversationView: View {
                         projections: visibleProjections,
                         isExpanded: isExpanded,
                         copiedItemID: store.copiedItemID,
-                        sectionRevision: sectionRevision
+                        sectionRevision: sectionRevision,
+                        presentsActiveStatus: presentsActiveStatus
                     )
                 }
             )
         }
         macTranscriptSectionCache.retain(itemIDs: retainedSectionIDs)
-        if showsPendingTurnIndicator {
+        if hasTurnActivitySlot {
             sections.append(
                 MacConversationTableSection(
                     id: "pending-turn",
-                    revision: 0,
-                    rows: [.pendingTurn]
+                    revision: presentsWorkingActivity ? 1 : 0,
+                    rows: [
+                        .pendingTurn(
+                            showsWorking: presentsWorkingActivity
+                        ),
+                    ]
                 )
             )
         }
@@ -1515,12 +1917,13 @@ struct ConversationView: View {
     private func makeToolGroupRows(
         group: ToolGroup,
         isGroupExpanded: Bool,
+        header: ToolGroupHeaderModel,
         revision: UInt64,
         headerRevision: UInt64
     ) -> [MacTranscriptRow] {
         var rows: [MacTranscriptRow] = [
             .toolGroupHeader(
-                group.headerModel(isExpanded: isGroupExpanded),
+                header,
                 revision: headerRevision
             ),
         ]
@@ -1561,7 +1964,8 @@ struct ConversationView: View {
                     isExpanded: member.isExpanded,
                     copiedItemID: store.copiedItemID,
                     sectionRevision: revision,
-                    showsCompactLine: member.showsCompactLine
+                    showsCompactLine: member.showsCompactLine,
+                    presentsActiveStatus: false
                 ))
             }
             // Permanently own the group's trailing conversation padding.
@@ -1671,13 +2075,13 @@ struct ConversationView: View {
         isLast: Bool
     ) -> some View {
         let beginsItem: Bool = {
-            if case .item(let projection, _, _, _) = row {
+            if case .item(let projection, _, _, _, _) = row {
                 return projection.isFirstInItem
             }
             return true
         }()
         let endsItem: Bool = {
-            if case .item(let projection, let isExpanded, _, _) = row {
+            if case .item(let projection, let isExpanded, _, _, _) = row {
                 if case .message(let message) = projection.displayItem,
                    !message.isStreaming,
                    message.hasText {
@@ -1697,13 +2101,23 @@ struct ConversationView: View {
             case .toolGroupHeader, .toolGroupLive, .toolGroupFooter,
                  .pendingTurn:
                 return ChatTypography.activityLinePadding
-            case .item(let projection, _, _, _):
+            case .item(let projection, _, _, _, _):
                 return projection.kind.isDisclosure
                     ? ChatTypography.activityLinePadding
                     : 7
             default:
                 return 7
             }
+        }()
+        let topPadding: CGFloat = {
+            if case .pendingTurn = row {
+                return ChatTypography.activityLinePadding
+            }
+            return isFirst ? 22 : (beginsItem ? itemSpacing : 0)
+        }()
+        let bottomPadding: CGFloat = {
+            if case .pendingTurn = row { return 16 }
+            return isLast ? 16 : (endsItem ? itemSpacing : 0)
         }()
         VStack(alignment: .leading, spacing: 0) {
             switch row {
@@ -1713,12 +2127,14 @@ struct ConversationView: View {
                 let projection,
                 let isExpanded,
                 _,
-                let showsCompactLine
+                let showsCompactLine,
+                let presentsActiveStatus
             ):
                 timelineView(
                     for: projection,
                     isExpanded: isExpanded,
-                    showsCompactLine: showsCompactLine
+                    showsCompactLine: showsCompactLine,
+                    presentsActiveStatus: presentsActiveStatus
                 )
                     .accessibilityIdentifier(
                         projection.isFirstInItem
@@ -1744,8 +2160,8 @@ struct ConversationView: View {
                 Color.clear
                     .frame(height: 0)
                     .accessibilityHidden(true)
-            case .pendingTurn:
-                PendingTurnIndicator()
+            case .pendingTurn(let showsWorking):
+                PendingTurnIndicator(showsWorking: showsWorking)
                     .accessibilityIdentifier("conversation.pending-turn")
             case .approval(let approval, _):
                 ApprovalCard(
@@ -1765,8 +2181,8 @@ struct ConversationView: View {
         }
         .frame(maxWidth: 760, alignment: .leading)
         .padding(.horizontal, horizontalTranscriptPadding)
-        .padding(.top, isFirst ? 22 : (beginsItem ? itemSpacing : 0))
-        .padding(.bottom, isLast ? 16 : (endsItem ? itemSpacing : 0))
+        .padding(.top, topPadding)
+        .padding(.bottom, bottomPadding)
         .frame(maxWidth: .infinity)
         .environment(\.chatRowActions, rowActions)
     }
@@ -1774,12 +2190,14 @@ struct ConversationView: View {
 
     #if os(iOS)
     private var iosTranscript: some View {
+        let activityPresentation = transcriptActivityPresentation
         // The first tool starts in the same group wrapper that owns the full
         // consecutive run. Appending a second tool updates that wrapper in
         // place instead of replacing the first component under the viewport.
         let renderedEntries = TranscriptEntry.entries(
             of: self.visibleItems.filter(\.isRenderedTranscriptItem),
-            minimumGroupSize: 1
+            minimumGroupSize: 1,
+            leadingToolIdentityItemID: leadingVisibleToolIdentityItemID
         )
         return ConversationTranscriptScroller(
             isConversationEmpty: isConversationEmpty,
@@ -1790,9 +2208,13 @@ struct ConversationView: View {
             itemExists: { id in
                 renderedEntries.contains(where: { $0.id == id })
             },
-            onNearBottomChange: { store.setNearBottom($0) },
+            onNearBottomChange: { setIOSNearBottom($0) },
             onAnchoredChange: { _ in },
-            onJump: { store.jumpToLatest() }
+            onJump: {
+                firstVisibleItemID = nil
+                lastVisibleItemID = nil
+                store.jumpToLatest()
+            }
         ) {
             VStack(alignment: .leading, spacing: 14) {
                 earlierContent
@@ -1800,19 +2222,29 @@ struct ConversationView: View {
                 ForEach(renderedEntries) { entry in
                     switch entry {
                     case .item(let item):
-                        timelineView(for: item)
+                        timelineView(
+                            for: item,
+                            activityPresentation: activityPresentation
+                        )
                             .id(entry.id)
                             .accessibilityIdentifier(
                                 "conversation.item.\(item.id)"
                             )
                     case .toolGroup(let group):
-                        ToolGroupCard(group: group, store: store)
+                        ToolGroupCard(
+                            group: group,
+                            store: store,
+                            activeToolID:
+                                activityPresentation.activeToolID
+                        )
                             .id(entry.id)
                     }
                 }
 
-                if showsPendingTurnIndicator {
-                    PendingTurnIndicator()
+                if hasTurnActivitySlot {
+                    PendingTurnIndicator(
+                        showsWorking: presentsWorkingActivity
+                    )
                         .id("pending-turn")
                         .accessibilityIdentifier("conversation.pending-turn")
                 }
@@ -1850,12 +2282,19 @@ struct ConversationView: View {
             if let oldValue, items.contains(where: { $0.id == oldValue }) {
                 // A history page prepended: reveal it. Prepends only happen
                 // when the user asked for earlier content.
+                if lastVisibleItemID == nil {
+                    lastVisibleItemID = visibleItems.last?.id
+                }
                 firstVisibleItemID = newValue
             } else if let firstVisibleItemID,
                       !items.contains(where: { $0.id == firstVisibleItemID }) {
                 // The window anchor was trimmed away; fall back to the tail.
                 self.firstVisibleItemID = nil
+                lastVisibleItemID = nil
             }
+        }
+        .onChange(of: store.isNearBottom, initial: true) { _, isNearBottom in
+            synchronizeIOSWindowAnchor(isNearBottom: isNearBottom)
         }
         .overlay {
             if isConversationEmpty {
@@ -1922,6 +2361,9 @@ struct ConversationView: View {
             items.startIndex,
             currentIndex - Self.transcriptWindowStep
         )
+        if lastVisibleItemID == nil {
+            lastVisibleItemID = visibleItems.last?.id
+        }
         firstVisibleItemID = items[newIndex].id
     }
 
@@ -1956,20 +2398,28 @@ struct ConversationView: View {
     }
 
     @ViewBuilder
-    private func timelineView(for item: ConversationItem) -> some View {
+    private func timelineView(
+        for item: ConversationItem,
+        activityPresentation: TranscriptActivityPresentation
+    ) -> some View {
         switch item {
         case .message(let message):
             ChatMessageView(message: message)
         case .reasoning(let reasoning):
             ReasoningCard(
                 reasoning: reasoning,
-                isExpanded: store.expandedItemIDs.contains(reasoning.id)
+                isExpanded: store.expandedItemIDs.contains(reasoning.id),
+                presentsActiveStatus:
+                    activityPresentation.presentsThinking(
+                        itemID: reasoning.id
+                    )
             )
         case .tool(let tool):
             ToolActivityCard(
                 tool: tool,
                 isExpanded: store.expandedItemIDs.contains(tool.id),
-                copiedItemID: store.copiedItemID
+                copiedItemID: store.copiedItemID,
+                presentsActiveStatus: false
             )
         case .diff(let diff):
             DiffCard(
@@ -1991,7 +2441,8 @@ struct ConversationView: View {
     private func timelineView(
         for projection: TranscriptRowProjection,
         isExpanded: Bool,
-        showsCompactLine: Bool
+        showsCompactLine: Bool,
+        presentsActiveStatus: Bool
     ) -> some View {
         switch projection.displayItem {
         case .message(let message):
@@ -2004,7 +2455,8 @@ struct ConversationView: View {
             ReasoningCard(
                 reasoning: reasoning,
                 isExpanded: isExpanded,
-                segment: projection
+                segment: projection,
+                presentsActiveStatus: presentsActiveStatus
             )
         case .tool(let tool):
             ToolActivityCard(
@@ -2012,7 +2464,8 @@ struct ConversationView: View {
                 isExpanded: isExpanded,
                 copiedItemID: store.copiedItemID,
                 segment: projection,
-                showsCompactLine: showsCompactLine
+                showsCompactLine: showsCompactLine,
+                presentsActiveStatus: presentsActiveStatus
             )
         case .diff(let diff):
             DiffCard(
@@ -2065,7 +2518,7 @@ struct ConversationView: View {
         !store.state.items.contains(where: \.isRenderedTranscriptItem)
             && store.state.approvals.isEmpty
             && store.state.questions.isEmpty
-            && !showsPendingTurnIndicator
+            && !hasTurnActivitySlot
     }
 
     private var isAwaitingInitialSnapshot: Bool {
@@ -2459,9 +2912,6 @@ struct ChatMessageView: View {
                     ForEach(message.contents) { content in
                         contentView(content)
                     }
-                    if message.isStreaming {
-                        StreamingIndicator()
-                    }
                 }
                 .padding(.horizontal, message.role == .user ? 12 : 0)
                 .padding(.top, messageTopPadding)
@@ -2686,45 +3136,35 @@ enum ChatTimestamp {
     }
 }
 
-private struct StreamingIndicator: View {
-    var body: some View {
-        HStack(spacing: 6) {
-            ProgressView()
-                .controlSize(.mini)
-            Text("Working")
-        }
-        .font(.caption)
-        .foregroundStyle(.secondary)
-        .accessibilityLabel("Assistant is responding")
-    }
-}
-
-/// Shown at the transcript tail for the duration of a running turn.
+/// A fixed-height transcript-tail slot mounted for the whole running turn.
 struct PendingTurnIndicator: View {
+    let showsWorking: Bool
+
     var body: some View {
-        HStack(spacing: 7) {
-            ProgressView()
-                .controlSize(.mini)
-                .frame(width: 16)
-            Text("Working…")
-                .font(ChatTypography.activityLine)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
+        ZStack(alignment: .leading) {
+            if showsWorking {
+                HStack(spacing: 7) {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .frame(width: 16)
+                    Text("Working…")
+                        .font(ChatTypography.activityLine)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .transition(.identity)
+            }
         }
         .frame(minHeight: ChatTypography.activityLineHeight)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Assistant is working")
-    }
-
-    /// One stable status row lives at the tail for the entire running turn.
-    /// Earlier versions repeatedly removed and reinserted a gap-only row
-    /// between reasoning, tools, and message blocks.
-    static func showsPendingTurn(
-        turnState: TurnState,
-        lastItem: ConversationItem?
-    ) -> Bool {
-        _ = lastItem
-        return turnState == .running
+        .accessibilityHidden(!showsWorking)
+        .animation(nil, value: showsWorking)
+        .conversationActivityAccessibility(
+            kind: "working",
+            label: "Working…",
+            isActive: showsWorking
+        )
     }
 }
 
@@ -2732,15 +3172,18 @@ private struct ReasoningCard: View {
     let reasoning: ChatReasoning
     let isExpanded: Bool
     var segment: TranscriptRowProjection?
+    let presentsActiveStatus: Bool
 
     init(
         reasoning: ChatReasoning,
         isExpanded: Bool,
-        segment: TranscriptRowProjection? = nil
+        segment: TranscriptRowProjection? = nil,
+        presentsActiveStatus: Bool = true
     ) {
         self.reasoning = reasoning
         self.isExpanded = isExpanded
         self.segment = segment
+        self.presentsActiveStatus = presentsActiveStatus
     }
 
     @Environment(\.chatRowActions) private var actions
@@ -2766,9 +3209,15 @@ private struct ReasoningCard: View {
             // even though its compact height and identity should be stable.
             if reasoning.isStreaming || displayText != nil {
                 DisclosureCard(
-                    title: reasoning.isStreaming ? "Thinking…" : "Reasoning summary",
+                    title: reasoning.isStreaming && presentsActiveStatus
+                        ? "Thinking…"
+                        : (reasoning.isStreaming
+                            ? "Reasoning"
+                            : "Reasoning summary"),
                     symbol: "brain.head.profile",
-                    statusColor: reasoning.isStreaming ? .blue : .secondary,
+                    statusColor: reasoning.isStreaming && presentsActiveStatus
+                        ? .blue
+                        : .secondary,
                     isExpanded: isExpanded,
                     toggle: { actions.toggleExpanded(itemID: reasoning.id) }
                 ) {
@@ -2776,6 +3225,11 @@ private struct ReasoningCard: View {
                         reasoningText(displayText)
                     }
                 }
+                .conversationActivityAccessibility(
+                    kind: "thinking",
+                    label: "Thinking…",
+                    isActive: reasoning.isStreaming && presentsActiveStatus
+                )
             }
         }
     }
@@ -2795,19 +3249,22 @@ private struct ToolActivityCard: View {
     let copiedItemID: String?
     var segment: TranscriptRowProjection?
     var showsCompactLine: Bool
+    let presentsActiveStatus: Bool
 
     init(
         tool: ToolActivity,
         isExpanded: Bool,
         copiedItemID: String?,
         segment: TranscriptRowProjection? = nil,
-        showsCompactLine: Bool = true
+        showsCompactLine: Bool = true,
+        presentsActiveStatus: Bool = true
     ) {
         self.tool = tool
         self.isExpanded = isExpanded
         self.copiedItemID = copiedItemID
         self.segment = segment
         self.showsCompactLine = showsCompactLine
+        self.presentsActiveStatus = presentsActiveStatus
     }
 
     @Environment(\.chatRowActions) private var actions
@@ -2855,7 +3312,8 @@ private struct ToolActivityCard: View {
             actions.toggleExpanded(itemID: tool.id)
         } label: {
             HStack(spacing: 7) {
-                if tool.status == .running || tool.status == .pending {
+                if presentsActiveStatus
+                    && (tool.status == .running || tool.status == .pending) {
                     ProgressView()
                         .controlSize(.mini)
                         .frame(width: 16)
@@ -2885,10 +3343,19 @@ private struct ToolActivityCard: View {
             "\(headline), \(isExpanded ? "expanded" : "collapsed")"
         )
         .accessibilityHint(isExpanded ? "Collapses details." : "Expands details.")
+        .conversationActivityAccessibility(
+            kind: "executing",
+            label: headline,
+            isActive: presentsActiveStatus
+                && (tool.status == .running || tool.status == .pending)
+        )
     }
 
     private var headline: String {
-        tool.composedHeadline(compactLine: segment?.compactLine)
+        tool.composedHeadline(
+            compactLine: segment?.compactLine,
+            presentsActiveStatus: presentsActiveStatus
+        )
     }
 
     @ViewBuilder
@@ -2921,7 +3388,11 @@ private struct ToolActivityCard: View {
                     .transcriptTextSelection()
             }
             if tool.input == nil, tool.output == nil, tool.errorMessage == nil {
-                Text(tool.status == .running ? "Waiting for output…" : "No additional output")
+                Text(
+                    presentsActiveStatus && tool.status == .running
+                        ? "Waiting for output…"
+                        : "No additional output"
+                )
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -2985,6 +3456,11 @@ struct ToolGroupHeaderRow: View {
         .accessibilityHint(
             header.isExpanded ? "Collapses the tool list." : "Expands the tool list."
         )
+        .conversationActivityAccessibility(
+            kind: "executing",
+            label: header.summary,
+            isActive: header.isRunning
+        )
     }
 }
 
@@ -3016,14 +3492,20 @@ struct ToolGroupLiveRow: View {
 struct ToolGroupCard: View {
     let group: ToolGroup
     @ObservedObject var store: ConversationStore
+    let activeToolID: String?
 
     var body: some View {
         let isExpanded = store.expandedItemIDs.contains(group.id)
-        let headerAccessibilityIdentifier = group.items.count == 1
+        let headerAccessibilityIdentifier = group.isStandaloneSingleton
             ? "conversation.item.\(group.items[0].id)"
             : "conversation.toolgroup.\(group.id)"
         VStack(alignment: .leading, spacing: 4) {
-            ToolGroupHeaderRow(header: group.headerModel(isExpanded: isExpanded))
+            ToolGroupHeaderRow(
+                header: group.headerModel(
+                    isExpanded: isExpanded,
+                    activeToolID: activeToolID
+                )
+            )
                 .accessibilityIdentifier(headerAccessibilityIdentifier)
             if isExpanded {
                 ForEach(group.items, id: \.id) { item in
@@ -3037,7 +3519,8 @@ struct ToolGroupCard: View {
                             tool: tool,
                             isExpanded: member.isExpanded,
                             copiedItemID: store.copiedItemID,
-                            showsCompactLine: member.showsCompactLine
+                            showsCompactLine: member.showsCompactLine,
+                            presentsActiveStatus: false
                         )
                         .accessibilityIdentifier("conversation.item.\(item.id)")
                     }

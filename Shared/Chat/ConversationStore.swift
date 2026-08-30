@@ -1511,6 +1511,10 @@ final class ConversationStore: ObservableObject {
     @Published private(set) var isLoadingOlderHistory = false
     private(set) var transcriptMutation = TranscriptMutation.empty
     private(set) var projectionDiagnostics = TranscriptProjectionDiagnostics()
+    /// Advances once per accepted turn start, including providers that omit a
+    /// turn ID. Cosmetic delayed UI work keys off this value so a timer from a
+    /// completed turn can never fire inside its successor.
+    private(set) var turnLifecycleRevision: UInt64 = 0
 
     /// Changes only when the hosted transcript's rows can change. Durable
     /// control traffic still advances `lastAppliedSequence`, but acknowledgements,
@@ -1641,6 +1645,9 @@ final class ConversationStore: ObservableObject {
             )
         }
         guard didApply else { return false }
+        if ChatEventKind(rawValue: envelope.type) == .turnStarted {
+            turnLifecycleRevision &+= 1
+        }
         logTranscriptEnvelope(envelope, previousItemCount: previousItemCount)
         let adoptedPreparedTranscriptItem: Bool
         switch (ChatEventKind(rawValue: envelope.type), preparedReducerPayload) {

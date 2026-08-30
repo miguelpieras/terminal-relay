@@ -1847,7 +1847,7 @@ final class MacConversationTableViewTests: XCTestCase {
         fontScale: CGFloat = 1,
         colorScheme: ColorScheme = .light
     ) async {
-        guard case .item(let projection, _, _, _) = row,
+        guard case .item(let projection, _, _, _, _) = row,
               case .message(let message) = projection.displayItem,
               let source = message.contents.first?.text,
               let prepared = await SanitizedMarkdownCache.shared
@@ -3079,7 +3079,7 @@ final class MacConversationTableViewTests: XCTestCase {
             sectionRevision: 1
         )
         XCTAssertTrue(streamingRows.allSatisfy { row in
-            guard case .item(let projection, _, _, _) = row else { return false }
+            guard case .item(let projection, _, _, _, _) = row else { return false }
             return row.nativeTextPresentation(
                 dynamicTypeSize: .large,
                 colorScheme: .light
